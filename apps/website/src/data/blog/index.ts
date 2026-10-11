@@ -3,6 +3,48 @@ import type { PostMeta } from './types'
 /** Индекс блога: список и метаданные без тяжёлых тел публикаций. */
 export const postsIndex: PostMeta[] = [
   {
+    slug: "from-a-minute-to-a-second",
+    title: "From a minute to a second: where the time to build t27 went, and where it still goes",
+    summary: "[measured on one 8-core Mac whose load varied overnight; pairs taken under the same load] One overnight loop measured every place t27 builds and waits, and fixed what the numbers pointed at. A warm t27c frontier went from 55-68 s to about 0.9 s, an unchanged bitstream is found in 0.22-0.39 s instead of 4.3-8.9 s, a board run after approval no longer builds first, and the corpus suite CI runs on every pull request dropped from 221-257 s to 108-140 s. Almost all of the old time went into recomputing what had not changed and into running independent work one item at a time. What is left: about 2 s per spec in zig's relink, 27 s of nextpnr per logic change, about 14 s to load a board, and a 72 s C-header gate.",
+    date: "2026-10-11",
+    readingMinutes: 8,
+    tags: ["t27", "Measurement", "FPGA", "Verification"],
+    receipts: [
+      { label: "t27#8095: the epic, with the consolidated before-and-after table (comment of 11 October)", href: "https://github.com/gHashTag/t27/issues/8095#issuecomment-6103268818" },
+      { label: "t27#8737: the loop ledger, one comment per tick", href: "https://github.com/gHashTag/t27/issues/8737" },
+      { label: "t27#8741: generated-code hashes from a cache keyed on the import closure and the binary · MERGED", href: "https://github.com/gHashTag/t27/pull/8741" },
+      { label: "t27#8847: a cold frontier fills that cache with 8 workers · MERGED", href: "https://github.com/gHashTag/t27/pull/8847" },
+      { label: "t27#8751: t27c frontier --watch · MERGED", href: "https://github.com/gHashTag/t27/pull/8751" },
+      { label: "t27#8825: the watch reads nothing until a stat moves · MERGED", href: "https://github.com/gHashTag/t27/pull/8825" },
+      { label: "t27#8856: watch reruns side by side · MERGED", href: "https://github.com/gHashTag/t27/pull/8856" },
+      { label: "t27#8808: tool digests from a stat-keyed cache · MERGED", href: "https://github.com/gHashTag/t27/pull/8808" },
+      { label: "t27#8814: the venv read directly, not through pip freeze · MERGED", href: "https://github.com/gHashTag/t27/pull/8814" },
+      { label: "t27#8797: the bench agent builds before the approval · MERGED", href: "https://github.com/gHashTag/t27/pull/8797" },
+      { label: "t27#8837, t27#8840, t27#8845: t27c suite in parallel · MERGED", href: "https://github.com/gHashTag/t27/pull/8837" },
+      { label: "t27#8819: a timed-out build stops its whole process tree · MERGED", href: "https://github.com/gHashTag/t27/pull/8819" },
+      { label: "t27#8872: tri hot · MERGED", href: "https://github.com/gHashTag/t27/pull/8872" },
+      { label: "t27#8754: nextpnr clock routing, the measurements and the patch", href: "https://github.com/gHashTag/t27/issues/8754" },
+      { label: "t27#8829: the C-header gate, the largest suite cost left", href: "https://github.com/gHashTag/t27/issues/8829" },
+    ],
+    openQuestions: [
+      "No board run was made after these changes: the ~13-15 s board load is from earlier runs, and the faster JTAG clock is untested.",
+      "All timings come from one Mac whose load varied from about 3 to about 140; the pairs were taken under the same load, but an idle-machine run of the whole flow is still owed.",
+      "The nextpnr patch is measured on two designs only (byte-identical output on both); it is not upstream and not in the toolchain the bench uses.",
+      "Skipping the per-run zig relink would cut a verdict to about 0.2-0.3 s, but it changes the test runner every seal names; the cost of the re-mint it forces is estimated, not measured.",
+    ],
+    published: true,
+    ru: {
+      title: "С минуты до секунды: куда уходило время сборки t27 и куда уходит сейчас",
+      summary: "[замеры на одном 8-ядерном Mac, нагрузка на котором менялась за ночь; пары сняты при одинаковой нагрузке] Один ночной цикл замерил все места, где t27 собирает и ждёт, и исправил то, на что указали цифры. Тёплый t27c frontier ускорился с 55-68 с примерно до 0,9 с, неизменный битстрим находится за 0,22-0,39 с вместо 4,3-8,9 с, запуск на плате после одобрения больше не собирает сначала, а прогон корпуса, который CI делает на каждом pull request, сократился с 221-257 с до 108-140 с. Почти всё прежнее время уходило на пересчёт того, что не менялось, и на поочерёдное выполнение независимой работы. Что осталось: около 2 с на спеку в перелинковке zig, 27 с nextpnr на правку логики, около 14 с загрузки платы и гейт C-заголовков на 72 с.",
+      openQuestions: [
+        "После этих изменений не было ни одного запуска на плате: ~13-15 с загрузки — из прежних запусков, а более быстрый JTAG не проверен.",
+        "Все замеры — с одного Mac, нагрузка на котором менялась примерно от 3 до 140; пары сняты при одинаковой нагрузке, но прогон всего потока на простаивающей машине ещё не сделан.",
+        "Патч nextpnr измерен только на двух дизайнах (на обоих результат побайтно тот же); он не принят в upstream и не стоит в тулчейне бенча.",
+        "Отказ от перелинковки zig сократил бы вердикт примерно до 0,2-0,3 с, но меняет тест-раннер, который называет каждая печать; цена вынужденной перепечати оценена, а не измерена.",
+      ],
+    },
+  },
+  {
     slug: "a-3-mb-compiler-spec-to-aarch64-in-5-ms",
     title: "A 3 MB compiler that turns a spec into AArch64 code in 5 ms, and where it still loses",
     summary: "[measured on a shared Railway lab; run times are qemu emulation, instruction counts are exact; t27b's code is -O0 class] t27b 0.2.0, released with the signed receipt of the very binary it ships, compiles a t27 spec with its tests in about 4.8 ms as a native x86_64 cross-compiler: 8.8x faster than gen-c plus gcc -O0 and about 640x faster than zig Debug per spec, in 5.3 MiB of memory, from one binary of about 3 MB, and it agrees with the reference on all 8,344 tests both ran. It is not a breakthrough in generated code: it executes 3.4x the instructions of gcc -O2 and 4.5x those of zig ReleaseFast, its code is up to 2x larger, and on Linux it is a JIT test runner that cannot yet write an ELF binary. Over the week its share of the reference's passing specs rose from 8.6% to 98.9%.",
