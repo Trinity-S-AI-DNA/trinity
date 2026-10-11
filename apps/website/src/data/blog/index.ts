@@ -3,6 +3,35 @@ import type { PostMeta } from './types'
 /** Индекс блога: список и метаданные без тяжёлых тел публикаций. */
 export const postsIndex: PostMeta[] = [
   {
+    slug: "the-ternary-machine-course",
+    title: "The ternary machine: a course where every widget is a compiled t27 spec",
+    summary: "[the widgets run in the browser; the TRI-27 modules follow the pinned emulator, the rest teaches with small numbers] Course 8 on t27.ai: 27 lessons from why base 3 is cheapest (39 against 40 for every number up to 999999) through balanced ternary, Kleene logic, adders, multiplying without a multiplier, five trits in a byte, the TRI-27 instruction word and a ternary machine, to neurons with weights -1, 0, +1.",
+    date: "2026-10-11",
+    readingMinutes: 4,
+    tags: ["t27", "Ternary", "Course"],
+    receipts: [
+      { label: "t27#8979: trits.t27 and radix_economy.t27 -- 21 tests, 8 of 8 negative controls caught", href: "https://github.com/gHashTag/t27/pull/8979" },
+      { label: "The course: The ternary machine", href: "https://t27.ai/learn/ternary-computing/" },
+      { label: "The ripple-carry widget", href: "https://t27.ai/widgets/tc-ripple-carry/" },
+      { label: "The opcode map widget", href: "https://t27.ai/widgets/tc-opcode-map/" },
+    ],
+    openQuestions: [
+      "Radix economy prices a digit by its states; it is a model, not a transistor count, and the lesson says binary won for other reasons.",
+      "The widgets' machine is a teaching machine with five instructions; only the instruction-word module follows the pinned TRI-27 emulator.",
+      "Two lesson specs, ternary_full_adder.t27 and ternary_ripple_adder.t27, are binary adders built from ternary neurons; the lessons say so.",
+    ],
+    published: true,
+    ru: {
+      title: "Троичная машина: курс, где каждый виджет — скомпилированная спека t27",
+      summary: "[виджеты работают в браузере; модули TRI-27 следуют закреплённой версии эмулятора, остальное учит на небольших числах] Курс 8 на t27.ai: 27 уроков от того, почему основание 3 самое дешёвое (39 против 40 для любого числа до 999999), через сбалансированную троичную, логику Клини, сумматоры, умножение без умножителя, пять тритов в байте, командное слово TRI-27 и троичную машину до нейронов с весами -1, 0, +1.",
+      openQuestions: [
+        "Радиксная экономика оценивает цифру числом её состояний; это модель, а не подсчёт транзисторов, и урок говорит, что двоичная система победила по другим причинам.",
+        "Машина виджетов — учебная, с пятью командами; только модуль о командном слове следует закреплённой версии эмулятора TRI-27.",
+        "Две спеки уроков, ternary_full_adder.t27 и ternary_ripple_adder.t27, — двоичные сумматоры из троичных нейронов; уроки так и говорят.",
+      ],
+    },
+  },
+  {
     slug: "three-widgets-under-the-bus",
     title: "Three widgets for the physics under the bus: reflections, a closing eye, an ECC word",
     summary: "[each widget's logic is a t27 spec compiled to wasm; lossless line, one-pole channel, values typed, nothing read from a board] A 1 V step from a 25 ohm driver into an open 50 ohm line reaches the far end as 1.333, 0.889, 1.037, 0.988 V before it settles at 1 V; one RC pole leaves a quarter of the eye at T = TAU and shuts it at TAU ln 2; a 13-bit SECDED word fixes any single flip and catches any two. Three new widgets show this, each running the fn bodies of its own t27 spec, with 20 spec tests and 15 negative controls behind them.",
