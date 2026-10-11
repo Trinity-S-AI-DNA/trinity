@@ -57,9 +57,13 @@ function barsSvg(lang: Lang = 'en'): string {
   return s + '</svg>'
 }
 
-const HOT_RUN = `$ T27_OPENXC7=$HOME/t27/build/fpga/openxc7 tri hot
-OK       frontier, warm: 856 ms (budget 5000 ms)
-OK       silicon, reuse hit: 242 ms (budget 2000 ms)`
+
+// A recorded before/after pair, side by side, as an animated GIF (made from the two casts below it).
+function compareSvg(id: string, h: number, label: string): string {
+  return `<svg viewBox="0 0 1310 ${h}" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" role="img" aria-label="${esc(label)}" style="width:100%;height:auto"><image href="/term/hot-${id}-after/compare.gif" xlink:href="/term/hot-${id}-after/compare.gif" width="1310" height="${h}"/></svg>`
+}
+
+const term = (id: string, title: string, caption: string): Block => ({ kind: 'terminal', src: `term/${id}/session.cast`, share: `https://t27.ai/term/${id}/`, title, caption })
 
 export const body: Block[] = [
   {
@@ -121,12 +125,23 @@ export const body: Block[] = [
     kind: 'p',
     text: 'Each next step in this table changes something outside the loop: what every seal records, what the board is sent, the GitHub API budget, or a file the project only lets its owner open for hand-written code. None of them was taken without the owner.',
   },
-  { kind: 'h', text: 'Check it yourself' },
-  {
-    kind: 'p',
-    text: '`tri hot` runs each hot path once to warm it, then once timed, and says OVER when one is past its budget, or ran and failed. It is the regression test for the caches above, and the loop now starts every tick with it.',
-  },
-  { kind: 'code', text: HOT_RUN },
+  { kind: 'h', text: "Every speed-up as one command, before and after" },
+  { kind: 'p', text: "Each speed-up above is now one `tri hot` word (t27#8953): `watch`, `frontier`, `prebuild`, `suite` and `caches`, with `tri hot` alone as the check. Below, each one was recorded twice on this Mac on 11 October: before, with the speed-up switched off by the same knob used to verify it, and after. The typing is staged; every byte printed is real and arrives when it was printed. `time` prints the real duration." },
+  { kind: 'figure', svg: compareSvg("frontier", 218, "tri hot frontier: what a build may reuse"), caption: "Before: an empty cache and T27_SUITE_JOBS=1, every spec generated again one after another, as every walk ran before t27#8741: 17.9 s. After: the cache warm, 1.4 s. Both print the same decision line, 1284 of 1856 reused." },
+  term("hot-frontier-after", "tri hot frontier, warm", "The after run in full; its before run is at t27.ai/term/hot-frontier-before/."),
+  { kind: 'figure', svg: compareSvg("prebuild", 350, "tri hot prebuild: the bitstream before the board run"), caption: "Before: T27_SILICON_REBUILD=1 forces yosys, nextpnr and the bitstream for ternary_link, what an approved board run waited for before t27#8797: 32.4 s. After: the bitstream from the reuse cache, 0.5 s, the cable never touched. The reuse key and the audit of every tenth hit make the cached bitstream the same bytes a build would write." },
+  term("hot-prebuild-after", "tri hot prebuild, a reuse hit", "The after run in full; its before run is at t27.ai/term/hot-prebuild-before/."),
+  { kind: 'figure', svg: compareSvg("watch", 434, "tri hot watch: a save reruns the specs that import it"), caption: "A save to reuse.t27 reruns 16 specs. Before, one at a time: the first verdict 3.1 s after the save, all 16 after 42.3 s. After, side by side: the first after 8.2 s, all 16 after 21.5 s. The batch finishes twice as fast; the first answer comes later, because eight compiles share the processor. Each verdict prints the moment its rerun ends (t27#8958)." },
+  term("hot-watch-after", "tri hot watch, a save to reuse.t27", "The after run in full; its before run is at t27.ai/term/hot-watch-before/."),
+  { kind: 'figure', svg: compareSvg("suite", 482, "tri hot suite: the corpus suite CI runs on every pull request"), caption: "Before: T27_SUITE_JOBS=1, about 13,000 per-spec runs one after another: 478 s. After: 8 workers, 231.5 s, the same 259 failures. Both on a loaded machine, played at x40. The FAIL lines the suite prints to stderr scroll past in both panes." },
+  term("hot-suite-after", "tri hot suite, 8 workers", "The after run in full; its before run is at t27.ai/term/hot-suite-before/."),
+  term('hot-check', "tri hot: the hot paths against their budgets", "`tri hot` runs each hot path once to warm it, then once timed, and says OVER when one is past its budget, or ran and failed. It is the regression test for the caches above, and the loop now starts every tick with it."),
+  term('hot-caches', "tri hot caches: every cache against its eviction limit", "The gen-hash, bitstream and digest caches, each with its size and the limit t27c enforces (t27#8930, t27#8935)."),
+  { kind: 'h', text: "Against the field: the TOP" },
+  { kind: 'p', text: "Six things this post needs, a spec’s verdict and then its bitstream on a board, checked against each tool’s own documentation. Yes means the tool does it; half means partly, or only with a separate tool or by wrapping the flow; no means it does not, or the documentation checked does not say so." },
+  { kind: 'table', head: ["", "t27 tri hot", "Bazel", "Nx", "Gradle", "Nix", "ccache", "Vivado incremental", "Quartus Rapid Recompile", "LiteX"], rows: [["Reuses a passing verdict when nothing it depends on changed", "yes", "yes", "yes", "yes", "½", "no", "no", "no", "no"], ["Reruns only what a save affects", "yes", "½ (ibazel)", "yes", "yes", "no", "no", "no", "no", "no"], ["Skips FPGA place-and-route when the design is unchanged", "yes", "½", "no", "no", "½", "no", "½", "½", "½"], ["Checks its own cache hits by rebuilding and comparing", "yes", "no", "no", "no", "yes", "no", "no", "no", "no"], ["Bounded cache with automatic eviction", "yes", "½", "no", "no", "no", "yes", "no", "no", "no"], ["Cache shared across machines", "no", "yes", "yes", "yes", "yes", "no", "no", "no", "no"], ["Score", "5", "3.5", "3", "3", "3", "1", "½", "½", "½"]] },
+  { kind: 'ol', items: ["t27 tri hot, 5 of 6. What it lacks is a shared cache: every machine builds its own, and the shared-bitstream path (P8) is a spec, not a service.", "Bazel, 3.5: cached test results and a remote cache; a watch only through ibazel, and disk-cache garbage collection still experimental.", "Nx, Gradle and Nix, 3 each. Nx and Gradle cache tasks and rerun on change; Nix shares binary caches and can rebuild a path to check that it is deterministic.", "ccache, 1: a bounded compiler cache, and nothing above the compiler.", "Vivado incremental, Quartus Rapid Recompile and LiteX, half each. Vivado reuses placement and routing from a reference checkpoint but still runs them; Quartus reuses fitting for a change it judges small, and the Pro edition removed it in 21.1; LiteX reloads firmware without rebuilding the gateware. None skips a build whose inputs did not change."] },
+  { kind: 'p', text: "This TOP is weighted toward this workflow: its rows are the six things t27 needed. On remote execution, ecosystem and scale, which is what a general build system is chosen for, Bazel, Nx, Gradle and Nix are far ahead, and t27 has no shared cache at all. No competitor was run on this workload; every number in this post is t27’s own, measured on one Mac." },
 ]
 
 export const ruBody: Block[] = [
@@ -189,10 +204,21 @@ export const ruBody: Block[] = [
     kind: 'p',
     text: 'Каждый следующий шаг в этой таблице меняет что-то за пределами цикла: то, что записывает каждая печать, то, что уходит на плату, бюджет GitHub API, или файл, который проект открывает для рукописного кода только с разрешения владельца. Ни один из них не сделан без владельца.',
   },
-  { kind: 'h', text: 'Проверьте сами' },
-  {
-    kind: 'p',
-    text: '`tri hot` прогоняет каждый горячий путь один раз для разогрева, затем один раз с замером, и пишет OVER, если путь вышел за бюджет или запустился и упал. Это регрессионный тест для кэшей выше, и цикл теперь начинает с него каждый тик.',
-  },
-  { kind: 'code', text: HOT_RUN },
+  { kind: 'h', text: "Каждое ускорение — одна команда: было и стало" },
+  { kind: 'p', text: "Каждое ускорение выше теперь вызывается одним словом `tri hot` (t27#8953): `watch`, `frontier`, `prebuild`, `suite` и `caches`, а `tri hot` без слова — проверка. Ниже каждое записано дважды на этом Mac 11 октября: «было» — с ускорением, выключенным той же ручкой, которой его проверяли, и «стало». Набор команды постановочный; каждый напечатанный байт настоящий и появляется тогда, когда был напечатан. `time` печатает реальную длительность." },
+  { kind: 'figure', svg: compareSvg("frontier", 218, "tri hot frontier: что можно не перепроверять"), caption: "Было: пустой кэш и T27_SUITE_JOBS=1, код каждой спеки генерируется заново, одна за другой, как шёл каждый проход до t27#8741: 17,9 с. Стало: кэш прогрет, 1,4 с. Оба печатают одну и ту же строку решений: 1284 из 1856 переиспользованы." },
+  term("hot-frontier-after", "tri hot frontier, кэш прогрет", "Прогон «стало» целиком; прогон «было» — на t27.ai/term/hot-frontier-before/."),
+  { kind: 'figure', svg: compareSvg("prebuild", 350, "tri hot prebuild: битстрим до запуска на плате"), caption: "Было: T27_SILICON_REBUILD=1 заставляет заново пройти yosys, nextpnr и сборку битстрима ternary_link — то, чего одобренный запуск на плате ждал до t27#8797: 32,4 с. Стало: битстрим из кэша, 0,5 с, кабель не тронут. Ключ кэша и аудит каждого десятого попадания гарантируют, что битстрим из кэша — те же байты, что дала бы сборка." },
+  term("hot-prebuild-after", "tri hot prebuild, попадание в кэш", "Прогон «стало» целиком; прогон «было» — на t27.ai/term/hot-prebuild-before/."),
+  { kind: 'figure', svg: compareSvg("watch", 434, "tri hot watch: правка перепроверяет спеки, которые её импортируют"), caption: "Правка reuse.t27 перепроверяет 16 спек. Было, по одной: первый вердикт через 3,1 с после сохранения, все 16 — через 42,3 с. Стало, параллельно: первый через 8,2 с, все 16 — через 21,5 с. Вся пачка заканчивается вдвое быстрее; первый ответ приходит позже, потому что восемь компиляций делят процессор. Каждый вердикт печатается, как только кончилась его перепроверка (t27#8958)." },
+  term("hot-watch-after", "tri hot watch, правка reuse.t27", "Прогон «стало» целиком; прогон «было» — на t27.ai/term/hot-watch-before/."),
+  { kind: 'figure', svg: compareSvg("suite", 482, "tri hot suite: прогон корпуса, который CI делает на каждом PR"), caption: "Было: T27_SUITE_JOBS=1, около 13 000 запусков по спекам один за другим: 478 с. Стало: 8 воркеров, 231,5 с, те же 259 падений. Оба на нагруженной машине, проигрывание в 40 раз быстрее. Строки FAIL, которые прогон пишет в stderr, пролетают в обоих окнах." },
+  term("hot-suite-after", "tri hot suite, 8 воркеров", "Прогон «стало» целиком; прогон «было» — на t27.ai/term/hot-suite-before/."),
+  term('hot-check', "tri hot: горячие пути против бюджетов", "`tri hot` прогоняет каждый горячий путь один раз для разогрева, затем один раз с замером, и пишет OVER, если путь вышел за бюджет или запустился и упал. Это регрессионный тест для кэшей выше, и цикл теперь начинает с него каждый тик."),
+  term('hot-caches', "tri hot caches: каждый кэш против своего лимита", "Кэши хэшей кода, битстримов и хэшей файлов — каждый с размером и лимитом, который соблюдает t27c (t27#8930, t27#8935)."),
+  { kind: 'h', text: "Против конкурентов: TOP" },
+  { kind: 'p', text: "Шесть вещей, которые нужны этому посту — вердикт спеки, а затем её битстрим на плате, — сверены с документацией каждого инструмента. «да» — инструмент это делает; «½» — частично, или только отдельным инструментом, или если обернуть поток; «нет» — не делает, или в проверенной документации об этом нет." },
+  { kind: 'table', head: ["", "t27 tri hot", "Bazel", "Nx", "Gradle", "Nix", "ccache", "Vivado incremental", "Quartus Rapid Recompile", "LiteX"], rows: [["Переиспользует вердикт, если ничего, от чего он зависит, не менялось", "да", "да", "да", "да", "½", "нет", "нет", "нет", "нет"], ["Перепроверяет только то, что затронула правка", "да", "½ (ibazel)", "да", "да", "нет", "нет", "нет", "нет", "нет"], ["Пропускает place-and-route, если дизайн не менялся", "да", "½", "нет", "нет", "½", "нет", "½", "½", "½"], ["Проверяет свои попадания в кэш пересборкой и сравнением", "да", "нет", "нет", "нет", "да", "нет", "нет", "нет", "нет"], ["Ограниченный кэш с автоматическим вытеснением", "да", "½", "нет", "нет", "нет", "да", "нет", "нет", "нет"], ["Кэш, общий для нескольких машин", "нет", "да", "да", "да", "да", "нет", "нет", "нет", "нет"], ["Сумма", "5", "3.5", "3", "3", "3", "1", "½", "½", "½"]] },
+  { kind: 'ol', items: ["t27 tri hot — 5 из 6. Нет общего кэша: каждая машина собирает своё, а общий путь для битстримов (P8) пока спека, а не сервис.", "Bazel — 3,5: кэш результатов тестов и удалённый кэш; watch только через ibazel, сборка мусора дискового кэша пока экспериментальная.", "Nx, Gradle и Nix — по 3. Nx и Gradle кэшируют задачи и перезапускают их при изменениях; Nix раздаёт бинарные кэши и умеет пересобрать путь, чтобы проверить детерминированность.", "ccache — 1: ограниченный кэш компилятора и ничего выше компилятора.", "Vivado incremental, Quartus Rapid Recompile и LiteX — по ½. Vivado берёт размещение и трассировку из эталонного checkpoint, но всё равно их выполняет; Quartus переиспользует fitting для изменения, которое сочтёт малым, а в Pro его убрали в 21.1; LiteX перезагружает прошивку без пересборки gateware. Ни один не пропускает сборку, у которой не менялись входы."] },
+  { kind: 'p', text: "Этот TOP взвешен в пользу нашей задачи: его строки — шесть вещей, которые были нужны t27. По удалённому исполнению, экосистеме и масштабу — то, за что выбирают общую систему сборки, — Bazel, Nx, Gradle и Nix далеко впереди, а общего кэша у t27 нет вовсе. Ни один конкурент не запускался на этой задаче; каждая цифра в посте — t27, измеренная на одном Mac." },
 ]
