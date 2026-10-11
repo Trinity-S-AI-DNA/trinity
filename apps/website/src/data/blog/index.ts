@@ -5,7 +5,7 @@ export const postsIndex: PostMeta[] = [
   {
     slug: "arithmetic-and-dsp-a-widget-per-lesson",
     title: "Arithmetic and DSP on the FPGA: 27 lessons, and a widget in each one that runs a t27 spec",
-    summary: "[every widget runs fn bodies of a t27 spec compiled to wasm; delays in lessons 1 and 26 are the reader's inputs, not device timing] Course 8 teaches the arithmetic an FPGA spends its area on, from the carry chain to a filter: adders, Booth multipliers and the DSP48E1 slice, fixed point, CORDIC, sampling, FIR and CIC filters, the FFT, and a capstone filter computed bit for bit. Five new specs in gHashTag/t27 carry the logic of 26 widgets, with 43 tests and 33 negative controls; the 27th runs the correlator of the existing modem spec.",
+    summary: "[every widget runs fn bodies of a t27 spec compiled to wasm; delays in lessons 1 and 26 are the reader's inputs, not device timing] Course 9 teaches the arithmetic an FPGA spends its area on, from the carry chain to a filter: adders, Booth multipliers and the DSP48E1 slice, fixed point, CORDIC, sampling, FIR and CIC filters, the FFT, and a capstone filter computed bit for bit. Five new specs in gHashTag/t27 carry the logic of 26 widgets, with 43 tests and 33 negative controls; the 27th runs the correlator of the existing modem spec.",
     date: "2026-10-11",
     readingMinutes: 4,
     tags: ["t27", "FPGA", "DSP"],
@@ -24,11 +24,40 @@ export const postsIndex: PostMeta[] = [
     published: true,
     ru: {
       title: "Арифметика и DSP на FPGA: 27 уроков, и в каждом виджет, который исполняет спеку t27",
-      summary: "[каждый виджет исполняет тела функций спеки t27, собранные в wasm; задержки в уроках 1 и 26 — входные данные читателя, а не тайминг устройства] Курс 8 учит той арифметике, на которую FPGA тратит площадь, от цепи переноса до фильтра: сумматоры, умножители Бута и слайс DSP48E1, фиксированная точка, CORDIC, дискретизация, фильтры FIR и CIC, БПФ и итоговый фильтр, посчитанный бит в бит. Пять новых спек в gHashTag/t27 несут логику 26 виджетов, с 43 тестами и 33 отрицательными контролями; 27-й исполняет коррелятор существующей спеки модема.",
+      summary: "[каждый виджет исполняет тела функций спеки t27, собранные в wasm; задержки в уроках 1 и 26 — входные данные читателя, а не тайминг устройства] Курс 9 учит той арифметике, на которую FPGA тратит площадь, от цепи переноса до фильтра: сумматоры, умножители Бута и слайс DSP48E1, фиксированная точка, CORDIC, дискретизация, фильтры FIR и CIC, БПФ и итоговый фильтр, посчитанный бит в бит. Пять новых спек в gHashTag/t27 несут логику 26 виджетов, с 43 тестами и 33 отрицательными контролями; 27-й исполняет коррелятор существующей спеки модема.",
       openQuestions: [
         "Тайминга устройства нет: задержки в виджетах carry-chain и fir-fit — условные входные данные; измерение — это отчёт о тайминге настоящей сборки.",
         "Раскладка по DSP48E1 — модель подсчёта; синтезатор может отдать мелкие куски LUT или использовать предсумматор иначе.",
         "Итоговый фильтр для этого поста на плату не загружался; виджеты стенда показывают путь, а не прогон этого фильтра.",
+      ],
+    },
+  },
+  {
+    slug: "the-ternary-machine-course",
+    title: "The ternary machine: a course where every widget is a compiled t27 spec",
+    summary: "[the widgets run in the browser; the TRI-27 modules follow the pinned emulator, the rest teaches with small numbers] Course 8 on t27.ai: 27 lessons from why base 3 is cheapest (39 against 40 for every number up to 999999) through balanced ternary, Kleene logic, adders, multiplying without a multiplier, five trits in a byte, the TRI-27 instruction word and a ternary machine, to neurons with weights -1, 0, +1.",
+    date: "2026-10-11",
+    readingMinutes: 4,
+    tags: ["t27", "Ternary", "Course"],
+    receipts: [
+      { label: "t27#8979: trits.t27 and radix_economy.t27 -- 21 tests, 8 of 8 negative controls caught", href: "https://github.com/gHashTag/t27/pull/8979" },
+      { label: "The course: The ternary machine", href: "https://t27.ai/learn/ternary-computing/" },
+      { label: "The ripple-carry widget", href: "https://t27.ai/widgets/tc-ripple-carry/" },
+      { label: "The opcode map widget", href: "https://t27.ai/widgets/tc-opcode-map/" },
+    ],
+    openQuestions: [
+      "Radix economy prices a digit by its states; it is a model, not a transistor count, and the lesson says binary won for other reasons.",
+      "The widgets' machine is a teaching machine with five instructions; only the instruction-word module follows the pinned TRI-27 emulator.",
+      "Two lesson specs, ternary_full_adder.t27 and ternary_ripple_adder.t27, are binary adders built from ternary neurons; the lessons say so.",
+    ],
+    published: true,
+    ru: {
+      title: "Троичная машина: курс, где каждый виджет — скомпилированная спека t27",
+      summary: "[виджеты работают в браузере; модули TRI-27 следуют закреплённой версии эмулятора, остальное учит на небольших числах] Курс 8 на t27.ai: 27 уроков от того, почему основание 3 самое дешёвое (39 против 40 для любого числа до 999999), через сбалансированную троичную, логику Клини, сумматоры, умножение без умножителя, пять тритов в байте, командное слово TRI-27 и троичную машину до нейронов с весами -1, 0, +1.",
+      openQuestions: [
+        "Радиксная экономика оценивает цифру числом её состояний; это модель, а не подсчёт транзисторов, и урок говорит, что двоичная система победила по другим причинам.",
+        "Машина виджетов — учебная, с пятью командами; только модуль о командном слове следует закреплённой версии эмулятора TRI-27.",
+        "Две спеки уроков, ternary_full_adder.t27 и ternary_ripple_adder.t27, — двоичные сумматоры из троичных нейронов; уроки так и говорят.",
       ],
     },
   },

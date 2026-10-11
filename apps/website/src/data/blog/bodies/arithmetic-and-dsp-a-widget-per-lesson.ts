@@ -1,13 +1,13 @@
 import type { Block } from '../types'
 
-// Course 8, arithmetic-and-dsp: 27 widgets, each running a gHashTag/t27 spec's fn bodies compiled to
+// Course 9, arithmetic-and-dsp: 27 widgets, each running a gHashTag/t27 spec's fn bodies compiled to
 // wasm (specs/fpga/dsp/*, t27#8990, and specs/fpga/bpsk.t27). The figure was drawn from the compiled
 // signals.t27: fir_db and fir_stop_db of a 31-tap Hamming low-pass, float, 16-bit and 8-bit taps.
 
 export const body: Block[] = [
   {
     "kind": "p",
-    "text": "Course 8 of t27.ai is out: Arithmetic and DSP on the FPGA, from the carry chain to a filter. It has 27 lessons in 9 modules, and each lesson opens a widget you play with: tap the bits of a sum, drag a vector, slide a tone between DFT bins, drop the coefficient bits of a filter. None of the 27 widgets computes anything on its own. Every value on the screen comes from a t27 spec whose fn bodies are compiled to WebAssembly, the same bodies the spec's own tests run."
+    "text": "Course 9 of t27.ai is out: Arithmetic and DSP on the FPGA, from the carry chain to a filter. It has 27 lessons in 9 modules, and each lesson opens a widget you play with: tap the bits of a sum, drag a vector, slide a tone between DFT bins, drop the coefficient bits of a filter. None of the 27 widgets computes anything on its own. Every value on the screen comes from a t27 spec whose fn bodies are compiled to WebAssembly, the same bodies the spec's own tests run."
   },
   {
     "kind": "h",
@@ -122,7 +122,7 @@ export const body: Block[] = [
 export const ruBody: Block[] = [
   {
     "kind": "p",
-    "text": "Вышел курс 8 на t27.ai: арифметика и DSP на FPGA, от цепи переноса до фильтра. В нём 27 уроков в 9 модулях, и каждый урок открывает виджет, с которым можно играть: нажимать на биты суммы, тянуть вектор, двигать тон между бинами ДПФ, урезать биты коэффициентов фильтра. Ни один из 27 виджетов ничего не считает сам. Каждое значение на экране приходит из спеки t27, тела функций которой собраны в WebAssembly, — те же тела, что прогоняют тесты самой спеки."
+    "text": "Вышел курс 9 на t27.ai: арифметика и DSP на FPGA, от цепи переноса до фильтра. В нём 27 уроков в 9 модулях, и каждый урок открывает виджет, с которым можно играть: нажимать на биты суммы, тянуть вектор, двигать тон между бинами ДПФ, урезать биты коэффициентов фильтра. Ни один из 27 виджетов ничего не считает сам. Каждое значение на экране приходит из спеки t27, тела функций которой собраны в WebAssembly, — те же тела, что прогоняют тесты самой спеки."
   },
   {
     "kind": "h",
