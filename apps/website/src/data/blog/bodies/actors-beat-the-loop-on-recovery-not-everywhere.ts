@@ -2,7 +2,7 @@ import type { Block } from '../types'
 
 // Numbers here come from the benchmark comments on gHashTag/t27#7851 (2026-10-08 and 2026-10-09), the merged
 // runtime PRs gHashTag/trios#1698, #1702, #1716, #1720, #1722, #1723, #1724, #1725 and the merged spec PRs
-// gHashTag/t27#8272, #8275, #8278, #8281, #8282, #8285, #8286, #8292, #8306, gHashTag/trios#1726 (the simulation gate) #1730 (the merge into production) and #1746 (the cost profile). The FPGA figures are yosys 0.63 synthesis
+// gHashTag/t27#8272, #8275, #8278, #8281, #8282, #8285, #8286, #8292, #8306, gHashTag/trios#1726 (the simulation gate) #1730 (the merge into production) and #1746 (the cost profile). The production readings come from the trios-agent-server logs of 2026-10-10 and the t27#7851 comments; the silicon run is bench job t27#8858. The FPGA figures are yosys 0.63 synthesis
 // of specs/queen/actors.t27 at t27 b9e62161d4; their provenance is in gHashTag/trinity#1582. The recording
 // public/term/t27c-queen-netlink-fence/ was made on 2026-10-09 with t27c 0.5.0 against t27 c6237a7.
 
@@ -184,15 +184,49 @@ export const body: Block[] = [
       '**Three boards need no new field.** The pid already carries a 12-bit node number, and the is-it-remote test costs 22 LUT.',
     ],
   },
+  {
+    kind: 'p',
+    text: 'Since then the card has been placed, timed and run on one die. t27b, our own compiler, gained a Verilog lowering whose rules are t27 plans (t27#8820); the hardware card lowers bit-exact to the reference on all 17 of its tests. A self-test and JTAG top is generated from t27 too (t27#8830), and its clocks are declared in t27 rather than in a hand-written constraint file (t27#8857).',
+  },
+  {
+    kind: 'ul',
+    items: [
+      '**Placed and routed** on the bench part xc7a200tfbg484-2 over 5 seeds: 2,191 LUT, 809 flip-flops, 160 CARRY4. The self-test clock reached 54.3 / 58.5 / 59.1 MHz (min / median / max) against the 8.85 MHz it runs at; the fast clock 317 / 447 / 576 MHz against 70.77 MHz.',
+      '**Run on silicon, die A** (the owner\'s ALINX AX7203, device DNA 050d58218fd9854, SRAM only, bench job t27#8858): the die computed 77,794 of the card\'s decisions over 1,024 operand sets and read back the expected verdict word 0xA5A536FD with signature 0x3DED69B1, so every decision equals the card.',
+      '**One die is not yet a citable run.** The run record needs three independent placements and says so; dies B and C have not run this job.',
+    ],
+  },
+  { kind: 'h', text: 'In production: the first readings' },
+  {
+    kind: 'p',
+    text: 'Three batches went into the production branch on 2026-10-10: trios#1730 at 13:38Z, trios#1754 at 16:03Z and trios#1764 at 19:25Z. Two flags are now on: telemetry since 19:29Z and turn stop since 20:38Z. The others stay off until data asks for them.',
+  },
+  {
+    kind: 'ul',
+    items: [
+      '**The reviewer, measured for an hour with telemetry on** (19:34 to 20:33Z, 12 windows of 300 s): 14 reviews, all succeeded, about 3 s each; the four workers were busy 9.3% of the time at the median and 24.9% in the busiest window; the intake mailbox never held more than 5; no crash, no dropped message, no restart storm. One model call ran past the 300 s limit, and the supervisor killed and restarted that worker. The readings are on t27#7851.',
+      '**The old question has an answer.** "23% busy" and "11 reviews an hour" were both right: 23% was a busy window (the busiest here was 24.9%), and 11 an hour is close to the 14 measured now. The typical worker is idle more than 90% of the time.',
+      '**Turn stop, the next 50 minutes:** 11 reviews, all succeeded, busy 6.9% at the median, no kill, no error. Nothing got worse, but no turn ran long enough to be stopped, so the stopping path itself was not exercised in production yet.',
+    ],
+  },
+  {
+    kind: 'p',
+    text: 'Continuous integration found what production had not yet met. Under a loaded CI runner, a process turn that ignores its SIGTERM was not killed at the 3 s grace, and in one case was still alive 13 s later. The cause was a timer: Bun sometimes runs a 3000 ms timer when the clock shows 2997 to 2999 ms, the card then correctly answers "not yet", and nothing asked again. Under an 8-thread CPU load, 27 of 100 escalations were lost in one run. The fix asks the card again until it says kill (trios#1809, and trios#1811 for the same defect in the orderly stop of keyed actors). With a test clock that fires every timer 1 ms early, the old code fails and the new code passes 20 of 20 runs under load with no surviving process. Production was exposed only on that path: a model call hears its abort within milliseconds, and with the flag off the same process was abandoned anyway.',
+  },
+  {
+    kind: 'p',
+    text: 'One correction to the stopping benchmark above: its "before" figure for a deaf stall, freed at 9998 to 9999 ms, was the benchmark cleaning up after itself, not the runtime. With the benchmark fixed, that row reads more than 10000 ms.',
+  },
   { kind: 'h', text: 'What this does not show' },
   {
     kind: 'ul',
     items: [
-      'Nothing here is switched on in production yet. `actors-next` merged into the production branch once, with the owner\'s OK: trios#1730, on 2026-10-10 at 13:38Z, and a second batch followed at 16:03Z (trios#1754): the review-lane queue, the bounded drain, the keyed hardening, actor events and the cost fix. Every new behaviour in them is behind a flag that is off, so production behaves as before until the flags are switched on one at a time, by data. Until then, every number here comes from a benchmark.',
-      'The reviewer, concurrency, turn-stop and dispatcher numbers are simulations with assumed fault rates and lengths. The loop side of the dispatcher benchmark is a model of `runRound`, not the function itself.',
-      'Telemetry\'s cost per message is measured on a quiet host only; there is no production reading yet.',
+      'Only two flags are on in production: telemetry and turn stop. The review-lane queue, long waits as rows, the adaptive reviewer pool, the keyed dispatcher and actor events are deployed but off. Every number for them is still a benchmark.',
+      'The concurrency and dispatcher numbers are simulations with assumed fault rates and lengths. The loop side of the dispatcher benchmark is a model of `runRound`, not the function itself.',
+      'Telemetry\'s CPU cost in production is not measured: that needs an on/off comparison under the same load, and the load was low.',
+      'Turn stop\'s kill path has not yet fired in production; the reading above covers a quiet stretch.',
       'The simulation gate does not yet simulate keyed actors or the adaptive reviewer pool, and nothing runs it nightly.',
-      'The FPGA figures are synthesis estimates with an assumed actor record. No design was placed, timed or run on silicon. DSP blocks were left out, because on the open flow they computed wrong results with live operands (t27 docs/reports/TRINET-DSP-DEFECT-W723.md).',
+      'The silicon run is one die. DSP blocks were left out, because on the open flow they computed wrong results with live operands (t27 docs/reports/TRINET-DSP-DEFECT-W723.md).',
       'The competitor figures are the vendors\' documented defaults, not our measurements.',
     ],
   },
@@ -371,15 +405,49 @@ export const ruBody: Block[] = [
       '**Трём платам не нужно нового поля.** В pid уже есть 12-битный номер узла, а проверка «удалённый ли» стоит 22 LUT.',
     ],
   },
+  {
+    kind: 'p',
+    text: 'С тех пор карту разместили, проверили по таймингу и запустили на одном кристалле. t27b, наш собственный компилятор, научился выводить Verilog по правилам, записанным планами на t27 (t27#8820); аппаратная карта опускается побитно равной эталону на всех 17 своих тестах. Самотест с JTAG-верхом тоже сгенерирован из t27 (t27#8830), а его клоки объявлены в t27, а не в ручном файле ограничений (t27#8857).',
+  },
+  {
+    kind: 'ul',
+    items: [
+      '**Размещено и оттрассировано** на кристалле стенда xc7a200tfbg484-2 на 5 сидах: 2191 LUT, 809 триггеров, 160 CARRY4. Клок самотеста — 54,3 / 58,5 / 59,1 МГц (мин / медиана / макс) при рабочих 8,85 МГц; быстрый клок — 317 / 447 / 576 МГц при 70,77 МГц.',
+      '**Запущено на кремнии, кристалл A** (ALINX AX7203 владельца, ДНК кристалла 050d58218fd9854, только SRAM, заявка t27#8858): кристалл посчитал 77 794 решения карты на 1024 наборах операндов и вернул ожидаемое слово вердикта 0xA5A536FD с подписью 0x3DED69B1, то есть каждое решение совпало с картой.',
+      '**Один кристалл — ещё не цитируемый прогон.** Протокол прогона требует трёх независимых размещений и так и пишет; кристаллы B и C эту заявку ещё не прогоняли.',
+    ],
+  },
+  { kind: 'h', text: 'В production: первые замеры' },
+  {
+    kind: 'p',
+    text: 'Три партии ушли в production-ветку 2026-10-10: trios#1730 в 13:38Z, trios#1754 в 16:03Z и trios#1764 в 19:25Z. Сейчас включены два флага: телеметрия с 19:29Z и остановка ходов с 20:38Z. Остальные выключены, пока данные их не попросят.',
+  },
+  {
+    kind: 'ul',
+    items: [
+      '**Ревьюер, час замера с включённой телеметрией** (19:34–20:33Z, 12 окон по 300 с): 14 ревью, все успешные, около 3 с каждое; четыре воркера заняты 9,3% времени по медиане и 24,9% в самом загруженном окне; в почтовом ящике приёмника не больше 5 сообщений; ни падений, ни потерянных сообщений, ни штормов перезапусков. Один вызов модели превысил лимит 300 с, и супервизор убил и перезапустил этот воркер. Замеры — в t27#7851.',
+      '**На старый вопрос есть ответ.** И «23% занятости», и «11 ревью в час» были верны: 23% — это загруженное окно (здесь пик 24,9%), а 11 в час близко к нынешним 14. Обычный воркер простаивает больше 90% времени.',
+      '**Остановка ходов, следующие 50 минут:** 11 ревью, все успешные, занятость 6,9% по медиане, ни одного убийства, ни одной ошибки. Хуже не стало, но ни один ход не длился достаточно долго, чтобы его останавливать, так что сам путь остановки в production ещё не срабатывал.',
+    ],
+  },
+  {
+    kind: 'p',
+    text: 'Непрерывная интеграция нашла то, с чем production ещё не встретился. На нагруженном раннере CI процесс, игнорирующий SIGTERM, не добивался по истечении grace в 3 с, а в одном случае был жив и через 13 с. Причина — таймер: Bun иногда запускает таймер на 3000 мс, когда часы показывают 2997–2999 мс, карта честно отвечает «ещё рано», и больше её никто не спрашивал. Под нагрузкой в 8 потоков в одном прогоне потерялись 27 эскалаций из 100. Исправление спрашивает карту снова, пока та не скажет «убить» (trios#1809, и trios#1811 для того же дефекта в упорядоченной остановке ключевых акторов). С тестовыми часами, которые срабатывают на 1 мс раньше, старый код падает, а новый проходит 20 из 20 прогонов под нагрузкой без единого выжившего процесса. Production был уязвим только на этом пути: вызов модели слышит отмену за миллисекунды, а с выключенным флагом тот же процесс и так бросался.',
+  },
+  {
+    kind: 'p',
+    text: 'Одна поправка к бенчмарку остановки выше: его цифра «до» для глухого зависания, освобождение за 9998–9999 мс, была уборкой самого бенчмарка, а не рантаймом. С исправленным бенчмарком эта строка показывает больше 10000 мс.',
+  },
   { kind: 'h', text: 'Чего это не показывает' },
   {
     kind: 'ul',
     items: [
-      'В production пока ничего из этого не включено. `actors-next` влита в production-ветку один раз, с согласия владельца: trios#1730, 2026-10-10 в 13:38Z, а в 16:03Z за ней ушла вторая партия (trios#1754): очередь слотов ревью, ограниченный drain, укреплённые ключевые акторы, события акторов и исправление цены. Каждое новое поведение в них стоит за выключенным флагом, поэтому production ведёт себя как прежде, пока флаги не включат по одному, по данным. До тех пор каждое число здесь получено из бенчмарка.',
-      'Числа ревьюера, параллелизма, остановки ходов и диспетчера — симуляции с принятыми частотами сбоев и длительностями. Сторона цикла в бенчмарке диспетчера — модель `runRound`, а не сама функция.',
-      'Цена телеметрии на сообщение измерена только на спокойной машине; production-замера ещё нет.',
+      'В production включены только два флага: телеметрия и остановка ходов. Очередь слотов ревью, долгие ожидания строками, адаптивный пул ревьюеров, ключевой диспетчер и события акторов выкачены, но выключены. Все их числа — по-прежнему бенчмарки.',
+      'Числа параллелизма и диспетчера — симуляции с принятыми частотами сбоев и длительностями. Сторона цикла в бенчмарке диспетчера — модель `runRound`, а не сама функция.',
+      'Цена телеметрии по CPU в production не измерена: для этого нужно сравнение «вкл/выкл» при одинаковой нагрузке, а нагрузка была низкой.',
+      'Путь убийства хода в production ещё ни разу не срабатывал; замер выше — спокойный отрезок.',
       'Шлюз симуляции пока не моделирует ключевых акторов и адаптивный пул ревьюеров, и каждую ночь его никто не запускает.',
-      'Числа по ПЛИС — оценки синтеза с принятой записью актора. Ни один дизайн не размещён, не проверен по таймингу и не запущен на кремнии. Блоки DSP не использовались: в открытом маршруте они считали неверно на живых операндах (t27 docs/reports/TRINET-DSP-DEFECT-W723.md).',
+      'Прогон на кремнии — один кристалл. Блоки DSP не использовались: в открытом маршруте они считали неверно на живых операндах (t27 docs/reports/TRINET-DSP-DEFECT-W723.md).',
       'Числа конкурентов — задокументированные значения по умолчанию самих вендоров, а не наши замеры.',
     ],
   },
