@@ -322,6 +322,14 @@ export function decodeBytes(text) {
  */
 export function literalValue(expr, name = 'literal') {
   if (expr.kind === 'ExprArrayLiteral') return (expr.children ?? []).map((el) => literalValue(el, name))
+  // A negative number inside an array literal arrives as unary minus over a number literal
+  // (`[-1, 5]`), while a scalar `-7` arrives as the literal "-7". Only that one shape is read;
+  // a minus over anything else is still refused.
+  if (expr.kind === 'ExprUnary' && expr.op === '-' && expr.children?.length === 1) {
+    const v = literalValue(expr.children[0], name)
+    if (typeof v !== 'number' || expr.children[0].nodeKind === 'string') throw new Error(`${name}: minus over a non-number`)
+    return -v
+  }
   if (expr.kind !== 'ExprLiteral') throw new Error(`${name}: unsupported expression kind ${expr.kind}`)
   const raw = decodeBytes(expr.value ?? '')
   // `pub const ENTRY : str = "";` arrives with no `value` key at all -- the
@@ -452,7 +460,8 @@ const TOOL_TRINITY_CLI_REQUIRED = {
 // A tri-cli card may name its recorded run (see castProblems); an mcp card may not.
 const TOOL_CAST_OPTIONAL = { CAST: 'str' }
 const TOOL_ROUTE_KINDS = ['execute_map', 'parse_command', 'main_chain', 'cell_map', 'namespace', 'none']
-const INT_MAX = { u8: 0xff, u16: 0xffff, u32: 0xffffffff }
+const INT_MAX = { u8: 0xff, u16: 0xffff, u32: 0xffffffff, i8: 0x7f, i16: 0x7fff, i32: 0x7fffffff }
+const INT_MIN = { u8: 0, u16: 0, u32: 0, i8: -0x80, i16: -0x8000, i32: -0x80000000 }
 export const CYRILLIC = /[\u0400-\u04ff]/
 
 // Translation contracts (specs/i18n/agents-<locale>.t27).
@@ -582,21 +591,28 @@ export function shapeProblem(decl, shape) {
     case 'u8':
     case 'u16':
     case 'u32':
+    case 'i8':
+    case 'i16':
+    case 'i32':
       if (type !== shape) return `annotated ${type}, must be ${shape}`
-      if (!Number.isInteger(value) || value < 0 || value > INT_MAX[shape]) return `value ${value} is not in ${shape} range`
+      if (!Number.isInteger(value) || value < INT_MIN[shape] || value > INT_MAX[shape]) return `value ${value} is not in ${shape} range`
       return null
     case 'arr': {
       if (!Array.isArray(value) || !value.every((x) => typeof x === 'string')) return 'value is not an array of strings'
       if (type !== `[${value.length}]str`) return `annotated ${type}, holds ${value.length} string(s)`
       return null
     }
-    // Integer arrays ([N]u8, [N]u16, [N]u32), e.g. the viewport matrix widths and heights.
+    // Integer arrays ([N]u8, [N]u16, [N]u32, and the signed [N]i8, [N]i16, [N]i32), e.g. the
+    // viewport matrix widths and heights, or a widget's trits of -1, 0 and +1.
     case 'arr-u8':
     case 'arr-u16':
-    case 'arr-u32': {
+    case 'arr-u32':
+    case 'arr-i8':
+    case 'arr-i16':
+    case 'arr-i32': {
       const elem = shape.slice(4)
       if (!Array.isArray(value)) return 'value is not an array'
-      const bad = value.find((x) => !Number.isInteger(x) || x < 0 || x > INT_MAX[elem])
+      const bad = value.find((x) => !Number.isInteger(x) || x < INT_MIN[elem] || x > INT_MAX[elem])
       if (bad !== undefined) return `element ${bad} is not in ${elem} range`
       if (type !== `[${value.length}]${elem}`) return `annotated ${type}, holds ${value.length} ${elem} value(s)`
       return null

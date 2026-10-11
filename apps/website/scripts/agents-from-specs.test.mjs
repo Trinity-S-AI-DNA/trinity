@@ -15,7 +15,7 @@ import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
-  I18N_SPEC_DIR, SITE, analyzeSpecFiles, castCommandRuns, castCommands, castProblems, readCasts, checkI18n, buildSpecCatalogs, constsOf, decodeBytes, loadCompiler, runNowTarget, sortKeys, verdictOf,
+  I18N_SPEC_DIR, SITE, analyzeSpecFiles, castCommandRuns, castCommands, castProblems, readCasts, checkI18n, buildSpecCatalogs, constsOf, decodeBytes, shapeProblem, loadCompiler, runNowTarget, sortKeys, verdictOf,
 } from './agents-from-specs.mjs'
 
 const analyze = await loadCompiler(readFileSync(join(SITE, 'public/t27/t27_compiler.wasm')))
@@ -89,6 +89,24 @@ test('array literals arrive as array nodes and UTF-8 arrives as bytes; both are 
   assert.equal(c.SUMMARY_EN.value, 'Issue → Spec ✓ ⟲ ◷ φ')
   assert.equal(decodeBytes('plain ascii'), 'plain ascii')
   assert.equal(decodeBytes('уже верно'), 'уже верно', 'text that is already decoded is left alone')
+})
+
+test('a negative number inside an array is read; a minus over anything else is refused', () => {
+  // The compiler sends a scalar -7 as the literal "-7" but each -1 inside [-1, 0, 5] as unary minus.
+  const c = constsOf(analyze('module m;\npub const A : [3]i32 = [-1, 0, 5];\npub const B : i32 = -7;\npub const S : [2]str = ["-1", "x"];\n'))
+  assert.deepEqual(c.A.value, [-1, 0, 5])
+  assert.equal(c.B.value, -7)
+  assert.deepEqual(c.S.value, ['-1', 'x'], 'a string that looks like a number stays a string')
+  assert.throws(() => constsOf(analyze('module m;\npub const N : [1]i32 = [-K];\npub const K : i32 = 1;\n')), /unsupported|minus/)
+})
+
+test('signed integers have a shape: in range passes, out of range and the wrong type do not', () => {
+  const c = constsOf(analyze('module m;\npub const T : [3]i32 = [-1, 0, 1];\npub const N : i32 = -5;\npub const B : i8 = -129;\npub const U : u8 = 3;\n'))
+  assert.equal(shapeProblem(c.T, 'arr-i32'), null)
+  assert.equal(shapeProblem(c.N, 'i32'), null)
+  assert.match(shapeProblem(c.B, 'i8'), /not in i8 range/)
+  assert.match(shapeProblem(c.U, 'i32'), /must be i32/)
+  assert.match(shapeProblem(c.T, 'arr-u32'), /not in u32 range/)
 })
 
 test('a clean pair is spec+code, healthy, with the reverse link filled in', () => {
