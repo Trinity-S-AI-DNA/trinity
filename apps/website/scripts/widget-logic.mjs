@@ -39,7 +39,9 @@ export function logicProblems(id, { logicJs, logicT27, toolJs, widgetSpec }, ana
     const a = analyze(logicT27)
     const v = verdictOf(a)
     if (!v.typecheckOk || v.discarded > 0 || !v.hirOk) p.push(`${at}/logic.t27: compiler verdict not clean (${JSON.stringify(v)})`)
-    p.push(...compilerErrors(a).map((m) => `${at}/logic.t27: ${m}`))
+    // A warning is not an error: the compiler's own count (verdictOf above) leaves it out too.
+    // bpsk.t27 (barker-corr) carries module-level vars this vendored compiler warns about.
+    p.push(...compilerErrors(a).filter((m) => !/^warning:/.test(m)).map((m) => `${at}/logic.t27: ${m}`))
     // A K_<NAME> of the widget spec that the logic spec also names must be the same number.
     if (widgetSpec) {
       let logicC = {}

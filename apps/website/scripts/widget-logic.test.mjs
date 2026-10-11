@@ -2,7 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { SITE, loadCompiler } from './agents-from-specs.mjs'
+import { SITE, compilerErrors, loadCompiler } from './agents-from-specs.mjs'
 import { logicProblems, logicWidgets } from './widget-logic.mjs'
 
 const analyze = await loadCompiler(readFileSync(join(SITE, 'public/t27/t27_compiler.wasm')))
@@ -22,6 +22,13 @@ test('every widget with logic runs the spec it carries', () => {
   const ids = logicWidgets()
   assert.ok(ids.length >= 3, ids.join(','))
   for (const id of ids) assert.deepEqual(logicProblems(id, inputs(id), analyze), [], id)
+})
+
+test('a compiler warning in the logic spec does not stop the build, an error does', () => {
+  const { logicT27 } = inputs('barker-corr')
+  assert.ok(compilerErrors(analyze(logicT27)).some((m) => m.startsWith('warning:')), 'bpsk.t27 is expected to carry a warning')
+  assert.deepEqual(logicProblems('barker-corr', inputs('barker-corr'), analyze), [])
+  fails('barker-corr', { logicT27: logicT27.replace('fn rx_push(win: u16, bit: u8) -> u16 {', 'fn rx_push(win: u16, bit: u8 -> u16 {') }, 'barker-corr/logic.t27')
 })
 
 test('a spec changed without recompiling the logic stops the build', () => {
