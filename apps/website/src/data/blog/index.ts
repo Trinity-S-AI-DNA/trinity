@@ -3,6 +3,36 @@ import type { PostMeta } from './types'
 /** Индекс блога: список и метаданные без тяжёлых тел публикаций. */
 export const postsIndex: PostMeta[] = [
   {
+    slug: "arithmetic-and-dsp-a-widget-per-lesson",
+    title: "Arithmetic and DSP on the FPGA: 27 lessons, and a widget in each one that runs a t27 spec",
+    summary: "[every widget runs fn bodies of a t27 spec compiled to wasm; delays in lessons 1 and 26 are the reader's inputs, not device timing] Course 8 teaches the arithmetic an FPGA spends its area on, from the carry chain to a filter: adders, Booth multipliers and the DSP48E1 slice, fixed point, CORDIC, sampling, FIR and CIC filters, the FFT, and a capstone filter computed bit for bit. Five new specs in gHashTag/t27 carry the logic of 26 widgets, with 43 tests and 33 negative controls; the 27th runs the correlator of the existing modem spec.",
+    date: "2026-10-11",
+    readingMinutes: 4,
+    tags: ["t27", "FPGA", "DSP"],
+    receipts: [
+      { label: "t27#8990: specs/fpga/dsp -- adders, multipliers, fixed_point, cordic, signals; 43 tests, 33 of 33 negative controls caught", href: "https://github.com/gHashTag/t27/pull/8990" },
+      { label: "The course: Arithmetic and DSP on the FPGA", href: "https://t27.ai/learn/arithmetic-and-dsp/" },
+      { label: "The carry chain widget", href: "https://t27.ai/widgets/carry-chain/" },
+      { label: "The CORDIC widget", href: "https://t27.ai/widgets/cordic/" },
+      { label: "The FIR design widget", href: "https://t27.ai/widgets/fir-design/" },
+    ],
+    openQuestions: [
+      "No device timing: the delays in the carry-chain and fir-fit widgets are illustrative inputs; a timing report of a real build is the measurement.",
+      "The DSP48E1 tiling is a count model; a synthesis tool may map small pieces to LUTs or use the pre-adder differently.",
+      "The capstone filter has not been loaded on the board for this post; the bench widgets show the path, not this filter's run.",
+    ],
+    published: true,
+    ru: {
+      title: "Арифметика и DSP на FPGA: 27 уроков, и в каждом виджет, который исполняет спеку t27",
+      summary: "[каждый виджет исполняет тела функций спеки t27, собранные в wasm; задержки в уроках 1 и 26 — входные данные читателя, а не тайминг устройства] Курс 8 учит той арифметике, на которую FPGA тратит площадь, от цепи переноса до фильтра: сумматоры, умножители Бута и слайс DSP48E1, фиксированная точка, CORDIC, дискретизация, фильтры FIR и CIC, БПФ и итоговый фильтр, посчитанный бит в бит. Пять новых спек в gHashTag/t27 несут логику 26 виджетов, с 43 тестами и 33 отрицательными контролями; 27-й исполняет коррелятор существующей спеки модема.",
+      openQuestions: [
+        "Тайминга устройства нет: задержки в виджетах carry-chain и fir-fit — условные входные данные; измерение — это отчёт о тайминге настоящей сборки.",
+        "Раскладка по DSP48E1 — модель подсчёта; синтезатор может отдать мелкие куски LUT или использовать предсумматор иначе.",
+        "Итоговый фильтр для этого поста на плату не загружался; виджеты стенда показывают путь, а не прогон этого фильтра.",
+      ],
+    },
+  },
+  {
     slug: "three-widgets-under-the-bus",
     title: "Three widgets for the physics under the bus: reflections, a closing eye, an ECC word",
     summary: "[each widget's logic is a t27 spec compiled to wasm; lossless line, one-pole channel, values typed, nothing read from a board] A 1 V step from a 25 ohm driver into an open 50 ohm line reaches the far end as 1.333, 0.889, 1.037, 0.988 V before it settles at 1 V; one RC pole leaves a quarter of the eye at T = TAU and shuts it at TAU ln 2; a 13-bit SECDED word fixes any single flip and catches any two. Three new widgets show this, each running the fn bodies of its own t27 spec, with 20 spec tests and 15 negative controls behind them.",
