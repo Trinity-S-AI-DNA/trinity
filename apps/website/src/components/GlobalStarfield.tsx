@@ -1,5 +1,6 @@
 import { useLocation } from 'react-router-dom'
 import PhiStarfield from './PhiStarfield'
+import { COURSE_ROUTES } from '../lib/courseRoutes.generated'
 
 // Звёздное поле было только на главной, хотя оно не украшение: положения звёзд
 // берутся из спирали Фогеля с углом 137.5077° = круг, делённый на φ², — то же
@@ -20,8 +21,8 @@ const OWN_CANVAS = new Set([
   '/tree',
 ])
 
-// The course routes of specs/course/courses.t27, kept here so the starfield does not load the courses.
-const COURSE_ROOTS = ['/t27-basics', '/course', '/ai-numbers', '/goldenfloat']
+// The course routes of specs/course/courses.t27, from the small generated list, so the starfield does not load the courses.
+const COURSE_ROOTS = COURSE_ROUTES.map((r) => `/${r}`)
 
 export default function GlobalStarfield() {
   const { pathname } = useLocation()

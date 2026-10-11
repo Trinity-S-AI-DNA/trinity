@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { SITE, loadCompiler } from './agents-from-specs.mjs'
-import { TS_OUT, buildCourses, digitsOf, publicSpecOf, readInputs } from './course-from-spec.mjs'
+import { ROUTES_OUT, TS_OUT, buildCourses, digitsOf, publicSpecOf, readInputs } from './course-from-spec.mjs'
 
 const analyze = await loadCompiler(readFileSync(join(SITE, 'public/t27/t27_compiler.wasm')))
 const inputs = await readInputs()
@@ -27,6 +27,7 @@ test('the committed specs build clean and the derived files are current', async 
   const out = await build()
   assert.deepEqual(out.problems, [])
   assert.equal(readFileSync(join(SITE, TS_OUT), 'utf8'), out.ts)
+  assert.equal(readFileSync(join(SITE, ROUTES_OUT), 'utf8'), out.routesTs)
   for (const [rel, text] of out.publicSpecs) assert.equal(readFileSync(join(SITE, rel), 'utf8'), text)
   for (const c of out.courses) assert.equal(c.sendsNothing, true)
 })
@@ -166,4 +167,22 @@ test('a Russian superlative fails the build', async () => {
 
 test('digitsOf reads a number once, whatever its separators', () => {
   assert.deepEqual(digitsOf('68.4% of 1,234 and 7'), ['1234', '684', '7'])
+})
+
+// 2026-10-10: the router listed 4 of the 7 courses by hand, and "Next course" after GoldenFloat
+// opened #/verify-hardware, which had no route. Every course address now comes from the catalog.
+test('every course has an address in the app: the router and the starfield import the generated list', async () => {
+  const out = await build()
+  assert.deepEqual(out.routesTs.match(/COURSE_ROUTES = (\[[^\]]*\])/) && JSON.parse(out.routesTs.match(/COURSE_ROUTES = (\[[^\]]*\])/)[1]), out.courses.map((c) => c.route))
+  for (const file of ['src/main.tsx', 'src/components/GlobalStarfield.tsx']) {
+    const text = readFileSync(join(SITE, file), 'utf8')
+    assert.match(text, /from '\.\.?\/lib\/courseRoutes\.generated'/, `${file} imports the generated course routes`)
+    for (const c of out.courses) assert.ok(!text.includes(`'/${c.route}'`) && !text.includes(`"/${c.route}"`), `${file} names /${c.route} by hand`)
+  }
+})
+
+test('a course with no menu entry fails the build', async () => {
+  const route = inputs.courses.length && (await build()).courses.at(-1).route
+  const navText = replaced(inputs.navText, `href: '#/${route}'`, `href: '#/${route}-gone'`)
+  await fails({ navText }, `no menu entry for #/${route}`)
 })

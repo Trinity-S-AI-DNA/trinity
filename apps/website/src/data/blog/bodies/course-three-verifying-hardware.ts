@@ -95,6 +95,14 @@ export const body: Block[] = [
       "In the app: t27.ai/#/verify-hardware",
       "The course spec: t27.ai/learn/verify-hardware.t27"
     ]
+  },
+  {
+    "kind": "h",
+    "text": "Correction, 2026-10-10"
+  },
+  {
+    "kind": "p",
+    "text": "The app address above opened nothing from 2026-10-07 to 2026-10-10. The router listed course addresses by hand and held 4 of the 7 courses, so \"Next course\" at the end of GoldenFloat led to #/verify-hardware, which had no route; clocks-and-cdc and buses-and-peripherals had none either. The share pages under learn/ were never affected. The router, the starfield and the menu now take every course address from one list that scripts/course-from-spec.mjs writes from specs/course/courses.t27, and the same check fails when a course has no menu entry."
   }
 ]
 
@@ -187,5 +195,13 @@ export const ruBody: Block[] = [
       "В приложении: t27.ai/#/verify-hardware",
       "Spec курса: t27.ai/learn/verify-hardware.t27"
     ]
+  },
+  {
+    "kind": "h",
+    "text": "Поправка, 10.10.2026"
+  },
+  {
+    "kind": "p",
+    "text": "Адрес в приложении выше с 07.10 по 10.10.2026 не открывал ничего. Маршрутизатор перечислял адреса курсов вручную и знал 4 курса из 7, поэтому «Следующий курс» в конце GoldenFloat вёл на #/verify-hardware, у которого не было маршрута; у clocks-and-cdc и buses-and-peripherals тоже. Страницы для ссылок в learn/ это не задело. Теперь маршрутизатор, звёздный фон и меню берут адреса всех курсов из одного списка, который scripts/course-from-spec.mjs пишет из specs/course/courses.t27, и та же проверка падает, если у курса нет пункта меню."
   }
 ]

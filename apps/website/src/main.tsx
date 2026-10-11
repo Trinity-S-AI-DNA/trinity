@@ -13,6 +13,7 @@ import { handExplorerLinksToQueen } from './lib/queenFrame'
 import { redirectLegacyQueen } from './lib/legacyQueenRedirect'
 import { triIdentity } from './lib/triIdentity'
 import { installBotLinkCarry, reportArrival } from './lib/trafficArrival'
+import { COURSE_ROUTES } from './lib/courseRoutes.generated'
 
 // THE QUEEN MOVED to https://app.t27.ai/queen/, which now builds this same
 // bundle and serves the board on the app's own origin. #/queen here is the old
@@ -142,14 +143,11 @@ createRoot(document.getElementById('root')!).render(
             <Route path="/verification" element={<HardwareVerification />} />
             {/* Each course is a t27 spec (specs/course/courses.t27 names them);
                 the paid training that used to live here moved to /fpga-training. */}
-            <Route path="/t27-basics" element={<Course />} />
-            <Route path="/t27-basics/:lessonId" element={<Course />} />
-            <Route path="/course" element={<Course />} />
-            <Route path="/course/:lessonId" element={<Course />} />
-            <Route path="/ai-numbers" element={<Course />} />
-            <Route path="/ai-numbers/:lessonId" element={<Course />} />
-            <Route path="/goldenfloat" element={<Course />} />
-            <Route path="/goldenfloat/:lessonId" element={<Course />} />
+            {/* Every course of specs/course/courses.t27: a hand list held 4 of 7 and "Next course" opened nothing. */}
+            {COURSE_ROUTES.flatMap((route) => [
+              <Route key={route} path={`/${route}`} element={<Course />} />,
+              <Route key={`${route}/lesson`} path={`/${route}/:lessonId`} element={<Course />} />,
+            ])}
             <Route path="/fpga-training" element={<FpgaTraining />} />
             <Route path="/cases" element={<CaseStudies />} />
             <Route path="/gft" element={<GFT />} />

@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { Link, Navigate, useLocation, useParams } from 'react-router-dom'
+import { Link, Navigate, useLocation, useNavigate, useParams } from 'react-router-dom'
 import { usePageMeta } from '../hooks/usePageMeta'
 import { useI18n } from '../i18n/context'
 import Navigation from '../components/Navigation'
 import Footer from '../components/Footer'
 import { COURSE, COURSES, type Course as CourseT, type CourseLesson } from '../lib/course.generated'
+import { LADDER, type LadderSay } from '../lib/courseLadder.generated'
+import { KEY_PARAM, STEP, checkKey, courseState, openCourse, readKeys, readOpened, reportDone, saveKeys, startLink, type Keys, type Opened } from '../lib/courseLadder'
 import './Course.css'
 
 // Every word, the order of the courses and lessons and the widget each one opens
@@ -52,7 +54,7 @@ function useProgress(C: CourseT) {
     })
   }, [])
   const done = useMemo(() => all.filter((id) => C.lessons.some((l) => l.id === id)), [all, C])
-  return { done, toggle }
+  return { done, all, toggle }
 }
 
 /** The course one hands its reader to, or the one it follows. */
@@ -99,7 +101,7 @@ function CourseMap({ C, lang, say, done, current }: { C: CourseT; lang: Lang; sa
   )
 }
 
-function Overview({ C, lang, say, done }: { C: CourseT; lang: Lang; say: Say; done: string[] }) {
+function Overview({ C, lang, say, done, shared }: { C: CourseT; lang: Lang; say: Say; done: string[]; shared?: string }) {
   const LESSONS = C.lessons
   const TOTAL = LESSONS.length
   const left = LESSONS.find((l) => !done.includes(l.id))
@@ -132,7 +134,7 @@ function Overview({ C, lang, say, done }: { C: CourseT; lang: Lang; say: Say; do
           {C.next ? <ChainLink lang={lang} say={say} to={C.next} next /> : <span />}
         </nav>
       ) : null}
-      <CourseNotes C={C} lang={lang} say={say} />
+      <CourseNotes C={C} lang={lang} say={say} shared={shared} />
     </div>
   )
 }
@@ -188,13 +190,14 @@ function CourseShare({ C, lang, say, id, title }: { C: CourseT; lang: Lang; say:
   )
 }
 
-function CourseNotes({ C, lang, say, id }: { C: CourseT; lang: Lang; say: Say; id?: string }) {
+function CourseNotes({ C, lang, say, id, shared }: { C: CourseT; lang: Lang; say: Say; id?: string; shared?: string }) {
   return (
     <div className="course-notes">
       <p>
         <a href={shareOf(C, lang, id)}>{say.SHARE}: t27.ai{shareOf(C, lang, id)}</a>
       </p>
-      <p>{say.PRIVATE}</p>
+      {/* Once the reader holds a key, finished lessons reach the author: say so instead. */}
+      <p>{shared ?? say.PRIVATE}</p>
       <p>{say.WIDGET_LANG}</p>
       <p>
         <a href={C.source.publicSpec.replace(/^public\//, '')} target="_blank" rel="noreferrer">
@@ -231,7 +234,7 @@ function framesOf(l: CourseLesson): Frame[] {
   return [main, ...spec, ...also]
 }
 
-function Lesson({ C, lesson, lang, say, done, toggle }: { C: CourseT; lesson: CourseLesson; lang: Lang; say: Say; done: string[]; toggle: (id: string) => void }) {
+function Lesson({ C, lesson, lang, say, done, toggle, shared }: { C: CourseT; lesson: CourseLesson; lang: Lang; say: Say; done: string[]; toggle: (id: string) => void; shared?: string }) {
   const LESSONS = C.lessons as readonly CourseLesson[]
   const TOTAL = LESSONS.length
   const frames = useMemo(() => framesOf(lesson), [lesson])
@@ -361,8 +364,106 @@ function Lesson({ C, lesson, lang, say, done, toggle }: { C: CourseT; lesson: Co
 
       <CourseMap C={C} lang={lang} say={say} done={done} current={lesson.id} />
       <p className="course-progress is-foot">{fmt(say.PROGRESS, done.length, TOTAL)}</p>
-      <CourseNotes C={C} lang={lang} say={say} id={lesson.id} />
+      <CourseNotes C={C} lang={lang} say={say} id={lesson.id} shared={shared} />
     </article>
+  )
+}
+
+
+/**
+ * THE LADDER (specs/ladder/course-ladder.t27, rules course-access.t27): which courses this
+ * reader opened, the keys the bot handed back, and whether each key still holds. A key
+ * arrives in the address (#/<route>?unlock=<key>) from the bot's button, is checked with
+ * the render, kept, and taken out of the address.
+ */
+function useLadder(C: CourseT, allDone: string[]) {
+  const known = useMemo(() => COURSES.map((c) => c.id as string), [])
+  const withProgress = useMemo(
+    () => COURSES.filter((c) => c.lessons.some((l) => allDone.includes(l.id))).map((c) => c.id as string),
+    // Seeded once, from the progress the reader had when the ladder first met them.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [],
+  )
+  const [opened, setOpened] = useState<Opened>(() => (typeof window === 'undefined' ? [] : readOpened(known, withProgress)))
+  const [keys, setKeys] = useState<Keys>(() => (typeof window === 'undefined' ? {} : readKeys()))
+  const [valid, setValid] = useState({ bot: false, paid: false })
+  const [checking, setChecking] = useState(true)
+  const [bad, setBad] = useState<string | null>(null)
+  const { search, pathname } = useLocation()
+  const navigate = useNavigate()
+
+  useEffect(() => {
+    let live = true
+    const fresh = new URLSearchParams(search).get(KEY_PARAM)
+    void (async () => {
+      const held: Keys = { ...readKeys() }
+      if (fresh) {
+        const r = await checkKey(fresh)
+        if (r.ok && (r.step === STEP.bot || r.step === STEP.paid)) {
+          if (r.step === STEP.bot) held.bot = fresh
+          else held.paid = fresh
+          saveKeys(held)
+          if (live) setBad(null)
+        } else if (live) setBad(r.reason ?? 'unknown')
+      }
+      const [b, p] = await Promise.all([
+        held.bot ? checkKey(held.bot) : Promise.resolve({ ok: false }),
+        held.paid ? checkKey(held.paid) : Promise.resolve({ ok: false }),
+      ])
+      if (!live) return
+      const now = { bot: Boolean(b.ok), paid: Boolean(p.ok) }
+      setKeys(held)
+      setValid(now)
+      setChecking(false)
+      // The key the bot just handed back opens the course it was handed for, and only then
+      // leaves the address: leaving first changed the address under this very effect,
+      // which dropped the open (measured in Chromium, 2026-10-11).
+      if (fresh) {
+        setOpened((o) => openCourse(C.id, o, now))
+        navigate(pathname, { replace: true })
+      }
+    })()
+    return () => {
+      live = false
+    }
+    // Once per arrival: a new key in the address, or a new course.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [search, C.id])
+
+  const state = courseState(C.id, opened, valid)
+  const open = () => setOpened((o) => openCourse(C.id, o, valid))
+  // The key a lesson report travels with: the paid one while it holds, else the bot's.
+  const reportKey = valid.paid ? keys.paid : valid.bot ? keys.bot : undefined
+  return { state, open, checking, bad, reportKey }
+}
+
+function LadderGate({ C, lang, ladder }: { C: CourseT; lang: Lang; ladder: ReturnType<typeof useLadder> }) {
+  const say = LADDER.say[lang] as LadderSay
+  const { state, checking, bad } = ladder
+  const step = state.step
+  return (
+    <section className="course-hero course-ladder" aria-live="polite">
+      <p className="course-kicker">{fmt(say.RUNG, state.rung)}</p>
+      <h2 className="course-title">{step === STEP.free ? say.FREE_TITLE : step === STEP.bot ? say.BOT_TITLE : say.PAID_TITLE}</h2>
+      <p className="course-lead">{step === STEP.free ? say.FREE_LINE : step === STEP.bot ? say.BOT_LINE : say.PAID_LINE}</p>
+      {bad ? <p className="course-desc course-ladder-bad">{fmt(say.KEY_BAD, bad)}</p> : null}
+      <div className="course-hero-actions">
+        {checking && step !== STEP.free ? (
+          <span className="course-progress">{say.CHECKING}</span>
+        ) : 'mayOpenNow' in state && state.mayOpenNow ? (
+          <button type="button" className="course-btn is-primary" onClick={ladder.open}>
+            {say.OPEN}
+          </button>
+        ) : (
+          <a className="course-btn is-primary" href={startLink(step, C.route)} target="_blank" rel="noopener noreferrer">
+            {step === STEP.paid ? say.PAID_PRESS : say.BOT_PRESS}
+          </a>
+        )}
+      </div>
+      {step !== STEP.free ? <p className="course-desc">{say.BOT_SHARES}</p> : null}
+      {step === STEP.paid ? <p className="course-desc">{say.PAID_LATER}</p> : null}
+      <p className="course-shape">{say.LADDER}</p>
+    </section>
   )
 }
 
@@ -376,7 +477,18 @@ export default function Course() {
   const { lang: siteLang } = useI18n()
   const lang: Lang = siteLang === 'ru' ? 'ru' : 'en'
   const say = C.say[lang] as Say
-  const { done, toggle } = useProgress(C)
+  const { done, all, toggle } = useProgress(C)
+  const ladder = useLadder(C, all)
+  // A finished lesson is marked here and, with a key, told to the course author (may_report).
+  const mark = useCallback(
+    (id: string) => {
+      const finishing = !done.includes(id)
+      toggle(id)
+      if (finishing) void reportDone(ladder.reportKey, C.route, id)
+    },
+    [done, toggle, ladder.reportKey, C.route],
+  )
+  const shared = ladder.reportKey ? (LADDER.say[lang] as LadderSay).SHARED : undefined
   const lesson = lessonId ? (C.lessons as readonly CourseLesson[]).find((l) => l.id === lessonId) : undefined
   // A lesson that moved to another course keeps its old address working.
   const moved = lessonId && !lesson ? COURSES.find((c) => c.lessons.some((l) => l.id === lessonId)) : undefined
@@ -394,10 +506,15 @@ export default function Course() {
               {say.ALL}
             </Link>
           </div>
+        ) : !ladder.state.open ? (
+          <>
+            <LadderGate C={C} lang={lang} ladder={ladder} />
+            <CourseMap C={C} lang={lang} say={say} done={done} current={lesson?.id} />
+          </>
         ) : lesson ? (
-          <Lesson C={C} lesson={lesson} lang={lang} say={say} done={done} toggle={toggle} />
+          <Lesson C={C} lesson={lesson} lang={lang} say={say} done={done} toggle={mark} shared={shared} />
         ) : (
-          <Overview C={C} lang={lang} say={say} done={done} />
+          <Overview C={C} lang={lang} say={say} done={done} shared={shared} />
         )}
       </main>
       <Footer />
