@@ -3,6 +3,36 @@ import type { PostMeta } from './types'
 /** Индекс блога: список и метаданные без тяжёлых тел публикаций. */
 export const postsIndex: PostMeta[] = [
   {
+    slug: "three-widgets-under-the-bus",
+    title: "Three widgets for the physics under the bus: reflections, a closing eye, an ECC word",
+    summary: "[each widget's logic is a t27 spec compiled to wasm; lossless line, one-pole channel, values typed, nothing read from a board] A 1 V step from a 25 ohm driver into an open 50 ohm line reaches the far end as 1.333, 0.889, 1.037, 0.988 V before it settles at 1 V; one RC pole leaves a quarter of the eye at T = TAU and shuts it at TAU ln 2; a 13-bit SECDED word fixes any single flip and catches any two. Three new widgets show this, each running the fn bodies of its own t27 spec, with 20 spec tests and 15 negative controls behind them.",
+    date: "2026-10-11",
+    readingMinutes: 4,
+    tags: ["t27", "FPGA", "Signal integrity"],
+    receipts: [
+      { label: "t27#8931: line_bounce.t27, eye_isi.t27, secded.t27 -- 20 tests, 15 of 15 negative controls caught", href: "https://github.com/gHashTag/t27/pull/8931" },
+      { label: "The line bounce widget", href: "https://t27.ai/widgets/line-bounce/" },
+      { label: "The eye and ISI widget", href: "https://t27.ai/widgets/eye-isi/" },
+      { label: "The ECC SECDED widget", href: "https://t27.ai/widgets/ecc-secded/" },
+      { label: "The buses course, where the three sit beside their lessons", href: "https://t27.ai/learn/buses-and-peripherals/" },
+    ],
+    openQuestions: [
+      "The line is lossless and the load a resistor; no trace on our board was measured for this post.",
+      "One pole is the mechanism of ISI, not a link budget: no jitter, crosstalk or receiver noise.",
+      "Three or more flips can alias to one in SECDED; the widget states it, the tests do not cover it.",
+    ],
+    published: true,
+    ru: {
+      title: "Три виджета о физике под шиной: отражения, закрывающийся глаз, слово ECC",
+      summary: "[логика каждого виджета — спека t27, собранная в wasm; линия без потерь, канал с одним полюсом, значения введены руками, с платы ничего не читалось] Ступенька 1 В от драйвера 25 Ом в открытую линию 50 Ом приходит на дальний конец как 1,333, 0,889, 1,037, 0,988 В и только потом устанавливается на 1 В; один RC-полюс оставляет четверть глаза при T = TAU и закрывает его при TAU ln 2; 13-битное слово SECDED исправляет любую одиночную ошибку и ловит любые две. Три новых виджета показывают это, каждый исполняет тела функций своей спеки t27; за ними 20 тестов спек и 15 отрицательных контролей.",
+      openQuestions: [
+        "Линия без потерь, нагрузка — резистор; ни одна дорожка нашей платы для этого поста не мерилась.",
+        "Один полюс — механизм межсимвольной интерференции, а не бюджет линка: нет джиттера, перекрёстных помех и шума приёмника.",
+        "Три и больше ошибок в SECDED могут выглядеть как одна; виджет это говорит, тесты этого не покрывают.",
+      ],
+    },
+  },
+  {
     slug: "actors-beat-the-loop-on-recovery-not-everywhere",
     title: "Actors beat the loop on recovery, not everywhere: seven measured changes to the Queen runtime",
     summary: "[simulated: reviewer, concurrency, turn stop, dispatcher; measured: node-link chaos and waits on PostgreSQL 16, decision replay, the simulation gate; FPGA: synthesis only; nothing in production] On one seeded input the Queen's actor runtime cuts the worst recovery from 1181 s to 27 s and finishes 18.7% more reviews under overload, but it does not win everywhere. Seven changes from a competitor study landed behind flags on 2026-10-09, each with a t27 spec and a benchmark against the code it would replace: a decision log that replays 73,435 decisions with 0 mismatches, turns that really stop, waits as Postgres rows (GitHub reads 180 to 24), a fenced node link (lost mail 21 to 0), and a seeded simulation gate that runs in 33.5 s and found a real runtime bug first. Most of the dispatcher's gain came from a 60-minute turn bound, not from actors, and adaptive concurrency loses with 3 lanes. On an XC7A200T the card as written costs 26,737 LUT and 13 functions do not synthesize; memory, not logic, caps it at about 37,000 actors a board.",
