@@ -26,6 +26,9 @@ const FIG_TEXT = {
   ru: { label: 'Секунды до и после, в логарифмической шкале, для шести мест, где t27 собирает и ждёт', title: 'Секунды ожидания, до и после (логарифмическая шкала)', before: 'было', after: 'стало' },
 }
 
+// Text placed inside the SVG is escaped, so a label with & < > or " cannot break the markup.
+const esc = (x: string) => x.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+
 function barsSvg(lang: Lang = 'en'): string {
   const t = FIG_TEXT[lang]
   const W = 720, rowH = 40, top = 56, x0 = 300, x1 = 690
@@ -34,10 +37,10 @@ function barsSvg(lang: Lang = 'en'): string {
   const xs = (v: number) => x0 + ((Math.log10(v) - lo) * (x1 - x0)) / (hi - lo)
   const num = (v: number) => (lang === 'ru' ? String(v).replace('.', ',') : String(v))
   const unit = lang === 'ru' ? 'с' : 's'
-  let s = `<svg viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="${t.label}" style="width:100%;height:auto;font-family:inherit">`
-  s += `<text x="10" y="22" font-size="15" font-weight="700" fill="currentColor">${t.title}</text>`
-  s += `<rect x="${x0}" y="32" width="12" height="8" fill="${GREY}"/><text x="${x0 + 16}" y="40" font-size="11" fill="currentColor">${t.before}</text>`
-  s += `<rect x="${x0 + 70}" y="32" width="12" height="8" fill="${GOLD}"/><text x="${x0 + 86}" y="40" font-size="11" fill="currentColor">${t.after}</text>`
+  let s = `<svg viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="${esc(t.label)}" style="width:100%;height:auto;font-family:inherit">`
+  s += `<text x="10" y="22" font-size="15" font-weight="700" fill="currentColor">${esc(t.title)}</text>`
+  s += `<rect x="${x0}" y="32" width="12" height="8" fill="${GREY}"/><text x="${x0 + 16}" y="40" font-size="11" fill="currentColor">${esc(t.before)}</text>`
+  s += `<rect x="${x0 + 70}" y="32" width="12" height="8" fill="${GOLD}"/><text x="${x0 + 86}" y="40" font-size="11" fill="currentColor">${esc(t.after)}</text>`
   for (const v of [0.1, 1, 10, 100, 1000]) {
     s += `<line x1="${xs(v)}" y1="${top - 6}" x2="${xs(v)}" y2="${top + BARS.length * rowH}" stroke="currentColor" stroke-opacity="0.12"/>`
     s += `<text x="${xs(v)}" y="${top + BARS.length * rowH + 16}" font-size="10" text-anchor="middle" fill="currentColor" fill-opacity="0.6">${num(v)} ${unit}</text>`
@@ -45,7 +48,7 @@ function barsSvg(lang: Lang = 'en'): string {
   BARS.forEach((b, i) => {
     const y = top + i * rowH
     const label = lang === 'ru' ? b[1] : b[0]
-    s += `<text x="${x0 - 8}" y="${y + 18}" font-size="11.5" text-anchor="end" fill="currentColor">${label}</text>`
+    s += `<text x="${x0 - 8}" y="${y + 18}" font-size="11.5" text-anchor="end" fill="currentColor">${esc(label)}</text>`
     s += `<rect x="${x0}" y="${y + 4}" width="${xs(b[2]) - x0}" height="12" fill="${GREY}" fill-opacity="0.75"/>`
     s += `<text x="${xs(b[2]) + 4}" y="${y + 14}" font-size="10" fill="currentColor" fill-opacity="0.7">${num(b[2])}</text>`
     s += `<rect x="${x0}" y="${y + 18}" width="${xs(b[3]) - x0}" height="12" fill="${GOLD}"/>`
@@ -111,7 +114,7 @@ export const body: Block[] = [
       ['Change logic, get a bitstream', '36.7 s (ternary_link)', 'nextpnr 27.3 s: clock routing searches the whole chip for the BSCAN to BUFG arc, and the router sets up every wire of the 200T before routing a few thousand', 'A patch with byte-identical output makes clock routing 1.8-5x faster (t27#8754); a place-and-route process that stays resident would remove the setup'],
       ['Bitstream onto the board', '~13-15 s', '9.73 MB over JTAG at the default clock', 'A faster JTAG clock on the HS2 cable, about 3 s; needs a test on the board'],
       ['Approval to the start of a run', 'up to 60 s', 'The bench agent polls once a minute', 'Poll every 15 s, at about 180 more GitHub API calls an hour'],
-      ['`t27c suite`', '~170 s', 'The C-header gate: 72 s of `cc -fsyntax-only` on every spec, every run', 'Cache its results by content (t27#8829)'],
+      ['`t27c suite`', '~170 s', 'The C-header gate: 72 s of `cc -fsyntax-only` on every spec, every run', 'Cache its results by content (t27#8900)'],
     ],
   },
   {
@@ -179,7 +182,7 @@ export const ruBody: Block[] = [
       ['Правка логики → битстрим', '36,7 с (ternary_link)', 'nextpnr 27,3 с: трассировка клоков ищет путь BSCAN → BUFG по всему кристаллу, а роутер настраивает каждый провод 200T, прежде чем развести несколько тысяч', 'Патч с побайтно тем же результатом ускоряет трассировку клоков в 1,8-5 раз (t27#8754); place-and-route, который остаётся в памяти, убрал бы настройку'],
       ['Битстрим → плата', '~13-15 с', '9,73 МБ по JTAG на частоте по умолчанию', 'Более быстрый JTAG на кабеле HS2 — около 3 с; нужен тест на плате'],
       ['Одобрение → старт запуска', 'до 60 с', 'Бенч-агент опрашивает раз в минуту', 'Опрос раз в 15 с — примерно на 180 вызовов GitHub API в час больше'],
-      ['`t27c suite`', '~170 с', 'Гейт C-заголовков: 72 с `cc -fsyntax-only` на каждую спеку при каждом прогоне', 'Кэшировать его результаты по содержимому (t27#8829)'],
+      ['`t27c suite`', '~170 с', 'Гейт C-заголовков: 72 с `cc -fsyntax-only` на каждую спеку при каждом прогоне', 'Кэшировать его результаты по содержимому (t27#8900)'],
     ],
   },
   {

@@ -24,7 +24,7 @@ export const postsIndex: PostMeta[] = [
       { label: "t27#8819: a timed-out build stops its whole process tree · MERGED", href: "https://github.com/gHashTag/t27/pull/8819" },
       { label: "t27#8872: tri hot · MERGED", href: "https://github.com/gHashTag/t27/pull/8872" },
       { label: "t27#8754: nextpnr clock routing, the measurements and the patch", href: "https://github.com/gHashTag/t27/issues/8754" },
-      { label: "t27#8829: the C-header gate, the largest suite cost left", href: "https://github.com/gHashTag/t27/issues/8829" },
+      { label: "t27#8900: the C-header gate, the largest suite cost left (waits for the owner)", href: "https://github.com/gHashTag/t27/issues/8900" },
     ],
     openQuestions: [
       "No board run was made after these changes: the ~13-15 s board load is from earlier runs, and the faster JTAG clock is untested.",
