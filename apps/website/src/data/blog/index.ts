@@ -3,6 +3,40 @@ import type { PostMeta } from './types'
 /** Индекс блога: список и метаданные без тяжёлых тел публикаций. */
 export const postsIndex: PostMeta[] = [
   {
+    slug: "a-wasm-interpreter-ran-on-the-board",
+    title: "A WASM interpreter ran on the board: 134 of 134, from a spec",
+    summary: "[the programs live in a ROM built from the spec; the wire carries requests, not .wasm binaries; one board, one night, six runs] A t27 spec in gHashTag/t27 (branch wasm-board, 351e3cdf4) became a Verilog core through t27c gen-verilog, passed through openXC7 onto an ALINX AX7203, and answered 134 of 134 requests exactly -- six runs in a row, 804 of 804. 21 opcodes of the WASM MVP set, a 14-program 101-byte ROM, i32.mul as a 32-clock shift-add microsequence; timing went from 18.57 to 70.41 MHz against a 68.7 bar at one percent of the LUTs -- every frequency here is a nextpnr estimate, not sign-off timing. The self-tested conformance harness caught a wire-offset bug that would have failed 76 checks against a perfectly working board.",
+    date: "2026-10-12",
+    readingMinutes: 4,
+    tags: ["t27", "FPGA", "WASM"],
+    receipts: [
+      { label: "trinity-fpga#918: the merged PR, +676/-0", href: "https://github.com/gHashTag/trinity-fpga/pull/918" },
+      { label: "Epic trinity-fpga#917: AI-generated FPGA hardware that executes WASM", href: "https://github.com/gHashTag/trinity-fpga/issues/917" },
+      { label: "The spec: gHashTag/t27 specs/fpga/wasm_board_ax7203.t27 (wasm-board, 351e3cdf4)", href: "https://github.com/gHashTag/t27/blob/351e3cdf4/specs/fpga/wasm_board_ax7203.t27" },
+      { label: "The recorded bench session", href: "https://t27.ai/term/wasm-board-ax7203/" },
+      { label: "Experience log: the night on the bench", href: "https://github.com/gHashTag/trinity-fpga/blob/main/fpga/experience/2026-10-12-wasm-board-ax7203.trinity.md" },
+    ],
+    openQuestions: [
+      "Twenty-one opcodes is a subset of the WebAssembly MVP set; the full ISA is unclaimed.",
+      "The programs live in a ROM built from the spec; nothing on the wire loads a .wasm binary yet.",
+      "416 answers per second is the pace of the 1,144,744-baud UART link, not a ceiling of the interpreter.",
+      "One board, one night, six runs: no voltage or temperature corners were swept.",
+      "The bring-up top is hand-written Verilog under the owner-approved-foreign exception; shrinking it is future work.",
+    ],
+    published: true,
+    ru: {
+      title: "WASM-интерпретатор заработал на плате: 134 из 134, из спеки",
+      summary: "[программы лежат в ROM, собранном из спеки; по проводу ходят запросы, а не .wasm-бинарники; одна плата, одна ночь, шесть прогонов] Спека t27 в gHashTag/t27 (ветка wasm-board, 351e3cdf4) стала Verilog-ядром через t27c gen-verilog, прошла через openXC7 на ALINX AX7203 и ответила на 134 из 134 запросов точно -- шесть прогонов подряд, 804 из 804. 21 опкод из набора WASM MVP, ROM на 14 программ и 101 байт, i32.mul как 32-тактовая микропоследовательность; тайминг вырос с 18,57 до 70,41 МГц при планке 68,7 на одном проценте LUT -- каждая частота здесь оценка nextpnr, а не подписанный тайминг. Самотест конформансного стенда поймал баг со смещениями в проводе, который завалил бы 76 проверок на полностью исправной плате.",
+      openQuestions: [
+        "Двадцать один опкод -- подмножество набора WebAssembly MVP; полный ISA не заявлен.",
+        "Программы лежат в ROM, собранном из спеки; .wasm-бинарник по проводу пока не грузится.",
+        "416 ответов в секунду -- темп UART-линии на 1 144 744 бода, а не потолок интерпретатора.",
+        "Одна плата, одна ночь, шесть прогонов: углы по напряжению и температуре не проверялись.",
+        "Верхний уровень подъёма платы -- рукописный Verilog под исключением owner-approved-foreign; ужимать его -- будущая работа.",
+      ],
+    },
+  },
+  {
     slug: "arithmetic-and-dsp-a-widget-per-lesson",
     title: "Arithmetic and DSP on the FPGA: 27 lessons, and a widget in each one that runs a t27 spec",
     summary: "[every widget runs fn bodies of a t27 spec compiled to wasm; delays in lessons 1 and 26 are the reader's inputs, not device timing] Course 9 teaches the arithmetic an FPGA spends its area on, from the carry chain to a filter: adders, Booth multipliers and the DSP48E1 slice, fixed point, CORDIC, sampling, FIR and CIC filters, the FFT, and a capstone filter computed bit for bit. Five new specs in gHashTag/t27 carry the logic of 26 widgets, with 43 tests and 33 negative controls; the 27th runs the correlator of the existing modem spec.",

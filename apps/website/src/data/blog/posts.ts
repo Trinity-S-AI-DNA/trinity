@@ -1,3 +1,4 @@
+import { body as body_a_wasm_interpreter_ran_on_the_board, ruBody as ruBody_a_wasm_interpreter_ran_on_the_board } from './bodies/a-wasm-interpreter-ran-on-the-board'
 import { body as body_arithmetic_and_dsp_a_widget_per_lesson, ruBody as ruBody_arithmetic_and_dsp_a_widget_per_lesson } from './bodies/arithmetic-and-dsp-a-widget-per-lesson'
 import { body as body_the_ternary_machine_course, ruBody as ruBody_the_ternary_machine_course } from './bodies/the-ternary-machine-course'
 import { body as body_three_widgets_under_the_bus, ruBody as ruBody_three_widgets_under_the_bus } from './bodies/three-widgets-under-the-bus'
@@ -113,6 +114,7 @@ import { body as body_features_that_change_no_bits, ruBody as ruBody_features_th
 import { body as body_one_commit_nine_workflow_outcomes, ruBody as ruBody_one_commit_nine_workflow_outcomes } from './bodies/one-commit-nine-workflow-outcomes'
 
 const bodies: Record<string, PostBody> = {
+  'a-wasm-interpreter-ran-on-the-board': { body: body_a_wasm_interpreter_ran_on_the_board, ruBody: ruBody_a_wasm_interpreter_ran_on_the_board },
   'a-3-mb-compiler-spec-to-aarch64-in-5-ms': { body: body_a_3_mb_compiler_spec_to_aarch64_in_5_ms, ruBody: ruBody_a_3_mb_compiler_spec_to_aarch64_in_5_ms },
   'actors-beat-the-loop-on-recovery-not-everywhere': { body: body_actors_beat_the_loop_on_recovery_not_everywhere, ruBody: ruBody_actors_beat_the_loop_on_recovery_not_everywhere },
   'from-a-minute-to-a-second': { body: body_from_a_minute_to_a_second, ruBody: ruBody_from_a_minute_to_a_second },
