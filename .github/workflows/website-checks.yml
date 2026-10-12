@@ -33,12 +33,18 @@
 name: Website checks
 
 # The workflow runs on EVERY pull request and decides in `scope` whether the
-# site is touched; the heavy `checks` job runs only then, and `website gate`
-# always reports. A path filter on the trigger made the check absent on most
-# PRs, so it could not be required, and #1535 (a catalog refresh that deleted
-# 40 course lesson specs) merged 70 s after it opened with no site check at all.
-# `website gate` is the one name branch protection requires: green when the
-# checks passed, or when the change touches nothing they read.
+# site is touched; the five `checks-*` jobs run only then, in parallel, and
+# `website gate` always reports. A path filter on the trigger made the check
+# absent on most PRs, so it could not be required, and #1535 (a catalog
+# refresh that deleted 40 course lesson specs) merged 70 s after it opened
+# with no site check at all. `website gate` is the one name branch protection
+# requires: green when the checks passed, or when the change touches nothing
+# they read.
+#
+# Five groups, because the serial `checks` job took 26 minutes and the groups
+# take the slowest of them (~8): the pure gates in one, one language audit
+# per locale, and two Chrome groups over the built site. A group that needs
+# dist/ builds its own; nothing crosses between groups.
 #
 # SITE_PATHS: apps/queen-proxy/** is in because one of the gates below reads
 # it. The proxy is the server half of the rule that only registered people
@@ -46,6 +52,7 @@ name: Website checks
 # otherwise touch no watched path and run no check at all. The five src/tri and
 # src/registry files are in for the same reason: check:tools-coverage re-reads
 # the dispatcher, and a new `tri` command must not land without its card.
+
 on:
   pull_request:
   push:
@@ -91,24 +98,33 @@ jobs:
 
   gate:
     name: website gate
-    needs: [scope, checks]
+    needs: [scope, checks-pure, checks-lang-en, checks-lang-ru, checks-browser-a, checks-browser-b]
     if: always()
     runs-on: ubuntu-latest
     steps:
       - env:
           SCOPE: ${{ needs.scope.result }}
           SITE: ${{ needs.scope.outputs.site }}
-          CHECKS: ${{ needs.checks.result }}
+          PURE: ${{ needs.checks-pure.result }}
+          LANG_EN: ${{ needs.checks-lang-en.result }}
+          LANG_RU: ${{ needs.checks-lang-ru.result }}
+          BROWSER_A: ${{ needs.checks-browser-a.result }}
+          BROWSER_B: ${{ needs.checks-browser-b.result }}
         run: |
-          echo "scope=$SCOPE site=$SITE checks=$CHECKS"
+          echo "scope=$SCOPE site=$SITE groups=$PURE,$LANG_EN,$LANG_RU,$BROWSER_A,$BROWSER_B"
           [ "$SCOPE" = success ] || { echo "the scope job did not finish"; exit 1; }
           if [ "$SITE" = true ]; then
-            [ "$CHECKS" = success ] || { echo "the site changed and its checks did not pass"; exit 1; }
+            for r in "$PURE" "$LANG_EN" "$LANG_RU" "$BROWSER_A" "$BROWSER_B"; do
+              [ "$r" = success ] || { echo "the site changed and its checks did not pass ($r)"; exit 1; }
+            done
           else
-            [ "$CHECKS" = skipped ] || { echo "the checks ran where nothing needed them: $CHECKS"; exit 1; }
+            for r in "$PURE" "$LANG_EN" "$LANG_RU" "$BROWSER_A" "$BROWSER_B"; do
+              [ "$r" = skipped ] || { echo "checks ran where nothing needed them: $r"; exit 1; }
+            done
           fi
 
-  checks:
+  checks-pure:
+    name: checks (pure gates)
     needs: scope
     if: needs.scope.outputs.site == 'true'
     runs-on: ubuntu-latest
@@ -481,6 +497,121 @@ jobs:
       # provider that rewrites them after load, and in og/og-image.svg.
       - name: Link preview words
         run: npm run check:og-preview
+      # The `on:` blocks of the five paying workflows are data in
+      # specs/ci/workflow_triggers.t27, read through the compiler; this gate
+      # fails when a committed trigger block is not what the spec says, so a
+      # parked hand edit to a workflow's triggers cannot come back quietly.
+      - name: CI triggers match the spec
+        run: npm run check:ci-triggers
+  checks-lang-en:
+    name: checks (language audits en)
+    needs: scope
+    if: needs.scope.outputs.site == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/website
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'   # render-check uses the WebSocket client built into 22
+          cache: npm
+          cache-dependency-path: apps/website/package-lock.json
+
+      - run: npm ci
+
+      - name: Build
+        run: npx vite build
+
+      # Skips itself if no Chrome is found rather than failing: a missing
+      # browser is an environment fact, not a defect in the change.
+      - uses: browser-actions/setup-chrome@v1
+        id: chrome
+
+      # Проверяет все маршруты в обеих локалях. Скрипты имеют собственные
+      # самотесты и используют Chrome через CDP без новой зависимости npm.
+      # One job per locale: the two audits together were the longest step of
+      # the serial job (8m50s of the 26m); split, neither holds up the other.
+      - name: Language audits (en)
+        env:
+          CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
+        run: |
+          npm run audit:en -- --selftest
+          python3 -m http.server 4173 --directory dist >/tmp/t27-language-audit-server.log 2>&1 &
+          SERVER_PID=$!
+          trap 'kill "$SERVER_PID" 2>/dev/null || true' EXIT
+          for attempt in 1 2 3 4 5; do
+            curl --fail --silent http://127.0.0.1:4173/index.html >/dev/null && break
+            sleep 1
+          done
+          curl --fail --silent http://127.0.0.1:4173/index.html >/dev/null
+          AUDIT_BASE_URL='http://127.0.0.1:4173/index.html?lang=en' npm run audit:en
+          # Same server, same Chrome harness, one more question: does any route
+          # scroll sideways at 375px. Runs its own --selftest first.
+          npm run audit:mobile -- --selftest
+          AUDIT_BASE_URL='http://127.0.0.1:4173/index.html' npm run audit:mobile
+  checks-lang-ru:
+    name: checks (language audits ru)
+    needs: scope
+    if: needs.scope.outputs.site == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/website
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'   # render-check uses the WebSocket client built into 22
+          cache: npm
+          cache-dependency-path: apps/website/package-lock.json
+
+      - run: npm ci
+
+      - name: Build
+        run: npx vite build
+
+      # Skips itself if no Chrome is found rather than failing: a missing
+      # browser is an environment fact, not a defect in the change.
+      - uses: browser-actions/setup-chrome@v1
+        id: chrome
+
+      - name: Language audits (ru)
+        env:
+          CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
+        run: |
+          npm run audit:ru -- --selftest
+          python3 -m http.server 4173 --directory dist >/tmp/t27-language-audit-server.log 2>&1 &
+          SERVER_PID=$!
+          trap 'kill "$SERVER_PID" 2>/dev/null || true' EXIT
+          for attempt in 1 2 3 4 5; do
+            curl --fail --silent http://127.0.0.1:4173/index.html >/dev/null && break
+            sleep 1
+          done
+          curl --fail --silent http://127.0.0.1:4173/index.html >/dev/null
+          AUDIT_BASE_URL='http://127.0.0.1:4173/index.html?lang=ru' npm run audit:ru
+          # Both locales: the Russian chrome is wider than the English, and the
+          # /specs language switcher was pushed off a 375px screen in RU while
+          # fitting in EN. A single-locale run would have passed it.
+          AUDIT_BASE_URL='http://127.0.0.1:4173/index.html?lang=ru' npm run audit:mobile
+  checks-browser-a:
+    name: checks (explorer, render, corpus)
+    needs: scope
+    if: needs.scope.outputs.site == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/website
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'   # render-check uses the WebSocket client built into 22
+          cache: npm
+          cache-dependency-path: apps/website/package-lock.json
+
+      - run: npm ci
 
       - name: Build
         run: npx vite build
@@ -490,6 +621,77 @@ jobs:
       # section. After the build, so the shell is checked in dist/ as shipped.
       - name: Home page shell a crawler reads
         run: npm run check:boot-shell
+
+      # Skips itself if no Chrome is found rather than failing: a missing
+      # browser is an environment fact, not a defect in the change.
+      - uses: browser-actions/setup-chrome@v1
+        id: chrome
+
+      # The five explorers and the spec explorer at every size in the spec's
+      # matrix: one pane on a phone, two above, the deep-linked card open and
+      # on screen, 44px controls where a finger is the pointer, one scroller
+      # per pane, nothing sideways. Skips itself without Chrome.
+      - name: Explorer viewport contract
+        env:
+          CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
+        run: npm run check:explorer-viewport -- --no-build
+
+      # The same contract on the built page: every Queen tab's root, the SPECS
+      # rung and the Explorer frame report one data-corpus-version, the manifest
+      # is fetched once between shell and frame, and world= in the shell's
+      # address narrows the frame to that world's count on the comb.
+      - name: Queen spec corpus, every tab
+        env:
+          CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
+        run: npm run check:queen-spec-sync -- --browser --no-build
+
+      - name: Render check
+        env:
+          CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
+        run: npm run check:render -- --no-build
+
+      # The landing in a browser that cannot create a WebGL context, and in one
+      # whose engine is refused after the probe: the page must render whole and
+      # only the scene may go. On 2026-10-03 a GPU-less Chromium got a blank
+      # t27.ai/ from one uncaught "WebGL not supported". Skips itself without
+      # Chrome.
+      - name: Landing without WebGL
+        env:
+          CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
+        run: npm run check:home-no-webgl -- --no-build
+
+      # A51: four PRs merged, every check green, and the live site changed
+      # nothing -- this app deploys from a second repository that holds build
+      # output only, copied there by hand. Every check above runs against the
+      # source, so all of them pass on a tree whose output nobody published.
+      #
+      # This one fetches t27.ai and compares the entry bundle. It never fails
+      # the job: a merge is not a deploy, and blocking one on the other
+      # inverts the order. It is here so the gap is visible in the log rather
+      # than discovered a week later in the site's <head>.
+      - name: Is the live site this build?
+        continue-on-error: true
+        run: npm run check:deployed
+  checks-browser-b:
+    name: checks (queen matrix, touch, dead API)
+    needs: scope
+    if: needs.scope.outputs.site == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/website
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'   # render-check uses the WebSocket client built into 22
+          cache: npm
+          cache-dependency-path: apps/website/package-lock.json
+
+      - run: npm ci
+
+      - name: Build
+        run: npx vite build
 
       # Skips itself if no Chrome is found rather than failing: a missing
       # browser is an environment fact, not a defect in the change.
@@ -508,66 +710,6 @@ jobs:
           CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
         run: npm run check:queen-viewport -- --no-build
 
-      # The same contract on the built page: every Queen tab's root, the SPECS
-      # rung and the Explorer frame report one data-corpus-version, the manifest
-      # is fetched once between shell and frame, and world= in the shell's
-      # address narrows the frame to that world's count on the comb.
-      - name: Queen spec corpus, every tab
-        env:
-          CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
-        run: npm run check:queen-spec-sync -- --browser --no-build
-
-      # Проверяет все маршруты в обеих локалях. Скрипты имеют собственные
-      # самотесты и используют Chrome через CDP без новой зависимости npm.
-      - name: Language audits
-        env:
-          CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
-        run: |
-          npm run audit:en -- --selftest
-          npm run audit:ru -- --selftest
-          python3 -m http.server 4173 --directory dist >/tmp/t27-language-audit-server.log 2>&1 &
-          SERVER_PID=$!
-          trap 'kill "$SERVER_PID" 2>/dev/null || true' EXIT
-          for attempt in 1 2 3 4 5; do
-            curl --fail --silent http://127.0.0.1:4173/index.html >/dev/null && break
-            sleep 1
-          done
-          curl --fail --silent http://127.0.0.1:4173/index.html >/dev/null
-          AUDIT_BASE_URL='http://127.0.0.1:4173/index.html?lang=en' npm run audit:en
-          AUDIT_BASE_URL='http://127.0.0.1:4173/index.html?lang=ru' npm run audit:ru
-          # Same server, same Chrome harness, one more question: does any route
-          # scroll sideways at 375px. Runs its own --selftest first.
-          npm run audit:mobile -- --selftest
-          # Both locales: the Russian chrome is wider than the English, and the
-          # /specs language switcher was pushed off a 375px screen in RU while
-          # fitting in EN. A single-locale run would have passed it.
-          AUDIT_BASE_URL='http://127.0.0.1:4173/index.html' npm run audit:mobile
-          AUDIT_BASE_URL='http://127.0.0.1:4173/index.html?lang=ru' npm run audit:mobile
-
-      - name: Render check
-        env:
-          CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
-        run: npm run check:render -- --no-build
-
-      # The landing in a browser that cannot create a WebGL context, and in one
-      # whose engine is refused after the probe: the page must render whole and
-      # only the scene may go. On 2026-10-03 a GPU-less Chromium got a blank
-      # t27.ai/ from one uncaught "WebGL not supported". Skips itself without
-      # Chrome.
-      - name: Landing without WebGL
-        env:
-          CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
-        run: npm run check:home-no-webgl -- --no-build
-
-      # The five explorers and the spec explorer at every size in the spec's
-      # matrix: one pane on a phone, two above, the deep-linked card open and
-      # on screen, 44px controls where a finger is the pointer, one scroller
-      # per pane, nothing sideways. Skips itself without Chrome.
-      - name: Explorer viewport contract
-        env:
-          CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
-        run: npm run check:explorer-viewport -- --no-build
-
       # Real touch events through CDP on the built board: a tap selects a unit,
       # a drag pans, two fingers zoom. It exits 2 (NOT MEASURED) when the page
       # does not answer a probe in 20 s, which on a runner is a failure too.
@@ -575,19 +717,6 @@ jobs:
         env:
           CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
         run: npm run check:queen-touch -- --no-build
-
-      # A51: four PRs merged, every check green, and the live site changed
-      # nothing -- this app deploys from a second repository that holds build
-      # output only, copied there by hand. Every check above runs against the
-      # source, so all of them pass on a tree whose output nobody published.
-      #
-      # This one fetches t27.ai and compares the entry bundle. It never fails
-      # the job: a merge is not a deploy, and blocking one on the other
-      # inverts the order. It is here so the gap is visible in the log rather
-      # than discovered a week later in the site's <head>.
-      - name: Is the live site this build?
-        continue-on-error: true
-        run: npm run check:deployed
 
       # Last, because it rebuilds dist/ against an address that refuses every
       # connection: with the API dead, no tile may show a bare number and the
