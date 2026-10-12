@@ -107,8 +107,8 @@ import { body as body_the_control_that_could_not_fail, ruBody as ruBody_the_cont
 import { body as body_the_scanner_scored_what_it_could_not_see, ruBody as ruBody_the_scanner_scored_what_it_could_not_see } from './bodies/the-scanner-scored-what-it-could-not-see'
 
 import { body as body_i_wrote_the_post_then_did_the_thing, ruBody as ruBody_i_wrote_the_post_then_did_the_thing } from './bodies/i-wrote-the-post-then-did-the-thing'
-import { body as body_course_buses_and_peripherals, ruBody as ruBody_course_buses_and_peripherals } from './bodies/course-buses-and-peripherals'
-import { body as body_clocks_resets_and_cdc, ruBody as ruBody_clocks_resets_and_cdc } from './bodies/course-3-clocks-resets-and-cdc'
+import { body as body_course_buses_and_peripherals, ruBody as ruBody_course_buses_and_peripherals } from './bodies/buses-and-peripherals'
+import { body as body_clocks_resets_and_cdc, ruBody as ruBody_clocks_resets_and_cdc } from './bodies/clocks-resets-and-cdc'
 import { body as body_real_value_in_integer_container, ruBody as ruBody_real_value_in_integer_container } from './bodies/real-value-in-integer-container'
 import { body as body_features_that_change_no_bits, ruBody as ruBody_features_that_change_no_bits } from './bodies/features-that-change-no-bits'
 import { body as body_one_commit_nine_workflow_outcomes, ruBody as ruBody_one_commit_nine_workflow_outcomes } from './bodies/one-commit-nine-workflow-outcomes'
