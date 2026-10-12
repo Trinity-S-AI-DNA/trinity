@@ -171,8 +171,51 @@ export function renderBlock(f, file) {
   if (f[`${w}_SCHEDULED`] === true) {
     lines.push('  schedule:', ...f[`${w}_SCHEDULE`].map((c) => `    - cron: ${quote(c)}`))
   }
-  lines.push(...comment('  ', f[`${w}_NOTE_TAIL`]))
+  // The tail note (why a schedule block is absent) rides right after the first
+  // branches line, not at the end of the block. The crons catalog
+  // (public/crons/manifest.json, gate check:crons-catalog) cites the
+  // no-schedule note of codegen.yml and brain-ci.yml BY LINE NUMBER and reads
+  // a window around it for the word cron; a header plus three paths lists
+  // would push an end-of-block note out of that window. citationProblem
+  // below enforces the same window here, so the two cannot drift apart.
+  const tail = comment('    ', f[`${w}_NOTE_TAIL`])
+  if (tail.length > 0) {
+    const first = lines.findIndex((l) => /^ {4}branches: \[/.test(l))
+    if (first < 0) lines.push(...comment('  ', f[`${w}_NOTE_TAIL`]))
+    else lines.splice(first + 1, 0, ...tail)
+  }
   return lines.join('\n')
+}
+
+// The catalog cites schedule-bearing lines of these workflows by number and
+// checks lines [line-3, line+2) for the word `cron` -- the same near-window
+// qa/crons-catalog-contract.mjs checks in CI. The generator owns the layout
+// now, so it owns keeping those citations true: a layout change that drifts a
+// citation fails here, at generation time, with the line numbers in hand.
+export function citationProblem(text, file, citations) {
+  const lines = text.split('\n')
+  for (const c of citations) {
+    const near = lines.slice(Math.max(0, c.line - 3), c.line + 2).join('\n')
+    if (!near.includes('cron')) {
+      return `${file}: the crons catalog entry ${c.id} cites ${file}:${c.line}; lines ${Math.max(1, c.line - 2)}-${c.line + 2} no longer mention cron`
+    }
+  }
+  return null
+}
+
+function catalogCitations() {
+  const manifest = JSON.parse(readFileSync(join(SITE, 'public/crons/manifest.json'), 'utf8'))
+  const byFile = new Map()
+  for (const entry of manifest.crons) {
+    const where = entry.where ?? {}
+    if (entry.kind !== 'github-actions' || !where.file?.startsWith('.github/workflows/') || !where.line) continue
+    // Citations resolve against the entry's own repository (the gate looks up
+    // ROOTS[entry.repo]); the bot repository's ci.yml:10 is not this ci.yml.
+    if ((entry.repo ?? '').replace('gHashTag/', '') !== 'trinity') continue
+    if (!byFile.has(where.file)) byFile.set(where.file, [])
+    byFile.get(where.file).push({ id: entry.id, line: where.line })
+  }
+  return byFile
 }
 
 // Replace the managed region: from the managed-by header if the generator has
@@ -227,10 +270,15 @@ export async function buildTriggers({ specText, analyze }) {
 
   const outputs = new Map()
   if (problems.length === 0) {
+    const citations = catalogCitations()
     for (const wf of f.GENERATED) {
       const wfPath = join(REPO, WORKFLOWS_DIR, wf)
       if (!existsSync(wfPath)) { problems.push(`${SPEC}: GENERATED names ${wf}, which is not in ${WORKFLOWS_DIR}`); continue }
-      outputs.set(wf, splice(readFileSync(wfPath, 'utf8'), renderBlock(f, wf), wf))
+      const text = splice(readFileSync(wfPath, 'utf8'), renderBlock(f, wf), wf)
+      const cited = citations.get(`${WORKFLOWS_DIR}/${wf}`) ?? []
+      const drift = citationProblem(text, wf, cited)
+      if (drift) problems.push(drift)
+      outputs.set(wf, text)
     }
   }
   return { problems, fields: f, outputs, specSha: sha256(Buffer.from(specText, 'utf8')) }
@@ -260,6 +308,14 @@ export async function selfTest({ specText, analyze, outputs }) {
 
   const flipped = await buildTriggers({ specText: specText.replace('pub const KOSCHEI_PRODUCTION_ON_PR : bool = false;', 'pub const KOSCHEI_PRODUCTION_ON_PR : bool = true;'), analyze })
   expect('a spec whose own test no longer holds is refused', flipped.problems.some((m) => m.startsWith(`${SPEC}: test`)))
+
+  expect('the crons-catalog citation window is enforced', (() => {
+    const quiet = Array.from({ length: 12 }, () => 'x').join('\n')
+    const bad = citationProblem(quiet, 'x.yml', [{ id: 'github-actions/trinity/x', line: 8 }])
+    const good = citationProblem('a\nb\nschedule:\n  - cron: x\n', 'x.yml', [{ id: 'github-actions/trinity/x', line: 4 }])
+    const none = citationProblem(quiet, 'x.yml', [])
+    return bad !== null && bad.includes('crons catalog') && good === null && none === null
+  })())
 
   return results
 }
