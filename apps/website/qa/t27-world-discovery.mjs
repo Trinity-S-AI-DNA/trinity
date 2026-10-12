@@ -135,7 +135,11 @@ assert.ok(onAt>-1&&jobsAt>onAt,'website-checks has a top-level on: before jobs: 
 const triggers=wc.slice(onAt,jobsAt);
 assert.match(triggers,/pull_request:/,'the trigger block is the one read');
 assert.doesNotMatch(triggers,/paths:/,'website-checks runs on every PR; scope decides, not a trigger path filter');
-assert.match(wc,/\n  gate:\n    name: website gate\n    needs: \[scope, checks\]\n    if: always\(\)/,'website gate always reports, after scope and checks');
+// The gate needs every check group by name, so a group added to the workflow
+// but not to this list reports "pass" while its checks never ran.
+const GROUPS=['checks-pure','checks-lang-en','checks-lang-ru','checks-browser-a','checks-browser-b'];
+assert.match(wc,new RegExp(`\\n  gate:\\n    name: website gate\\n    needs: \\[scope, ${GROUPS.join(', ')}\\]\\n    if: always\\(\\)`),'website gate always reports, after scope and every check group');
+for(const g of GROUPS)assert.match(wc,new RegExp(`\\n  ${g}:\\n`),`check group ${g} exists`);
 assert.match(wc,/if: needs\.scope\.outputs\.site == 'true'/,'the heavy checks run when scope says the site changed');
 assert.match(wc,/grep -Eq "\$SITE_PATHS" <<< "\$FILES"/,'scope reads the file list without a pipe into grep -q');
 assert.doesNotMatch(wc,/\| grep -Eq "\$SITE_PATHS"/,'no pipe into grep -q: SIGPIPE under pipefail reads a big change as none');
