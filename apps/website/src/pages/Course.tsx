@@ -234,7 +234,7 @@ function framesOf(l: CourseLesson): Frame[] {
   return [main, ...spec, ...also]
 }
 
-function Lesson({ C, lesson, lang, say, done, toggle, shared }: { C: CourseT; lesson: CourseLesson; lang: Lang; say: Say; done: string[]; toggle: (id: string) => void; shared?: string }) {
+function Lesson({ C, lesson, lang, say, done, toggle, shared, ladder }: { C: CourseT; lesson: CourseLesson; lang: Lang; say: Say; done: string[]; toggle: (id: string) => void; shared?: string; ladder: ReturnType<typeof useLadder> }) {
   const LESSONS = C.lessons as readonly CourseLesson[]
   const TOTAL = LESSONS.length
   const frames = useMemo(() => framesOf(lesson), [lesson])
@@ -362,6 +362,8 @@ function Lesson({ C, lesson, lang, say, done, toggle, shared }: { C: CourseT; le
         )}
       </nav>
 
+      {lesson.n === 1 && !ladder.checking && !ladder.inClub ? <ClubTeaser C={C} lang={lang} /> : null}
+
       <CourseMap C={C} lang={lang} say={say} done={done} current={lesson.id} />
       <p className="course-progress is-foot">{fmt(say.PROGRESS, done.length, TOTAL)}</p>
       <CourseNotes C={C} lang={lang} say={say} id={lesson.id} shared={shared} />
@@ -434,7 +436,29 @@ function useLadder(C: CourseT, allDone: string[]) {
   const open = () => setOpened((o) => openCourse(C.id, o, valid))
   // The key a lesson report travels with: the paid one while it holds, else the bot's.
   const reportKey = valid.paid ? keys.paid : valid.bot ? keys.bot : undefined
-  return { state, open, checking, bad, reportKey }
+  return { state, open, checking, bad, reportKey, inClub: valid.paid }
+}
+
+/**
+ * The club, named where a reader actually is. The gate below says the club only when a course
+ * is locked, and a reader who never climbs past their first open course never meets it at all;
+ * the bot's thirty-day funnel counted 1 club card against 56 new people. So lesson one carries
+ * the teaser: its words are the ladder spec's (SAY_CLUB_*), its button is the same start link
+ * the gate uses, and a reader already holding a paid key sees nothing (owner, 2026-10-13).
+ */
+function ClubTeaser({ C, lang }: { C: CourseT; lang: Lang }) {
+  const say = LADDER.say[lang] as LadderSay
+  return (
+    <section className="course-hero course-ladder">
+      <h2 className="course-title">{say.CLUB_TITLE}</h2>
+      <p className="course-lead">{say.CLUB_LINE}</p>
+      <div className="course-hero-actions">
+        <a className="course-btn is-primary" href={startLink(STEP.paid, C.route)} target="_blank" rel="noopener noreferrer">
+          {say.PAID_PRESS}
+        </a>
+      </div>
+    </section>
+  )
 }
 
 function LadderGate({ C, lang, ladder }: { C: CourseT; lang: Lang; ladder: ReturnType<typeof useLadder> }) {
@@ -512,7 +536,7 @@ export default function Course() {
             <CourseMap C={C} lang={lang} say={say} done={done} current={lesson?.id} />
           </>
         ) : lesson ? (
-          <Lesson C={C} lesson={lesson} lang={lang} say={say} done={done} toggle={mark} shared={shared} />
+          <Lesson C={C} lesson={lesson} lang={lang} say={say} done={done} toggle={mark} shared={shared} ladder={ladder} />
         ) : (
           <Overview C={C} lang={lang} say={say} done={done} shared={shared} />
         )}

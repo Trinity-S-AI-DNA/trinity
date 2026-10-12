@@ -22,6 +22,8 @@ export const LADDER = {
       "PAID_LINE": "The club is paid in Telegram Stars in the bot, which shows the price. Already in the club? The same button hands you the key.",
       "PAID_PRESS": "Join the club in Telegram",
       "PAID_LATER": "Paying here in roubles, dollars or crypto is not built yet.",
+      "CLUB_TITLE": "The club opens the rest of the ladder",
+      "CLUB_LINE": "Every course from the fourth on opens with the club: our one subscription, paid in Telegram Stars in the bot, which shows the price. Part of every payment returns to you as tokens.",
       "CHECKING": "Checking your key...",
       "KEY_BAD": "This key did not open the course ({0}). Press the button again for a fresh one.",
       "SHARED": "Your finished lessons are shared with the course author."
@@ -40,6 +42,8 @@ export const LADDER = {
       "PAID_LINE": "Клуб оплачивается звёздами Telegram в боте, там же цена. Уже в клубе? Та же кнопка выдаст ключ.",
       "PAID_PRESS": "Вступить в клуб в Telegram",
       "PAID_LATER": "Оплата здесь в рублях, долларах или крипте ещё не сделана.",
+      "CLUB_TITLE": "Клуб открывает остальную лестницу",
+      "CLUB_LINE": "Четвёртый и все следующие курсы открываются с клубом: наша единственная подписка, оплачивается звёздами Telegram в боте, там же цена. Часть каждого платежа возвращается вам токенами.",
       "CHECKING": "Проверяем ключ...",
       "KEY_BAD": "Этот ключ не открыл курс ({0}). Нажмите кнопку ещё раз — бот выдаст новый.",
       "SHARED": "Ваши пройденные уроки видит автор курса."
