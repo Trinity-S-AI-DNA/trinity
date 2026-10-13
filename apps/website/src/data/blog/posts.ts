@@ -4,6 +4,7 @@ import { body as body_course_three_verifying_hardware, ruBody as ruBody_course_t
 import { body as body_course_zero_t27_basics, ruBody as ruBody_course_zero_t27_basics } from './bodies/course-zero-t27-basics'
 import { body as body_tri_test_now_runs_the_tests, ruBody as ruBody_tri_test_now_runs_the_tests } from './bodies/tri-test-now-runs-the-tests'
 import { body as body_two_courses_twenty_seven_lessons_each, ruBody as ruBody_two_courses_twenty_seven_lessons_each } from './bodies/two-courses-twenty-seven-lessons-each'
+import { body as body_a_recipe_step_cannot_be_dropped_silently, ruBody as ruBody_a_recipe_step_cannot_be_dropped_silently } from './bodies/a-recipe-step-cannot-be-dropped-silently'
 import { body as body_the_queen_knows_how_to_build_a_course, ruBody as ruBody_the_queen_knows_how_to_build_a_course } from './bodies/the-queen-knows-how-to-build-a-course'
 import { body as body_a_course_pr_carries_its_post, ruBody as ruBody_a_course_pr_carries_its_post } from './bodies/a-course-pr-carries-its-post'
 import { body as body_one_outlier_twenty_three_zeros, ruBody as ruBody_one_outlier_twenty_three_zeros } from './bodies/one-outlier-twenty-three-zeros'
@@ -111,6 +112,7 @@ const bodies: Record<string, PostBody> = {
   'course-zero-t27-basics': { body: body_course_zero_t27_basics, ruBody: ruBody_course_zero_t27_basics },
   'tri-test-now-runs-the-tests': { body: body_tri_test_now_runs_the_tests, ruBody: ruBody_tri_test_now_runs_the_tests },
   'two-courses-twenty-seven-lessons-each': { body: body_two_courses_twenty_seven_lessons_each, ruBody: ruBody_two_courses_twenty_seven_lessons_each },
+  'a-recipe-step-cannot-be-dropped-silently': { body: body_a_recipe_step_cannot_be_dropped_silently, ruBody: ruBody_a_recipe_step_cannot_be_dropped_silently },
   'the-queen-knows-how-to-build-a-course': { body: body_the_queen_knows_how_to_build_a_course, ruBody: ruBody_the_queen_knows_how_to_build_a_course },
   'a-course-pr-carries-its-post': { body: body_a_course_pr_carries_its_post, ruBody: ruBody_a_course_pr_carries_its_post },
   'one-outlier-twenty-three-zeros': { body: body_one_outlier_twenty_three_zeros, ruBody: ruBody_one_outlier_twenty_three_zeros },
