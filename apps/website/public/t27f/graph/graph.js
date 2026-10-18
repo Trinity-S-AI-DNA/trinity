@@ -21,7 +21,7 @@ async function show(path, file) {
     return (status.textContent = `${path}: refused, ${nm('ERR_', v).replace(/_/g, ' ')} (${why}). No graph is drawn and none is truncated.`, status.className = 'refused')
   }
   if (R.gx_view_verdict() !== G.VIEW_OK) return (status.textContent = `${path}: the view refuses it, verdict ${R.gx_view_verdict()}.`, status.className = 'refused')
-  const W = R.gx_view_width(), H = R.gx_view_height(), svg = el('svg', { viewBox: `0 0 ${W} ${H}`, width: W, height: H, 'font-family': 'system-ui,sans-serif' }, el('rect', { width: W, height: H, fill: hex(G.VIEW_BACKDROP) }))
+  const W = R.gx_view_width(), H = R.gx_view_height(), svg = el('svg', { viewBox: `0 0 ${W} ${H}`, width: W, height: H, 'font-family': "'JetBrains Mono',ui-monospace,monospace" }, el('rect', { width: W, height: H, fill: hex(G.VIEW_BACKDROP) }))
   for (let j = 0; j < R.gx_edge_count(); j++)
     svg.append(el('line', { x1: R.gx_view_edge_x1(j), y1: R.gx_view_edge_y1(j), x2: R.gx_view_edge_x2(j), y2: R.gx_view_edge_y2(j), stroke: hex(R.gx_view_edge_stroke(j)), 'stroke-width': 1.5, ...dash(R.gx_view_edge_dash(j)) },
       el('title', {}, `${nm('EDGE_', R.gx_edge_kind(j))}: ${name(R.gx_edge_from(j))} -> ${name(R.gx_edge_to(j))}, line ${R.gx_edge_line(j)}`)))
