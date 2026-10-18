@@ -16,25 +16,25 @@ const loadGlue = () => (glue ??= import(/* @vite-ignore */ new URL('t27f/graph/t
 
 export function SpecGraphView({ path, text, onNode, loading }: { path: string; text: string; onNode: (n: GraphNodeClick) => void; loading: string }) {
   const out = useRef<HTMLDivElement>(null)
-  const [state, setState] = useState<{ refused: boolean; message: string } | null>(null)
-  const [failed, setFailed] = useState<string | null>(null)
+  // The outcome carries the spec it is for, so an older one is never shown under a newer spec (and no state is set in the effect body).
+  const [done, setDone] = useState<{ path: string; text: string; refused: boolean; message: string } | null>(null)
   useEffect(() => {
+    if (!text) { out.current?.replaceChildren(); return }
     let live = true
-    setFailed(null)
-    if (!text) { setState(null); return }
     loadGlue().then(
-      (g) => { if (live && out.current) setState(g.draw(out.current, path, text, onNode)) },
-      (e) => { glue = null; if (live) setFailed(String(e)) },
+      (g) => { if (live && out.current) setDone({ path, text, ...g.draw(out.current, path, text, onNode) }) },
+      (e) => { glue = null; if (live) setDone({ path, text, refused: true, message: String(e) }) },
     )
     return () => { live = false }
   }, [path, text, onNode])
-  const note = failed ?? state?.message ?? loading
+  const state = done && done.path === path && done.text === text ? done : null
+  const note = state?.message ?? loading
   return (
     <div style={{ display: 'flex', flexDirection: 'column', minHeight: '100%' }}>
       <div
         role="status"
-        data-graph-status={failed || state?.refused ? 'refused' : 'ok'}
-        style={{ padding: '8px 14px', fontFamily: C.mono, fontSize: 12, lineHeight: 1.5, color: failed || state?.refused ? C.warn : C.muted, borderBottom: `1px solid ${C.border}` }}
+        data-graph-status={state?.refused ? 'refused' : 'ok'}
+        style={{ padding: '8px 14px', fontFamily: C.mono, fontSize: 12, lineHeight: 1.5, color: state?.refused ? C.warn : C.muted, borderBottom: `1px solid ${C.border}` }}
       >
         {note}
       </div>
