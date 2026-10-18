@@ -1,15 +1,16 @@
 // nn-maxpool/tool.js -- lesson 11 of neural-networks: what a network keeps when it shrinks a
 // picture. Max pooling keeps the largest value of each window and remembers where it was; learning
-// then sends each window's gradient to that one cell. Every output and argmax is pool_at, every
-// gradient backward_at of gHashTag/t27 specs/ml/layers/maxpool2d_layer.t27, compiled to wasm
-// (./logic.js), on the spec's 4 x 4 fixture (K_INPUT, held equal to it by the tests below the spec).
+// then sends each window's gradient to that one cell. Every output and argmax is pool_at, the
+// output side out_side, every gradient backward_at of gHashTag/t27
+// specs/ml/layers/maxpool2d_layer.t27, compiled to wasm (./logic.js), on the spec's 4 x 4 fixture
+// (K_INPUT, held equal to it by the tests below the spec).
 // Words are SAY_ and numbers K_ constants of specs/widgets/nn-maxpool.t27.
-import { backwardAt, poolAt } from './logic.js'
+import { backwardAt, outSide, poolAt } from './logic.js'
 import { COLORS, K, W, ask, canvas, controls, el, fmt, heat, root, say, source, tiles, tone } from '../nn-kit.js'
 
 const SIDE = K('K_SIDE', 4)
 const INPUT = K('K_INPUT', [])
-const KS = K('K_KERNELS', []), ST = K('K_STRIDES', []), OUT = K('K_OUT_SIDES', [])
+const KS = K('K_KERNELS', []), ST = K('K_STRIDES', [])
 const ctl = controls([
   { key: 'cfg', label: say('SAY_CONFIG'), kind: 'choice', options: W.SAY_CONFIG_NAMES ?? [] },
   { key: 'cell', kind: 'hidden', min: 0, max: 8 },
@@ -23,7 +24,7 @@ const inLabel = el('p', { class: 'dk-label' })
 root.replaceChildren(ask(say('SAY_ASK')), ctl.node, el('div', { class: 'nn-two' }, el('div', {}, inLabel, img), el('div', {}, el('p', { class: 'dk-label' }, say('SAY_OUT_LABEL')), out)), stat, el('p', { class: 'dk-note' }, say('SAY_NOTE')), source())
 
 function draw(s) {
-  const k = KS[s.cfg], st = ST[s.cfg], n = OUT[s.cfg]
+  const k = KS[s.cfg], st = ST[s.cfg], n = outSide(k, st)
   const cell = Math.min(s.cell, n * n - 1)
   const oy = Math.floor(cell / n), ox = cell % n
   const inWin = (r, c) => r >= oy * st && r < oy * st + k && c >= ox * st && c < ox * st + k
