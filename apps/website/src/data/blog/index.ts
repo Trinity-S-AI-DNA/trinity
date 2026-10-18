@@ -14,6 +14,7 @@ export const postsIndex: PostMeta[] = [
       { label: "t27#10392: the issue", href: "https://github.com/gHashTag/t27/issues/10392" },
       { label: "t27-mcp#23: the t27_paper_claims tool", href: "https://github.com/gHashTag/t27-mcp/pull/23" },
       { label: "The widget: all 45 rows", href: "https://t27.ai/widgets/paper-claims/" },
+      { label: "trinity#1689: the widget and this post", href: "https://github.com/gHashTag/trinity/issues/1689" },
       { label: "arXiv:2606.05017 (GoldenFloat)", href: "https://arxiv.org/abs/2606.05017" },
       { label: "arXiv:2606.09686 (Golden Ruler)", href: "https://arxiv.org/abs/2606.09686" },
     ],
