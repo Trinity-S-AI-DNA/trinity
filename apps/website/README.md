@@ -236,6 +236,16 @@ npm run check:discovery                                                 # кон
 коммитит свои числа. Публикация на t27.ai остаётся за `deploy-site.yml` — вручную,
 по правилу «контент утверждается до выхода».
 
+### T27F graph view (`/t27f/graph/`)
+
+A static page, `public/t27f/graph/`, that draws the T27F graph of a `.t27` spec: one box per node,
+one line per edge, labelled with kind, name, source lines and inference label. The graph comes from
+`specs/t27f/spec_graph_export.t27` and the layout from `specs/t27f/spec_graph_view.t27`, both
+compiled to `t27f.wasm`; `graph.js` is only the glue (loads the wasm, feeds the bytes, emits SVG).
+A spec over the graph's cap (192 nodes, 254 edges) is refused with the verdict, never truncated.
+`PROVENANCE.txt` in that directory records the t27 commit, the compiler, the checksums and how to
+rebuild. To add a spec to the picker, copy it from t27 into `specs/` there and add an `<option>`.
+
 ### Проверки
 
 ```bash
