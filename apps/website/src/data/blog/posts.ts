@@ -112,8 +112,10 @@ import { body as body_clocks_resets_and_cdc, ruBody as ruBody_clocks_resets_and_
 import { body as body_real_value_in_integer_container, ruBody as ruBody_real_value_in_integer_container } from './bodies/real-value-in-integer-container'
 import { body as body_features_that_change_no_bits, ruBody as ruBody_features_that_change_no_bits } from './bodies/features-that-change-no-bits'
 import { body as body_one_commit_nine_workflow_outcomes, ruBody as ruBody_one_commit_nine_workflow_outcomes } from './bodies/one-commit-nine-workflow-outcomes'
+import { body as body_forty_five_printed_numbers, ruBody as ruBody_forty_five_printed_numbers } from './bodies/forty-five-printed-numbers'
 
 const bodies: Record<string, PostBody> = {
+  'forty-five-printed-numbers': { body: body_forty_five_printed_numbers, ruBody: ruBody_forty_five_printed_numbers },
   'a-wasm-interpreter-ran-on-the-board': { body: body_a_wasm_interpreter_ran_on_the_board, ruBody: ruBody_a_wasm_interpreter_ran_on_the_board },
   'a-3-mb-compiler-spec-to-aarch64-in-5-ms': { body: body_a_3_mb_compiler_spec_to_aarch64_in_5_ms, ruBody: ruBody_a_3_mb_compiler_spec_to_aarch64_in_5_ms },
   'actors-beat-the-loop-on-recovery-not-everywhere': { body: body_actors_beat_the_loop_on_recovery_not_everywhere, ruBody: ruBody_actors_beat_the_loop_on_recovery_not_everywhere },

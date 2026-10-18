@@ -3,6 +3,37 @@ import type { PostMeta } from './types'
 /** Индекс блога: список и метаданные без тяжёлых тел публикаций. */
 export const postsIndex: PostMeta[] = [
   {
+    slug: "forty-five-printed-numbers",
+    title: "45 numbers from three format papers, recomputed: 34 fit, 8 do not",
+    summary: "[only numbers that follow from a rule the paper states; this checks arithmetic, not the arguments; u64 stops the Lucas check at n = 45] One t27 spec, specs/numeric/paper_claims.t27 in gHashTag/t27, recomputes 45 numbers printed in the GoldenFloat paper (arXiv:2606.05017), the Golden Ruler catalog (arXiv:2606.09686) and the TNF paper, in exact integers with no floating point. 34 fit, 8 do not, 3 cannot be checked. Golden Ruler says 12 clusters where its catalog has 13; seven TNF numbers miss, four of them because Tables 1 and 24 do not follow the M = N - 1 - Et rule Section 10 adopts. tri papers and the MCP tool t27_paper_claims run the same spec.",
+    date: "2026-10-18",
+    readingMinutes: 4,
+    tags: ["t27", "GoldenFloat", "Verification"],
+    receipts: [
+      { label: "t27#10401: specs/numeric/paper_claims.t27 and tri papers", href: "https://github.com/gHashTag/t27/pull/10401" },
+      { label: "t27#10392: the issue", href: "https://github.com/gHashTag/t27/issues/10392" },
+      { label: "t27-mcp#23: the t27_paper_claims tool", href: "https://github.com/gHashTag/t27-mcp/pull/23" },
+      { label: "The widget: all 45 rows", href: "https://t27.ai/widgets/paper-claims/" },
+      { label: "arXiv:2606.05017 (GoldenFloat)", href: "https://arxiv.org/abs/2606.05017" },
+      { label: "arXiv:2606.09686 (Golden Ruler)", href: "https://arxiv.org/abs/2606.09686" },
+    ],
+    openQuestions: [
+      "The Lucas identity is checked only to n = 45; going to the paper's 256 needs big integers in t27.",
+      "Three claims stay unchecked until their inputs are published: the testbench log, the ml_dtypes run, the Table 23 counting method.",
+      "No paper has been revised yet; the misfits are reported, not corrected.",
+    ],
+    published: true,
+    ru: {
+      title: "45 чисел из трёх статей о форматах, пересчитаны: 34 подходят, 8 нет",
+      summary: "[только числа, которые следуют из правила, сформулированного в самой статье; проверяется арифметика, а не аргументы; u64 останавливает проверку Люка на n = 45] Одна спецификация t27, specs/numeric/paper_claims.t27 в gHashTag/t27, пересчитывает 45 чисел, напечатанных в статье GoldenFloat (arXiv:2606.05017), каталоге Golden Ruler (arXiv:2606.09686) и статье TNF, в точных целых числах без плавающей точки. 34 подходят, 8 нет, 3 проверить нельзя. Golden Ruler пишет о 12 кластерах, а в каталоге их 13; семь чисел TNF не сходятся, четыре из них потому, что таблицы 1 и 24 не следуют правилу M = N - 1 - Et, принятому в разделе 10. tri papers и инструмент MCP t27_paper_claims запускают ту же спецификацию.",
+      openQuestions: [
+        "Тождество Люка проверено только до n = 45; чтобы дойти до 256, как в статье, в t27 нужны длинные целые.",
+        "Три утверждения остаются непроверенными, пока не опубликованы исходные данные: журнал тестового стенда, прогон ml_dtypes, способ подсчёта в таблице 23.",
+        "Ни одна статья пока не исправлена; несовпадения названы, но не исправлены.",
+      ],
+    },
+  },
+  {
     slug: "a-wasm-interpreter-ran-on-the-board",
     title: "A WASM interpreter ran on the board: 134 of 134, from a spec",
     summary: "[the programs live in a ROM built from the spec; the wire carries requests, not .wasm binaries; one board, one night, six runs] A t27 spec in gHashTag/t27 (branch wasm-board, 351e3cdf4) became a Verilog core through t27c gen-verilog, passed through openXC7 onto an ALINX AX7203, and answered 134 of 134 requests exactly -- six runs in a row, 804 of 804. 21 opcodes of the WASM MVP set, a 14-program 101-byte ROM, i32.mul as a 32-clock shift-add microsequence; timing went from 18.57 to 70.41 MHz against a 68.7 bar at one percent of the LUTs -- every frequency here is a nextpnr estimate, not sign-off timing. The self-tested conformance harness caught a wire-offset bug that would have failed 76 checks against a perfectly working board.",
