@@ -416,7 +416,7 @@ const CRON_OPTIONAL = { SCHEDULE: 'str', SCHEDULE_NOTE: 'str', INTERVAL_MS: 'u32
 const AGENT_REQUIRED = {
   KIND: 'str', ID: 'str', LETTER: 'str', ORDINAL: 'u8', LETTER_NAME: 'str', NAME: 'str', DOMAIN: 'str', ARCHETYPE: 'str',
   REGISTER: 'str', LAYER: 'str', SUMMARY_EN: 'str', SOUL: 'str', AGENTS_DOC: 'str', ALPHABET: 'str', KEY_FILES: 'arr',
-  ENTRY_INVARIANT: 'str', EXIT_INVARIANT: 'str', CLARA_ROLE: 'str', SKILLS: 'arr', SKILLS_NOTE: 'str',
+  ENTRY_INVARIANT: 'str', EXIT_INVARIANT: 'str', AR_ROLE: 'str', SKILLS: 'arr', SKILLS_NOTE: 'str',
   EXPERIENCE_LOG: 'str', ENABLED: 'bool',
 }
 // TOOLS arrived with layer 5 (specs/tools); an agent spec written before it may still omit it.
@@ -1102,7 +1102,7 @@ export function buildSpecCatalogs({ skillSpecs, cronSpecs, agentSpecs = [], func
       withCrons: agents.filter((a) => a.crons.length).length,
       withTools: agents.filter((a) => a.tools.length).length,
       withExperience: agents.filter((a) => a.experience.episodes > 0).length,
-      withClaraRole: agents.filter((a) => a.fields.CLARA_ROLE).length,
+      withArRole: agents.filter((a) => a.fields.AR_ROLE).length,
       specPlusExperience: agents.filter((a) => a.witness === 'spec+experience').length,
       specOnly: agents.filter((a) => a.witness === 'spec-only').length,
       byLayer: Object.fromEntries(AGENT_LAYERS.map((l) => [l, agents.filter((a) => a.fields.LAYER === l).length])),
