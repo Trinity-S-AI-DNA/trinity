@@ -1,4 +1,5 @@
 import { body as body_a_wasm_interpreter_ran_on_the_board, ruBody as ruBody_a_wasm_interpreter_ran_on_the_board } from './bodies/a-wasm-interpreter-ran-on-the-board'
+import { body as body_neural_networks_in_t27_a_widget_per_lesson, ruBody as ruBody_neural_networks_in_t27_a_widget_per_lesson } from './bodies/neural-networks-in-t27-a-widget-per-lesson'
 import { body as body_arithmetic_and_dsp_a_widget_per_lesson, ruBody as ruBody_arithmetic_and_dsp_a_widget_per_lesson } from './bodies/arithmetic-and-dsp-a-widget-per-lesson'
 import { body as body_the_ternary_machine_course, ruBody as ruBody_the_ternary_machine_course } from './bodies/the-ternary-machine-course'
 import { body as body_three_widgets_under_the_bus, ruBody as ruBody_three_widgets_under_the_bus } from './bodies/three-widgets-under-the-bus'
@@ -140,6 +141,7 @@ const bodies: Record<string, PostBody> = {
   'bypass-or-a-broken-shift': { body: body_bypass_or_a_broken_shift, ruBody: ruBody_bypass_or_a_broken_shift },
   'the-ternary-machine-course': { body: body_the_ternary_machine_course, ruBody: ruBody_the_ternary_machine_course },
   'three-widgets-under-the-bus': { body: body_three_widgets_under_the_bus, ruBody: ruBody_three_widgets_under_the_bus },
+  'neural-networks-in-t27-a-widget-per-lesson': { body: body_neural_networks_in_t27_a_widget_per_lesson, ruBody: ruBody_neural_networks_in_t27_a_widget_per_lesson },
   'arithmetic-and-dsp-a-widget-per-lesson': { body: body_arithmetic_and_dsp_a_widget_per_lesson, ruBody: ruBody_arithmetic_and_dsp_a_widget_per_lesson },
   'the-back-half-of-openxc7-from-a-spec': { body: body_the_back_half_of_openxc7_from_a_spec, ruBody: ruBody_the_back_half_of_openxc7_from_a_spec },
   'tri-mined-not-sold': { body: body_tri_mined_not_sold, ruBody: ruBody_tri_mined_not_sold },

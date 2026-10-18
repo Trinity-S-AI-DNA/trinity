@@ -3,6 +3,37 @@ import type { PostMeta } from './types'
 /** Индекс блога: список и метаданные без тяжёлых тел публикаций. */
 export const postsIndex: PostMeta[] = [
   {
+    slug: "neural-networks-in-t27-a-widget-per-lesson",
+    title: "Neural networks in t27: 27 lessons, and a widget in each one that runs a specs/ml spec",
+    summary: "[every widget runs fn bodies of a gHashTag/t27 specs/ml spec compiled to wasm; lesson 10 is average pooling until t27#10612 merges; the fixtures are the specs' own, nothing is trained on real data] Course 10 opens the parts the project's agents think with: ReLU, GELU and softmax, embeddings and dropout, pooling and batch norm, MSE, cross-entropy and Huber, SGD, RMSProp, Adam and LAMB, backpropagation, a 2-8-1 network that learns XOR in the browser, a recurrent cell, LSTM gates, attention, positional encoding, an encoder block and PPO.",
+    date: "2026-10-18",
+    readingMinutes: 4,
+    tags: ["t27", "Course", "AI"],
+    receipts: [
+      { label: "trinity#1695: the course issue, 27 widgets on gHashTag/t27 specs/ml", href: "https://github.com/gHashTag/trinity/issues/1695" },
+      { label: "The course: Neural networks in t27", href: "https://t27.ai/learn/neural-networks/" },
+      { label: "The XOR widget: a network trained in the browser", href: "https://t27.ai/widgets/nn-xor/" },
+      { label: "The softmax widget", href: "https://t27.ai/widgets/nn-softmax/" },
+      { label: "The attention widget", href: "https://t27.ai/widgets/nn-attention/" },
+      { label: "t27#10612: the sliding conv2d spec lesson 10 waits for", href: "https://github.com/gHashTag/t27/issues/10612" },
+    ],
+    openQuestions: [
+      "Lesson 10 averages each 2 x 2 window; a convolution with a learned kernel waits for t27#10612.",
+      "The XOR widget shows the four inputs the spec exposes, not a decision region over the plane.",
+      "Every fixture is a spec's own small one; no widget runs a model trained on real data.",
+    ],
+    published: true,
+    ru: {
+      title: "Нейросети на t27: 27 уроков, и в каждом виджет, который исполняет спеку specs/ml",
+      summary: "[каждый виджет исполняет тела функций спеки gHashTag/t27 specs/ml, собранные в wasm; урок 10 это усредняющий пулинг, пока не слита t27#10612; фикстуры взяты из самих спек, на настоящих данных ничего не обучалось] Курс 10 открывает части, которыми думают агенты проекта: ReLU, GELU и softmax, эмбеддинги и dropout, пулинг и пакетную нормализацию, MSE, перекрёстную энтропию и функцию Хьюбера, SGD, RMSProp, Adam и LAMB, обратное распространение, сеть 2-8-1, которая учит XOR в браузере, рекуррентную ячейку, вентили LSTM, внимание, позиционное кодирование, блок энкодера и PPO.",
+      openQuestions: [
+        "Урок 10 усредняет каждое окно 2 x 2; свёртка с выученным ядром ждёт t27#10612.",
+        "Виджет XOR показывает четыре входа, которые открывает спека, а не область решения на плоскости.",
+        "Каждая фикстура это маленькая фикстура самой спеки; ни один виджет не исполняет модель, обученную на настоящих данных.",
+      ],
+    },
+  },
+  {
     slug: "a-wasm-interpreter-ran-on-the-board",
     title: "A WASM interpreter ran on the board: 134 of 134, from a spec",
     summary: "[the programs live in a ROM built from the spec; the wire carries requests, not .wasm binaries; one board, one night, six runs] A t27 spec in gHashTag/t27 (branch wasm-board, 351e3cdf4) became a Verilog core through t27c gen-verilog, passed through openXC7 onto an ALINX AX7203, and answered 134 of 134 requests exactly -- six runs in a row, 804 of 804. 21 opcodes of the WASM MVP set, a 14-program 101-byte ROM, i32.mul as a 32-clock shift-add microsequence; timing went from 18.57 to 70.41 MHz against a 68.7 bar at one percent of the LUTs -- every frequency here is a nextpnr estimate, not sign-off timing. The self-tested conformance harness caught a wire-offset bug that would have failed 76 checks against a perfectly working board.",
