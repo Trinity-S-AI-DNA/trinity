@@ -62,7 +62,8 @@ function SpecEditorImpl({ value, onChange, lines, onRun, ariaLabel, reveal }: Pr
     const ta = taRef.current
     const first = preRef.current?.children[(reveal?.from ?? 0) - 1] as HTMLElement | undefined
     if (!reveal || !ta || !first) return
-    const rows = value.split('\n')
+    // The textarea holds LF only, so a CRLF spec counts one character per line break.
+    const rows = value.split(/\r?\n/)
     const start = rows.slice(0, reveal.from - 1).reduce((n, r) => n + r.length + 1, 0)
     const end = rows.slice(0, reveal.to).reduce((n, r) => n + r.length + 1, 0) - 1
     ta.focus({ preventScroll: true })
