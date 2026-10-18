@@ -101,7 +101,7 @@ export const body: Block[] = [
   },
   {
     kind: 'p',
-    text: '**GoldenFloat.** All nine numbers that can be checked fit: the exponent and mantissa split e = round((N-1)/phi^2) at all 17 widths, the printed (N-1)/phi^2 = 5.7295 for GF16, e = 391 for GF1024, the GF16 code 0x47C0 decoding to 30, and the look-elsewhere p = 83 / 80000 = 1.04e-3. The Lucas identity phi^(2n) + phi^(-2n) = L_(2n) is checked for n = 1 to 45, where u64 runs out; the paper checks it up to 256 at 500 digits. The 35 of 35 testbench vectors at 323 MHz is a hardware result and cannot be recomputed here.',
+    text: '**GoldenFloat.** All nine numbers that can be checked fit: the exponent and mantissa split e = round((N-1)/phi^2) at all 17 widths, the printed (N-1)/phi^2 = 5.7295 for GF16, e = 391 for GF1024, the GF16 code 0x47C0 decoding to 30, and the look-elsewhere p = 83 / 80000 = 1.04e-3. The Lucas identity phi^(2n) + phi^(-2n) = L_(2n) is checked for n = 1 to 45, where u64 runs out; the paper checks it up to 256 at 500 digits. The 35 of 35 testbench vectors are a hardware result and cannot be recomputed here. The clock frequency the abstract prints beside them was withdrawn by t27 itself on 2026-08-18 (RESEARCH_CLAIMS.md): it is the toggle rate of a ring oscillator, not a path through GF16 arithmetic, and the paper still carries it.',
   },
   {
     kind: 'p',
@@ -179,7 +179,7 @@ export const ruBody: Block[] = [
   },
   {
     kind: 'p',
-    text: '**GoldenFloat.** Подходят все девять проверяемых чисел: разбиение на экспоненту и мантиссу e = round((N-1)/phi^2) на всех 17 ширинах, напечатанное (N-1)/phi^2 = 5.7295 для GF16, e = 391 для GF1024, код GF16 0x47C0, который декодируется в 30, и поправка на множественные сравнения p = 83 / 80000 = 1.04e-3. Тождество Люка phi^(2n) + phi^(-2n) = L_(2n) проверено для n от 1 до 45 — дальше u64 не хватает; статья проверяет его до 256 с точностью 500 знаков. 35 из 35 тестовых векторов на 323 МГц — аппаратный результат, пересчитать его здесь нельзя.',
+    text: '**GoldenFloat.** Подходят все девять проверяемых чисел: разбиение на экспоненту и мантиссу e = round((N-1)/phi^2) на всех 17 ширинах, напечатанное (N-1)/phi^2 = 5.7295 для GF16, e = 391 для GF1024, код GF16 0x47C0, который декодируется в 30, и поправка на множественные сравнения p = 83 / 80000 = 1.04e-3. Тождество Люка phi^(2n) + phi^(-2n) = L_(2n) проверено для n от 1 до 45 — дальше u64 не хватает; статья проверяет его до 256 с точностью 500 знаков. 35 из 35 тестовых векторов — аппаратный результат, пересчитать его здесь нельзя. Тактовую частоту, которую аннотация печатает рядом с ними, сам t27 отозвал 2026-08-18 (RESEARCH_CLAIMS.md): это частота переключения кольцевого генератора, а не путь через арифметику GF16, и в статье она всё ещё стоит.',
   },
   {
     kind: 'p',
