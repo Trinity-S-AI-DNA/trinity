@@ -340,10 +340,12 @@ export function literalValue(expr, name = 'literal') {
   if (expr.value === undefined) throw new Error(`${name}: literal carries no value`)
   if (raw === 'true') return true
   if (raw === 'false') return false
-  // Integers and decimal floats. Hex, binary expressions, struct literals and
-  // calls appear elsewhere in the corpus and are deliberately still refused:
-  // this function reads declarations, it does not evaluate them.
-  if (/^-?\d+(\.\d+)?$/.test(raw)) return Number(raw)
+  // Integers and decimal floats, with an optional exponent (`1e-8`, `-1.0e30`: the
+  // epsilons of t27 specs/ml, which the course 10 widgets run). Hex, binary
+  // expressions, struct literals and calls appear elsewhere in the corpus and are
+  // deliberately still refused: this function reads declarations, it does not
+  // evaluate them.
+  if (/^-?\d+(\.\d+)?([eE][-+]?\d+)?$/.test(raw)) return Number(raw)
   throw new Error(`${name}: unsupported literal ${JSON.stringify(raw)}`)
 }
 
