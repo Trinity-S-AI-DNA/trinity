@@ -4,6 +4,7 @@ import { usePageMeta } from '../hooks/usePageMeta'
 import { useI18n } from '../i18n/context'
 import Navigation from '../components/Navigation'
 import Footer from '../components/Footer'
+import ClawPromo from '../components/ClawPromo'
 import CourseShelf from '../components/CourseShelf'
 import { shareTagged } from '../lib/shareTags'
 import { COURSE, COURSES, type Course as CourseT, type CourseLesson } from '../lib/course.generated'
@@ -540,7 +541,7 @@ export default function Course() {
         {/* Other courses at the foot of every course page (owner, 2026-10-13). */}
         <CourseShelf lang={lang} exclude={C.id} />
       </main>
-      <Footer promo={false} claw />
+      <Footer promo={false} aside={<ClawPromo lang={lang} />} />
     </div>
   )
 }

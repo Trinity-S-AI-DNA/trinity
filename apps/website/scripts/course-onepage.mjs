@@ -43,7 +43,7 @@ export const frameHeight = (h, view) => Math.min(view.FRAME_MAX_PX, Math.max(vie
 /** A widget page on this site, framed with its words in the reader's language. */
 const framed = (preview, lang) => `/${preview}${lang === 'ru' && preview.startsWith('widgets/') ? `${preview.includes('?') ? '&' : '?'}lang=ru` : ''}`
 
-/** The TRI CLAW block, the same three paths as the app's footer (components/Footer.tsx ClawPromo). */
+/** The TRI CLAW block, the same three paths as the app's course footer (components/ClawPromo.tsx). */
 export function clawHtml(ladder, lang) {
   const say = ladder.say[lang]
   const c = ladder.claw
@@ -58,8 +58,8 @@ export function clawHtml(ladder, lang) {
     .join('')}</ul></aside>`
 }
 
-/** The TRI CLAW block's look: one stylesheet for the app's footer (components/Footer.tsx imports
- * it) and for every static course page (inlined here). */
+/** The TRI CLAW block's look: one stylesheet for the app's course footer (components/ClawPromo.tsx
+ * imports it) and for every static course page (inlined here). */
 export const CLAW_CSS = readFileSync(new URL('../src/styles/claw.css', import.meta.url), 'utf8').replace(/\/\*[\s\S]*?\*\/\n?/g, '').trim()
 
 /** The lessons of one course, as the course-deck widget reads them: words in both languages. */

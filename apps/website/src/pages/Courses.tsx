@@ -3,6 +3,7 @@ import { usePageMeta } from '../hooks/usePageMeta'
 import { useI18n } from '../i18n/context'
 import Navigation from '../components/Navigation'
 import Footer from '../components/Footer'
+import ClawPromo from '../components/ClawPromo'
 import { CourseCard } from '../components/CourseShelf'
 import { useLadderView } from '../lib/useLadderView'
 import { COURSES, type CourseLesson } from '../lib/course.generated'
@@ -53,7 +54,7 @@ export default function Courses() {
           ))}
         </ul>
       </main>
-      <Footer promo={false} claw />
+      <Footer promo={false} aside={<ClawPromo lang={lang} />} />
     </div>
   )
 }
