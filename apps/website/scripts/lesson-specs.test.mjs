@@ -49,15 +49,22 @@ test('teachable is the course check: discarded lines alone make a spec unteachab
   assert.equal(teachable(null), false)
 })
 
-test('the scan reads lesson specs before its wipe and settles them after it', async () => {
+test('the scan reads lesson specs before it touches the tree and settles them after it', async () => {
   const { readFileSync } = await import('node:fs')
   const sync = readFileSync(join(WEBSITE, 'scripts/sync-t27-specs.mjs'), 'utf8')
+  // Since #1687 nothing is wiped: the scan writes through put() and deletes through sweep().
+  // Those two are what can overwrite or delete a lesson spec, so the read must precede both.
   const read = sync.indexOf('lessonSpecPaths(')
-  const wipe = sync.indexOf('rmSync(SPECS_OUT,')
-  const write = sync.indexOf('writeFileSync(dest, text)')
+  const firstPut = sync.search(/(?<!function )\bput\(/)
+  const scanEnd = sync.indexOf('lap(`analyze + write')
   const settle = sync.indexOf('for (const [rel, text] of pinned)')
-  assert.ok(read > -1 && read < wipe, 'the lesson specs are read before the wipe')
-  assert.ok(settle > write, 'the lesson specs settle after the scan has written its copies')
+  const sweep = sync.search(/(?<!function )\bsweep\(\)/)
+  for (const [name, at] of Object.entries({ read, firstPut, scanEnd, settle, sweep }))
+    assert.ok(at > -1, `anchor ${name} is gone from sync-t27-specs.mjs: the guard would pass vacuously`)
+  assert.ok(read < firstPut, 'the lesson specs are read before the scan first writes into the tree')
+  assert.ok(read < sweep, 'the lesson specs are read before the sweep can delete one')
+  assert.ok(settle > scanEnd, 'the lesson specs settle after the scan has written its copies')
+  assert.ok(settle < sweep, 'the lesson specs settle before the sweep, so what they keep is recorded and survives it')
   // The scanned copy stays only when a lesson can show it.
   assert.match(sync.slice(settle), /if \(teachable\(a\)\) \{ fresher\+\+; continue \}/)
 })
