@@ -19,6 +19,11 @@
 //   node scripts/course-pages.mjs           # write pages + sitemap, render stale cards
 //   node scripts/course-pages.mjs --check   # CI: pages current, every card present and current
 //
+// Each course also has its whole course on one page (scripts/course-onepage.mjs):
+// <share path>all/, with its own card, and the course-deck widget's data for it
+// (public/widgets/course-deck/courses/<id>.json). Every page here ends with the
+// TRI CLAW block (specs/ladder/course-ladder.t27).
+//
 // Cards are PNGs rendered by headless Chromium (as scripts/og-image.mjs does)
 // and committed; public/learn/cards.json records what each was drawn from, so
 // --check can tell a stale card without a browser.
@@ -29,6 +34,9 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, wri
 import { tmpdir } from 'node:os'
 import { dirname, join, relative } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
+import { CLAW_CSS, clawHtml, deckData, esc, fmt, loadConst, onePageHtml, onePagePath, pad, snippet } from './course-onepage.mjs'
+// t27-plumbing: the app's own share tagger (utm_source=<platform>), not a second copy of it.
+import { shareTagged } from '../src/lib/shareTags.ts'
 
 const SITE = join(dirname(fileURLToPath(import.meta.url)), '..')
 const PUBLIC = join(SITE, 'public')
@@ -36,13 +44,13 @@ const ORIGIN = 'https://t27.ai'
 const BASE = 'learn'
 const MANIFEST = join(PUBLIC, BASE, 'cards.json')
 const CARD = { width: 1200, height: 630, maxBytes: 600_000 }
+const VIEW = loadConst(join(SITE, 'src/lib/courseView.generated.ts'), 'VIEW')
+const LADDER = loadConst(join(SITE, 'src/lib/courseLadder.generated.ts'), 'LADDER')
+const VIEW_CSS = join(SITE, 'src/styles/courseView.generated.css')
+const POOL = join(PUBLIC, 'widgets/frame-pool.js')
+export const DECK_DIR = join(PUBLIC, 'widgets', VIEW.deckWidget, 'courses')
 
 const sha = (b) => createHash('sha256').update(b).digest('hex')
-const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
-const fmt = (s, ...a) => a.reduce((out, x, i) => out.split(`{${i}}`).join(String(x)), s)
-const pad = (n) => String(n).padStart(2, '0')
-/** A search snippet: Google shows about 155 characters, so cut at a word before that. */
-const snippet = (s, max = 155) => (s.length <= max ? s : `${s.slice(0, max).replace(/\s+\S*$/, '')}…`)
 const unesc = (s) => s.replace(/&#39;/g, "'").replace(/&quot;/g, '"').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&')
 
 /** The widget page's own og:description: the gallery's words for the tool, not a second copy here. */
@@ -88,17 +96,17 @@ function thumbOf(widget) {
 // Black and white like the course page (owner, 2026-10-05: no green fields or
 // glows): white type and rules on black, a widget's picture in greyscale.
 
-function cardHtml(C, lang, lesson) {
+function cardHtml(C, lang, lesson, onePage = false) {
   const say = C.say[lang]
   const font = lang === 'ru' ? `'Helvetica Neue', Arial, sans-serif` : `'Outfit', 'Helvetica Neue', sans-serif`
   const fonts = pathToFileURL(join(PUBLIC, 'fonts')).href
   const mod = lesson ? C.modules.find((m) => m.id === lesson.module) : null
   const title = lesson ? lesson[lang].title : say.TITLE
-  const sub = lesson ? lesson[lang].goal : say.LEAD
-  const kicker = lesson ? `${fmt(say.MODULE, mod.n)} · ${mod[lang].title}` : ''
+  const sub = lesson ? lesson[lang].goal : onePage ? VIEW.say[lang].ONE_PAGE_LINE : say.LEAD
+  const kicker = lesson ? `${fmt(say.MODULE, mod.n)} · ${mod[lang].title}` : onePage ? VIEW.say[lang].ONE_PAGE : ''
   const thumb = lesson ? thumbOf(lesson.widget) : null
   const cells = C.lessons
-    .map((l) => `<i class="${lesson && l.id === lesson.id ? 'on' : lesson && l.n < lesson.n ? 'past' : ''}"></i>`)
+    .map((l) => `<i class="${onePage || (lesson && l.id === lesson.id) ? 'on' : lesson && l.n < lesson.n ? 'past' : ''}"></i>`)
     .reduce((out, c, i) => out + (i % 3 === 0 && i ? '<b></b>' : '') + c, '')
   const big = title.length > 40 ? 52 : title.length > 22 ? 60 : 72
   return `<!doctype html><html lang="${lang}"><head><meta charset="utf-8"><style>
@@ -123,7 +131,7 @@ p { margin-top: 22px; font-size: 27px; line-height: 1.32; color: #a6a6a6; displa
 </style></head><body>
 <div class="top"><span class="brand">t27.ai · ${esc(say.KICKER)}</span><span class="where">${esc(kicker)}</span></div>
 <div class="main"><div class="text">${lesson ? `<div class="n">${esc(fmt(say.LESSON, pad(lesson.n), C.lessons.length))}</div>` : ''}<h1>${esc(title)}</h1><p>${esc(sub)}</p></div>${thumb ? `<div class="thumb"><img src="${pathToFileURL(thumb).href}"></div>` : ''}</div>
-<div class="bottom"><div class="cells">${cells}</div><span class="url">t27.ai/${esc(pathOf(C, lang, lesson?.id).replace(/\/$/, ''))}</span></div>
+<div class="bottom"><div class="cells">${cells}</div><span class="url">t27.ai/${esc((onePage ? onePagePath(C, lang, VIEW) : pathOf(C, lang, lesson?.id)).replace(/\/$/, ''))}</span></div>
 </body></html>`
 }
 
@@ -180,7 +188,7 @@ function pageHtml(C, lang, lesson, cardUrl, all = []) {
 <section><h2>${esc(say.GOAL)}</h2><p class="goal">${esc(t.goal)}</p></section>
 <p>${esc(t.text)}</p>
 <section><h2>${esc(say.TRY)}</h2><p>${esc(t.task)}</p></section>
-<p><a class="cta" href="${appOf(C, id)}">${esc(say.OPEN_LESSON)} →</a></p>
+<p><a class="cta" href="${appOf(C, id)}">${esc(say.OPEN_LESSON)} →</a> <a class="cta" href="/${onePagePath(C, lang, VIEW)}#lesson-${lesson.n}">${esc(VIEW.say[lang].ONE_PAGE)} →</a></p>
 <figure><a href="${esc(lesson.widget.url.slice(ORIGIN.length))}">${thumb ? `<img src="${esc(thumb)}" width="600" height="315" alt="${esc(lesson.widget.title)}" loading="lazy">` : ''}<figcaption>${esc(lesson.widget.title)} ↗</figcaption></a></figure>
 ${about ? `<p class="about" lang="en">${esc(about)}</p>` : ''}
 ${lesson.spec ? `<section><h2>${esc(lesson.spec.path)}</h2>${code ? `<pre lang="en"><code>${esc(code)}</code></pre>` : ''}<p><a href="/${esc(lesson.spec.preview)}">${esc(say.SPEC)} ↗</a></p></section>` : ''}
@@ -189,7 +197,8 @@ ${lesson.spec ? `<section><h2>${esc(lesson.spec.path)}</h2>${code ? `<pre lang="
 <h1>${esc(say.TITLE)}</h1>
 <p class="goal">${esc(say.LEAD)}</p>
 <p>${esc(say.DESCRIPTION)}</p>
-<p><a class="cta" href="${appOf(C)}">${esc(say.OPEN_COURSE)} →</a></p>
+<p><a class="cta" href="${appOf(C)}">${esc(say.OPEN_COURSE)} →</a> <a class="cta" href="/${onePagePath(C, lang, VIEW)}">${esc(VIEW.say[lang].ONE_PAGE)} →</a></p>
+<p class="free">${esc(LADDER.say[lang].LADDER)}</p>
 ${catalog}${courses}`
   return `<!doctype html>
 <html lang="${lang}">
@@ -243,14 +252,17 @@ figcaption { font-size: 15px; margin-top: 8px; }
 pre { overflow-x: auto; background: #0b0f0e; border: 1px solid #1e2624; border-radius: 10px; padding: 14px 16px; font: 13px/1.5 'JetBrains Mono', ui-monospace, monospace; color: #cfe3de; max-height: 520px; }
 .about { color: #b9c4c2; font-size: 16px; }
 .outline li.on a { color: #fff; font-weight: 600; } footer { color: #8fa19d; font-size: 15px; }
+.cta { min-height: 44px; margin-right: 8px; } .free { display: inline-block; padding: 6px 14px; border: 1px solid #fff; border-radius: 999px; color: #fff; font-size: 15px; }
+${readFileSync(VIEW_CSS, 'utf8').replace(/\/\*[\s\S]*?\*\/\n?/g, '')}${CLAW_CSS}
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
 </style>
 </head>
-<body>
+<body class="op-page">
 <header><a href="/${lang === 'ru' ? 'ru/' : ''}">t27.ai</a><a href="/${pathOf(C, other, id)}" hreflang="${other}" lang="${other}">${other === 'ru' ? 'Русский' : 'English'}</a></header>
 <main>
 ${body}
 <section><h2>${esc(say.ALL)}</h2><ul class="outline">${outline}</ul></section>
+${clawHtml(LADDER, lang)}
 <footer><p><a href="/${C.source.publicSpec.replace(/^public\//, '')}">${esc(say.SOURCE)}</a></p><p>${esc(say.WIDGET_LANG)}</p></footer>
 </main>
 ${CARRY_UTM}
@@ -274,6 +286,13 @@ export function buildPages(courses, manifest = {}) {
         const cardUrl = `${ORIGIN}/${dir}card.png?v=${v}`
         pages.push({ course: C, lang, lesson, dir, card, input: cardInput(card), png, html: pageHtml(C, lang, lesson, cardUrl, courses), drawn: manifest[dir] })
       }
+      // The whole course on one page, with its own card.
+      const dir = onePagePath(C, lang, VIEW)
+      const card = cardHtml(C, lang, null, true)
+      const png = join(PUBLIC, dir, 'card.png')
+      const v = existsSync(png) ? sha(readFileSync(png)).slice(0, 12) : 'missing'
+      const html = onePageHtml(C, lang, { view: VIEW, ladder: LADDER, cardUrl: `${ORIGIN}/${dir}card.png?v=${v}`, share: (url, source) => shareTagged(url, source, 'course', C.route), poolV: sha(readFileSync(POOL)).slice(0, 12), viewCss: readFileSync(VIEW_CSS, 'utf8'), origin: ORIGIN, carryUtm: CARRY_UTM })
+      pages.push({ course: C, lang, lesson: null, onePage: true, dir, card, input: cardInput(card), png, html, drawn: manifest[dir] })
     }
   }
   const dirs = pages.map((p) => p.dir)
@@ -288,15 +307,23 @@ export function sitemapOf(pages) {
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9" xmlns:xhtml="http://www.w3.org/1999/xhtml">
 ${pages.map((p) => {
     const id = p.lesson?.id
-    return `  <url><loc>${urlOf(p.course, p.lang, id)}</loc>${['en', 'ru'].map((h) => `<xhtml:link rel="alternate" hreflang="${h}" href="${urlOf(p.course, h, id)}"/>`).join('')}</url>`
+    const at = (lang) => (p.onePage ? `${ORIGIN}/${onePagePath(p.course, lang, VIEW)}` : urlOf(p.course, lang, id))
+    return `  <url><loc>${at(p.lang)}</loc>${['en', 'ru'].map((h) => `<xhtml:link rel="alternate" hreflang="${h}" href="${at(h)}"/>`).join('')}</url>`
   }).join('\n')}
 </urlset>
 `
 }
 
+/** The course-deck widget's data: the catalog, then one file per course, [[path, text]]. */
+export const deckFiles = (courses) => [
+  [join(DECK_DIR, 'index.json'), `${JSON.stringify(courses.map((C) => ({ id: C.id, title: Object.fromEntries(C.locales.map((l) => [l, C.say[l].TITLE])) })))}\n`],
+  ...courses.map((C) => [join(DECK_DIR, `${C.id}.json`), `${JSON.stringify(deckData(C, VIEW))}\n`]),
+]
+
 /** What is wrong with the pages on disk; empty when current. */
-export function problemsOf(pages, sitemap) {
+export function problemsOf(pages, sitemap, decks = []) {
   const p = []
+  for (const [f, text] of decks) if (!existsSync(f) || readFileSync(f, 'utf8') !== text) p.push(`${relative(SITE, f)} is not current; run node scripts/course-pages.mjs`)
   for (const pg of pages) {
     const f = join(PUBLIC, pg.dir, 'index.html')
     if (!existsSync(f) || readFileSync(f, 'utf8') !== pg.html) p.push(`public/${pg.dir}index.html is not current; run node scripts/course-pages.mjs`)
@@ -366,13 +393,15 @@ async function main() {
       writeFileSync(join(PUBLIC, p.dir, 'index.html'), p.html)
     }
     writeFileSync(join(PUBLIC, BASE, 'sitemap.xml'), sitemapOf(pages))
+    mkdirSync(DECK_DIR, { recursive: true })
+    for (const [f, text] of deckFiles(courses)) writeFileSync(f, text)
   }
-  const problems = problemsOf(pages, sitemapOf(pages))
+  const problems = problemsOf(pages, sitemapOf(pages), deckFiles(courses))
   if (problems.length) {
     console.error(problems.join('\n'))
     process.exit(1)
   }
-  console.log(`course-pages: ${check ? 'up to date' : 'wrote'} ${pages.length} pages for ${courses.length} courses (${courses.map((c) => c.id).join(', ')}), ${pages.length} cards, ${BASE}/sitemap.xml`)
+  console.log(`course-pages: ${check ? 'up to date' : 'wrote'} ${pages.length} pages for ${courses.length} courses (${courses.map((c) => c.id).join(', ')}), ${pages.filter((p) => p.onePage).length} of them whole courses on one page, ${pages.length} cards, ${courses.length + 1} course-deck files, ${BASE}/sitemap.xml`)
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) await main()

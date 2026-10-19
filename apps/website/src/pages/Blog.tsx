@@ -721,7 +721,7 @@ export function BlogPost() {
         <Receipts post={post} lang={lang} />
         <Share post={post} lang={lang} />
         <Suspense fallback={null}>
-          <CourseShelf lang={lang === 'ru' ? 'ru' : 'en'} placement={`blog:${post.slug}`} />
+          <CourseShelf lang={lang === 'ru' ? 'ru' : 'en'} />
         </Suspense>
 
         <p style={{ marginTop: '3em' }}>
