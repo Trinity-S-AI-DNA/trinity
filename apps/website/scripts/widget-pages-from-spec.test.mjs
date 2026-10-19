@@ -1,9 +1,10 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
+import { cpSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { SITE, loadCompiler } from './agents-from-specs.mjs'
-import { CARD, buildAll, buildTool, galleryWords, pageOut, pngSize, specOut, toolSpecs } from './widget-pages-from-spec.mjs'
+import { CARD, buildAll, buildTool, galleryWords, isNative, pageOut, pngSize, specOut, toolProblems, toolSpecs } from './widget-pages-from-spec.mjs'
 
 const analyze = await loadCompiler(readFileSync(join(SITE, 'public/t27/t27_compiler.wasm')))
 const { g } = galleryWords(analyze)
@@ -39,4 +40,23 @@ test('a spec that claims to send data, or tests nothing, is refused', () => {
     const wrongId = text.replace(/^(pub const ID : str = )"[^"]*";/m, '$1"not-this-file";')
     assert.ok(buildTool({ file, specText: wrongId, analyze, gallery: g }).problems.length > 0, `${file} under another ID is refused`)
   }
+})
+
+test('a native tool (widget.wasm, no tool.js) loads the shared host and is refused without it', async () => {
+  const { tools } = await buildAll({ analyze })
+  const native = tools.filter((t) => isNative(SITE, t.fields.ID))
+  assert.ok(native.length >= 2, 'jtag-verdict and race-the-bee are native')
+  for (const t of native) {
+    assert.match(t.page, /<script type="module" src="\.\.\/host\.js\?v=[0-9a-f]{12}"><\/script>/)
+    assert.ok(!t.page.includes('./tool.js'), `${t.fields.ID} loads no tool.js`)
+    assert.ok(!('IR_TEXT' in t.fields || 'DATA' in t.fields), `${t.fields.ID} hands the page no wasm state`)
+  }
+  const f = native[0]
+  const root = mkdtempSync(join(tmpdir(), 'native-'))
+  cpSync(join(SITE, 'public/widgets'), join(root, 'public/widgets'), { recursive: true })
+  assert.deepEqual(toolProblems(f.fields, f.file, root), [])
+  rmSync(join(root, 'public/widgets/host.js'))
+  assert.ok(toolProblems(f.fields, f.file, root).some((m) => m.includes('host.js')), 'a native tool without host.js is refused')
+  rmSync(join(root, 'public/widgets', f.fields.ID, 'widget.wasm'))
+  assert.ok(toolProblems(f.fields, f.file, root).some((m) => m.includes('tool.js is missing')), 'neither tool.js nor widget.wasm is refused')
 })

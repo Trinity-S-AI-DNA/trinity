@@ -43,6 +43,17 @@ export const PAGE_WORDS = ['TOOL_BRAND', 'TOOL_GALLERY_LINK', 'TOOL_SOURCE_LINK'
 // The Russian words of the pages: a contract spec (no Cyrillic) names the bundle that holds them.
 export const RU_SPEC = 'specs/widgets/i18n/widgets-ru.t27'
 
+// A native tool has widget.wasm and no tool.js; its page loads the one shared host (public/widgets/host.js).
+export const HOST = 'host.js'
+export const isNative = (root, id) => existsSync(join(root, 'public/widgets', id, 'widget.wasm')) && !existsSync(join(root, 'public/widgets', id, 'tool.js'))
+
+// What a native spec holds beyond its words: module `var`s (the page's state) and W_* constants
+// (its own sizes) belong to the wasm, not to the words handed to the page; and a test that calls one of
+// the spec's functions runs under t27c (the evaluator here reads constants only).
+export const isInternal = (name, analysis) => /^W_[A-Z0-9_]+$/.test(name) || (analysis.ast?.children ?? []).some((n) => n.kind === 'ConstDecl' && n.name === name && n.mutable === true)
+const callsFunction = (n) => (n.kind === 'ExprCall' && n.name !== 'assert') || (n.children ?? []).some(callsFunction)
+export const wordsOnly = (analysis) => ({ ...analysis, ast: { ...analysis.ast, children: (analysis.ast?.children ?? []).filter((n) => n.kind !== 'TestBlock' || !callsFunction(n)) } })
+
 export const pageOut = (id) => `public/widgets/${id}/index.html`
 export const specOut = (id) => `public/widgets/${id}/${id}.t27`
 export const moduleOf = (id) => `widget_${id.replaceAll('-', '_')}`
@@ -86,6 +97,7 @@ const REF_RE = /(?:\bimport\s*\(?\s*|\bfrom\s*|new URL\(\s*)['"](\.{1,2}\/[^'"]+
 export function pageFiles(root, id) {
   const base = join(root, 'public/widgets')
   const seen = new Set([...toolFiles(root, id).map((r) => `${id}/${r}`), 'widget.css'])
+  if (isNative(root, id)) seen.add(HOST)
   const queue = [...seen]
   while (queue.length) {
     const rel = queue.shift()
@@ -143,12 +155,15 @@ export function toolProblems(f, file, root = SITE) {
   if (f.SENDS_NOTHING !== true) p.push(`${file}: SENDS_NOTHING must be true; a widget sends the reader's data nowhere`)
   if (!f.DATA_SOURCES?.length || f.DATA_SOURCES.some((s) => !s.trim())) p.push(`${file}: DATA_SOURCES must name where every number came from`)
   const dir = `public/widgets/${f.ID}`
-  const tool = join(root, dir, 'tool.js')
-  if (!existsSync(tool)) p.push(`${file}: ${dir}/tool.js is missing`)
-  else {
-    const js = readFileSync(tool, 'utf8')
-    if (/\b(fetch|import)\s*\(\s*['"`]https?:/.test(js) || /\bfrom\s+['"]https?:/.test(js)) p.push(`${file}: ${dir}/tool.js loads from another host; a widget reads only its own files`)
-    if (/\b(localStorage|document\.cookie)\b/.test(js)) p.push(`${file}: ${dir}/tool.js keeps state in the reader's browser; the page sets nothing`)
+  const native = isNative(root, f.ID)
+  const scripts = native ? [[`public/widgets/${HOST}`, join(root, 'public/widgets', HOST)]] : [[`${dir}/tool.js`, join(root, dir, 'tool.js')]]
+  if (native && !existsSync(scripts[0][1])) p.push(`${file}: ${dir}/widget.wasm needs public/widgets/${HOST}, which is missing`)
+  if (!native && !existsSync(scripts[0][1])) p.push(`${file}: ${dir}/tool.js is missing (or ${dir}/widget.wasm, for a native tool)`)
+  for (const [name, path] of scripts) {
+    if (!existsSync(path)) continue
+    const js = readFileSync(path, 'utf8')
+    if (/\b(fetch|import)\s*\(\s*['"`]https?:/.test(js) || /\bfrom\s+['"]https?:/.test(js)) p.push(`${file}: ${name} loads from another host; a widget reads only its own files`)
+    if (/\b(localStorage|document\.cookie)\b/.test(js)) p.push(`${file}: ${name} keeps state in the reader's browser; the page sets nothing`)
   }
   const card = join(root, dir, 'card.png')
   if (!existsSync(card)) p.push(`${file}: ${dir}/card.png is missing`)
@@ -161,7 +176,7 @@ export function toolProblems(f, file, root = SITE) {
   return p
 }
 
-export function renderPage(f, g, { specSha, toolSha, cardSha, shared = [], ru = null }) {
+export function renderPage(f, g, { specSha, toolSha, cardSha, shared = [], ru = null, native = false }) {
   const url = `${g.ORIGIN}widgets/${f.ID}/`
   const image = `${url}card.png?v=${cardSha.slice(0, 12)}`
   const words = Object.fromEntries(Object.entries(f).filter(([k]) => k !== 'GENERATED'))
@@ -211,7 +226,7 @@ export function renderPage(f, g, { specSha, toolSha, cardSha, shared = [], ru = 
 </footer>
 <script>window.T27_WIDGET=${inlineJson(words)}</script>${ru ? `
 <script>window.T27_WIDGET_RU=${inlineJson(ru)};if(/[?&]lang=ru\\b/.test(location.search)){Object.assign(window.T27_WIDGET,window.T27_WIDGET_RU);document.documentElement.lang='ru'}</script>` : ''}
-<script type="module" src="./tool.js?v=${toolSha.slice(0, 12)}"></script>
+<script type="module" src="${native ? '../' + HOST : './tool.js'}?v=${toolSha.slice(0, 12)}"></script>
 </body>
 </html>
 `
@@ -228,6 +243,8 @@ export function buildTool({ file, specText, analyze, gallery, root = SITE }) {
   if (CYRILLIC.test(specText)) problems.push(`${file}: Cyrillic in the spec (LANG-EN)`)
   let consts = {}
   try { consts = constsOf(analysis) } catch (e) { problems.push(`${file}: ${e.message}`) }
+  const native = isNative(root, consts.ID?.value ?? '')
+  if (native) consts = Object.fromEntries(Object.entries(consts).filter(([k]) => !isInternal(k, analysis)))
   // SAY_* are the tool's words and K_* its numbers (a [N]u16 array stays arr-u16); anything else is a name nobody reads.
   const optional = Object.fromEntries(Object.entries(consts).filter(([k]) => /^(SAY|K)_[A-Z0-9_]+$/.test(k)).map(([k, v]) => [k, Array.isArray(v.value) ? (v.value.every((x) => typeof x === 'string') ? 'arr' : `arr-${String(v.type).replace(/^\[\d+\]/, '')}`) : typeof v.value === 'string' ? 'str' : v.type]))
   problems.push(...checkSchema(consts, TOOL_REQUIRED, optional, file))
@@ -237,7 +254,7 @@ export function buildTool({ file, specText, analyze, gallery, root = SITE }) {
   let tests = { tests: 0, asserts: 0, failures: [] }
   if (problems.length === 0) {
     problems.push(...toolProblems(fields, file, root))
-    tests = runSpecTests(analysis, fields)
+    tests = runSpecTests(native ? wordsOnly(analysis) : analysis, fields)
     if (tests.tests < 2) problems.push(`${file}: ${tests.tests} test block(s); a widget tests at least two of its own invariants`)
     problems.push(...tests.failures.map((m) => `${file}: test ${m}`))
   }
@@ -245,10 +262,10 @@ export function buildTool({ file, specText, analyze, gallery, root = SITE }) {
   const files = pageFiles(root, fields.ID)
   const toolSha = sha256(Buffer.concat(files.map((r) => readFileSync(join(root, 'public/widgets', r)))))
   // Shared modules are imported without a query; an import map gives them the page's stamp.
-  const shared = files.filter((r) => !r.includes('/') && /\.m?js$/.test(r))
+  const shared = files.filter((r) => !r.includes('/') && r !== HOST && /\.m?js$/.test(r))
   const cardSha = sha256(readFileSync(join(root, 'public/widgets', fields.ID, 'card.png')))
   const specSha = sha256(Buffer.from(specText, 'utf8'))
-  return { problems, fields, tests, page: renderPage(fields, gallery, { specSha, toolSha, cardSha, shared }), publicSpec: specText, stamps: { specSha, toolSha, cardSha, shared } }
+  return { problems, fields, tests, page: renderPage(fields, gallery, { specSha, toolSha, cardSha, shared, native: isNative(root, fields.ID) }), publicSpec: specText, stamps: { specSha, toolSha, cardSha, shared, native: isNative(root, fields.ID) } }
 }
 
 /** The tool specs under specs/widgets: every .t27 there but the gallery. */
