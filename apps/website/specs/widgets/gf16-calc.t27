@@ -191,3 +191,2503 @@ test the_widget_sends_nothing {
     assert READS_LOCAL_FILES == false;
     assert K_TERNARY_FRAC_TRITS < K_TERNARY_MAX_TRITS;
 }
+
+
+; =================================================================================================
+; THE NATIVE PAGE (epic gHashTag/t27#10937, issue #10938, stage "page" of specs/t27f/widget_factory.t27)
+; Everything below replaces public/widgets/gf16-calc/tool.js (511 lines of hand-written JavaScript:
+; the BigInt arithmetic and the page). The words and numbers above are unchanged: the view prints SAY_
+; constants and K_ numbers, it writes no English of its own.
+; --
+; ARITHMETIC. tool.js rounds on exact fractions of BigInts. There is no BigInt in .t27, so this module
+; has the little it needs: sixteen registers of 640 32-bit limbs (20480 bits; the widest value is a
+; 999-digit decimal times 10^999, about 6700 bits) with compare, add, subtract, multiply, shift, divide
+; by a small number, and a binary long division that costs one shift and one compare per bit of the
+; QUOTIENT (every quotient in this page is small: a 12-bit mantissa, a 34-bit rounded digit string, a
+; 95-bit ternary count). Nothing here is a float: a decimal the reader types is read digit by digit into
+; one of these registers.
+; --
+; Host protocol (host.js; all exports of this module):
+;   w_base(url)         unused (the page link is built by the host)
+;   w_init(hash)        the page opens, with the address's #fragment
+;   w_hash(hash)        the address's fragment changed
+;   w_data(i, bytes)    the layout file (W_DATA_FILE) was fetched; w_data_failed(i) when it was not
+;   w_input(i, bytes)   control i (among input and textarea) changed: 0 is the number field
+;   w_press(i)          button number i in page order (the page maps it to its action)
+;   w_copied(ok)        the host's answer to a copy effect
+;   w_timer(id)         a timer effect ran out
+;   w_hash_out(dst)     the fragment to show after the last event (length 0: leave it)
+;   w_effect(k, dst)    effect k after the last event: 'v' + control index + text = set that control's value;
+;                       'c' = copy the page link (without ?embed) to the clipboard, then call w_copied(ok);
+;                       's' + control index = select that control's text; 't' + id + decimal ms = call w_timer(id) after ms
+;   w_render(dst)       the page's HTML, length (0 until the layout file has been read or has failed)
+; Not carried over from JavaScript: the number field is cut at W_X_CAP (8192) bytes; a layout wider than 40 bits,
+; with a mantissa wider than 30 bits or an exponent wider than 20, reads as unreadable (the spec's layout is used);
+; the value attribute of the number field follows the text (tool.js leaves the initial text there, the property is the same);
+; Unicode lower-casing is ASCII only; a malformed %-escape in the address stays as written.
+
+use widgets::html_out::ok;
+use widgets::html_out::OVER;
+use widgets::html_out::put;
+use widgets::html_out::raw;
+use widgets::html_out::put_escaped;
+use widgets::html_out::text;
+use widgets::html_out::attr;
+use widgets::html_out::dec_to;
+use widgets::html_out::fill_named;
+use widgets::html_out::name_is;
+use widgets::html_out::is_word_byte;
+use widgets::html_out::H_LT;
+use widgets::html_out::H_GT;
+use widgets::html_out::H_AMP;
+use widgets::html_out::H_QUOTE;
+use widgets::html_out::H_APOS;
+use widgets::html_out::H_SPACE;
+use widgets::html_out::H_SLASH;
+use widgets::html_out::H_EQ;
+
+pub const W_DATA_FILE : str = "../../t27/files/specs/numeric/gf16.t27";
+pub const W_X_CAP : usize = 8192;
+pub const W_BNL : usize = 640;
+pub const W_NAN_ID : u32 = 0;
+
+pub var BN : [10240]u32 = [0; 10240];
+pub var BLEN : [16]usize = [0; 16];
+
+; --- the registers --------------------------------------------------------------------------------------
+; 0 W_R_N and 1 W_R_D hold the parsed fraction; 2..9 are scratch for the function that names them; 14 and 15
+; belong to bn_divmod and bn_shl.
+pub const W_R_N : usize = 0;
+pub const W_R_D : usize = 1;
+pub const W_R_T : usize = 15;
+pub const W_R_S : usize = 14;
+
+fn bn_norm(r: usize) -> u32 {
+    var n : usize = BLEN[r];
+    while (n > 0 and BN[r * 640 + n - 1] == 0) { n = n - 1; }
+    BLEN[r] = n;
+    return 0;
+}
+
+fn bn_zero(r: usize) -> u32 {
+    BLEN[r] = 0;
+    return 0;
+}
+
+fn bn_from_u64(r: usize, v: u64) -> u32 {
+    BN[r * 640] = (v & 4294967295) as u32;
+    BN[r * 640 + 1] = (v >> 32) as u32;
+    BLEN[r] = 2;
+    bn_norm(r);
+    return 0;
+}
+
+fn bn_copy(d: usize, s: usize) -> u32 {
+    const n : usize = BLEN[s];
+    var i : usize = 0;
+    while (i < n) {
+        BN[d * 640 + i] = BN[s * 640 + i];
+        i = i + 1;
+    }
+    BLEN[d] = n;
+    return 0;
+}
+
+fn bn_cmp(a: usize, b: usize) -> i32 {
+    const la : usize = BLEN[a];
+    const lb : usize = BLEN[b];
+    if (la < lb) { return -1; }
+    if (la > lb) { return 1; }
+    var i : usize = la;
+    while (i > 0) {
+        i = i - 1;
+        const x : u32 = BN[a * 640 + i];
+        const y : u32 = BN[b * 640 + i];
+        if (x < y) { return -1; }
+        if (x > y) { return 1; }
+    }
+    return 0;
+}
+
+fn bn_add(d: usize, a: usize, b: usize) -> u32 {
+    const la : usize = BLEN[a];
+    const lb : usize = BLEN[b];
+    var n : usize = la;
+    if (lb > n) { n = lb; }
+    var carry : u64 = 0;
+    var i : usize = 0;
+    while (i < n) {
+        var s : u64 = carry;
+        if (i < la) { s = s + (BN[a * 640 + i] as u64); }
+        if (i < lb) { s = s + (BN[b * 640 + i] as u64); }
+        BN[d * 640 + i] = (s & 4294967295) as u32;
+        carry = s >> 32;
+        i = i + 1;
+    }
+    if (carry > 0) {
+        BN[d * 640 + n] = carry as u32;
+        n = n + 1;
+    }
+    BLEN[d] = n;
+    return 0;
+}
+
+/// d = a - b, for a >= b.
+fn bn_sub(d: usize, a: usize, b: usize) -> u32 {
+    const la : usize = BLEN[a];
+    const lb : usize = BLEN[b];
+    var borrow : u64 = 0;
+    var i : usize = 0;
+    while (i < la) {
+        var y : u64 = borrow;
+        if (i < lb) { y = y + (BN[b * 640 + i] as u64); }
+        const x : u64 = (BN[a * 640 + i] as u64) + 4294967296;
+        const t : u64 = x - y;
+        BN[d * 640 + i] = (t & 4294967295) as u32;
+        borrow = 1 - (t >> 32);
+        i = i + 1;
+    }
+    BLEN[d] = la;
+    bn_norm(d);
+    return 0;
+}
+
+fn bn_mul_small(d: usize, a: usize, m: u64) -> u32 {
+    const la : usize = BLEN[a];
+    var carry : u64 = 0;
+    var i : usize = 0;
+    while (i < la) {
+        const t : u64 = (BN[a * 640 + i] as u64) * m + carry;
+        BN[d * 640 + i] = (t & 4294967295) as u32;
+        carry = t >> 32;
+        i = i + 1;
+    }
+    var n : usize = la;
+    if (carry > 0) {
+        BN[d * 640 + n] = carry as u32;
+        n = n + 1;
+    }
+    BLEN[d] = n;
+    bn_norm(d);
+    return 0;
+}
+
+fn bn_add_small(d: usize, a: usize, v: u64) -> u32 {
+    const la : usize = BLEN[a];
+    var carry : u64 = v;
+    var i : usize = 0;
+    while (i < la) {
+        const t : u64 = (BN[a * 640 + i] as u64) + carry;
+        BN[d * 640 + i] = (t & 4294967295) as u32;
+        carry = t >> 32;
+        i = i + 1;
+    }
+    var n : usize = la;
+    while (carry > 0) {
+        BN[d * 640 + n] = (carry & 4294967295) as u32;
+        carry = carry >> 32;
+        n = n + 1;
+    }
+    BLEN[d] = n;
+    return 0;
+}
+
+/// d = a / m, the remainder returned.
+fn bn_divmod_small(d: usize, a: usize, m: u64) -> u64 {
+    const la : usize = BLEN[a];
+    var rem : u64 = 0;
+    var i : usize = la;
+    while (i > 0) {
+        i = i - 1;
+        const cur : u64 = (rem << 32) + (BN[a * 640 + i] as u64);
+        BN[d * 640 + i] = (cur / m) as u32;
+        rem = cur % m;
+    }
+    BLEN[d] = la;
+    bn_norm(d);
+    return rem;
+}
+
+fn bitlen32(x: u32) -> u32 {
+    var n : u32 = 0;
+    var v : u32 = x;
+    while (v > 0) {
+        n = n + 1;
+        v = v >> 1;
+    }
+    return n;
+}
+
+fn bn_bitlen(r: usize) -> u32 {
+    const n : usize = BLEN[r];
+    if (n == 0) { return 0; }
+    return ((n - 1) as u32) * 32 + bitlen32(BN[r * 640 + n - 1]);
+}
+
+/// d = a << sh (alias-safe: it works from the top limb down).
+fn bn_shl(d: usize, a: usize, sh: u32) -> u32 {
+    const la : usize = BLEN[a];
+    if (la == 0) {
+        BLEN[d] = 0;
+        return 0;
+    }
+    const ls : usize = (sh / 32) as usize;
+    const bs : u32 = sh % 32;
+    const nl : usize = la + ls + 1;
+    var i : usize = nl;
+    while (i > 0) {
+        i = i - 1;
+        var v : u64 = 0;
+        if (i >= ls and i - ls < la) {
+            v = (BN[a * 640 + i - ls] as u64) << bs;
+        }
+        if (bs > 0 and i >= ls + 1 and i - ls - 1 < la) {
+            v = v | ((BN[a * 640 + i - ls - 1] as u64) >> (32 - bs));
+        }
+        if (i < ls) { v = 0; }
+        BN[d * 640 + i] = (v & 4294967295) as u32;
+    }
+    BLEN[d] = nl;
+    bn_norm(d);
+    return 0;
+}
+
+/// d = a * b (d must not be a or b).
+fn bn_mul(d: usize, a: usize, b: usize) -> u32 {
+    const la : usize = BLEN[a];
+    const lb : usize = BLEN[b];
+    if (la == 0 or lb == 0) {
+        BLEN[d] = 0;
+        return 0;
+    }
+    var i : usize = 0;
+    while (i < la + lb) {
+        BN[d * 640 + i] = 0;
+        i = i + 1;
+    }
+    i = 0;
+    while (i < la) {
+        var carry : u64 = 0;
+        const x : u64 = BN[a * 640 + i] as u64;
+        var j : usize = 0;
+        while (j < lb) {
+            const t : u64 = x * (BN[b * 640 + j] as u64) + (BN[d * 640 + i + j] as u64) + carry;
+            BN[d * 640 + i + j] = (t & 4294967295) as u32;
+            carry = t >> 32;
+            j = j + 1;
+        }
+        BN[d * 640 + i + lb] = carry as u32;
+        i = i + 1;
+    }
+    BLEN[d] = la + lb;
+    bn_norm(d);
+    return 0;
+}
+
+fn pow10_small(k: u32) -> u64 {
+    var v : u64 = 1;
+    var i : u32 = 0;
+    while (i < k) {
+        v = v * 10;
+        i = i + 1;
+    }
+    return v;
+}
+
+/// d = a * 10^p
+fn bn_mul_pow10(d: usize, a: usize, p: u32) -> u32 {
+    if (d != a) { bn_copy(d, a); }
+    var left : u32 = p;
+    while (left >= 9) {
+        bn_mul_small(d, d, 1000000000);
+        left = left - 9;
+    }
+    if (left > 0) { bn_mul_small(d, d, pow10_small(left)); }
+    return 0;
+}
+
+/// d = base^e for a small base.
+fn bn_set_pow(d: usize, base: u64, e: u32) -> u32 {
+    bn_from_u64(d, 1);
+    var i : u32 = 0;
+    while (i < e) {
+        bn_mul_small(d, d, base);
+        i = i + 1;
+    }
+    return 0;
+}
+
+/// q = a / b and rem = a mod b by binary long division: one shift and one compare per quotient bit.
+/// q, rem, a, b are four different registers; W_R_T is scratch.
+fn bn_divmod(q: usize, rem: usize, a: usize, b: usize) -> u32 {
+    bn_copy(rem, a);
+    const ka : u32 = bn_bitlen(a);
+    const kb : u32 = bn_bitlen(b);
+    if (ka < kb) {
+        BLEN[q] = 0;
+        return 0;
+    }
+    const k : u32 = ka - kb;
+    const nl : usize = ((k / 32) + 1) as usize;
+    var z : usize = 0;
+    while (z < nl) {
+        BN[q * 640 + z] = 0;
+        z = z + 1;
+    }
+    BLEN[q] = nl;
+    var i : u32 = k + 1;
+    while (i > 0) {
+        i = i - 1;
+        bn_shl(W_R_T, b, i);
+        if (bn_cmp(W_R_T, rem) <= 0) {
+            bn_sub(rem, rem, W_R_T);
+            const li : usize = (i / 32) as usize;
+            BN[q * 640 + li] = BN[q * 640 + li] | ((1 as u32) << (i % 32));
+        }
+    }
+    bn_norm(q);
+    return 0;
+}
+
+/// The value as a u64 (the register holds at most two limbs).
+fn bn_u64(r: usize) -> u64 {
+    var v : u64 = 0;
+    if (BLEN[r] > 0) { v = BN[r * 640] as u64; }
+    if (BLEN[r] > 1) { v = v | ((BN[r * 640 + 1] as u64) << 32); }
+    return v;
+}
+
+/// The decimal digits of a register, most significant first, into o at n0; the new length ("0" for zero).
+fn bn_dec(o: []u8, n0: u32, r: usize) -> u32 {
+    var n : u32 = n0;
+    if (BLEN[r] == 0) { return put(o, n, 48); }
+    // peel nine digits at a time off a copy in register 13
+    bn_copy(13, r);
+    var chunks : [100]u32 = [0; 100];
+    var nc : usize = 0;
+    while (BLEN[13] > 0 and nc < 100) {
+        chunks[nc] = bn_divmod_small(13, 13, 1000000000) as u32;
+        nc = nc + 1;
+    }
+    var first : bool = true;
+    while (nc > 0) {
+        nc = nc - 1;
+        var digits : [9]u8 = [48; 9];
+        var v : u32 = chunks[nc];
+        var j : usize = 9;
+        while (j > 0) {
+            j = j - 1;
+            digits[j] = ((v % 10) as u8) + 48;
+            v = v / 10;
+        }
+        var from : usize = 0;
+        if (first) {
+            while (from < 8 and digits[from] == 48) { from = from + 1; }
+            first = false;
+        }
+        while (from < 9) {
+            n = put(o, n, digits[from]);
+            from = from + 1;
+        }
+    }
+    return n;
+}
+
+; --- the layout ----------------------------------------------------------------------------------------------
+pub var LB : u64 = 16;
+pub var LE : u64 = 6;
+pub var LM : u64 = 9;
+pub var LBIAS : u64 = 31;
+pub var LEXPMAX : u64 = 63;
+pub var LNAN : u64 = 65025;
+pub var WIDE_N : u32 = 79;
+
+fn set_spec_layout() -> u32 {
+    LB = K_BITS as u64;
+    LE = K_EXP_BITS as u64;
+    LM = K_MANT_BITS as u64;
+    LBIAS = K_BIAS as u64;
+    LEXPMAX = K_EXP_MAX as u64;
+    LNAN = K_NAN_BITS as u64;
+    return 0;
+}
+
+fn pow2(k: u64) -> u64 {
+    return (1 as u64) << k;
+}
+
+; --- the number field: trim, lower-case, no underscores -----------------------------------------------------
+pub var PS : [8256]u8 = [0; 8256];
+pub var PS_N : usize = 0;
+pub var P_KIND : u32 = 0;
+pub var P_NEG : bool = false;
+pub var P_HEX : u64 = 0;
+
+/// The length of the JavaScript white space that starts at s[p] (0 when none).
+fn ws_fwd(s: []const u8, p: usize) -> usize {
+    const b : u8 = s[p];
+    if (b == 32 or (b >= 9 and b <= 13)) { return 1; }
+    const left : usize = s.len - p;
+    if (b == 194 and left >= 2 and s[p + 1] == 160) { return 2; }
+    if (left < 3) { return 0; }
+    const c : u8 = s[p + 1];
+    const d : u8 = s[p + 2];
+    if (b == 225 and c == 154 and d == 128) { return 3; }
+    if (b == 226 and c == 128 and ((d >= 128 and d <= 138) or d == 168 or d == 169 or d == 175)) { return 3; }
+    if (b == 226 and c == 129 and d == 159) { return 3; }
+    if (b == 227 and c == 128 and d == 128) { return 3; }
+    if (b == 239 and c == 187 and d == 191) { return 3; }
+    return 0;
+}
+
+/// The length of the white space that ends at s[e - 1] (0 when none).
+fn ws_back(s: []const u8, e: usize) -> usize {
+    const c : u8 = s[e - 1];
+    if (c == 32 or (c >= 9 and c <= 13)) { return 1; }
+    if (e >= 2 and s[e - 2] == 194 and c == 160) { return 2; }
+    if (e < 3) { return 0; }
+    const a : u8 = s[e - 3];
+    const m : u8 = s[e - 2];
+    if (a == 225 and m == 154 and c == 128) { return 3; }
+    if (a == 226 and m == 128 and ((c >= 128 and c <= 138) or c == 168 or c == 169 or c == 175)) { return 3; }
+    if (a == 226 and m == 129 and c == 159) { return 3; }
+    if (a == 227 and m == 128 and c == 128) { return 3; }
+    if (a == 239 and m == 187 and c == 191) { return 3; }
+    return 0;
+}
+
+/// String(raw).trim().toLowerCase().replace(/_/g, '') into PS.
+fn clean(raw_s: []const u8) -> u32 {
+    var lo : usize = 0;
+    var hi : usize = raw_s.len;
+    while (lo < hi) {
+        const w : usize = ws_fwd(raw_s, lo);
+        if (w == 0) { break; }
+        lo = lo + w;
+    }
+    while (hi > lo) {
+        const w2 : usize = ws_back(raw_s[0..hi], hi);
+        if (w2 == 0) { break; }
+        hi = hi - w2;
+    }
+    var n : usize = 0;
+    var k : usize = lo;
+    while (k < hi) {
+        var b : u8 = raw_s[k];
+        if (b >= 65 and b <= 90) { b = b + 32; }
+        if (b != 95) {
+            PS[n] = b;
+            n = n + 1;
+        }
+        k = k + 1;
+    }
+    PS_N = n;
+    return 0;
+}
+
+fn is_dig(b: u8) -> bool {
+    return b >= 48 and b <= 57;
+}
+
+fn hex_digit(b: u8) -> i32 {
+    if (b >= 48 and b <= 57) { return (b as i32) - 48; }
+    if (b >= 97 and b <= 102) { return (b as i32) - 87; }
+    return -1;
+}
+
+fn ps_is(p: usize, w: []const u8) -> bool {
+    if (p + w.len != PS_N) { return false; }
+    var k : usize = 0;
+    while (k < w.len) {
+        if (PS[p + k] != w[k]) { return false; }
+        k = k + 1;
+    }
+    return true;
+}
+
+/// parseInput(raw): P_KIND 0 none, 1 hex, 2 inf, 3 nan, 4 num (then W_R_N / W_R_D hold the fraction).
+fn parse_number(raw_s: []const u8) -> u32 {
+    P_KIND = 0;
+    P_NEG = false;
+    clean(raw_s);
+    const n : usize = PS_N;
+    if (n == 0) { return 0; }
+    const hexn : usize = ((LB + 3) / 4) as usize;
+    if (n >= 3 and PS[0] == 48 and PS[1] == 120) {
+        var all : bool = true;
+        var v : u64 = 0;
+        var k : usize = 2;
+        while (k < n) {
+            const h : i32 = hex_digit(PS[k]);
+            if (h < 0) { all = false; break; }
+            if (k - 2 < 16) { v = v * 16 + (h as u64); }
+            k = k + 1;
+        }
+        if (all) {
+            if (n - 2 > hexn) { return 0; }
+            if (v < pow2(LB)) {
+                P_KIND = 1;
+                P_HEX = v;
+            }
+            return 0;
+        }
+    }
+    var p : usize = 0;
+    var neg : bool = false;
+    if (PS[0] == 43 or PS[0] == 45) {
+        neg = PS[0] == 45;
+        p = 1;
+    }
+    if (ps_is(p, "inf") or ps_is(p, "infinity")) {
+        P_KIND = 2;
+        P_NEG = PS[0] == 45;
+        return 0;
+    }
+    if (ps_is(p, "nan")) {
+        P_KIND = 3;
+        return 0;
+    }
+    const ilo : usize = p;
+    while (p < n and is_dig(PS[p])) { p = p + 1; }
+    const ihi : usize = p;
+    var flo : usize = p;
+    var fhi : usize = p;
+    if (p < n and PS[p] == 46) {
+        p = p + 1;
+        flo = p;
+        while (p < n and is_dig(PS[p])) { p = p + 1; }
+        fhi = p;
+    }
+    var exp : i64 = 0;
+    if (p < n and PS[p] == 101) {
+        p = p + 1;
+        var eneg : bool = false;
+        if (p < n and (PS[p] == 43 or PS[p] == 45)) {
+            eneg = PS[p] == 45;
+            p = p + 1;
+        }
+        const elo : usize = p;
+        while (p < n and is_dig(PS[p])) { p = p + 1; }
+        if (p == elo) { return 0; }
+        var z : usize = elo;
+        while (z + 1 < p and PS[z] == 48) { z = z + 1; }
+        if (p - z > 3) { return 0; }
+        var ev : i64 = 0;
+        while (z < p) {
+            ev = ev * 10 + ((PS[z] - 48) as i64);
+            z = z + 1;
+        }
+        if (eneg) { ev = 0 - ev; }
+        exp = ev;
+    }
+    if (p != n) { return 0; }
+    if (ihi == ilo and fhi == flo) { return 0; }
+    if (exp > 999 or exp < -999) { return 0; }
+    if ((ihi - ilo) + (fhi - flo) > 999) { return 0; }
+    bn_zero(W_R_N);
+    var i : usize = ilo;
+    while (i < ihi) {
+        bn_mul_small(W_R_N, W_R_N, 10);
+        bn_add_small(W_R_N, W_R_N, (PS[i] - 48) as u64);
+        i = i + 1;
+    }
+    i = flo;
+    while (i < fhi) {
+        bn_mul_small(W_R_N, W_R_N, 10);
+        bn_add_small(W_R_N, W_R_N, (PS[i] - 48) as u64);
+        i = i + 1;
+    }
+    const scale : i64 = exp - ((fhi - flo) as i64);
+    if (scale >= 0) {
+        bn_mul_pow10(W_R_N, W_R_N, scale as u32);
+        bn_from_u64(W_R_D, 1);
+    } else {
+        bn_from_u64(W_R_D, 1);
+        bn_mul_pow10(W_R_D, W_R_D, (0 - scale) as u32);
+    }
+    P_KIND = 4;
+    P_NEG = neg;
+    return 0;
+}
+
+; --- rounding to the layout ----------------------------------------------------------------------------------------
+pub var E_BITS : u64 = 0;
+pub var E_DIR : i32 = 0;
+pub var E_TIE : bool = false;
+pub var E_OVER : bool = false;
+pub var E_UNDER : bool = false;
+
+fn enc_set(bits: u64, dir: i32, tie: bool, over: bool, under: bool) -> u32 {
+    E_BITS = bits;
+    E_DIR = dir;
+    E_TIE = tie;
+    E_OVER = over;
+    E_UNDER = under;
+    return 0;
+}
+
+/// encodeExact(neg, n, d, L, mode) with n, d in W_R_N, W_R_D.
+fn encode_exact(neg: bool, even: bool) -> u32 {
+    var sign_bit : u64 = 0;
+    if (neg) { sign_bit = pow2(LB - 1); }
+    const inf_bits : u64 = sign_bit + (LEXPMAX << LM);
+    if (BLEN[W_R_N] == 0) { return enc_set(sign_bit, 0, false, false, false); }
+    var e : i64 = (bn_bitlen(W_R_N) as i64) - (bn_bitlen(W_R_D) as i64);
+    // cmpPow2(n, d, e) < 0 ?
+    if (e >= 0) {
+        bn_copy(2, W_R_N);
+        bn_shl(3, W_R_D, e as u32);
+    } else {
+        bn_shl(2, W_R_N, (0 - e) as u32);
+        bn_copy(3, W_R_D);
+    }
+    if (bn_cmp(2, 3) < 0) { e = e - 1; }
+    const emin : i64 = 1 - (LBIAS as i64);
+    if (e > (LEXPMAX as i64) - (LBIAS as i64)) { return enc_set(inf_bits, 1, false, true, false); }
+    var eff : i64 = e;
+    if (emin > eff) { eff = emin; }
+    const sh : i64 = (LM as i64) - eff;
+    if (sh >= 0) {
+        bn_shl(2, W_R_N, sh as u32);
+        bn_copy(3, W_R_D);
+    } else {
+        bn_copy(2, W_R_N);
+        bn_shl(3, W_R_D, (0 - sh) as u32);
+    }
+    bn_divmod(4, 5, 2, 3);
+    var q : u64 = bn_u64(4);
+    bn_shl(6, 5, 1);
+    const c : i32 = bn_cmp(6, 3);
+    const rzero : bool = BLEN[5] == 0;
+    const tie : bool = !rzero and c == 0;
+    const up : bool = !rzero and (c > 0 or (tie and even and (q & 1) == 1));
+    if (up) { q = q + 1; }
+    var dir : i32 = 0;
+    if (!rzero) {
+        if (up) { dir = 1; } else { dir = -1; }
+    }
+    var ee : i64 = eff;
+    const one_m : u64 = pow2(LM);
+    if (q == one_m * 2) {
+        q = q / 2;
+        ee = ee + 1;
+    }
+    var biased : i64 = 0;
+    if (q >= one_m) { biased = ee + (LBIAS as i64); }
+    if (biased >= (LEXPMAX as i64)) { return enc_set(inf_bits, 1, tie, true, false); }
+    var mant : u64 = q;
+    if (biased != 0) { mant = q - one_m; }
+    if (biased == 0 and mant == 0) { return enc_set(sign_bit, -1, tie, false, true); }
+    return enc_set(sign_bit + ((biased as u64) << LM) + mant, dir, tie, false, false);
+}
+
+/// encodeParsed(p, L, mode)
+fn encode_parsed(even: bool) -> u32 {
+    if (P_KIND == 1) { return enc_set(P_HEX, 0, false, false, false); }
+    if (P_KIND == 3) { return enc_set(LNAN, 0, false, false, false); }
+    if (P_KIND == 2) {
+        var sb : u64 = 0;
+        if (P_NEG) { sb = pow2(LB - 1); }
+        return enc_set(sb + (LEXPMAX << LM), 0, false, false, false);
+    }
+    return encode_exact(P_NEG, even);
+}
+
+pub var D_SIGN : u64 = 0;
+pub var D_EXP : u64 = 0;
+pub var D_MANT : u64 = 0;
+pub var D_CLS : u32 = 0;
+pub var D_HASQ : bool = false;
+pub var D_Q : u64 = 0;
+pub var D_K : i64 = 0;
+
+/// decodeBits(bits, L)
+fn decode_bits(bits: u64) -> u32 {
+    D_SIGN = (bits >> (LB - 1)) & 1;
+    D_EXP = (bits >> LM) & LEXPMAX;
+    D_MANT = bits & (pow2(LM) - 1);
+    D_HASQ = true;
+    D_Q = 0;
+    D_K = 0;
+    if (D_EXP == LEXPMAX) {
+        D_HASQ = false;
+        if (D_MANT == 0) { D_CLS = 3; } else { D_CLS = 4; }
+        return 0;
+    }
+    if (D_EXP == 0) {
+        if (D_MANT == 0) { D_CLS = 0; } else { D_CLS = 1; }
+        D_Q = D_MANT;
+        D_K = 1 - (LBIAS as i64) - (LM as i64);
+        return 0;
+    }
+    D_CLS = 2;
+    D_Q = pow2(LM) + D_MANT;
+    D_K = (D_EXP as i64) - (LBIAS as i64) - (LM as i64);
+    return 0;
+}
+
+/// hexOf(bits, L): 0x and upper-case digits, padded to ceil(bits / 4).
+fn hex_to(o: []u8, n0: u32, bits: u64) -> u32 {
+    var n : u32 = raw(o, n0, "0x");
+    const digits : u64 = (LB + 3) / 4;
+    var i : u64 = digits;
+    while (i > 0) {
+        i = i - 1;
+        const d : u64 = (bits >> (i * 4)) & 15;
+        if (d < 10) { n = put(o, n, (d as u8) + 48); } else { n = put(o, n, (d as u8) + 55); }
+    }
+    return n;
+}
+
+; --- decimal text of exact values ----------------------------------------------------------------------------------
+/// exactDecimal(q, k, neg)
+fn exact_decimal(o: []u8, n0: u32, q: u64, k: i64, neg: bool) -> u32 {
+    var n : u32 = n0;
+    if (neg) { n = put(o, n, 45); }
+    if (k >= 0) {
+        bn_from_u64(4, q);
+        bn_shl(4, 4, k as u32);
+        return bn_dec(o, n, 4);
+    }
+    const kk : u32 = (0 - k) as u32;
+    bn_from_u64(4, q);
+    var i : u32 = 0;
+    while (i < kk) {
+        bn_mul_small(4, 4, 5);
+        i = i + 1;
+    }
+    var tmp : [512]u8 = [0; 512];
+    var tl : u32 = bn_dec(tmp[0..], 0, 4);
+    // padStart(-k + 1, '0')
+    var digits : [640]u8 = [0; 640];
+    var dl : u32 = 0;
+    var pad : u32 = 0;
+    if (tl < kk + 1) { pad = kk + 1 - tl; }
+    var z : u32 = 0;
+    while (z < pad) { digits[dl as usize] = 48; dl = dl + 1; z = z + 1; }
+    z = 0;
+    while (z < tl) { digits[dl as usize] = tmp[z as usize]; dl = dl + 1; z = z + 1; }
+    const cut : u32 = dl - kk;
+    // the integer part, a point, the fraction without its trailing zeros
+    var fe : u32 = dl;
+    while (fe > cut and digits[(fe - 1) as usize] == 48) { fe = fe - 1; }
+    var j : u32 = 0;
+    while (j < cut) { n = put(o, n, digits[j as usize]); j = j + 1; }
+    if (fe > cut) {
+        n = put(o, n, 46);
+        j = cut;
+        while (j < fe) { n = put(o, n, digits[j as usize]); j = j + 1; }
+    }
+    return n;
+}
+
+fn ge10(pp: i32) -> bool {
+    // R6 >= R7 * 10^pp (pp >= 0), or R6 * 10^-pp >= R7
+    if (pp >= 0) {
+        bn_mul_pow10(8, 7, pp as u32);
+        return bn_cmp(6, 8) >= 0;
+    }
+    bn_mul_pow10(8, 6, (0 - pp) as u32);
+    return bn_cmp(8, 7) >= 0;
+}
+
+/// fmtSig(num, den, sig) for the magnitude in R6 over R7 (and a sign): significant digits, plain or e-notation.
+fn fmt_sig(o: []u8, n0: u32, neg: bool, sig: u32) -> u32 {
+    var n : u32 = n0;
+    if (BLEN[6] == 0) { return put(o, n, 48); }
+    const diff : i64 = (bn_bitlen(6) as i64) - (bn_bitlen(7) as i64);
+    var x : i64 = diff * 30103;
+    var rem : i64 = x % 100000;
+    if (rem < 0) { rem = rem + 100000; }
+    var p : i32 = ((x - rem) / 100000) as i32;
+    while (!ge10(p)) { p = p - 1; }
+    while (ge10(p + 1)) { p = p + 1; }
+    const shift : i32 = (sig as i32) - 1 - p;
+    if (shift >= 0) {
+        bn_mul_pow10(9, 6, shift as u32);
+        bn_copy(10, 7);
+    } else {
+        bn_copy(9, 6);
+        bn_mul_pow10(10, 7, (0 - shift) as u32);
+    }
+    // m = (2 * sn + sd) / (2 * sd)
+    bn_shl(11, 9, 1);
+    bn_add(11, 11, 10);
+    bn_shl(12, 10, 1);
+    bn_divmod(13, 8, 11, 12);
+    var m : u64 = bn_u64(13);
+    if (m >= pow10_small(sig)) {
+        m = m / 10;
+        p = p + 1;
+    }
+    var digits : [24]u8 = [0; 24];
+    const dl : u32 = dec_to(digits[0..], m);
+    if (neg) { n = put(o, n, 45); }
+    if (p >= -4 and p < (sig as i32) + 2) {
+        var body : [64]u8 = [0; 64];
+        var bl : u32 = 0;
+        if (p >= 0) {
+            const int_len : u32 = (p + 1) as u32;
+            var j : u32 = 0;
+            while (j < int_len) {
+                if (j < dl) { body[bl as usize] = digits[j as usize]; } else { body[bl as usize] = 48; }
+                bl = bl + 1;
+                j = j + 1;
+            }
+            if (dl > int_len) {
+                body[bl as usize] = 46;
+                bl = bl + 1;
+                j = int_len;
+                while (j < dl) { body[bl as usize] = digits[j as usize]; bl = bl + 1; j = j + 1; }
+            }
+        } else {
+            body[0] = 48;
+            body[1] = 46;
+            bl = 2;
+            var z : i32 = 0;
+            while (z < 0 - p - 1) { body[bl as usize] = 48; bl = bl + 1; z = z + 1; }
+            var j2 : u32 = 0;
+            while (j2 < dl) { body[bl as usize] = digits[j2 as usize]; bl = bl + 1; j2 = j2 + 1; }
+        }
+        var has_dot : bool = false;
+        var t : u32 = 0;
+        while (t < bl) { if (body[t as usize] == 46) { has_dot = true; } t = t + 1; }
+        if (has_dot) {
+            while (bl > 0 and body[(bl - 1) as usize] == 48) { bl = bl - 1; }
+            if (bl > 0 and body[(bl - 1) as usize] == 46) { bl = bl - 1; }
+        }
+        var w : u32 = 0;
+        while (w < bl) { n = put(o, n, body[w as usize]); w = w + 1; }
+        return n;
+    }
+    n = put(o, n, digits[0]);
+    var re : u32 = dl;
+    while (re > 1 and digits[(re - 1) as usize] == 48) { re = re - 1; }
+    if (re > 1) {
+        n = put(o, n, 46);
+        var j3 : u32 = 1;
+        while (j3 < re) { n = put(o, n, digits[j3 as usize]); j3 = j3 + 1; }
+    }
+    n = put(o, n, 101);
+    if (p < 0) {
+        n = put(o, n, 45);
+        return dnum(o, n, (0 - p) as u64);
+    }
+    return dnum(o, n, p as u64);
+}
+
+fn dnum(o: []u8, n0: u32, v: u64) -> u32 {
+    var tmp : [24]u8 = [0; 24];
+    const m : u32 = dec_to(tmp[0..], v);
+    return raw(o, n0, tmp[0..(m as usize)]);
+}
+
+; --- balanced ternary ------------------------------------------------------------------------------------------------
+pub var TR : [200]i32 = [0; 200];
+pub var TR1 : [200]i32 = [0; 200];
+pub var TR_N : usize = 0;
+pub var TR_INT : usize = 0;
+pub var TR_WIDE : bool = false;
+pub var TR_NEG : bool = false;
+
+/// ternaryOf(neg, n, d, frac, maxInt) for n, d in R2, R3. On success the trits are in TR (most significant
+/// first), the scaled integer's magnitude in R5.
+fn ternary_of(neg: bool, frac: u32, max_int: u32) -> u32 {
+    TR_WIDE = false;
+    TR_N = 0;
+    TR_NEG = neg;
+    if (bn_bitlen(2) > bn_bitlen(3) and bn_bitlen(2) - bn_bitlen(3) > WIDE_N) {
+        TR_WIDE = true;
+        return 0;
+    }
+    bn_copy(4, 2);
+    var i : u32 = 0;
+    while (i < frac) { bn_mul_small(4, 4, 3); i = i + 1; }
+    // T = (2 * scaled + d) / (2 * d)
+    bn_shl(8, 4, 1);
+    bn_add(8, 8, 3);
+    bn_shl(9, 3, 1);
+    bn_divmod(5, 10, 8, 9);
+    bn_copy(12, 5);
+    var digits : [200]i32 = [0; 200];
+    var dn : usize = 0;
+    while (BLEN[12] > 0 and dn < 190) {
+        const r : u64 = bn_divmod_small(12, 12, 3);
+        if (r == 0) { digits[dn] = 0; }
+        if (r == 1) { digits[dn] = 1; }
+        if (r == 2) {
+            digits[dn] = -1;
+            bn_add_small(12, 12, 1);
+        }
+        dn = dn + 1;
+    }
+    while (dn < (frac as usize) + 1) { digits[dn] = 0; dn = dn + 1; }
+    const int_trits : usize = dn - (frac as usize);
+    if (int_trits > (max_int as usize)) {
+        TR_WIDE = true;
+        return 0;
+    }
+    var k : usize = 0;
+    while (k < dn) {
+        var t : i32 = digits[dn - 1 - k];
+        if (neg) { t = 0 - t; }
+        TR[k] = t;
+        k = k + 1;
+    }
+    TR_N = dn;
+    TR_INT = int_trits;
+    return 0;
+}
+
+/// The signed value the trits spell, as a magnitude in R2 and its sign in the result.
+fn trits_value(src_arr: u32) -> bool {
+    bn_zero(8);
+    bn_zero(9);
+    var k : usize = 0;
+    while (k < TR_N) {
+        var t : i32 = TR[k];
+        if (src_arr == 1) { t = TR1[k]; }
+        bn_mul_small(8, 8, 3);
+        bn_mul_small(9, 9, 3);
+        if (t == 1) { bn_add_small(8, 8, 1); }
+        if (t == -1) { bn_add_small(9, 9, 1); }
+        k = k + 1;
+    }
+    if (bn_cmp(8, 9) >= 0) {
+        bn_sub(2, 8, 9);
+        return false;
+    }
+    bn_sub(2, 9, 8);
+    return true;
+}
+
+; --- state --------------------------------------------------------------------------------------------------------------
+pub var X : [8256]u8 = [0; 8256];
+pub var X_N : usize = 0;
+pub var ST_R : u32 = 0;
+pub var ST_T : u32 = 0;
+pub var HASH_RAW : [8256]u8 = [0; 8256];
+pub var HASH_N : usize = 0;
+pub var BUILT : bool = false;
+pub var LAYOUT_KIND : u32 = 2;
+pub var LAYOUT_DIFF : [96]u8 = [0; 96];
+pub var LAYOUT_DIFF_N : u32 = 0;
+pub var CK_OKV : u32 = 0;
+pub var CK_OKT : u32 = 0;
+pub var CK_FAIL : [1024]u8 = [0; 1024];
+pub var CK_FAIL_N : u32 = 0;
+pub var CUR_OK : bool = false;
+pub var CUR_BITS : u64 = 0;
+pub var CARD_EMPTY : bool = true;
+pub var BAD_HIDDEN : bool = true;
+pub var HAVE_RES : bool = false;
+pub var COPIED : bool = false;
+pub var HASH_OUT : [8400]u8 = [0; 8400];
+pub var HASH_OUT_N : u32 = 0;
+pub var EFF_VAL : bool = false;
+pub var EFF_COPY : bool = false;
+pub var EFF_SEL : bool = false;
+pub var EFF_TIMER : bool = false;
+pub var BTN_ACT : [64]u32 = [0; 64];
+pub var BTN_N : u32 = 0;
+pub var H_X_SET : bool = false;
+pub var H_X : [8256]u8 = [0; 8256];
+pub var H_X_N : usize = 0;
+pub var H_R : i32 = -1;
+pub var H_T : i32 = -1;
+
+; the last good analysis
+pub var RES_BITS : u64 = 0;
+pub var RES_KIND : u32 = 0;
+pub var RES_DIR : i32 = 0;
+pub var RES_TIE : bool = false;
+pub var RES_OVER : bool = false;
+pub var RES_UNDER : bool = false;
+pub var RES_SIGN : u64 = 0;
+pub var RES_EXP : u64 = 0;
+pub var RES_MANT : u64 = 0;
+pub var RES_CLS : u32 = 0;
+pub var RES_HASQ : bool = false;
+pub var RES_R : u32 = 0;
+pub var RES_NOTE : u32 = 0;
+pub var RES_HEX : [48]u8 = [0; 48];
+pub var RES_HEX_N : u32 = 0;
+pub var RES_DEC : [256]u8 = [0; 256];
+pub var RES_DEC_N : u32 = 0;
+pub var RES_HAS_ERR : bool = false;
+pub var RES_ERR : [160]u8 = [0; 160];
+pub var RES_ERR_N : u32 = 0;
+pub var RES_HAS_REL : bool = false;
+pub var RES_REL : [160]u8 = [0; 160];
+pub var RES_REL_N : u32 = 0;
+pub var RES_ECHO : [8256]u8 = [0; 8256];
+pub var RES_ECHO_N : usize = 0;
+pub var RES_TSTATE : u32 = 0;
+pub var RES_TR : [200]i32 = [0; 200];
+pub var RES_TR_N : usize = 0;
+pub var RES_TR_INT : usize = 0;
+pub var RES_APPROX : [160]u8 = [0; 160];
+pub var RES_APPROX_N : u32 = 0;
+pub var RES_TERR : [160]u8 = [0; 160];
+pub var RES_TERR_N : u32 = 0;
+pub var RES_TRT : bool = false;
+pub var RES_RTBITS : u64 = 0;
+
+fn btn_mark(a: u32) -> u32 {
+    if (BTN_N < 64) { BTN_ACT[BTN_N as usize] = a; }
+    BTN_N = BTN_N + 1;
+    return 0;
+}
+
+; --- the address -----------------------------------------------------------------------------------------------------------
+fn hex_val(b: u8) -> i32 {
+    if (b >= 48 and b <= 57) { return (b as i32) - 48; }
+    if (b >= 97 and b <= 102) { return (b as i32) - 87; }
+    if (b >= 65 and b <= 70) { return (b as i32) - 55; }
+    return -1;
+}
+
+/// A form-urlencoded component s[lo..hi) decoded (plus is a space, %XX a byte) into dst; its length.
+fn url_decode(dst: []u8, s: []const u8, lo: usize, hi: usize) -> usize {
+    var n : usize = 0;
+    var k : usize = lo;
+    while (k < hi and n < dst.len) {
+        const b : u8 = s[k];
+        if (b == 43) {
+            dst[n] = 32;
+            n = n + 1;
+            k = k + 1;
+        } else {
+            if (b == 37 and k + 2 < hi and hex_val(s[k + 1]) >= 0 and hex_val(s[k + 2]) >= 0) {
+                dst[n] = ((hex_val(s[k + 1]) * 16 + hex_val(s[k + 2])) as u8);
+                n = n + 1;
+                k = k + 3;
+            } else {
+                dst[n] = b;
+                n = n + 1;
+                k = k + 1;
+            }
+        }
+    }
+    return n;
+}
+
+/// readHash(): x, r and t of the address's fragment (a leading # dropped); the first of each name counts.
+fn read_hash() -> u32 {
+    H_X_SET = false;
+    H_X_N = 0;
+    H_R = -1;
+    H_T = -1;
+    const h : []const u8 = HASH_RAW[0..HASH_N];
+    var start : usize = 0;
+    if (h.len > 0 and h[0] == 35) { start = 1; }
+    var seen_x : bool = false;
+    var seen_r : bool = false;
+    var seen_t : bool = false;
+    var p : usize = start;
+    while (p <= h.len) {
+        var e : usize = p;
+        while (e < h.len and h[e] != 38) { e = e + 1; }
+        if (e > p) {
+            var eq : usize = p;
+            while (eq < e and h[eq] != 61) { eq = eq + 1; }
+            var name : [64]u8 = [0; 64];
+            const nl : usize = url_decode(name[0..], h, p, eq);
+            var vlo : usize = eq + 1;
+            if (eq >= e) { vlo = e; }
+            if (nl == 1 and name[0] == 120 and !seen_x) {
+                seen_x = true;
+                H_X_SET = true;
+                H_X_N = url_decode(H_X[0..], h, vlo, e);
+            }
+            if (nl == 1 and name[0] == 114 and !seen_r) {
+                seen_r = true;
+                var v : [64]u8 = [0; 64];
+                const vl : usize = url_decode(v[0..], h, vlo, e);
+                H_R = -2;
+                if (eq_s(v[0..vl], K_ROUNDING_IDS[0])) { H_R = 0; }
+                if (eq_s(v[0..vl], K_ROUNDING_IDS[1])) { H_R = 1; }
+            }
+            if (nl == 1 and name[0] == 116 and !seen_t) {
+                seen_t = true;
+                var v2 : [64]u8 = [0; 64];
+                const vl2 : usize = url_decode(v2[0..], h, vlo, e);
+                H_T = 0;
+                if (vl2 == 1 and v2[0] == 49) { H_T = 1; }
+            }
+        }
+        p = e + 1;
+    }
+    return 0;
+}
+
+fn eq_s(a: []const u8, b: []const u8) -> bool {
+    if (a.len != b.len) { return false; }
+    var k : usize = 0;
+    while (k < a.len) {
+        if (a[k] != b[k]) { return false; }
+        k = k + 1;
+    }
+    return true;
+}
+
+/// URLSearchParams.toString for x, r, t, with a leading #.
+fn build_hash_out() -> u32 {
+    var n : u32 = raw(HASH_OUT[0..], 0, "#x=");
+    var k : usize = 0;
+    while (k < X_N) {
+        const b : u8 = X[k];
+        if ((b >= 48 and b <= 57) or (b >= 65 and b <= 90) or (b >= 97 and b <= 122) or b == 42 or b == 45 or b == 46 or b == 95) {
+            n = put(HASH_OUT[0..], n, b);
+        } else {
+            if (b == 32) {
+                n = put(HASH_OUT[0..], n, 43);
+            } else {
+                n = put(HASH_OUT[0..], n, 37);
+                const hi : u8 = b / 16;
+                const lo : u8 = b % 16;
+                if (hi < 10) { n = put(HASH_OUT[0..], n, hi + 48); } else { n = put(HASH_OUT[0..], n, hi + 55); }
+                if (lo < 10) { n = put(HASH_OUT[0..], n, lo + 48); } else { n = put(HASH_OUT[0..], n, lo + 55); }
+            }
+        }
+        k = k + 1;
+    }
+    n = raw(HASH_OUT[0..], n, "&r=");
+    n = raw(HASH_OUT[0..], n, K_ROUNDING_IDS[ST_R as usize]);
+    n = raw(HASH_OUT[0..], n, "&t=");
+    if (ST_T == 1) { n = put(HASH_OUT[0..], n, 49); } else { n = put(HASH_OUT[0..], n, 48); }
+    HASH_OUT_N = n;
+    return 0;
+}
+
+; --- the analysis ---------------------------------------------------------------------------------------------------------
+fn x_trim(lo_out: u32) -> usize {
+    // state.x.trim(): the range of X that is not white space, copied to RES_ECHO; its length
+    var lo : usize = 0;
+    var hi : usize = X_N;
+    while (lo < hi) {
+        const w : usize = ws_fwd(X[0..X_N], lo);
+        if (w == 0) { break; }
+        lo = lo + w;
+    }
+    while (hi > lo) {
+        const w2 : usize = ws_back(X[0..hi], hi);
+        if (w2 == 0) { break; }
+        hi = hi - w2;
+    }
+    var n : usize = 0;
+    while (lo < hi) {
+        RES_ECHO[n] = X[lo];
+        n = n + 1;
+        lo = lo + 1;
+    }
+    return n;
+}
+
+fn same_trits(a_n: usize) -> bool {
+    var k : usize = 0;
+    while (k < a_n) {
+        if (TR[k] != TR1[k]) { return false; }
+        k = k + 1;
+    }
+    return true;
+}
+
+/// analyse(raw, c, L, mode): fills RES_* and returns true, or returns false when the text is not read.
+fn analyse(even: bool) -> bool {
+    parse_number(X[0..X_N]);
+    if (P_KIND == 0) { return false; }
+    const kind : u32 = P_KIND;
+    const pneg : bool = P_NEG;
+    encode_parsed(even);
+    RES_BITS = E_BITS;
+    RES_DIR = E_DIR;
+    RES_TIE = E_TIE;
+    RES_OVER = E_OVER;
+    RES_UNDER = E_UNDER;
+    RES_KIND = kind;
+    decode_bits(E_BITS);
+    RES_SIGN = D_SIGN;
+    RES_EXP = D_EXP;
+    RES_MANT = D_MANT;
+    RES_CLS = D_CLS;
+    RES_HASQ = D_HASQ;
+    const dq : u64 = D_Q;
+    const dk : i64 = D_K;
+    const dneg : bool = D_SIGN == 1;
+    RES_R = ST_R;
+    RES_NOTE = ST_T;
+    RES_HEX_N = hex_to(RES_HEX[0..], 0, E_BITS);
+    if (D_HASQ) { RES_DEC_N = exact_decimal(RES_DEC[0..], 0, dq, dk, dneg); } else { RES_DEC_N = 0; }
+    RES_ECHO_N = x_trim(0);
+    // the error of the rounding
+    RES_HAS_ERR = false;
+    RES_HAS_REL = false;
+    if (kind == 4 and RES_HASQ) {
+        var shift : u32 = 0;
+        bn_from_u64(5, dq);
+        if (dk >= 0) {
+            bn_shl(5, 5, dk as u32);
+        } else {
+            shift = (0 - dk) as u32;
+        }
+        bn_mul(4, 5, W_R_D);
+        if (shift > 0) { bn_shl(5, W_R_N, shift); } else { bn_copy(5, W_R_N); }
+        var diff_neg : bool = false;
+        if (bn_cmp(4, 5) >= 0) {
+            bn_sub(6, 4, 5);
+        } else {
+            bn_sub(6, 5, 4);
+            diff_neg = true;
+        }
+        if (shift > 0) { bn_shl(7, W_R_D, shift); } else { bn_copy(7, W_R_D); }
+        RES_ERR_N = fmt_sig(RES_ERR[0..], 0, diff_neg != pneg, K_SIG_DIGITS as u32);
+        RES_HAS_ERR = true;
+        if (BLEN[W_R_N] > 0) {
+            if (shift > 0) { bn_shl(7, W_R_N, shift); } else { bn_copy(7, W_R_N); }
+            RES_REL_N = fmt_sig(RES_REL[0..], 0, diff_neg, K_SIG_DIGITS as u32);
+            RES_HAS_REL = true;
+        }
+    }
+    // the ternary row: the number the input names, or the raw bits decoded
+    var has_src : bool = false;
+    var sneg : bool = false;
+    if (kind == 4) {
+        has_src = true;
+        sneg = pneg;
+        bn_copy(2, W_R_N);
+        bn_copy(3, W_R_D);
+    }
+    if (kind == 1 and RES_HASQ) {
+        has_src = true;
+        sneg = dneg;
+        if (dk >= 0) {
+            bn_from_u64(2, dq);
+            bn_shl(2, 2, dk as u32);
+            bn_from_u64(3, 1);
+        } else {
+            bn_from_u64(2, dq);
+            bn_from_u64(3, 1);
+            bn_shl(3, 3, (0 - dk) as u32);
+        }
+    }
+    RES_TSTATE = 0;
+    RES_TRT = false;
+    if (has_src) {
+        const frac : u32 = K_TERNARY_FRAC_TRITS as u32;
+        ternary_of(sneg, frac, K_TERNARY_MAX_TRITS as u32);
+        if (TR_WIDE) {
+            RES_TSTATE = 1;
+        } else {
+            RES_TSTATE = 2;
+            RES_TR_N = TR_N;
+            RES_TR_INT = TR_INT;
+            var q : usize = 0;
+            while (q < TR_N) { RES_TR[q] = TR[q]; TR1[q] = TR[q]; q = q + 1; }
+            // t.approx
+            bn_copy(6, 5);
+            bn_set_pow(7, 3, frac);
+            RES_APPROX_N = fmt_sig(RES_APPROX[0..], 0, sneg, 10);
+            // t.err = T * d - s * n * 3^frac over 3^frac * d
+            bn_mul(4, 5, 3);
+            bn_copy(8, 2);
+            var i : u32 = 0;
+            while (i < frac) { bn_mul_small(8, 8, 3); i = i + 1; }
+            var tneg : bool = false;
+            if (bn_cmp(4, 8) >= 0) {
+                bn_sub(6, 4, 8);
+            } else {
+                bn_sub(6, 8, 4);
+                tneg = true;
+            }
+            bn_copy(7, 3);
+            i = 0;
+            while (i < frac) { bn_mul_small(7, 7, 3); i = i + 1; }
+            RES_TERR_N = fmt_sig(RES_TERR[0..], 0, tneg != sneg, K_SIG_DIGITS as u32);
+            // read the trits back and write them again
+            const back_neg : bool = trits_value(0);
+            bn_set_pow(3, 3, frac);
+            ternary_of(back_neg, frac, K_TERNARY_MAX_TRITS as u32);
+            RES_TRT = !TR_WIDE and TR_N == RES_TR_N and same_trits(RES_TR_N);
+        }
+    }
+    // the decoded value, encoded again
+    if (RES_HASQ) {
+        if (dk >= 0) {
+            bn_from_u64(W_R_N, dq);
+            bn_shl(W_R_N, W_R_N, dk as u32);
+            bn_from_u64(W_R_D, 1);
+        } else {
+            bn_from_u64(W_R_N, dq);
+            bn_from_u64(W_R_D, 1);
+            bn_shl(W_R_D, W_R_D, (0 - dk) as u32);
+        }
+        encode_exact(dneg, even);
+        RES_RTBITS = E_BITS;
+    } else {
+        var sb : u64 = 0;
+        if (dneg) { sb = pow2(LB - 1); }
+        if (RES_CLS == 3) { RES_RTBITS = sb + (LEXPMAX << LM); } else { RES_RTBITS = LNAN; }
+    }
+    return true;
+}
+
+fn is_blank() -> bool {
+    var lo : usize = 0;
+    while (lo < X_N) {
+        const w : usize = ws_fwd(X[0..X_N], lo);
+        if (w == 0) { return false; }
+        lo = lo + w;
+    }
+    return true;
+}
+
+/// update(writeHash)
+fn update_page(write_hash: bool) -> u32 {
+    if (write_hash) { build_hash_out(); }
+    const a : bool = analyse(ST_R == 0);
+    CUR_OK = a;
+    if (a) { CUR_BITS = RES_BITS; HAVE_RES = true; }
+    BAD_HIDDEN = a or is_blank();
+    CARD_EMPTY = !a;
+    return 0;
+}
+
+fn set_x_from(s: []const u8) -> u32 {
+    var n : usize = s.len;
+    if (n > W_X_CAP) { n = W_X_CAP; }
+    var k : usize = 0;
+    while (k < n) { X[k] = s[k]; k = k + 1; }
+    X_N = n;
+    return 0;
+}
+
+; --- the layout file and the self-check -----------------------------------------------------------------------------------
+pub var RL : [8]u64 = [0; 8];
+
+fn skip_space(t: []const u8, p0: usize) -> usize {
+    var p : usize = p0;
+    while (p < t.len) {
+        const w : usize = ws_fwd(t, p);
+        if (w == 0) { break; }
+        p = p + w;
+    }
+    return p;
+}
+
+fn word_at(t: []const u8, p: usize, w: []const u8) -> bool {
+    if (p + w.len > t.len) { return false; }
+    var k : usize = 0;
+    while (k < w.len) {
+        if (t[p + k] != w[k]) { return false; }
+        k = k + 1;
+    }
+    return true;
+}
+
+/// The value of  pub const NAME : type = value ;  on its own line, first such line; -1 when none.
+fn find_const(t: []const u8, name: []const u8) -> i64 {
+    var ls : usize = 0;
+    while (ls <= t.len) {
+        var p : usize = skip_space(t, ls);
+        var good : bool = true;
+        if (!word_at(t, p, "pub")) { good = false; }
+        if (good) {
+            p = p + 3;
+            const a : usize = skip_space(t, p);
+            if (a == p) { good = false; }
+            p = a;
+        }
+        if (good and !word_at(t, p, "const")) { good = false; }
+        if (good) {
+            p = p + 5;
+            const a2 : usize = skip_space(t, p);
+            if (a2 == p) { good = false; }
+            p = a2;
+        }
+        if (good and !word_at(t, p, name)) { good = false; }
+        if (good) {
+            p = skip_space(t, p + name.len);
+            if (p >= t.len or t[p] != 58) { good = false; }
+        }
+        if (good) {
+            p = skip_space(t, p + 1);
+            const tl : usize = p;
+            while (p < t.len and ((t[p] >= 97 and t[p] <= 122) or (t[p] >= 48 and t[p] <= 57))) { p = p + 1; }
+            if (p == tl) { good = false; }
+        }
+        if (good) {
+            p = skip_space(t, p);
+            if (p >= t.len or t[p] != 61) { good = false; }
+        }
+        if (good) {
+            p = skip_space(t, p + 1);
+            var v : u64 = 0;
+            var digits : usize = 0;
+            if (p + 2 < t.len + 1 and word_at(t, p, "0x") and p + 2 < t.len and hex_val(t[p + 2]) >= 0) {
+                p = p + 2;
+                while (p < t.len and hex_val(t[p]) >= 0) {
+                    if (v < 1152921504606846976) { v = v * 16 + (hex_val(t[p]) as u64); }
+                    p = p + 1;
+                    digits = digits + 1;
+                }
+            } else {
+                while (p < t.len and t[p] >= 48 and t[p] <= 57) {
+                    if (v < 1844674407370955161) { v = v * 10 + ((t[p] - 48) as u64); }
+                    p = p + 1;
+                    digits = digits + 1;
+                }
+            }
+            if (digits == 0) { good = false; }
+            if (good) {
+                p = skip_space(t, p);
+                if (p >= t.len or t[p] != 59) { good = false; }
+            }
+            if (good) { return v as i64; }
+        }
+        // the next line start
+        var q : usize = ls;
+        while (q < t.len and t[q] != 10 and t[q] != 13) { q = q + 1; }
+        ls = q + 1;
+    }
+    return -1;
+}
+
+/// layoutFromSpecText: true and RL = bits, e, m, bias, expMax, nan when the file reads and is consistent.
+fn read_layout(t: []const u8) -> bool {
+    const sign_shift : i64 = find_const(t, "SIGN_SHIFT");
+    const exp_shift : i64 = find_const(t, "EXP_SHIFT");
+    const exp_max : i64 = find_const(t, "EXP_MAX");
+    const bias : i64 = find_const(t, "BIAS");
+    const mant_mask : i64 = find_const(t, "MANT_MASK");
+    const nan : i64 = find_const(t, "GF16_NAN");
+    if (sign_shift < 0 or exp_shift < 0 or exp_max < 0 or bias < 0 or mant_mask < 0 or nan < 0) { return false; }
+    const mant : i64 = exp_shift;
+    const exp : i64 = sign_shift - exp_shift;
+    if (!(mant > 0 and exp > 0)) { return false; }
+    if (mant > 30 or exp > 8 or sign_shift + 1 > 40) { return false; }
+    if (mant_mask != (1 << mant) - 1 or exp_max != (1 << exp) - 1) { return false; }
+    RL[0] = (sign_shift + 1) as u64;
+    RL[1] = exp as u64;
+    RL[2] = mant as u64;
+    RL[3] = bias as u64;
+    RL[4] = exp_max as u64;
+    RL[5] = nan as u64;
+    return true;
+}
+
+fn push_name(n0: u32, w: []const u8) -> u32 {
+    var n : u32 = n0;
+    if (n > 0) { n = raw(LAYOUT_DIFF[0..], n, ", "); }
+    return raw(LAYOUT_DIFF[0..], n, w);
+}
+
+fn load_layout(t: []const u8, have: bool) -> u32 {
+    set_spec_layout();
+    LAYOUT_KIND = 2;
+    LAYOUT_DIFF_N = 0;
+    if (have and read_layout(t)) {
+        var n : u32 = 0;
+        if (RL[0] != (K_BITS as u64)) { n = push_name(n, "bits"); }
+        if (1 != (K_SIGN_BITS as u64)) { n = push_name(n, "s"); }
+        if (RL[1] != (K_EXP_BITS as u64)) { n = push_name(n, "e"); }
+        if (RL[2] != (K_MANT_BITS as u64)) { n = push_name(n, "m"); }
+        if (RL[3] != (K_BIAS as u64)) { n = push_name(n, "bias"); }
+        if (RL[4] != (K_EXP_MAX as u64)) { n = push_name(n, "expMax"); }
+        if (RL[5] != (K_NAN_BITS as u64)) { n = push_name(n, "nan"); }
+        LAYOUT_DIFF_N = n;
+        LB = RL[0];
+        LE = RL[1];
+        LM = RL[2];
+        LBIAS = RL[3];
+        LEXPMAX = RL[4];
+        LNAN = RL[5];
+        if (n > 0) { LAYOUT_KIND = 1; } else { LAYOUT_KIND = 0; }
+    }
+    return 0;
+}
+
+fn check_name(n0: u32, w: []const u8) -> u32 {
+    var n : u32 = n0;
+    if (n > 0) { n = raw(CK_FAIL[0..], n, ", "); }
+    return raw(CK_FAIL[0..], n, w);
+}
+
+/// runChecks(c, L): the 20 conformance vectors and the four tie vectors.
+fn run_checks() -> u32 {
+    CK_OKV = 0;
+    CK_OKT = 0;
+    CK_FAIL_N = 0;
+    var i : usize = 0;
+    var failed : u32 = 0;
+    while (i < 20) {
+        parse_number(K_CHECK_INPUTS[i]);
+        var good : bool = false;
+        if (P_KIND != 0) {
+            encode_parsed(true);
+            good = E_BITS == (K_CHECK_BITS[i] as u64);
+        }
+        if (good) { CK_OKV = CK_OKV + 1; } else { failed = check_name(failed, K_CHECK_NAMES[i]); }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 2) {
+        var m : u32 = 0;
+        while (m < 2) {
+            parse_number(K_TIE_INPUTS[i]);
+            encode_parsed(m == 0);
+            var want : u64 = K_TIE_BITS_EVEN[i] as u64;
+            if (m == 1) { want = K_TIE_BITS_ZERO[i] as u64; }
+            if (E_BITS == want) {
+                CK_OKT = CK_OKT + 1;
+            } else {
+                failed = check_name(failed, K_TIE_INPUTS[i]);
+                failed = raw(CK_FAIL[0..], failed, "/");
+                failed = raw(CK_FAIL[0..], failed, K_ROUNDING_IDS[m as usize]);
+            }
+            m = m + 1;
+        }
+        i = i + 1;
+    }
+    CK_FAIL_N = failed;
+    return 0;
+}
+
+/// The page is built once the layout file has been read or has failed.
+fn build_page(t: []const u8, have: bool) -> u32 {
+    load_layout(t, have);
+    // 3^K_TERNARY_MAX_TRITS - 1 has as many bits as ceil(log2(3^max))
+    bn_set_pow(4, 3, K_TERNARY_MAX_TRITS as u32);
+    bn_from_u64(5, 1);
+    bn_sub(4, 4, 5);
+    WIDE_N = bn_bitlen(4) + 2;
+    run_checks();
+    read_hash();
+    if (H_X_SET) { set_x_from(H_X[0..H_X_N]); } else { set_x_from(K_DEFAULT_INPUT); }
+    ST_R = 0;
+    if (H_R >= 0) { ST_R = H_R as u32; }
+    ST_T = 0;
+    if (H_T == 1) { ST_T = 1; }
+    BUILT = true;
+    COPIED = false;
+    HAVE_RES = false;
+    update_page(false);
+    return 0;
+}
+
+; --- drawing ------------------------------------------------------------------------------------------------------------------
+fn sdec(o: []u8, v: i64) -> u32 {
+    var n : u32 = 0;
+    var x : i64 = v;
+    if (v < 0) {
+        o[0] = 45;
+        n = 1;
+        x = 0 - v;
+    }
+    var tmp : [24]u8 = [0; 24];
+    const m : u32 = dec_to(tmp[0..], x as u64);
+    return raw(o, n, tmp[0..(m as usize)]);
+}
+
+fn udec(o: []u8, v: u64) -> u32 {
+    return dec_to(o, v);
+}
+
+fn dd_open(o: []u8, n0: u32, term: []const u8, cls: []const u8) -> u32 {
+    var n : u32 = raw(o, n0, "<dt>");
+    n = text(o, n, term);
+    n = raw(o, n, "</dt><dd");
+    if (cls.len > 0) {
+        n = raw(o, n, " class=\"");
+        n = raw(o, n, cls);
+        n = raw(o, n, "\"");
+    }
+    return raw(o, n, ">");
+}
+
+fn row_text(o: []u8, n0: u32, term: []const u8, cls: []const u8, val: []const u8) -> u32 {
+    var n : u32 = dd_open(o, n0, term, cls);
+    n = text(o, n, val);
+    return raw(o, n, "</dd>");
+}
+
+fn emit_gf16_facts(o: []u8, n0: u32) -> u32 {
+    var n : u32 = n0;
+    if (!HAVE_RES) { return n; }
+    var a : [32]u8 = [0; 32];
+    var b : [32]u8 = [0; 32];
+    var c : [32]u8 = [0; 32];
+    n = row_text(o, n, SAY_FIELD_NAMES[0], "g16-f0", SAY_SIGN_DETAIL[RES_SIGN as usize]);
+    n = dd_open(o, n, SAY_FIELD_NAMES[1], "g16-f1");
+    const al : u32 = udec(a[0..], RES_EXP);
+    if (RES_EXP == LEXPMAX) {
+        n = fill_named(o, n, SAY_EXP_SPECIAL, "e", a[0..(al as usize)], "", "", "", "", "", "", "", "", "", "");
+    } else {
+        if (RES_EXP == 0) {
+            const ul : u32 = sdec(b[0..], 1 - (LBIAS as i64));
+            n = fill_named(o, n, SAY_EXP_SUBNORMAL, "u", b[0..(ul as usize)], "", "", "", "", "", "", "", "", "", "");
+        } else {
+            const bl : u32 = udec(b[0..], LBIAS);
+            const ul2 : u32 = sdec(c[0..], (RES_EXP as i64) - (LBIAS as i64));
+            n = fill_named(o, n, SAY_EXP_DETAIL, "e", a[0..(al as usize)], "b", b[0..(bl as usize)], "u", c[0..(ul2 as usize)], "", "", "", "", "", "");
+        }
+    }
+    n = raw(o, n, "</dd>");
+    n = dd_open(o, n, SAY_FIELD_NAMES[2], "g16-f2");
+    const ml : u32 = udec(a[0..], RES_MANT);
+    const ol : u32 = udec(b[0..], pow2(LM));
+    n = fill_named(o, n, SAY_MANT_DETAIL, "m", a[0..(ml as usize)], "one", b[0..(ol as usize)], "", "", "", "", "", "", "", "");
+    n = raw(o, n, "</dd>");
+    n = row_text(o, n, SAY_CLASS_LABEL, "", SAY_CLASS_NAMES[RES_CLS as usize]);
+    if (RES_KIND == 1) {
+        n = row_text(o, n, SAY_RAW_ECHO, "", RES_HEX[0..(RES_HEX_N as usize)]);
+    } else {
+        n = row_text(o, n, SAY_INPUT_ECHO, "", RES_ECHO[0..RES_ECHO_N]);
+    }
+    if (RES_HASQ) { n = row_text(o, n, SAY_DECODED, "g16-big", RES_DEC[0..(RES_DEC_N as usize)]); }
+    if (RES_HAS_ERR) {
+        n = row_text(o, n, SAY_ERROR, "", RES_ERR[0..(RES_ERR_N as usize)]);
+        if (RES_HAS_REL) { n = row_text(o, n, SAY_REL_ERROR, "", RES_REL[0..(RES_REL_N as usize)]); }
+    }
+    if (RES_KIND == 4) {
+        n = dd_open(o, n, SAY_ROUNDED_LABEL, "");
+        if (RES_OVER) {
+            n = text(o, n, SAY_OVERFLOW);
+        } else {
+            if (RES_UNDER) {
+                n = text(o, n, SAY_UNDERFLOW);
+            } else {
+                if (RES_DIR == 0) { n = text(o, n, SAY_ROUNDED_NAMES[0]); }
+                if (RES_DIR < 0) { n = text(o, n, SAY_ROUNDED_NAMES[1]); }
+                if (RES_DIR > 0) { n = text(o, n, SAY_ROUNDED_NAMES[2]); }
+            }
+        }
+        if (RES_TIE) {
+            n = raw(o, n, "; ");
+            n = fill_named(o, n, SAY_TIE, "rule", SAY_ROUNDING_NAMES[RES_R as usize], "", "", "", "", "", "", "", "", "", "");
+        }
+        n = raw(o, n, "</dd>");
+    }
+    return n;
+}
+
+fn emit_ternary(o: []u8, n0: u32) -> u32 {
+    var n : u32 = n0;
+    if (!HAVE_RES) { return n; }
+    if (RES_TSTATE == 0) {
+        n = raw(o, n, "<p class=\"g16-note\">");
+        n = text(o, n, SAY_TERNARY_NONE);
+        return raw(o, n, "</p>");
+    }
+    if (RES_TSTATE == 1) {
+        var m : [24]u8 = [0; 24];
+        const ml : u32 = udec(m[0..], K_TERNARY_MAX_TRITS as u64);
+        n = raw(o, n, "<p class=\"g16-note\">");
+        n = fill_named(o, n, SAY_TERNARY_TOO_WIDE, "n", m[0..(ml as usize)], "", "", "", "", "", "", "", "", "", "");
+        return raw(o, n, "</p>");
+    }
+    var idx : usize = 0;
+    while (idx < RES_TR_N) {
+        const d : i32 = RES_TR[idx];
+        if (idx == RES_TR_INT) { n = raw(o, n, "<span class=\"g16-point\">.</span>"); }
+        const p : i64 = (RES_TR_INT as i64) - 1 - (idx as i64);
+        var db : [24]u8 = [0; 24];
+        var pb : [24]u8 = [0; 24];
+        const dl : u32 = sdec(db[0..], d as i64);
+        const pl : u32 = sdec(pb[0..], p);
+        n = raw(o, n, "<span class=\"g16-trit g16-t");
+        n = dnum(o, n, ((d + 1) as u64));
+        n = raw(o, n, "\"");
+        var ttl : [96]u8 = [0; 96];
+        const tl : u32 = fill_named(ttl[0..], 0, SAY_TRIT_TITLE, "d", db[0..(dl as usize)], "p", pb[0..(pl as usize)], "", "", "", "", "", "", "", "");
+        n = raw(o, n, " title=\"");
+        n = raw(o, n, ttl[0..(tl as usize)]);
+        n = raw(o, n, "\">");
+        n = text(o, n, K_TRIT_GLYPHS[(RES_NOTE as usize) * 3 + ((d + 1) as usize)]);
+        n = raw(o, n, "</span>");
+        idx = idx + 1;
+    }
+    return n;
+}
+
+fn emit_ternary_facts(o: []u8, n0: u32) -> u32 {
+    var n : u32 = n0;
+    if (!HAVE_RES or RES_TSTATE != 2) { return n; }
+    var cb : [24]u8 = [0; 24];
+    const cl : u32 = udec(cb[0..], RES_TR_N as u64);
+    var tmp : [160]u8 = [0; 160];
+    var tl : u32 = raw(tmp[0..], 0, SAY_APPROX);
+    tl = raw(tmp[0..], tl, " ");
+    tl = raw(tmp[0..], tl, RES_APPROX[0..(RES_APPROX_N as usize)]);
+    tl = raw(tmp[0..], tl, " (");
+    tl = fill_named(tmp[0..], tl, SAY_TRIT_COUNT, "n", cb[0..(cl as usize)], "", "", "", "", "", "", "", "", "", "");
+    tl = raw(tmp[0..], tl, ")");
+    n = row_text(o, n, SAY_TERNARY_VALUE, "", tmp[0..(tl as usize)]);
+    return row_text(o, n, SAY_ERROR, "", RES_TERR[0..(RES_TERR_N as usize)]);
+}
+
+fn same_dd(o: []u8, n0: u32, good: bool) -> u32 {
+    var n : u32 = n0;
+    if (good) {
+        n = raw(o, n, "<dd class=\"g16-ok\">");
+        n = text(o, n, SAY_SAME);
+    } else {
+        n = raw(o, n, "<dd class=\"g16-warn\">");
+        n = text(o, n, SAY_DIFFERENT);
+    }
+    return raw(o, n, "</dd>");
+}
+
+fn emit_roundtrip(o: []u8, n0: u32) -> u32 {
+    var n : u32 = n0;
+    if (!HAVE_RES) { return n; }
+    var hb : [48]u8 = [0; 48];
+    const hl : u32 = hex_to(hb[0..], 0, RES_RTBITS);
+    n = raw(o, n, "<dt>");
+    n = fill_named(o, n, SAY_RT_GF16, "hex", hb[0..(hl as usize)], "", "", "", "", "", "", "", "", "", "");
+    n = raw(o, n, "</dt>");
+    n = same_dd(o, n, RES_RTBITS == RES_BITS);
+    if (RES_TSTATE == 2) {
+        n = raw(o, n, "<dt>");
+        n = text(o, n, SAY_RT_TERNARY);
+        n = raw(o, n, "</dt>");
+        n = same_dd(o, n, RES_TRT);
+    }
+    return n;
+}
+
+fn card_open(o: []u8, n0: u32) -> u32 {
+    var n : u32 = raw(o, n0, "<section class=\"g16-card");
+    if (CARD_EMPTY) { n = raw(o, n, " is-empty"); }
+    return raw(o, n, "\">");
+}
+
+fn emit_layout_line(o: []u8, n0: u32) -> u32 {
+    var n : u32 = n0;
+    var file : usize = 0;
+    // fileName = K_LAYOUT_FILE without its leading ../ pairs
+    while (file + 3 <= K_LAYOUT_FILE.len and K_LAYOUT_FILE[file] == 46 and K_LAYOUT_FILE[file + 1] == 46 and K_LAYOUT_FILE[file + 2] == 47) { file = file + 3; }
+    const fname : []const u8 = K_LAYOUT_FILE[file..K_LAYOUT_FILE.len];
+    var sb : [24]u8 = [0; 24];
+    var eb : [24]u8 = [0; 24];
+    var mb : [24]u8 = [0; 24];
+    var bb : [24]u8 = [0; 24];
+    var sv : u64 = 1;
+    if (LAYOUT_KIND == 2) { sv = K_SIGN_BITS as u64; }
+    const sl : u32 = udec(sb[0..], sv);
+    const el : u32 = udec(eb[0..], LE);
+    const ml : u32 = udec(mb[0..], LM);
+    const bl : u32 = udec(bb[0..], LBIAS);
+    if (LAYOUT_KIND == 1) {
+        return fill_named(o, n, SAY_LAYOUT_MISMATCH, "file", fname, "names", LAYOUT_DIFF[0..(LAYOUT_DIFF_N as usize)], "", "", "", "", "", "", "", "");
+    }
+    if (LAYOUT_KIND == 0) {
+        return fill_named(o, n, SAY_LAYOUT_READ, "file", fname, "s", sb[0..(sl as usize)], "e", eb[0..(el as usize)], "m", mb[0..(ml as usize)], "b", bb[0..(bl as usize)], "", "");
+    }
+    return fill_named(o, n, SAY_LAYOUT_FALLBACK, "file", fname, "s", sb[0..(sl as usize)], "e", eb[0..(el as usize)], "m", mb[0..(ml as usize)], "b", bb[0..(bl as usize)], "", "");
+}
+
+pub fn w_render(dst: []u8) -> u32 {
+    if (!BUILT) { return 0; }
+    BTN_N = 0;
+    var n : u32 = raw(dst, 0, "<div class=\"g16\"><div class=\"g16-inputrow\"><label for=\"g16-in\">");
+    n = text(dst, n, SAY_INPUT_LABEL);
+    n = raw(dst, n, "</label><div class=\"g16-inputline\"><input id=\"g16-in\" class=\"g16-input\" type=\"text\" inputmode=\"text\" autocomplete=\"off\" autocapitalize=\"off\" spellcheck=\"false\"");
+    n = attr(dst, n, "placeholder", SAY_INPUT_PLACEHOLDER);
+    n = attr(dst, n, "value", X[0..X_N]);
+    n = raw(dst, n, ">");
+    btn_mark(0);
+    n = raw(dst, n, "<button type=\"button\" class=\"t27-btn\">");
+    if (COPIED) { n = text(dst, n, SAY_COPIED); } else { n = text(dst, n, SAY_COPY_LINK); }
+    n = raw(dst, n, "</button></div></div><div class=\"g16-row\"><span class=\"g16-rowlabel\">");
+    n = text(dst, n, SAY_EXAMPLES_LABEL);
+    n = raw(dst, n, "</span>");
+    var i : u32 = 0;
+    while (i < 7) {
+        btn_mark(10 + i);
+        n = raw(dst, n, "<button type=\"button\" class=\"t27-btn\">");
+        n = text(dst, n, K_EXAMPLES[i as usize]);
+        n = raw(dst, n, "</button>");
+        i = i + 1;
+    }
+    n = raw(dst, n, "</div><div class=\"g16-row\"><span class=\"g16-rowlabel\">");
+    n = text(dst, n, SAY_ROUNDING_LABEL);
+    n = raw(dst, n, "</span>");
+    i = 0;
+    while (i < 2) {
+        btn_mark(20 + i);
+        n = raw(dst, n, "<button type=\"button\" class=\"t27-btn\"");
+        n = attr(dst, n, "title", SAY_ROUNDING_NOTES[i as usize]);
+        n = raw(dst, n, " aria-pressed=\"");
+        if (ST_R == i) { n = raw(dst, n, "true"); } else { n = raw(dst, n, "false"); }
+        n = raw(dst, n, "\">");
+        n = text(dst, n, SAY_ROUNDING_NAMES[i as usize]);
+        n = raw(dst, n, "</button>");
+        i = i + 1;
+    }
+    n = raw(dst, n, "<span class=\"g16-rowlabel\">");
+    n = text(dst, n, SAY_NOTATION_LABEL);
+    n = raw(dst, n, "</span>");
+    i = 0;
+    while (i < 2) {
+        btn_mark(30 + i);
+        n = raw(dst, n, "<button type=\"button\" class=\"t27-btn\" aria-pressed=\"");
+        if (ST_T == i) { n = raw(dst, n, "true"); } else { n = raw(dst, n, "false"); }
+        n = raw(dst, n, "\">");
+        n = text(dst, n, SAY_NOTATION_NAMES[i as usize]);
+        n = raw(dst, n, "</button>");
+        i = i + 1;
+    }
+    n = raw(dst, n, "</div><p class=\"g16-note\">");
+    n = text(dst, n, SAY_ROUNDING_NOTES[ST_R as usize]);
+    n = raw(dst, n, "</p><p class=\"g16-bad\" role=\"alert\"");
+    if (BAD_HIDDEN) { n = raw(dst, n, " hidden=\"\""); }
+    n = raw(dst, n, ">");
+    n = text(dst, n, SAY_BAD_INPUT);
+    n = raw(dst, n, "</p><div class=\"g16-cards\">");
+    // the GF16 card
+    n = card_open(dst, n);
+    n = raw(dst, n, "<h2><span>");
+    n = text(dst, n, SAY_GF16_HEADING);
+    n = raw(dst, n, "</span><span class=\"g16-hex\">");
+    if (HAVE_RES) { n = text(dst, n, RES_HEX[0..(RES_HEX_N as usize)]); }
+    var wb : [24]u8 = [0; 24];
+    const nl : u32 = udec(wb[0..], LB);
+    n = raw(dst, n, "</span></h2><div class=\"g16-bits\" style=\"--n:");
+    n = raw(dst, n, wb[0..(nl as usize)]);
+    n = raw(dst, n, "\">");
+    var j : u64 = 0;
+    while (j < LB) {
+        const bi : u64 = LB - 1 - j;
+        var field : u32 = 2;
+        if (bi == LB - 1) { field = 0; } else { if (bi >= LM) { field = 1; } }
+        btn_mark(100 + (bi as u32));
+        var tb : [24]u8 = [0; 24];
+        var ttl : [64]u8 = [0; 64];
+        const bl : u32 = udec(tb[0..], bi);
+        const tl : u32 = fill_named(ttl[0..], 0, SAY_BIT_TITLE, "i", tb[0..(bl as usize)], "", "", "", "", "", "", "", "", "", "");
+        n = raw(dst, n, "<button type=\"button\" class=\"g16-bit g16-f");
+        n = dnum(dst, n, field as u64);
+        var on : bool = false;
+        if (HAVE_RES) { on = ((RES_BITS >> bi) & 1) == 1; }
+        if (on) { n = raw(dst, n, " is-one"); }
+        n = raw(dst, n, "\" aria-label=\"");
+        n = raw(dst, n, ttl[0..(tl as usize)]);
+        n = raw(dst, n, "\" title=\"");
+        n = raw(dst, n, ttl[0..(tl as usize)]);
+        n = raw(dst, n, "\">");
+        if (HAVE_RES) { if (on) { n = raw(dst, n, "1"); } else { n = raw(dst, n, "0"); } }
+        n = raw(dst, n, "</button>");
+        j = j + 1;
+    }
+    n = raw(dst, n, "</div><div class=\"g16-flabels\" style=\"--n:");
+    n = raw(dst, n, wb[0..(nl as usize)]);
+    n = raw(dst, n, "\">");
+    var f : u32 = 0;
+    while (f < 3) {
+        var w : u64 = 1;
+        if (f == 1) { w = LE; }
+        if (f == 2) { w = LM; }
+        var fb : [24]u8 = [0; 24];
+        const fl : u32 = udec(fb[0..], w);
+        n = raw(dst, n, "<span class=\"g16-flabel g16-f");
+        n = dnum(dst, n, f as u64);
+        n = raw(dst, n, "\" style=\"--w:");
+        n = raw(dst, n, fb[0..(fl as usize)]);
+        n = raw(dst, n, "\">");
+        n = text(dst, n, SAY_FIELD_NAMES[f as usize]);
+        n = raw(dst, n, "</span>");
+        f = f + 1;
+    }
+    n = raw(dst, n, "</div><dl class=\"g16-facts\">");
+    n = emit_gf16_facts(dst, n);
+    n = raw(dst, n, "</dl></section>");
+    // the ternary card
+    n = card_open(dst, n);
+    n = raw(dst, n, "<h2><span>");
+    n = text(dst, n, SAY_TERNARY_HEADING);
+    n = raw(dst, n, "</span></h2><p class=\"g16-note\">");
+    var fr : [24]u8 = [0; 24];
+    const frl : u32 = udec(fr[0..], K_TERNARY_FRAC_TRITS as u64);
+    n = fill_named(dst, n, SAY_TERNARY_NOTE, "f", fr[0..(frl as usize)], "", "", "", "", "", "", "", "", "", "");
+    n = raw(dst, n, "</p><div class=\"g16-trits\">");
+    n = emit_ternary(dst, n);
+    n = raw(dst, n, "</div><dl class=\"g16-facts\">");
+    n = emit_ternary_facts(dst, n);
+    n = raw(dst, n, "</dl></section>");
+    // the round trip
+    n = card_open(dst, n);
+    n = raw(dst, n, "<h2><span>");
+    n = text(dst, n, SAY_ROUNDTRIP_HEADING);
+    n = raw(dst, n, "</span></h2><dl class=\"g16-facts\">");
+    n = emit_roundtrip(dst, n);
+    n = raw(dst, n, "</dl></section></div><div class=\"g16-meta\"><p>");
+    n = emit_layout_line(dst, n);
+    n = raw(dst, n, "</p><p class=\"");
+    if (CK_FAIL_N > 0) { n = raw(dst, n, "g16-warn"); }
+    n = raw(dst, n, "\">");
+    var ob : [24]u8 = [0; 24];
+    var nb : [24]u8 = [0; 24];
+    var tb2 : [24]u8 = [0; 24];
+    var tnb : [24]u8 = [0; 24];
+    const o1 : u32 = udec(ob[0..], CK_OKV as u64);
+    const o2 : u32 = udec(nb[0..], 20);
+    const o3 : u32 = udec(tb2[0..], CK_OKT as u64);
+    const o4 : u32 = udec(tnb[0..], 4);
+    n = fill_named(dst, n, SAY_CONFORMANCE, "ok", ob[0..(o1 as usize)], "n", nb[0..(o2 as usize)], "tok", tb2[0..(o3 as usize)], "tn", tnb[0..(o4 as usize)], "", "", "", "");
+    if (CK_FAIL_N > 0) {
+        n = raw(dst, n, " ");
+        n = fill_named(dst, n, SAY_CONFORMANCE_FAIL, "names", CK_FAIL[0..(CK_FAIL_N as usize)], "", "", "", "", "", "", "", "", "", "");
+    }
+    n = raw(dst, n, "</p></div></div>");
+    if (!ok(n)) { return 0; }
+    return n;
+}
+
+; --- events -----------------------------------------------------------------------------------------------------------------------
+fn clear_effects() -> u32 {
+    EFF_VAL = false;
+    EFF_COPY = false;
+    EFF_SEL = false;
+    EFF_TIMER = false;
+    HASH_OUT_N = 0;
+    return 0;
+}
+
+pub fn w_base(u: []const u8) -> u32 {
+    return 0;
+}
+
+pub fn w_init(h: []const u8) -> u32 {
+    clear_effects();
+    var n : usize = h.len;
+    if (n > 8192) { n = 8192; }
+    var k : usize = 0;
+    while (k < n) { HASH_RAW[k] = h[k]; k = k + 1; }
+    HASH_N = n;
+    set_spec_layout();
+    BUILT = false;
+    HAVE_RES = false;
+    CUR_OK = false;
+    COPIED = false;
+    X_N = 0;
+    ST_R = 0;
+    ST_T = 0;
+    CARD_EMPTY = true;
+    BAD_HIDDEN = true;
+    return 0;
+}
+
+pub fn w_hash(h: []const u8) -> u32 {
+    clear_effects();
+    var n : usize = h.len;
+    if (n > 8192) { n = 8192; }
+    var k : usize = 0;
+    while (k < n) { HASH_RAW[k] = h[k]; k = k + 1; }
+    HASH_N = n;
+    if (!BUILT) { return 0; }
+    read_hash();
+    if (H_X_SET and !eq_s(H_X[0..H_X_N], X[0..X_N])) {
+        set_x_from(H_X[0..H_X_N]);
+        EFF_VAL = true;
+    }
+    if (H_R >= 0) { ST_R = H_R as u32; }
+    if (H_T >= 0) { ST_T = H_T as u32; }
+    update_page(false);
+    return 0;
+}
+
+pub fn w_data(i: u32, s: []const u8) -> u32 {
+    clear_effects();
+    build_page(s, true);
+    return 0;
+}
+
+pub fn w_data_failed(i: u32) -> u32 {
+    clear_effects();
+    build_page("", false);
+    return 0;
+}
+
+pub fn w_input(i: u32, s: []const u8) -> u32 {
+    clear_effects();
+    if (i != 0 or !BUILT) { return 0; }
+    set_x_from(s);
+    update_page(true);
+    return 0;
+}
+
+pub fn w_press(i: u32) -> u32 {
+    clear_effects();
+    if (!BUILT or i >= BTN_N or i >= 64) { return 0; }
+    const a : u32 = BTN_ACT[i as usize];
+    if (a == 0) { EFF_COPY = true; }
+    if (a >= 10 and a < 17) {
+        set_x_from(K_EXAMPLES[(a - 10) as usize]);
+        EFF_VAL = true;
+        update_page(true);
+    }
+    if (a >= 20 and a < 22) {
+        ST_R = a - 20;
+        update_page(true);
+    }
+    if (a >= 30 and a < 32) {
+        ST_T = a - 30;
+        update_page(true);
+    }
+    if (a >= 100 and CUR_OK) {
+        const bits : u64 = CUR_BITS ^ pow2((a - 100) as u64);
+        var hb : [48]u8 = [0; 48];
+        const hl : u32 = hex_to(hb[0..], 0, bits);
+        set_x_from(hb[0..(hl as usize)]);
+        EFF_VAL = true;
+        update_page(true);
+    }
+    return 0;
+}
+
+pub fn w_copied(good: u32) -> u32 {
+    clear_effects();
+    if (good != 0) { COPIED = true; } else { EFF_SEL = true; }
+    EFF_TIMER = true;
+    return 0;
+}
+
+pub fn w_timer(id: u32) -> u32 {
+    clear_effects();
+    COPIED = false;
+    return 0;
+}
+
+pub fn w_hash_out(dst: []u8) -> u32 {
+    if (HASH_OUT_N == 0 or (HASH_OUT_N as usize) > dst.len) { return 0; }
+    var k : usize = 0;
+    while (k < (HASH_OUT_N as usize)) { dst[k] = HASH_OUT[k]; k = k + 1; }
+    return HASH_OUT_N;
+}
+
+/// The effects after the last event, in a fixed order: set the field, copy the link, select the field, start the timer.
+pub fn w_effect(k: u32, dst: []u8) -> u32 {
+    var at : u32 = 0;
+    if (EFF_VAL) {
+        if (at == k) {
+            if ((X_N + 2) > dst.len) { return 0; }
+            dst[0] = 118;
+            dst[1] = 0;
+            var q : usize = 0;
+            while (q < X_N) { dst[2 + q] = X[q]; q = q + 1; }
+            return (X_N + 2) as u32;
+        }
+        at = at + 1;
+    }
+    if (EFF_COPY) {
+        if (at == k) {
+            dst[0] = 99;
+            return 1;
+        }
+        at = at + 1;
+    }
+    if (EFF_SEL) {
+        if (at == k) {
+            dst[0] = 115;
+            dst[1] = 0;
+            return 2;
+        }
+        at = at + 1;
+    }
+    if (EFF_TIMER) {
+        if (at == k) {
+            dst[0] = 116;
+            dst[1] = 0;
+            dst[2] = 49;
+            dst[3] = 53;
+            dst[4] = 48;
+            dst[5] = 48;
+            return 6;
+        }
+    }
+    return 0;
+}
+
+/// The splicer follows only the names a module itself mentions, not the names its imported functions
+/// mention. This anchor mentions every helper the writer calls. Never called.
+pub fn imports_anchor(o: []u8, s: []const u8) -> u32 {
+    var n : u32 = put(o, 0, 0);
+    n = put_escaped(o, n, 0);
+    n = n + OVER + ((H_LT + H_GT + H_AMP + H_QUOTE + H_APOS + H_SPACE + H_SLASH + H_EQ) as u32);
+    n = n + (name_is(s, 0, 0, s) as u32) + (is_word_byte(0) as u32);
+    return n;
+}
+
+; --- Tests of the native page --------------------------------------------------------------------------------------
+; The numbers are the page's own vectors (the spec's K_CHECK_ list, the two ties) and values worked out by hand.
+
+pub var T_OUT : [262144]u8 = [0; 262144];
+pub const W_LAY_T : str = "pub const SIGN_SHIFT : u8 = 15;
+pub const EXP_SHIFT : u8 = 9;
+pub const EXP_MAX : u8 = 0x3F;
+pub const BIAS : i8 = 31;
+pub const MANT_MASK : u16 = 0x1FF;
+pub const GF16_NAN : u16 = 0xFE01;
+";
+pub const W_LAY_B30 : str = "pub const SIGN_SHIFT : u8 = 15;
+pub const EXP_SHIFT : u8 = 9;
+pub const EXP_MAX : u8 = 0x3F;
+pub const BIAS : i8 = 30;
+pub const MANT_MASK : u16 = 0x1FF;
+pub const GF16_NAN : u16 = 0xFE01;
+";
+pub const W_LAY_HALF : str = "pub const SIGN_SHIFT : u8 = 15;
+pub const EXP_SHIFT : u8 = 10;
+pub const EXP_MAX : u8 = 31;
+pub const BIAS : i8 = 15;
+pub const MANT_MASK : u16 = 1023;
+pub const GF16_NAN : u16 = 0xFE01;
+";
+
+fn contains(s: []const u8, w: []const u8) -> bool {
+    if (w.len > s.len) { return false; }
+    var p : usize = 0;
+    while (p + w.len <= s.len) {
+        if (word_at(s, p, w)) { return true; }
+        p = p + 1;
+    }
+    return false;
+}
+
+fn render() -> u32 {
+    return w_render(T_OUT[0..]);
+}
+
+fn has(n: u32, w: []const u8) -> bool {
+    return contains(T_OUT[0..(n as usize)], w);
+}
+
+fn press_act(a: u32) -> u32 {
+    render();
+    var i : u32 = 0;
+    while (i < BTN_N) {
+        if (BTN_ACT[i as usize] == a) {
+            w_press(i);
+            return 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn start(h: []const u8) -> u32 {
+    w_init(h);
+    w_data(0, W_LAY_T);
+    return 0;
+}
+
+fn dec_of(r: usize) -> u64 {
+    var b : [64]u8 = [0; 64];
+    const n : u32 = bn_dec(b[0..], 0, r);
+    var v : u64 = 0;
+    var k : usize = 0;
+    while (k < (n as usize)) { v = v * 10 + ((b[k] - 48) as u64); k = k + 1; }
+    return v;
+}
+
+test the_registers_add_multiply_shift_and_divide_exactly {
+    var b : [128]u8 = [0; 128];
+    bn_set_pow(2, 10, 30);
+    var n : u32 = bn_dec(b[0..], 0, 2);
+    assert eq_s(b[0..(n as usize)], "1000000000000000000000000000000");
+    bn_set_pow(3, 3, 48);
+    n = bn_dec(b[0..], 0, 3);
+    assert eq_s(b[0..(n as usize)], "79766443076872509863361");
+    assert bn_bitlen(3) == 77;
+    bn_mul(4, 2, 3);
+    n = bn_dec(b[0..], 0, 4);
+    assert eq_s(b[0..(n as usize)], "79766443076872509863361000000000000000000000000000000");
+    bn_set_pow(5, 10, 40);
+    bn_add_small(5, 5, 7);
+    bn_set_pow(6, 10, 20);
+    bn_divmod(7, 8, 5, 6);
+    n = bn_dec(b[0..], 0, 7);
+    assert eq_s(b[0..(n as usize)], "100000000000000000000");
+    assert dec_of(8) == 7;
+    bn_from_u64(9, 1);
+    bn_shl(9, 9, 100);
+    n = bn_dec(b[0..], 0, 9);
+    assert eq_s(b[0..(n as usize)], "1267650600228229401496703205376");
+    bn_sub(9, 9, 9);
+    assert BLEN[9] == 0;
+    assert bn_cmp(5, 6) > 0;
+    assert bn_cmp(6, 5) < 0;
+    assert bn_cmp(6, 6) == 0;
+}
+
+test the_number_field_is_read_the_way_parseInput_reads_it {
+    set_spec_layout();
+    parse_number("1.5");
+    assert P_KIND == 4 and !P_NEG;
+    parse_number("  -0x3f3c ");
+    assert P_KIND == 0;
+    parse_number("0X3f3C");
+    assert P_KIND == 1 and P_HEX == 16188;
+    parse_number("0x3F3C0");
+    assert P_KIND == 0;
+    parse_number("0x");
+    assert P_KIND == 0;
+    parse_number("-Infinity");
+    assert P_KIND == 2 and P_NEG;
+    parse_number("+nan");
+    assert P_KIND == 3;
+    parse_number("1_0.5_0e1_0");
+    assert P_KIND == 4;
+    parse_number("");
+    assert P_KIND == 0;
+    parse_number("1e999");
+    assert P_KIND == 4;
+    parse_number("1e1000");
+    assert P_KIND == 0;
+    parse_number("1e-");
+    assert P_KIND == 0;
+    parse_number(".e5");
+    assert P_KIND == 0;
+    parse_number(".5");
+    assert P_KIND == 4;
+    parse_number("5.");
+    assert P_KIND == 4;
+    parse_number("1 2");
+    assert P_KIND == 0;
+    parse_number("0.25");
+    assert dec_of(W_R_N) == 25 and dec_of(W_R_D) == 100;
+}
+
+test the_rounding_matches_the_conformance_pack_and_the_two_tie_rules {
+    set_spec_layout();
+    parse_number("1.618033988749895");
+    encode_parsed(true);
+    assert E_BITS == 16188;
+    assert E_DIR == -1;
+    parse_number("1.0009765625");
+    encode_parsed(true);
+    assert E_BITS == 15872 and E_TIE;
+    encode_parsed(false);
+    assert E_BITS == 15872;
+    parse_number("1.0029296875");
+    encode_parsed(true);
+    assert E_BITS == 15874;
+    encode_parsed(false);
+    assert E_BITS == 15873;
+    parse_number("1e40");
+    encode_parsed(true);
+    assert E_BITS == 32256 and E_OVER and E_DIR == 1;
+    parse_number("1e-13");
+    encode_parsed(true);
+    assert E_BITS == 0 and E_UNDER;
+    parse_number("-1.8189894035458565e-12");
+    encode_parsed(true);
+    assert E_BITS == 32769;
+    parse_number("-0.0");
+    encode_parsed(true);
+    assert E_BITS == 32768 and E_DIR == 0;
+    parse_number("4290772992.0");
+    encode_parsed(true);
+    assert E_BITS == 32255;
+    run_checks();
+    assert CK_OKV == 20 and CK_OKT == 4 and CK_FAIL_N == 0;
+}
+
+test the_code_fields_and_their_exact_decimals {
+    set_spec_layout();
+    decode_bits(16188);
+    assert D_SIGN == 0 and D_EXP == 31 and D_MANT == 316 and D_CLS == 2;
+    var b : [160]u8 = [0; 160];
+    var n : u32 = exact_decimal(b[0..], 0, D_Q, D_K, false);
+    assert eq_s(b[0..(n as usize)], "1.6171875");
+    decode_bits(1);
+    assert D_CLS == 1 and D_Q == 1 and D_K == -39;
+    n = exact_decimal(b[0..], 0, D_Q, D_K, true);
+    assert eq_s(b[0..(n as usize)], "-0.000000000001818989403545856475830078125");
+    decode_bits(32255);
+    n = exact_decimal(b[0..], 0, D_Q, D_K, false);
+    assert eq_s(b[0..(n as usize)], "4290772992");
+    decode_bits(32256);
+    assert D_CLS == 3 and !D_HASQ;
+    decode_bits(65025);
+    assert D_CLS == 4;
+    n = hex_to(b[0..], 0, 15);
+    assert eq_s(b[0..(n as usize)], "0x000F");
+}
+
+test significant_digits_are_rounded_like_fmtSig {
+    var b : [64]u8 = [0; 64];
+    bn_from_u64(6, 1);
+    bn_from_u64(7, 3);
+    var n : u32 = fmt_sig(b[0..], 0, false, 4);
+    assert eq_s(b[0..(n as usize)], "0.3333");
+    bn_from_u64(6, 2);
+    n = fmt_sig(b[0..], 0, true, 4);
+    assert eq_s(b[0..(n as usize)], "-0.6667");
+    bn_from_u64(6, 1);
+    bn_from_u64(7, 1000000000);
+    n = fmt_sig(b[0..], 0, false, 4);
+    assert eq_s(b[0..(n as usize)], "1e-9");
+    bn_from_u64(6, 123456);
+    bn_from_u64(7, 1);
+    n = fmt_sig(b[0..], 0, false, 4);
+    assert eq_s(b[0..(n as usize)], "123500");
+    bn_from_u64(6, 10000000);
+    n = fmt_sig(b[0..], 0, false, 4);
+    assert eq_s(b[0..(n as usize)], "1e7");
+    bn_from_u64(6, 5);
+    bn_from_u64(7, 1000);
+    n = fmt_sig(b[0..], 0, false, 4);
+    assert eq_s(b[0..(n as usize)], "0.005");
+    bn_from_u64(6, 9999);
+    bn_from_u64(7, 10);
+    n = fmt_sig(b[0..], 0, false, 3);
+    assert eq_s(b[0..(n as usize)], "1000");
+    bn_from_u64(6, 0);
+    n = fmt_sig(b[0..], 0, false, 4);
+    assert eq_s(b[0..(n as usize)], "0");
+    bn_from_u64(6, 12345678);
+    bn_from_u64(7, 1);
+    n = fmt_sig(b[0..], 0, false, 10);
+    assert eq_s(b[0..(n as usize)], "12345678");
+}
+
+test the_page_opens_on_the_default_number_with_its_cards {
+    start("");
+    assert BUILT;
+    assert X_N == 17;
+    assert LAYOUT_KIND == 0;
+    const n : u32 = render();
+    assert n > 5000;
+    assert has(n, "<input id=\"g16-in\" class=\"g16-input\" type=\"text\" inputmode=\"text\" autocomplete=\"off\" autocapitalize=\"off\" spellcheck=\"false\" placeholder=\"1.618033988749895 or 0x3F3C\" value=\"1.618033988749895\">");
+    assert has(n, "<span class=\"g16-hex\">0x3F3C</span>");
+    assert has(n, "<div class=\"g16-bits\" style=\"--n:16\"><button type=\"button\" class=\"g16-bit g16-f0\" aria-label=\"bit 15\" title=\"bit 15\">0</button>");
+    assert has(n, "<span class=\"g16-flabel g16-f1\" style=\"--w:6\">exponent</span>");
+    assert has(n, "<dt>decoded, exactly</dt><dd class=\"g16-big\">1.6171875</dd><dt>error</dt><dd>-0.0008465</dd><dt>relative error</dt><dd>-0.0005232</dd><dt>rounding</dt><dd>rounded down in magnitude</dd>");
+    assert has(n, "<span class=\"g16-trit g16-t1\" title=\"0 x 3^0\">0</span><span class=\"g16-point\">.</span>") == false;
+    assert has(n, "<dt>these trits are</dt><dd>about 1.61804603 (11 trits)</dd><dt>error</dt><dd>1.204e-5</dd>");
+    assert has(n, "<dt>decoded value, encoded again: 0x3F3C</dt><dd class=\"g16-ok\">same</dd><dt>trits read back, written again</dt><dd class=\"g16-ok\">same</dd>");
+    assert has(n, "<p>Layout read from t27/files/specs/numeric/gf16.t27: S1 E6 M9, bias 31.</p><p class=\"\">20 of 20 vectors from gf16_conformance_v0.json encode bit-exact on this page; tie vectors 4 of 4.</p>");
+    assert has(n, "<section class=\"g16-card is-empty\">") == false;
+    assert has(n, "<p class=\"g16-bad\" role=\"alert\" hidden=\"\">");
+    assert BTN_N == 28;
+}
+
+test the_address_sets_the_number_the_rounding_and_the_notation_and_typing_writes_it_back {
+    start("#x=0x7E00&r=zero&t=1");
+    assert X_N == 6;
+    assert ST_R == 1 and ST_T == 1;
+    var n : u32 = render();
+    assert has(n, "aria-pressed=\"true\">toward zero</button>");
+    assert has(n, "aria-pressed=\"true\">- 0 +</button>");
+    assert has(n, "<dt>class</dt><dd>infinity</dd>");
+    assert has(n, "<p class=\"g16-note\">Infinity and NaN have no ternary digits.</p>");
+    w_input(0, "a b&c");
+    assert HASH_OUT_N > 0;
+    var h : [64]u8 = [0; 64];
+    const hl : u32 = w_hash_out(h[0..]);
+    assert eq_s(h[0..(hl as usize)], "#x=a+b%26c&r=zero&t=1");
+    n = render();
+    // the text is not a number: the cards keep what they showed, marked empty, and the message shows
+    assert has(n, "<section class=\"g16-card is-empty\">");
+    assert has(n, "<p class=\"g16-bad\" role=\"alert\">");
+    assert has(n, "<span class=\"g16-hex\">0x7E00</span>");
+    assert CUR_OK == false;
+    w_input(0, "   ");
+    n = render();
+    assert has(n, "<p class=\"g16-bad\" role=\"alert\" hidden=\"\">");
+    w_hash("#x=2&r=bogus&t=0");
+    assert X_N == 1;
+    assert ST_R == 1 and ST_T == 0;
+    assert EFF_VAL;
+    assert HASH_OUT_N == 0;
+}
+
+test the_buttons_flip_bits_set_examples_and_move_the_toggles {
+    start("");
+    assert press_act(100 + 15) == 1;
+    assert X_N == 6;
+    assert EFF_VAL;
+    var e : [64]u8 = [0; 64];
+    const el : u32 = w_effect(0, e[0..]);
+    assert el == 8;
+    assert e[0] == 118 and e[1] == 0 and e[2] == 48 and e[3] == 120 and e[4] == 66;
+    assert press_act(11) == 1;
+    assert X_N == 3;
+    assert eq_s(X[0..X_N], "0.1");
+    assert press_act(21) == 1;
+    assert ST_R == 1;
+    assert press_act(31) == 1;
+    assert ST_T == 1;
+    var h : [64]u8 = [0; 64];
+    const hl : u32 = w_hash_out(h[0..]);
+    assert eq_s(h[0..(hl as usize)], "#x=0.1&r=zero&t=1");
+    w_input(0, "oops");
+    assert press_act(100 + 3) == 1;
+    assert X_N == 4;
+}
+
+test the_copy_button_asks_the_host_and_the_label_comes_back_on_a_timer {
+    start("");
+    assert press_act(0) == 1;
+    var e : [8]u8 = [0; 8];
+    assert w_effect(0, e[0..]) == 1;
+    assert e[0] == 99;
+    w_copied(1);
+    var n : u32 = render();
+    assert has(n, "<button type=\"button\" class=\"t27-btn\">Copied</button>");
+    assert w_effect(0, e[0..]) == 6;
+    assert e[0] == 116 and e[2] == 49 and e[3] == 53 and e[4] == 48 and e[5] == 48;
+    w_timer(0);
+    n = render();
+    assert has(n, "<button type=\"button\" class=\"t27-btn\">Copy link</button>");
+    w_copied(0);
+    assert w_effect(0, e[0..]) == 2;
+    assert e[0] == 115;
+    assert w_effect(1, e[0..]) == 6;
+    n = render();
+    assert has(n, "<button type=\"button\" class=\"t27-btn\">Copy link</button>");
+}
+
+test a_layout_that_disagrees_is_used_and_said_and_a_missing_one_falls_back {
+    w_init("");
+    w_data(0, W_LAY_B30);
+    assert LAYOUT_KIND == 1;
+    assert LBIAS == 30;
+    var n : u32 = render();
+    assert has(n, "t27/files/specs/numeric/gf16.t27 and this widget&#39;s spec disagree (bias); the page uses t27/files/specs/numeric/gf16.t27.");
+    assert has(n, "Failed here: ");
+    w_init("");
+    w_data(0, W_LAY_HALF);
+    assert LAYOUT_KIND == 1 and LM == 10 and LE == 5;
+    n = render();
+    assert has(n, "disagree (e, m, bias, expMax)");
+    assert has(n, "style=\"--w:5\">exponent</span>");
+    w_init("");
+    w_data_failed(0);
+    assert LAYOUT_KIND == 2 and LBIAS == 31;
+    n = render();
+    assert has(n, "Could not read t27/files/specs/numeric/gf16.t27; using this widget&#39;s spec: S1 E6 M9, bias 31.");
+    w_init("");
+    assert w_render(T_OUT[0..]) == 0;
+    w_data(0, "pub const SIGN_SHIFT : u8 = 15;");
+    assert LAYOUT_KIND == 2;
+}
+
+test the_balanced_ternary_of_a_tenth_and_the_url_escapes {
+    start("#x=0.1");
+    assert RES_TSTATE == 2;
+    assert RES_TR_N == 10 and RES_TR_INT == 1;
+    assert RES_TR[0] == 0 and RES_TR[1] == 0 and RES_TR[2] == 1 and RES_TR[3] == 0 and RES_TR[4] == -1;
+    assert RES_TRT;
+    start("#x=%E2%82%AC+1%2e5&x=second");
+    assert X_N == 7;
+    assert X[0] == 226 and X[3] == 32;
+    start("#x=1e100000");
+    var n : u32 = render();
+    assert has(n, "<p class=\"g16-bad\" role=\"alert\">");
+    start("#x=1e60");
+    n = render();
+    assert has(n, "<p class=\"g16-note\">More than 48 trits before the point; not drawn.</p>");
+}

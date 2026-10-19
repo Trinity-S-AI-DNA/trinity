@@ -21,7 +21,7 @@ import { createHash } from 'node:crypto'
 import { readFileSync, writeFileSync } from 'node:fs'
 import { basename, dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import * as L from '../../public/widgets/lut-explain/lut.js'
+import * as L from './lut-explain-lut.js'
 
 const SITE = join(dirname(fileURLToPath(import.meta.url)), '..', '..')
 const OUT_DIR = join(SITE, 'public/widgets/lut-explain')
