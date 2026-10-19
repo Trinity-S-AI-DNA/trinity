@@ -35,7 +35,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { constsOf, loadCompiler, sha256 } from '../agents-from-specs.mjs'
 import { runSpecTests } from '../viewport-from-spec.mjs'
-import { countsOf, layoutFsm, parseAny, parseKiss2, parseLog } from '../../public/widgets/fsm-sketch/fsmparse.js'
+import { countsOf, layoutFsm, parseAny, parseKiss2, parseLog } from './fsm-sketch-fsmparse.js'
 
 const SITE = join(dirname(fileURLToPath(import.meta.url)), '..', '..')
 const REPO = join(SITE, '..', '..')
