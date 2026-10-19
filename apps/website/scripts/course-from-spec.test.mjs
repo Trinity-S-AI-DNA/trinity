@@ -119,7 +119,7 @@ test('a lesson in two courses fails the build: its page can show one', async () 
 })
 
 test('a course left out of the catalog fails the build', async () => {
-  await fails({ catalogText: replaced(inputs.catalogText, 'pub const COURSE_COUNT : u8 = 10;', 'pub const COURSE_COUNT : u8 = 11;') }, 'the_basics_come_first')
+  await fails({ catalogText: replaced(inputs.catalogText, 'pub const COURSE_COUNT : u8 = 11;', 'pub const COURSE_COUNT : u8 = 12;') }, 'the_basics_come_first')
 })
 
 test('a broken claim in a spec fails its own test block', async () => {
