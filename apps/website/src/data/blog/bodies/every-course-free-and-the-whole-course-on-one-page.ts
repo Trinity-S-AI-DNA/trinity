@@ -55,7 +55,7 @@ export const body: Block[] = [
     "items": [
       "Free with your own key: add an API key (NVIDIA or z.ai today) and the agent runs on it; add more keys any time. The button opens the app's key screen inside Telegram.",
       "We do it for you: the club in the bot, which shows the price before you pay.",
-      "On GitHub: TRI CLAW is also a GitHub App that checks .t27 in pull requests. It is not open to other repositories yet, so the button opens the TRI CLAW post; one constant in the spec switches it to the App's page."
+      "On GitHub: TRI CLAW is also a GitHub App, built to check the .t27 specs a pull request changes. It is not open to other repositories yet, so the button opens the TRI CLAW post; one constant in the spec switches it to the App's page."
     ]
   },
   {
@@ -64,7 +64,7 @@ export const body: Block[] = [
   },
   {
     "kind": "p",
-    "text": "Every number of the course screens is in specs/view/course-view.t27 with tests: the column width, the breakpoints, the frame budget, the 44 px finger, the 2 px focus ring, the 4.5:1 contrast floor. The column width was measured, not guessed: an average character of lesson text is 0.43 em in English and 0.53 em in Russian, so a 70 character line is 30.1 em and 37.2 em. A 68ch column would have been 95 characters wide, because a ch is a zero and Outfit's zero is 0.66 em. Text and widget stand side by side from 1150 px; below that the widget comes right after the task it answers."
+    "text": "The layout numbers this change decides are in specs/view/course-view.t27 with tests: the column width, the breakpoints, the frame budget and when the pool looks again, the 44 px finger, the 2 px focus ring. Type sizes, paddings and colours stay in the stylesheets; contrast was measured on the rendered pages, at 5.92:1 or more. The column width was measured, not guessed: an average character of lesson text is 0.43 em in English and 0.53 em in Russian, so a 70 character line is 30.1 em and 37.2 em. A 68ch column would have been 95 characters wide, because a ch is a zero and Outfit's zero is 0.66 em. Text and widget stand side by side from 1150 px; below that the widget comes right after the task it answers."
   },
   {
     "kind": "h",
@@ -131,7 +131,7 @@ export const ruBody: Block[] = [
     "items": [
       "Бесплатно со своим ключом: добавьте API-ключ (сегодня NVIDIA или z.ai), и агент работает на нём; ещё ключи — в любой момент. Кнопка открывает экран ключей приложения внутри Telegram.",
       "Сделаем за вас: клуб в боте, который показывает цену до оплаты.",
-      "На GitHub: TRI CLAW — ещё и GitHub-приложение, которое проверяет .t27 в пулл-реквестах. Для других репозиториев оно пока не открыто, поэтому кнопка открывает пост о TRI CLAW; одна константа в спеке переключит её на страницу приложения."
+      "На GitHub: TRI CLAW — ещё и GitHub-приложение, созданное, чтобы проверять спеки .t27, которые меняет пулл-реквест. Для других репозиториев оно пока не открыто, поэтому кнопка открывает пост о TRI CLAW; одна константа в спеке переключит её на страницу приложения."
     ]
   },
   {
@@ -140,7 +140,7 @@ export const ruBody: Block[] = [
   },
   {
     "kind": "p",
-    "text": "Каждое число экранов курса лежит в specs/view/course-view.t27 с тестами: ширина колонки, точки перелома, бюджет рамок, палец 44 px, рамка фокуса 2 px, нижняя граница контраста 4.5:1. Ширину колонки измерили, а не угадали: средний знак текста урока — 0.43 em по-английски и 0.53 em по-русски, поэтому строка в 70 знаков — это 30.1 em и 37.2 em. Колонка 68ch была бы шириной 95 знаков: ch — это ноль, а ноль у Outfit — 0.66 em. Текст и виджет стоят рядом с 1150 px; ниже виджет идёт сразу после задания, на которое отвечает."
+    "text": "Числа вёрстки, которые решает эта правка, лежат в specs/view/course-view.t27 с тестами: ширина колонки, точки перелома, бюджет рамок и когда пул смотрит заново, палец 44 px, рамка фокуса 2 px. Размеры шрифта, отступы и цвета остаются в таблицах стилей; контраст измерен на отрисованных страницах — 5.92:1 и выше. Ширину колонки измерили, а не угадали: средний знак текста урока — 0.43 em по-английски и 0.53 em по-русски, поэтому строка в 70 знаков — это 30.1 em и 37.2 em. Колонка 68ch была бы шириной 95 знаков: ch — это ноль, а ноль у Outfit — 0.66 em. Текст и виджет стоят рядом с 1150 px; ниже виджет идёт сразу после задания, на которое отвечает."
   },
   {
     "kind": "h",

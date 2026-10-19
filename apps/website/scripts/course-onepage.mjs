@@ -138,7 +138,7 @@ ${m.lessons.map((id) => lessonHtml(C.lessons.find((l) => l.id === id))).join('\n
     .join('\n')
   const chain = (to, isNext) => `<a href="/${lang === 'ru' ? 'ru/' : ''}${to.share}${view.onePageDir}/">${isNext ? `${esc(say.NEXT_COURSE)}: ${esc(to.title[lang])} →` : `← ${esc(say.PREV_COURSE)}: ${esc(to.title[lang])}`}</a>`
   const words = { PROGRESS: say.PROGRESS, MARK: say.MARK, MARKED: say.MARKED, COPY: vs.COPY, COPIED: vs.COPIED, LESSON: say.LESSON }
-  const cfg = { live: view.LIVE_FRAMES_MAX, mount: view.MOUNT_MARGIN_PX, unmount: view.UNMOUNT_MARGIN_PX, key: C.progressKey, total }
+  const cfg = { live: view.LIVE_FRAMES_MAX, mount: view.MOUNT_MARGIN_PX, unmount: view.UNMOUNT_MARGIN_PX, settle: view.SETTLE_MS, key: C.progressKey, total }
   const V = view
   return `<!doctype html>
 <html lang="${lang}">
@@ -182,7 +182,7 @@ html { -webkit-text-size-adjust: 100%; }
 body { margin: 0; background: #000; color: #e6e6e6; font: var(--course-text-px)/1.65 'Outfit', system-ui, sans-serif; padding-bottom: calc(var(--course-thumb-bar) + env(safe-area-inset-bottom)); overflow-x: hidden; }
 a { color: #fff; text-underline-offset: 3px; text-decoration-color: #777; }
 a:hover { text-decoration-color: #fff; }
-:focus-visible { outline: var(--course-focus-ring) solid #fff; outline-offset: 2px; }
+:focus-visible { outline: var(--course-focus-ring) solid #fff; outline-offset: var(--course-focus-offset); }
 .op-label { display: block; font-size: 12px; letter-spacing: .16em; text-transform: uppercase; color: #a6a6a6; margin: 0 0 6px; }
 .op-head { display: flex; justify-content: space-between; align-items: center; max-width: var(--course-page-max); margin: 0 auto; padding: 0 var(--course-gutter-phone); border-bottom: 1px solid #1f1f1f; }
 .op-head a { display: inline-flex; align-items: center; min-height: var(--course-touch); padding: 0 6px; text-decoration: none; font-size: 15px; }
@@ -202,7 +202,7 @@ h1 { font-size: clamp(36px, 9vw, 96px); line-height: .95; letter-spacing: -.04em
 .op-pill:hover { border-color: #fff; }
 .op-pill[aria-pressed="true"] { background: #fff; color: #000; border-color: #fff; }
 .op-cta { background: #fff; color: #000; border-color: #fff; font-weight: 600; }
-.op-bar { display: grid; grid-template-columns: repeat(${total}, 1fr); gap: 3px; max-width: 760px; margin: 12px 0 6px; }
+.op-bar { display: grid; grid-template-columns: repeat(${total}, 1fr); gap: 3px; max-width: var(--course-read); margin: 12px 0 6px; }
 .op-bar i { height: 6px; border-radius: 2px; background: #262626; }
 .op-bar i.is-done { background: #fff; }
 .op-bar i.is-here { background: #8a8a8a; }
@@ -314,10 +314,10 @@ ${clawHtml(ladder, lang)}
 <script>window.OP=${json({ say: words, ...cfg })}</script>
 <script type="module">
 import { framePool } from '/widgets/frame-pool.js?v=${poolV}'
-const { say, live, mount, unmount, key, total } = window.OP
+const { say, live, mount, unmount, settle, key, total } = window.OP
 const fmt = (s, ...a) => a.reduce((o, x, i) => o.split('{' + i + '}').join(String(x)), s)
 const pad = (n) => String(n).padStart(2, '0')
-window.__t27Pool = framePool({ slots: document.querySelectorAll('.op-slot'), live, mount, unmount })
+window.__t27Pool = framePool({ slots: document.querySelectorAll('.op-slot'), live, mount, unmount, settle })
 const read = () => { try { const l = JSON.parse(localStorage.getItem(key) || '[]'); return Array.isArray(l) ? l.filter((x) => typeof x === 'string') : [] } catch { return [] } }
 const write = (l) => { try { localStorage.setItem(key, JSON.stringify(l)) } catch {} }
 const lessons = [...document.querySelectorAll('.op-lesson')]

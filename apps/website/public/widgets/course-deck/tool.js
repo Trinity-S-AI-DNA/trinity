@@ -7,6 +7,7 @@
 // &lang=ru the Russian words. Each lesson card nests that lesson's own widget page; ../frame-pool.js
 // mounts a frame only as its card nears the row's view and keeps K_LIVE_FRAMES_MAX of them live.
 import { framePool } from '../frame-pool.js'
+import { pickCourse } from './pick.js'
 
 const W = window.T27_WIDGET
 const q = new URLSearchParams(location.search)
@@ -25,6 +26,8 @@ document.head.append(css)
 
 const root = document.getElementById('widget')
 root.style.setProperty('--cd-touch', `${W.K_TOUCH_TARGET_PX}px`)
+root.style.setProperty('--cd-focus', `${W.K_FOCUS_RING_PX}px`)
+root.style.setProperty('--cd-focus-offset', `${W.K_FOCUS_OFFSET_PX}px`)
 const ROOT = new URL('../../', import.meta.url).href
 
 async function load(path) {
@@ -34,13 +37,14 @@ async function load(path) {
 }
 
 const catalog = await load('./courses/index.json')
-const pick = catalog.find((c) => c.id === q.get('course')) ?? catalog[0]
+const pick = pickCourse(catalog, q.get('course'))
 let course = null
 try {
-  course = await load(`./courses/${pick.id}.json`)
+  if (pick) course = await load(`./courses/${pick.id}.json`)
 } catch {
-  root.append(el('p', 'cd-empty', W.SAY_NOT_FOUND))
+  course = null
 }
+if (!course) root.append(el('p', 'cd-empty', W.SAY_NOT_FOUND))
 
 let pool = null
 function show(n) {
@@ -77,7 +81,7 @@ function show(n) {
     row.append(card)
   }
   row.scrollLeft = 0
-  pool = framePool({ slots: row.querySelectorAll('.cd-slot'), live: W.K_LIVE_FRAMES_MAX, mount: W.K_MOUNT_MARGIN_PX, unmount: W.K_UNMOUNT_MARGIN_PX, root: row })
+  pool = framePool({ slots: row.querySelectorAll('.cd-slot'), live: W.K_LIVE_FRAMES_MAX, mount: W.K_MOUNT_MARGIN_PX, unmount: W.K_UNMOUNT_MARGIN_PX, settle: W.K_SETTLE_MS, root: row })
   window.__t27Pool = pool
 }
 

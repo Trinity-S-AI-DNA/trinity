@@ -9,14 +9,15 @@
 // mounts its iframe when it comes within `mount` px of the viewport (or of `root`, for a deck
 // that scrolls sideways). At most `live` frames are mounted at once: a new one takes the place
 // of the mounted frame farthest from the viewport. A frame farther than `unmount` px away is
-// taken down, and its slot shows its placeholder again. A press on the slot's [data-load]
+// taken down, and its slot shows its placeholder again. `settle` ms after the last scroll event
+// the pool looks again, so a frame that gave way while near comes back once it is among the nearest. A press on the slot's [data-load]
 // button mounts it at once.
 //
 // The page can read how many frames are live: document.documentElement.dataset.liveFrames, and
 // the pool's own live() and peak().
 
-export function framePool({ slots, live, mount, unmount, root = null, onChange = () => {} }) {
-  if (!(live >= 1) || !(unmount > mount)) throw new RangeError('frame-pool: live >= 1 and unmount > mount')
+export function framePool({ slots, live, mount, unmount, settle, root = null, onChange = () => {} }) {
+  if (!(live >= 1) || !(unmount > mount) || !(settle > 0)) throw new RangeError('frame-pool: live >= 1, unmount > mount and settle > 0')
   const mounted = new Set()
   let peak = 0
   const all = [...slots]
@@ -92,11 +93,11 @@ export function framePool({ slots, live, mount, unmount, root = null, onChange =
   )
   // A slot that stayed in the near zone while it gave way comes back once it is among the nearest.
   let pending = 0
-  const settle = () => {
+  const onScroll = () => {
     clearTimeout(pending)
-    pending = setTimeout(() => rebalance(), 120)
+    pending = setTimeout(() => rebalance(), settle)
   }
-  ;(root ?? window).addEventListener('scroll', settle, { passive: true })
+  ;(root ?? window).addEventListener('scroll', onScroll, { passive: true })
 
   for (const slot of all) {
     slot.dataset.live = '0'
@@ -114,7 +115,7 @@ export function framePool({ slots, live, mount, unmount, root = null, onChange =
     stop() {
       near.disconnect()
       far.disconnect()
-      ;(root ?? window).removeEventListener('scroll', settle)
+      ;(root ?? window).removeEventListener('scroll', onScroll)
       clearTimeout(pending)
       wanted.clear()
       for (const s of [...mounted]) take(s)

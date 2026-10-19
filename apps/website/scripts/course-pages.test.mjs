@@ -3,6 +3,7 @@ import { test } from 'node:test'
 import { existsSync, readFileSync } from 'node:fs'
 import { appOf, buildPages, deckFiles, loadCourses, sitemapOf } from './course-pages.mjs'
 import { frameHeight, loadConst, onePagePath } from './course-onepage.mjs'
+import { pickCourse } from '../public/widgets/course-deck/pick.js'
 
 const COURSES = loadCourses()
 const pages = buildPages(COURSES)
@@ -134,6 +135,7 @@ test("no widget frame is in the page: frame-pool.js mounts them, with the view s
     assert.equal(cfg.live, VIEW.LIVE_FRAMES_MAX)
     assert.equal(cfg.mount, VIEW.MOUNT_MARGIN_PX)
     assert.equal(cfg.unmount, VIEW.UNMOUNT_MARGIN_PX)
+    assert.equal(cfg.settle, VIEW.SETTLE_MS)
   }
 })
 
@@ -187,4 +189,17 @@ test('the course deck reads one file per course, every lesson in it, and the cat
     assert.equal(d.modules.flatMap((m) => m.lessons).length, COURSES[i].lessons.length)
     for (const l of d.modules.flatMap((m) => m.lessons)) assert.match(l.frame, /^(widgets|play|term)\//)
   }
+})
+
+test('the course deck shows the course it is asked for, the first one when none, and none for an unknown one', () => {
+  const catalog = JSON.parse(deckFiles(COURSES)[0][1])
+  assert.equal(pickCourse(catalog, null).id, COURSES[0].id)
+  assert.equal(pickCourse(catalog, '').id, COURSES[0].id)
+  assert.equal(pickCourse(catalog, 'neural-networks').id, 'neural-networks')
+  // ?course=nope used to show t27 basics in its place; it now shows the widget's not-found words.
+  assert.equal(pickCourse(catalog, 'nope'), null)
+  assert.equal(pickCourse([], null), null)
+  const tool = readFileSync(new URL('../public/widgets/course-deck/tool.js', import.meta.url), 'utf8')
+  assert.match(tool, /const pick = pickCourse\(catalog, q\.get\('course'\)\)/)
+  assert.match(tool, /if \(!course\) root\.append\(el\('p', 'cd-empty', W\.SAY_NOT_FOUND\)\)/)
 })
