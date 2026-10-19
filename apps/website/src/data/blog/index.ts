@@ -3,6 +3,36 @@ import type { PostMeta } from './types'
 /** Индекс блога: список и метаданные без тяжёлых тел публикаций. */
 export const postsIndex: PostMeta[] = [
   {
+    slug: "one-spec-many-targets-a-course-on-the-t27-compiler",
+    title: "One spec, many targets: a course on the t27 compiler, 27 widgets on compiled specs",
+    summary: "[every widget runs fn bodies of a gHashTag/t27 spec compiled to wasm; no lesson runs a whole stage of t27c, because its lexer and parser scan structs; lab accounts are quoted with the dates the specs record] Course 12 follows a .t27 file through the compiler: bytes and scanners, precedence and refusals, type names, the cost estimate, the same answer from every backend, the output file, seals, a table of nine compilers, seven builds of one commit, double-compiling, and the machine word of the t27a assembler.",
+    date: "2026-10-19",
+    readingMinutes: 4,
+    tags: ["t27", "Course", "Compiler"],
+    receipts: [
+      { label: "trinity#1705: the course issue, 27 widgets on gHashTag/t27 specs/compiler, verified, t27mcp and isa", href: "https://github.com/gHashTag/trinity/issues/1705" },
+      { label: "The course: One spec, many targets, the t27 compiler", href: "https://t27.ai/learn/t27-compiler/" },
+      { label: "The reproducible builds widget", href: "https://t27.ai/widgets/cmp-builds/" },
+      { label: "The compiler sieve widget", href: "https://t27.ai/widgets/cmp-sieve/" },
+      { label: "The assembler widget", href: "https://t27.ai/widgets/cmp-assemble/" },
+    ],
+    openQuestions: [
+      "No lesson runs a whole stage of t27c: the typechecker, pipeline and optimizer specs do not compile to Zig today.",
+      "The seal rules of lessons 18 and 21 are rules the specs state; whether t27c does them is for the specs and the compiler to say.",
+      "The cost lessons show the compiler's static estimates, not a place-and-route report.",
+    ],
+    published: true,
+    ru: {
+      title: "Одна спека, много целей: курс о компиляторе t27, 27 виджетов на скомпилированных спеках",
+      summary: "[каждый виджет исполняет тела функций спеки gHashTag/t27, собранные в wasm; ни один урок не запускает целый этап t27c, потому что его лексер и парсер сканируют структуры; отчёты стенда приведены с датами, которые записывают спеки] Курс 12 ведёт файл .t27 через компилятор: байты и сканеры, приоритет и отказы, имена типов, оценку стоимости, один ответ от каждого бэкенда, выходной файл, печати, таблицу девяти компиляторов, семь сборок одного коммита, двойную компиляцию и машинное слово ассемблера t27a.",
+      openQuestions: [
+        "Ни один урок не запускает целый этап t27c: спеки typechecker, pipeline и optimizer сегодня не компилируются в Zig.",
+        "Правила печатей из уроков 18 и 21 — это правила, которые формулируют спеки; делает ли их t27c, должны сказать спеки и сам компилятор.",
+        "Уроки о стоимости показывают статические оценки компилятора, а не отчёт размещения и трассировки.",
+      ],
+    },
+  },
+  {
     slug: "the-queen-and-the-hive-a-course-on-how-the-project-builds-itself",
     title: "The Queen and the hive: a course on how the project builds itself, 27 widgets on compiled specs",
     summary: "[every widget runs fn bodies of a gHashTag/t27 specs/queen or specs/automation spec compiled to wasm; no widget reads the live Queen; the game widgets are flat sketches] Course 11 opens the rules the Queen runs the hive by: shaping an issue and its boundary, priority, aging and review first, a task's state machine, the ship in the game, a deploy mid-flight, the reviewer's concurrency and back-off, the merge gate, the review jam and inherited red, refused keys and the next key, credit and token prices, agent bots in one group, the night watch, the public board and the comb.",
