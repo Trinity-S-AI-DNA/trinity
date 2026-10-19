@@ -7,7 +7,7 @@ import { cappedLevel, effectiveLevel, eligible, outranks, why } from './logic.js
 import { K, W, ask, controls, el, fill, head, ladder, root, say, source, taps } from '../hive-kit.js'
 
 const N = K('K_ISSUES', 7), AGES = K('K_AGES', []), BLOCK = K('K_BLOCKERS', []), NUM = K('K_NUMBERS', [])
-const NO_LABEL = 4, NORMAL = K('K_LEVEL_NORMAL', 2), CRITICAL = K('K_LEVEL_CRITICAL', 0)
+const NO_LABEL = K('K_NO_LABEL', 4), NORMAL = K('K_LEVEL_NORMAL', 2), CRITICAL = K('K_LEVEL_CRITICAL', 0)
 const keys = [...Array(N)].map((_, i) => `l${i}`)
 const ctl = controls(keys.map((key) => ({ key, kind: 'hidden', min: 0, max: NO_LABEL })),
   { names: W.SAY_PRESET_NAMES, values: Object.fromEntries(keys.map((k, i) => [k, K(`K_PRESET_L${i}`, [])])) }, draw)

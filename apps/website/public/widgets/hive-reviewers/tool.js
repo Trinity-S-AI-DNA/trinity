@@ -21,10 +21,10 @@ function draw(s) {
   const slots = reviewerConcurrency(s.keys, s.lanes, s.mb, s.per, s.waiting)
   const need = slotsNeeded(s.rate)
   const ok = keepsUp(slots, s.rate)
-  const top = K('K_REVIEWER_CEILING', 16)
+  const top = K('K_REVIEWER_CEILING', 16), fixed = K('K_REVIEWER_CONCURRENCY', 4)
   out.replaceChildren(
     meters([
-      { label: say('SAY_AT_ONCE'), value: slots, max: top, text: String(slots), tone: ok ? 0 : 6, mark: K('K_REVIEWER_CONCURRENCY', 4), markLabel: say('SAY_FIXED') },
+      { label: say('SAY_AT_ONCE'), value: slots, max: top, text: String(slots), tone: ok ? 0 : 6, mark: fixed, markLabel: fill(say('SAY_FIXED'), fixed) },
       { label: say('SAY_NEEDED'), value: need, max: top, text: String(need), tone: 1 },
     ]),
     gate(ok, ok ? say('SAY_KEEPS') : say('SAY_BEHIND'), fill(say('SAY_GAP'), slots, need)))

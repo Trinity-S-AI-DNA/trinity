@@ -19,7 +19,7 @@ const CLAIM_TONES = [1, 0, 4, 2, 6]
 function draw(s) {
   const cards = [...Array(NC)].map((_, c) => ({ col: columnOf(c, !!s.open, !!s.known), title: say('SAY_CLAIM_NAMES', c), sub: say('SAY_CLAIM'), tone: CLAIM_TONES[c] }))
   const done = cards.filter((c) => c.col === K('K_COL_DONE', 4)).length
-  out.replaceChildren(head(fill(say('SAY_IN_DONE'), done)), board([...Array(NCOL)].map((_, i) => ({ name: say('SAY_COLUMN_NAMES', i), tone: COL_TONES[i] })), cards))
+  out.replaceChildren(head(fill(say('SAY_IN_DONE'), done, cards.length)), board([...Array(NCOL)].map((_, i) => ({ name: say('SAY_COLUMN_NAMES', i), tone: COL_TONES[i] })), cards))
 }
 
 ctl.start()

@@ -18,7 +18,7 @@ function draw(s) {
   const brk = K('K_KEY_BREAK_SECONDS', 1800)
   out.replaceChildren(two(
     ladder([...Array(K('K_RUNGS', 7))].map((_, n) => ({ label: fill(say('SAY_RUNG'), n), sub: fill(say('SAY_REST'), cooldownSeconds(TRANSIENT, n)), tone: 1, on: s.kind === TRANSIENT && n === s.strikes }))),
-    el('div', {}, dial({ value: rest, max: brk, tone: rest >= brk ? 6 : rest ? 1 : 0, big: rest ? `${rest} s` : say('SAY_NONE'), small: say('SAY_DIAL'), label: say('SAY_DIAL'), marks: [{ at: K('K_COOL_CAP_SECONDS', 240), tone: 1 }] }),
+    el('div', {}, dial({ value: rest, max: brk, tone: rest >= brk ? 6 : rest ? 1 : 0, big: rest ? `${rest} s` : say('SAY_NONE'), small: fill(say('SAY_DIAL'), brk), label: fill(say('SAY_DIAL'), brk), marks: [{ at: K('K_COOL_CAP_SECONDS', 240), tone: 1 }] }),
       el('p', { class: 'hk-cap' }, `${say('SAY_KIND_NAMES', s.kind)} · ${fill(say('SAY_RUNG'), s.strikes)}`))))
 }
 

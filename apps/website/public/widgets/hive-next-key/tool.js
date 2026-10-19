@@ -25,7 +25,7 @@ function draw(s) {
   const mask = (1 << s.size) - 1
   const tried = s.tried & mask, resting = s.resting & mask & ~tried
   const next = nextFree(tried, resting, s.size, s.last < s.size ? s.last : NO_KEY)
-  const nextPool = nextFree(1, 0, 2, 0)
+  const nextPool = nextFree(K('K_POOL_LIST_TRIED', 1), K('K_POOL_LIST_RESTING', 0), K('K_POOL_LIST_SIZE', 2), K('K_POOL_LIST_LAST', 0))
   const st = step(TRANSIENT, s.attempts, next, s.overload, s.size, nextPool)
   const out1305 = poolOverloaded(s.overload, s.size)
   const state = (i) => (tried & (1 << i) ? 1 : resting & (1 << i) ? 2 : 0)
