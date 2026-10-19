@@ -1,4 +1,5 @@
 import { body as body_a_wasm_interpreter_ran_on_the_board, ruBody as ruBody_a_wasm_interpreter_ran_on_the_board } from './bodies/a-wasm-interpreter-ran-on-the-board'
+import { body as body_neural_networks_in_t27_a_widget_per_lesson, ruBody as ruBody_neural_networks_in_t27_a_widget_per_lesson } from './bodies/neural-networks-in-t27-a-widget-per-lesson'
 import { body as body_arithmetic_and_dsp_a_widget_per_lesson, ruBody as ruBody_arithmetic_and_dsp_a_widget_per_lesson } from './bodies/arithmetic-and-dsp-a-widget-per-lesson'
 import { body as body_the_ternary_machine_course, ruBody as ruBody_the_ternary_machine_course } from './bodies/the-ternary-machine-course'
 import { body as body_three_widgets_under_the_bus, ruBody as ruBody_three_widgets_under_the_bus } from './bodies/three-widgets-under-the-bus'
@@ -113,8 +114,10 @@ import { body as body_real_value_in_integer_container, ruBody as ruBody_real_val
 import { body as body_features_that_change_no_bits, ruBody as ruBody_features_that_change_no_bits } from './bodies/features-that-change-no-bits'
 import { body as body_one_commit_nine_workflow_outcomes, ruBody as ruBody_one_commit_nine_workflow_outcomes } from './bodies/one-commit-nine-workflow-outcomes'
 import { body as body_forty_five_printed_numbers, ruBody as ruBody_forty_five_printed_numbers } from './bodies/forty-five-printed-numbers'
+import { body as body_training_cheaper_on_int8_tensor_cores, ruBody as ruBody_training_cheaper_on_int8_tensor_cores } from './bodies/training-cheaper-on-int8-tensor-cores'
 
 const bodies: Record<string, PostBody> = {
+  'training-cheaper-on-int8-tensor-cores': { body: body_training_cheaper_on_int8_tensor_cores, ruBody: ruBody_training_cheaper_on_int8_tensor_cores },
   'forty-five-printed-numbers': { body: body_forty_five_printed_numbers, ruBody: ruBody_forty_five_printed_numbers },
   'a-wasm-interpreter-ran-on-the-board': { body: body_a_wasm_interpreter_ran_on_the_board, ruBody: ruBody_a_wasm_interpreter_ran_on_the_board },
   'a-3-mb-compiler-spec-to-aarch64-in-5-ms': { body: body_a_3_mb_compiler_spec_to_aarch64_in_5_ms, ruBody: ruBody_a_3_mb_compiler_spec_to_aarch64_in_5_ms },
@@ -142,6 +145,7 @@ const bodies: Record<string, PostBody> = {
   'bypass-or-a-broken-shift': { body: body_bypass_or_a_broken_shift, ruBody: ruBody_bypass_or_a_broken_shift },
   'the-ternary-machine-course': { body: body_the_ternary_machine_course, ruBody: ruBody_the_ternary_machine_course },
   'three-widgets-under-the-bus': { body: body_three_widgets_under_the_bus, ruBody: ruBody_three_widgets_under_the_bus },
+  'neural-networks-in-t27-a-widget-per-lesson': { body: body_neural_networks_in_t27_a_widget_per_lesson, ruBody: ruBody_neural_networks_in_t27_a_widget_per_lesson },
   'arithmetic-and-dsp-a-widget-per-lesson': { body: body_arithmetic_and_dsp_a_widget_per_lesson, ruBody: ruBody_arithmetic_and_dsp_a_widget_per_lesson },
   'the-back-half-of-openxc7-from-a-spec': { body: body_the_back_half_of_openxc7_from_a_spec, ruBody: ruBody_the_back_half_of_openxc7_from_a_spec },
   'tri-mined-not-sold': { body: body_tri_mined_not_sold, ruBody: ruBody_tri_mined_not_sold },

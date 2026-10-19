@@ -54,6 +54,7 @@ const PAGES: PageLink[] = [
   { href: '#/buses-and-peripherals', en: 'Course: buses and peripherals', ru: 'Курс: шины и периферия', note: 'UART, SPI, APB, AXI4, Ethernet, 27 lessons', noteRu: 'UART, SPI, APB, AXI4, Ethernet, 27 уроков' },
   { href: '#/ternary-computing', en: 'Course: the ternary machine', ru: 'Курс: троичная машина', note: 'Trits, logic, adders, a machine, neurons; a live widget per lesson, 27 lessons', noteRu: 'Триты, логика, сумматоры, машина, нейроны; живой виджет в каждом уроке, 27 уроков' },
   { href: '#/arithmetic-and-dsp', en: 'Course: arithmetic and DSP', ru: 'Курс: арифметика и DSP', note: 'Adders, multipliers, fixed point, CORDIC, FIR, CIC, FFT, 27 lessons', noteRu: 'Сумматоры, умножители, фиксированная точка, CORDIC, FIR, CIC, БПФ, 27 уроков' },
+  { href: '#/neural-networks', en: 'Course: neural networks', ru: 'Курс: нейросети', note: 'Activations, losses, Adam, backprop, XOR, attention, a transformer block, 27 lessons', noteRu: 'Активации, потери, Adam, обратное распространение, XOR, внимание, блок трансформера, 27 уроков' },
   { href: '#/foundry', en: 'Golden Foundry', ru: 'Золотая Литейная', note: 'A club for people who build on silicon', noteRu: 'Клуб разработчиков на кремнии', color: '#C9A24B' },
   { href: '#/about', en: 'About', ru: 'Об авторе', note: 'Background, papers, contact', noteRu: 'Биография, статьи, контакты' },
   { href: '#/resources', en: 'Resources', ru: 'Материалы', note: 'Papers and datasets, each with a DOI', noteRu: 'Статьи и датасеты, у каждого DOI' },

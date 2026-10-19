@@ -3,6 +3,39 @@ import type { PostMeta } from './types'
 /** Индекс блога: список и метаданные без тяжёлых тел публикаций. */
 export const postsIndex: PostMeta[] = [
   {
+    slug: "training-cheaper-on-int8-tensor-cores",
+    title: "t27t: training gets 16% to 24% cheaper on int8 tensor cores, if f is what we think",
+    summary: "[one RTX 4090, one day, five GEMM shapes; the int8 times are CUTLASS s8 standing in for torch._int_mm; f, the share of a step in forward GEMMs, is an estimate nobody has measured] t27t is the t27 trainer, and its law is one spec, specs/t27t/t27t.t27 in gHashTag/t27. On the five GEMM shapes of our training run, int8 tensor cores were 2.9x to 3.5x faster than bf16, and int8 dp4a on CUDA cores was slower than bf16 on every shape. With forward GEMMs in int8 and gradients in bf16, a run saves f x (1 - 1/s): 16% to 24% for f = 1/4 to 1/3, or $16 to $24 of every $100. No custom CUDA backend is needed, because PyTorch reaches those cores through torch._int_mm.",
+    date: "2026-10-19",
+    readingMinutes: 5,
+    tags: ["t27", "Training", "Verification"],
+    receipts: [
+      { label: "t27#10790: specs/t27t/t27t.t27 and tri t27t", href: "https://github.com/gHashTag/t27/pull/10790" },
+      { label: "t27#10789: the issue", href: "https://github.com/gHashTag/t27/issues/10789" },
+      { label: "t27#10360: the GEMM bench and the verdict", href: "https://github.com/gHashTag/t27/issues/10360" },
+      { label: "The widget: run savings by f and s", href: "https://t27.ai/widgets/t27t-savings/" },
+      { label: "trinity#1690: the widget and this post", href: "https://github.com/gHashTag/trinity/pull/1690" },
+      { label: "The papers post: 45 printed numbers", href: "https://t27.ai/#/blog/forty-five-printed-numbers" },
+    ],
+    openQuestions: [
+      "f, the share of a real step spent in forward GEMMs, has not been measured; timing one step of tern-tc-500m gives it.",
+      "The cost of quantizing activations from bf16 to int8 is not in the saving yet.",
+      "The runner gHashTag/igla-coder-gpu does not call torch._int_mm yet, so no run has billed the saving.",
+      "Whether int8 forward GEMMs change the loss curve was not measured.",
+    ],
+    published: true,
+    ru: {
+      title: "t27t: обучение дешевеет на 16–24% на тензорных ядрах int8, если f такая, как мы думаем",
+      summary: "[одна RTX 4090, один день, пять форм GEMM; времена int8 это CUTLASS s8 вместо torch._int_mm; f, доля шага на прямые GEMM, это оценка, её никто не мерил] t27t это тренер t27, и его закон это одна спецификация, specs/t27t/t27t.t27 в gHashTag/t27. На пяти формах GEMM из нашего обучения тензорные ядра int8 были в 2.9–3.5 раза быстрее bf16, а int8 dp4a на ядрах CUDA был медленнее bf16 на каждой форме. Если прямые GEMM считать в int8, а градиенты оставить в bf16, прогон экономит f x (1 - 1/s): 16–24% при f от 1/4 до 1/3, то есть $16–24 с каждых $100. Свой CUDA-бэкенд не нужен: PyTorch достаёт до этих ядер через torch._int_mm.",
+      openQuestions: [
+        "f, долю настоящего шага на прямые GEMM, никто не мерил; её даст замер одного шага tern-tc-500m.",
+        "Цена квантования активаций из bf16 в int8 пока не вычтена из экономии.",
+        "Исполнитель gHashTag/igla-coder-gpu пока не вызывает torch._int_mm, поэтому экономию не видел ни один счёт.",
+        "Меняют ли прямые GEMM в int8 кривую потерь, не измерялось.",
+      ],
+    },
+  },
+  {
     slug: "forty-five-printed-numbers",
     title: "45 numbers from three format papers, recomputed: 34 fit, 8 do not",
     summary: "[only numbers that follow from a rule the paper states; this checks arithmetic, not the arguments; u64 stops the Lucas check at n = 45] One t27 spec, specs/numeric/paper_claims.t27 in gHashTag/t27, recomputes 45 numbers printed in the GoldenFloat paper (arXiv:2606.05017), the Golden Ruler catalog (arXiv:2606.09686) and the TNF paper, in exact integers with no floating point. 34 fit, 8 do not, 3 cannot be checked. Golden Ruler says 12 clusters where its catalog has 13; seven TNF numbers miss, four of them because Tables 1 and 24 do not follow the M = N - 1 - Et rule Section 10 adopts. tri papers and the MCP tool t27_paper_claims run the same spec.",
@@ -31,6 +64,37 @@ export const postsIndex: PostMeta[] = [
         "Тождество Люка проверено только до n = 45; чтобы дойти до 256, как в статье, в t27 нужны длинные целые.",
         "Три утверждения остаются непроверенными, пока не опубликованы исходные данные: журнал тестового стенда, прогон ml_dtypes, способ подсчёта в таблице 23.",
         "Ни одна статья пока не исправлена; несовпадения названы, но не исправлены.",
+      ],
+    },
+  },
+  {
+    slug: "neural-networks-in-t27-a-widget-per-lesson",
+    title: "Neural networks in t27: 27 lessons, and a widget in each one that runs a specs/ml spec",
+    summary: "[every widget runs fn bodies of a gHashTag/t27 specs/ml spec compiled to wasm; lesson 10 is average pooling until t27#10612 merges; the fixtures are the specs' own, nothing is trained on real data] Course 10 opens the parts the project's agents think with: ReLU, GELU and softmax, embeddings and dropout, pooling and batch norm, MSE, cross-entropy and Huber, SGD, RMSProp, Adam and LAMB, backpropagation, a 2-8-1 network that learns XOR in the browser, a recurrent cell, LSTM gates, attention, positional encoding, an encoder block and PPO.",
+    date: "2026-10-18",
+    readingMinutes: 4,
+    tags: ["t27", "Course", "AI"],
+    receipts: [
+      { label: "trinity#1695: the course issue, 27 widgets on gHashTag/t27 specs/ml", href: "https://github.com/gHashTag/trinity/issues/1695" },
+      { label: "The course: Neural networks in t27", href: "https://t27.ai/learn/neural-networks/" },
+      { label: "The XOR widget: a network trained in the browser", href: "https://t27.ai/widgets/nn-xor/" },
+      { label: "The softmax widget", href: "https://t27.ai/widgets/nn-softmax/" },
+      { label: "The attention widget", href: "https://t27.ai/widgets/nn-attention/" },
+      { label: "t27#10612: the sliding conv2d spec lesson 10 waits for", href: "https://github.com/gHashTag/t27/issues/10612" },
+    ],
+    openQuestions: [
+      "Lesson 10 averages each 2 x 2 window; a convolution with a learned kernel waits for t27#10612.",
+      "The XOR widget shows the four inputs the spec exposes, not a decision region over the plane.",
+      "Every fixture is a spec's own small one; no widget runs a model trained on real data.",
+    ],
+    published: true,
+    ru: {
+      title: "Нейросети на t27: 27 уроков, и в каждом виджет, который исполняет спеку specs/ml",
+      summary: "[каждый виджет исполняет тела функций спеки gHashTag/t27 specs/ml, собранные в wasm; урок 10 это усредняющий пулинг, пока не слита t27#10612; фикстуры взяты из самих спек, на настоящих данных ничего не обучалось] Курс 10 открывает части, которыми думают агенты проекта: ReLU, GELU и softmax, эмбеддинги и dropout, пулинг и пакетную нормализацию, MSE, перекрёстную энтропию и функцию Хьюбера, SGD, RMSProp, Adam и LAMB, обратное распространение, сеть 2-8-1, которая учит XOR в браузере, рекуррентную ячейку, вентили LSTM, внимание, позиционное кодирование, блок энкодера и PPO.",
+      openQuestions: [
+        "Урок 10 усредняет каждое окно 2 x 2; свёртка с выученным ядром ждёт t27#10612.",
+        "Виджет XOR показывает четыре входа, которые открывает спека, а не область решения на плоскости.",
+        "Каждая фикстура это маленькая фикстура самой спеки; ни один виджет не исполняет модель, обученную на настоящих данных.",
       ],
     },
   },

@@ -2,4 +2,4 @@
 // Do not edit: change the .t27 source and regenerate.
 
 /** Every course's address in the app (#/<route>, #/<route>/<lesson>), in reading order. */
-export const COURSE_ROUTES = ["t27-basics","course","ai-numbers","goldenfloat","verify-hardware","clocks-and-cdc","buses-and-peripherals","ternary-computing","arithmetic-and-dsp"] as const
+export const COURSE_ROUTES = ["t27-basics","course","ai-numbers","goldenfloat","verify-hardware","clocks-and-cdc","buses-and-peripherals","ternary-computing","arithmetic-and-dsp","neural-networks"] as const

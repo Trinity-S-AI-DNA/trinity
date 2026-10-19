@@ -100,6 +100,15 @@ test('a negative number inside an array is read; a minus over anything else is r
   assert.throws(() => constsOf(analyze('module m;\npub const N : [1]i32 = [-K];\npub const K : i32 = 1;\n')), /unsupported|minus/)
 })
 
+test('a float with an exponent is read as its number; hex is still refused', () => {
+  // t27 specs/ml writes its epsilons this way (adam.t27 DEFAULT_EPSILON = 1e-8, attention NEG_INF = -1.0e30).
+  const c = constsOf(analyze('module m;\npub const E : f32 = 1e-8;\npub const F : f32 = 1.0e-5;\npub const G : f32 = -1.0e30;\n'))
+  assert.equal(c.E.value, 1e-8)
+  assert.equal(c.F.value, 1e-5)
+  assert.equal(c.G.value, -1e30)
+  assert.throws(() => constsOf(analyze('module m;\npub const H : u32 = 0xff;\n')), /unsupported/)
+})
+
 test('signed integers have a shape: in range passes, out of range and the wrong type do not', () => {
   const c = constsOf(analyze('module m;\npub const T : [3]i32 = [-1, 0, 1];\npub const N : i32 = -5;\npub const B : i8 = -129;\npub const U : u8 = 3;\n'))
   assert.equal(shapeProblem(c.T, 'arr-i32'), null)
