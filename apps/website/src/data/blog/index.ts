@@ -3,6 +3,36 @@ import type { PostMeta } from './types'
 /** Индекс блога: список и метаданные без тяжёлых тел публикаций. */
 export const postsIndex: PostMeta[] = [
   {
+    slug: "the-queen-and-the-hive-a-course-on-how-the-project-builds-itself",
+    title: "The Queen and the hive: a course on how the project builds itself, 27 widgets on compiled specs",
+    summary: "[every widget runs fn bodies of a gHashTag/t27 specs/queen or specs/automation spec compiled to wasm; no widget reads the live Queen; the game widgets are flat sketches] Course 11 opens the rules the Queen runs the hive by: shaping an issue and its boundary, priority, aging and review first, a task's state machine, the ship in the game, a deploy mid-flight, the reviewer's concurrency and back-off, the merge gate, the review jam and inherited red, refused keys and the next key, credit and token prices, agent bots in one group, the night watch, the public board and the comb.",
+    date: "2026-10-19",
+    readingMinutes: 4,
+    tags: ["t27", "Course", "Queen"],
+    receipts: [
+      { label: "trinity#1698: the course issue, 27 widgets on gHashTag/t27 specs/queen and specs/automation", href: "https://github.com/gHashTag/trinity/issues/1698" },
+      { label: "The course: the Queen and the hive", href: "https://t27.ai/learn/queen-and-hive/" },
+      { label: "The review jam widget", href: "https://t27.ai/widgets/hive-jam/" },
+      { label: "The next key widget", href: "https://t27.ai/widgets/hive-next-key/" },
+      { label: "999#4020: two door fixes review-jam needed", href: "https://github.com/gHashTag/999-multibots-telegraf/pull/4020" },
+    ],
+    openQuestions: [
+      "No widget reads the live Queen; the measured numbers are the ones the specs record.",
+      "Lesson 26 shows the board drawing a closed issue's finished claims as done, a finding dispatch.t27 records.",
+      "The game widgets are flat sketches of the 3D game, not the game.",
+    ],
+    published: true,
+    ru: {
+      title: "Королева и улей: курс о том, как проект строит себя сам, 27 виджетов на скомпилированных спеках",
+      summary: "[каждый виджет исполняет тела функций спеки gHashTag/t27 specs/queen или specs/automation, собранные в wasm; ни один виджет не читает живую Королеву; игровые виджеты — плоские наброски] Курс 11 открывает правила, по которым Королева ведёт улей: оформление задачи и её границу, приоритет, старение и сначала ревью, автомат состояний задачи, корабль в игре, деплой на лету, число ревью сразу и паузы ревьюера, ворота слияния, затор ревью и унаследованный красный, отклонённые ключи и следующий ключ, заслуги и цены в токенах, ботов агентов в одной группе, ночной дозор, публичную доску и соты.",
+      openQuestions: [
+        "Ни один виджет не читает живую Королеву; измеренные числа — те, что записаны в спеках.",
+        "Урок 26 показывает, как доска рисует завершённые притязания закрытой задачи готовыми — эту находку записывает dispatch.t27.",
+        "Игровые виджеты — плоские наброски 3D-игры, а не сама игра.",
+      ],
+    },
+  },
+  {
     slug: "neural-networks-in-t27-a-widget-per-lesson",
     title: "Neural networks in t27: 27 lessons, and a widget in each one that runs a specs/ml spec",
     summary: "[every widget runs fn bodies of a gHashTag/t27 specs/ml spec compiled to wasm; lesson 10 is average pooling until t27#10612 merges; the fixtures are the specs' own, nothing is trained on real data] Course 10 opens the parts the project's agents think with: ReLU, GELU and softmax, embeddings and dropout, pooling and batch norm, MSE, cross-entropy and Huber, SGD, RMSProp, Adam and LAMB, backpropagation, a 2-8-1 network that learns XOR in the browser, a recurrent cell, LSTM gates, attention, positional encoding, an encoder block and PPO.",
