@@ -21,7 +21,7 @@ function draw(s) {
   const pass = verdictPass(check)
   out.replaceChildren(
     verdict(say('SAY_CHECKS', check), pass ? 0 : check === K('K_CHECK_UNKNOWN', 8) ? 1 : 6, pass ? say('SAY_PASS') : say('SAY_NOT_PASS')),
-    ladder(W.SAY_CHECKS.map((name, i) => ({ label: `${i} ${name}`, tone: i === 0 ? 0 : i === 8 ? 1 : 6, on: i === check }))))
+    ladder(W.SAY_CHECKS.map((name, i) => ({ label: `${i} ${name}`, tone: verdictPass(i) ? 0 : i === K('K_CHECK_UNKNOWN', 8) ? 1 : 6, on: i === check }))))
 }
 
 ctl.start()

@@ -1,6 +1,6 @@
 // cmp-kit.js -- the drawing the t27-compiler widgets share, on top of hive-kit.js (sliders, chips, tap
-// rows, meters, ladders, grids, verdict banners, the URL hash): a strip showing which stage of the
-// compiler the lesson is about, a text box with sample lines, and a tape of cells that colours each
+// rows, meters, ladders, grids, verdict banners, the URL hash): a strip showing which of the nine steps of
+// the course the lesson is in, a text box with sample lines, and a tape of cells that colours each
 // character, token or word by the answer a compiled spec fn gave for it. It decides nothing about a
 // compiler: every class, status, count and verdict a widget shows comes from that widget's
 // ./logic.js, the fn bodies of one gHashTag/t27 spec compiled to wasm. Every word is a SAY_ and every
@@ -16,7 +16,8 @@ css.href = new URL('./cmp-kit.css', import.meta.url).href
 document.head.appendChild(css)
 
 /**
- * The nine stages a .t27 file passes, one per module of the course, as a bar: the lesson's stage is lit
+ * The nine steps of the course, one per module, as a bar. They are the course's own division, not the six stages of
+ * pipeline.t27 (Lex, Parse, TypeCheck, Optimize, Codegen, Link): the lesson's step is lit
  * and named under the bar. Words are SAY_STAGES and SAY_STAGE_LINE, the index is K_STAGE.
  */
 export function stages() {

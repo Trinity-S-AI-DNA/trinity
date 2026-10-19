@@ -1,6 +1,7 @@
 // cmp-fields/tool.js -- lesson 26 of t27-compiler: packing an instruction word. The word is t27a_encode, the fields are read
 // back by opcode_of, dst_of, t27a_src1, t27a_src2, v3_of and t27a_imm, and the judgements are is_canonical and imm_clamped,
-// fn bodies of gHashTag/t27 specs/isa/t27a.t27 compiled to wasm (./logic.js). Words are SAY_ and numbers K_ constants of
+// fn bodies compiled to wasm (./logic.js) from gHashTag/t27 specs/isa/t27a.t27 and the
+// isa/ternary_encoding.t27 and isa/t27a_mnemonics.t27 it uses. Words are SAY_ and numbers K_ constants of
 // specs/widgets/cmp-fields.t27.
 import { dstOf, immClamped, isCanonical, listingChar, listingLen, opcodeAt, opcodeOf, t27aEncode, t27aImm, t27aSrc1, t27aSrc2, v3Of } from './logic.js'
 import { K, W, ask, bitOwners, controls, el, facts, fill, hue, legend, root, say, source, stages, verdict, wordTape } from '../cmp-kit.js'

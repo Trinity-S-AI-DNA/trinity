@@ -19,14 +19,16 @@ const ctl = controls([
 const out = el('div')
 root.replaceChildren(stages(), ask(say('SAY_ASK')), ctl.node, out, el('p', { class: 'dk-note' }, say('SAY_NOTE')), source())
 
+// A verdict is good when it is verified, doubtful when unknown or vacuous, and bad otherwise: the spec names the codes.
+const toneOf = (code) => (code === K('K_SV_VERIFIED', 7) ? 0 : code === K('K_SV_UNKNOWN', 2) || code === K('K_SV_VACUOUS', 6) ? 1 : 6)
+
 function draw(s) {
   const failed = Math.max(0, s.total - s.passed)
   const path = say('SAY_PATHS', 0)
   const code = sealVerdict(s.has ? 1 : 0, s.samePath ? path : say('SAY_PATHS', 1), path, s.recorded ? '' : say('SAY_DIGESTS', 0), say('SAY_DIGESTS', s.current), s.total, s.passed, failed, failed, Math.min(s.vacuous, s.total), s.forced ? 1 : 0)
-  const good = code === K('K_SV_VERIFIED', 7)
   out.replaceChildren(
-    verdict(say('SAY_VERDICTS', code - 1), good ? 0 : code === K('K_SV_UNKNOWN', 2) || code === K('K_SV_VACUOUS', 6) ? 1 : 6, say('SAY_NOTES', code - 1)),
-    ladder(W.SAY_VERDICTS.map((name, i) => ({ label: `${i + 1} ${name}`, tone: i === 6 ? 0 : i === 1 || i === 5 ? 1 : 6, on: i === code - 1 }))))
+    verdict(say('SAY_VERDICTS', code - 1), toneOf(code), say('SAY_NOTES', code - 1)),
+    ladder(W.SAY_VERDICTS.map((name, i) => ({ label: `${i + 1} ${name}`, tone: toneOf(i + 1), on: i === code - 1 }))))
 }
 
 ctl.start()

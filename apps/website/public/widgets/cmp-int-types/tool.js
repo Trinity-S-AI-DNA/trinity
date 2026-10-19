@@ -1,6 +1,6 @@
 // cmp-int-types/tool.js -- lesson 7 of t27-compiler: what a type name means to the reference compiler. The width is
 // int_rank, the suffix verdict is is_integer_type_suffix and the kept span is trim_lo and trim_hi, fn bodies of
-// gHashTag/t27 specs/compiler/int_type_names.t27 compiled to wasm (./logic.js). Words are SAY_ and numbers K_
+// gHashTag/t27 specs/compiler/int_type_names.t27 (trim_lo and trim_hi come from specs/tri/t27b/type_text.t27 through use) compiled to wasm (./logic.js). Words are SAY_ and numbers K_
 // constants of specs/widgets/cmp-int-types.t27.
 import { intRank, isIntegerTypeSuffix, trimHi, trimLo } from './logic.js'
 import { K, W, ask, el, facts, fill, hue, ladder, root, say, source, stages, tape, textBox, verdict } from '../cmp-kit.js'

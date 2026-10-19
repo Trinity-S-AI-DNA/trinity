@@ -25,7 +25,7 @@ function draw(s) {
       cell: (r, c) => { const d = afterCut(r + 1, c + 1, !!s.foreign); return { text: cutSafe(d) ? 'ok' : 'x', tone: cutSafe(d) ? 0 : 6, on: r === s.proto && c === s.cut } },
     }),
     el('p', { class: 'dk-label' }, `${say('SAY_PROTOS', s.proto)}: ${protoCutSafe(s.proto + 1) ? say('SAY_ALL_SAFE') : say('SAY_NOT_ALL_SAFE')}`),
-    ladder(W.SAY_DISKS.map((name, i) => ({ label: name, tone: i < 2 ? 0 : 6, on: i === disk - 1 }))))
+    ladder(W.SAY_DISKS.map((name, i) => ({ label: name, tone: cutSafe(i + 1) ? 0 : 6, on: i === disk - 1 }))))
 }
 
 ctl.start()

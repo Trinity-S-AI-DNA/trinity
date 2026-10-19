@@ -1,7 +1,7 @@
 // cmp-assemble/tool.js -- lesson 25 of t27-compiler: the t27a assembler and disassembler. The status and the word are
 // assemble_status and assemble, the listing is listing_len and listing_char, the round trip is is_canonical and
-// reassemble, and the field owners are found with the spec's own decoders, fn bodies of gHashTag/t27 specs/isa/t27a.t27
-// compiled to wasm (./logic.js). Words are SAY_ and numbers K_ constants of specs/widgets/cmp-assemble.t27.
+// reassemble, and the field owners are found with the decoders of isa/ternary_encoding.t27 that t27a.t27 uses, fn bodies of
+// gHashTag/t27 specs/isa/t27a.t27 compiled to wasm (./logic.js). Words are SAY_ and numbers K_ constants of specs/widgets/cmp-assemble.t27.
 import { assemble, assembleStatus, dstOf, isCanonical, listingChar, listingLen, opcodeOf, reassemble, t27aImm, t27aSrc1, t27aSrc2, v3Of } from './logic.js'
 import { K, W, ask, bitOwners, el, facts, fill, hue, legend, root, say, source, stages, textBox, verdict, wordTape } from '../cmp-kit.js'
 

@@ -12,7 +12,11 @@ export const body: Block[] = [
   },
   {
     "kind": "h",
-    "text": "Nine stages, twenty-seven widgets"
+    "text": "Nine steps, twenty-seven widgets"
+  },
+  {
+    "kind": "p",
+    "text": "The pipeline in pipeline.t27 has 6 stages: Lex, Parse, TypeCheck, Optimize, Codegen and Link. The 9 modules of the course are its own division of the road, not those 6 stages."
   },
   {
     "kind": "table",
@@ -105,7 +109,7 @@ export const body: Block[] = [
   },
   {
     "kind": "p",
-    "text": "No widget copies a rule. scripts/t27-logic.mjs of 999-multibots-telegraf runs t27c gen on a spec, builds the Zig with Zig 0.16 for wasm32 and writes a module with one function per spec fn, and scripts/widget-logic.mjs puts it beside the widget with a byte-identical copy of the spec. The share of functions that lower runs from 5 of 20 in the lexer, which scans a struct, to all 58 of the t27a assembler. A str crosses the boundary as UTF-8 bytes, which is how the assembler and the tuple check take text. The course needed no new spec."
+    "text": "No widget copies a rule. scripts/t27-logic.mjs of 999-multibots-telegraf runs t27c gen on a spec, builds the Zig with Zig 0.16 for wasm32 and writes a module with one function per spec fn, and scripts/widget-logic.mjs puts it beside the widget with a byte-identical copy of the spec. The share of the functions a spec declares that lower runs from 5 of 20 in the lexer, which scans a struct, to 38 of 38 in the t27a assembler. A module also holds the functions of the specs its spec takes in with use, whose files are not vendored beside the widget: t27a.t27 lowers 58 functions, 38 its own and 20 spliced in from isa/ternary_encoding.t27 and isa/t27a_mnemonics.t27, and six other specs splice in from 1 to 7 functions each. Lessons 7 and 8 use fns spliced in from tri/t27b/type_text.t27, tools/t27o/rust_std.t27 and hosting/toolchain.t27. A str crosses the boundary as UTF-8 bytes, which is how the assembler and the tuple check take text. The course needed no new spec for its logic: it uses the 18 and the specs they use."
   },
   {
     "kind": "h",
@@ -115,7 +119,7 @@ export const body: Block[] = [
     "kind": "ul",
     "items": [
       "No lesson runs a whole stage of t27c. The lexer and the parser scan structs, which WebAssembly cannot take, so the widgets run their byte tests and their precedence rule. The typechecker, pipeline and optimizer specs do not compile to Zig today.",
-      "The t27a assembler is the exception: it is a small front end of its own, and all 58 of its functions lower, so lessons 2, 3, 6, 25 and 26 run a real parser, assembler and disassembler.",
+      "The t27a assembler is the exception: it is a small front end of its own, and all 38 functions it declares lower, with 20 more spliced in through use, so lessons 2, 3, 6, 25 and 26 run a real parser, assembler and disassembler.",
       "Lessons 16, 18, 21 and 23 quote lab accounts that the specs record with a date. The seal rules of lessons 18 and 21 are rules the specs state, and whether t27c does them is for the specs and the compiler to say.",
       "The costs of lessons 10 to 12 are the static estimates of the compiler, not a place-and-route report."
     ]
@@ -141,7 +145,11 @@ export const ruBody: Block[] = [
   },
   {
     "kind": "h",
-    "text": "Девять этапов, двадцать семь виджетов"
+    "text": "Девять шагов, двадцать семь виджетов"
+  },
+  {
+    "kind": "p",
+    "text": "Конвейер в pipeline.t27 состоит из 6 этапов: Lex, Parse, TypeCheck, Optimize, Codegen и Link. 9 модулей курса — собственное деление дороги, а не эти 6 этапов."
   },
   {
     "kind": "table",
@@ -221,7 +229,7 @@ export const ruBody: Block[] = [
   },
   {
     "kind": "p",
-    "text": "sieve.t27 задаёт десять вопросов девяти компиляторам и держит «неизвестно» отдельно от «ложь». Рисунок считает клетки каждого компилятора скомпилированной cells_with: у t27c 4 ложных клетки, у t27b 1, потому что для этих двух источник — мы сами. У семи сторонних компиляторов нет ложных клеток и от 3 до 5 неизвестных, потому что ни один открытый источник их не называет. Компилятор отсеивает только ложь, поэтому по приведённым данным решето отсеивает только двух компиляторов, которых мы читаем изнутри, а спека оговаривает, что её нельзя читать как «t27 хуже X»."
+    "text": "sieve.t27 задаёт десять вопросов девяти компиляторам и держит «неизвестно» отдельно от «ложь». Рисунок считает клетки каждого компилятора скомпилированной cells_with: у t27c 4 ложных клетки, у t27b 1, потому что для этих двух источник — мы сами. У семи сторонних компиляторов нет ложных клеток и от 3 до 5 неизвестных, потому что ни один открытый источник их не называет. Решето отсеивает компилятор только по значению «ложь», поэтому по приведённым данным оно отсеивает только двух компиляторов, которых мы читаем изнутри, а спека оговаривает, что её нельзя читать как «t27 хуже X»."
   },
   {
     "kind": "figure",
@@ -234,7 +242,7 @@ export const ruBody: Block[] = [
   },
   {
     "kind": "p",
-    "text": "Ни один виджет не копирует правило. scripts/t27-logic.mjs из 999-multibots-telegraf запускает t27c gen на спеке, собирает Zig в Zig 0.16 под wasm32 и пишет модуль с одной функцией на каждую fn спеки, а scripts/widget-logic.mjs кладёт его рядом с виджетом вместе с побайтной копией спеки. Доля функций, которые переводятся, идёт от 5 из 20 в лексере, сканирующем структуру, до всех 58 у ассемблера t27a. Строка str пересекает границу как байты UTF-8, так ассемблер и проверка кортежей принимают текст. Для курса новая спека не понадобилась."
+    "text": "Ни один виджет не копирует правило. scripts/t27-logic.mjs из 999-multibots-telegraf запускает t27c gen на спеке, собирает Zig в Zig 0.16 под wasm32 и пишет модуль с одной функцией на каждую fn спеки, а scripts/widget-logic.mjs кладёт его рядом с виджетом вместе с побайтной копией спеки. Доля объявленных в спеке функций, которые переводятся, идёт от 5 из 20 в лексере, сканирующем структуру, до 38 из 38 у ассемблера t27a. В модуль попадают и функции спек, которые эта спека подтягивает через use, а их файлы рядом с виджетом не лежат: t27a.t27 переводит 58 функций, 38 свои и 20 подтянутых из isa/ternary_encoding.t27 и isa/t27a_mnemonics.t27, а шесть других спек подтягивают от 1 до 7 функций. Уроки 7 и 8 используют функции, подтянутые из tri/t27b/type_text.t27, tools/t27o/rust_std.t27 и hosting/toolchain.t27. Строка str пересекает границу как байты UTF-8, так ассемблер и проверка кортежей принимают текст. Для логики курса новая спека не понадобилась: он использует эти 18 и спеки, которые они подтягивают."
   },
   {
     "kind": "h",
@@ -244,7 +252,7 @@ export const ruBody: Block[] = [
     "kind": "ul",
     "items": [
       "Ни один урок не запускает целый этап t27c. Лексер и парсер сканируют структуры, которые WebAssembly принять не может, поэтому виджеты исполняют их проверки байтов и правило приоритета. Спеки typechecker, pipeline и optimizer сегодня не компилируются в Zig.",
-      "Ассемблер t27a — исключение: это небольшой самостоятельный фронтенд, и все его 58 функций переводятся, поэтому уроки 2, 3, 6, 25 и 26 исполняют настоящие парсер, ассемблер и дизассемблер.",
+      "Ассемблер t27a — исключение: это небольшой самостоятельный фронтенд, и переводятся все 38 объявленных в нём функций, а ещё 20 подтянуты через use, поэтому уроки 2, 3, 6, 25 и 26 исполняют настоящие парсер, ассемблер и дизассемблер.",
       "Уроки 16, 18, 21 и 23 цитируют отчёты стенда, которые спеки записывают с датой. Правила печатей из уроков 18 и 21 — это правила, которые формулируют спеки, а делает ли их t27c, должны сказать спеки и сам компилятор.",
       "Стоимости из уроков 10–12 — статические оценки компилятора, а не отчёт размещения и трассировки."
     ]

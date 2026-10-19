@@ -16,12 +16,15 @@ const ctl = controls([
 const out = el('div')
 root.replaceChildren(stages(), ask(say('SAY_ASK')), ctl.node, out, el('p', { class: 'dk-note' }, say('SAY_NOTE')), source())
 
+// Only the write answer is green; the spec numbers the four answers and the refusals are the rest.
+const toneOf = (answer) => (answer === K('K_OUT_WRITE', 0) ? 0 : 6)
+
 function draw(s) {
   const answer = outputCheck(!!s.spec, !!s.exists, !!s.readable, s.mark, !!s.named)
   const before = outputCheckToday(!!s.spec, !!s.exists, !!s.readable, s.mark, !!s.named)
   out.replaceChildren(
-    verdict(say('SAY_ANSWERS', answer), answer === K('K_OUT_WRITE', 0) ? 0 : 6, say('SAY_ANSWER_LINES', answer)),
-    ladder([0, 1, 2, 3].map((i) => ({ label: say('SAY_ANSWERS', i), tone: i === 0 ? 0 : 6, on: i === answer }))),
+    verdict(say('SAY_ANSWERS', answer), toneOf(answer), say('SAY_ANSWER_LINES', answer)),
+    ladder([0, 1, 2, 3].map((i) => ({ label: say('SAY_ANSWERS', i), tone: toneOf(i), on: i === answer }))),
     el('p', { class: 'dk-note' }, fill(say('SAY_BEFORE'), say('SAY_ANSWERS', before))))
 }
 

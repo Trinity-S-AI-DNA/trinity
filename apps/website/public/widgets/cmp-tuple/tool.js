@@ -1,8 +1,9 @@
-// cmp-tuple/tool.js -- lesson 8 of t27-compiler: is a type text a simple tuple? The three tests are starts_with,
+// cmp-tuple/tool.js -- lesson 8 of t27-compiler: is a type text a simple tuple? The three tests are starts,
 // ends_with and bytes_contain, the verdict is is_simple_tuple_type and the builtin check is is_icarus_builtin, fn
-// bodies of gHashTag/t27 specs/compiler/verilog_names.t27 compiled to wasm (./logic.js). Words are SAY_ and numbers
+// bodies of gHashTag/t27 specs/compiler/verilog_names.t27 compiled to wasm (./logic.js); starts, bytes_contain and ends_with
+// are spliced in from tri/t27b/type_text.t27, tools/t27o/rust_std.t27 and hosting/toolchain.t27. Words are SAY_ and numbers
 // K_ constants of specs/widgets/cmp-tuple.t27.
-import { bytesContain, endsWith, isIcarusBuiltin, isSimpleTupleType, startsWith } from './logic.js'
+import { bytesContain, endsWith, isIcarusBuiltin, isSimpleTupleType, starts } from './logic.js'
 import { K, W, ask, el, facts, hue, root, say, source, stages, textBox, verdict } from '../cmp-kit.js'
 
 const out = el('div')
@@ -11,7 +12,7 @@ root.replaceChildren(stages(), ask(say('SAY_ASK')), box.node, out, el('p', { cla
 
 function draw(text) {
   const simple = isSimpleTupleType(text)
-  const tests = [startsWith(text, '('), endsWith(text, ')'), bytesContain(text, K('K_COLON', 58))]
+  const tests = [starts(text, 0, new TextEncoder().encode(text).length, '('), endsWith(text, ')'), bytesContain(text, K('K_COLON', 58))]
   const yn = (v) => (v ? say('SAY_YES') : say('SAY_NO'))
   out.replaceChildren(
     verdict(simple ? say('SAY_VERDICT', 0) : say('SAY_VERDICT', 1), simple ? 0 : 6, say('SAY_VERDICT_LINE')),
