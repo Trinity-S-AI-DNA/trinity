@@ -50,8 +50,11 @@ export const isNative = (root, id) => existsSync(join(root, 'public/widgets', id
 // What a native spec holds beyond its words: module `var`s (the page's state) and W_* constants
 // (its own sizes) belong to the wasm, not to the words handed to the page; and a test that calls one of
 // the spec's functions runs under t27c (the evaluator here reads constants only).
-export const isInternal = (name, analysis) => /^W_[A-Z0-9_]+$/.test(name) || (analysis.ast?.children ?? []).some((n) => n.kind === 'ConstDecl' && n.name === name && n.mutable === true)
-const callsFunction = (n) => (n.kind === 'ExprCall' && n.name !== 'assert') || (n.children ?? []).some(callsFunction)
+// W_DATA_FILE / W_DATA_FILES are the exception: they name the files the shared host fetches for the wasm, so they stay in the page.
+export const DATA_NAME = /^W_DATA_FILES?$/
+export const isInternal = (name, analysis) => (/^W_[A-Z0-9_]+$/.test(name) && !DATA_NAME.test(name)) || (analysis.ast?.children ?? []).some((n) => n.kind === 'ConstDecl' && n.name === name && n.mutable === true)
+const withoutVars = (analysis) => ({ ...analysis, ast: { ...analysis.ast, children: (analysis.ast?.children ?? []).filter((n) => !(n.kind === 'ConstDecl' && n.mutable === true)) } })
+const callsFunction = (n) => (n.kind === 'ExprCall' && n.name !== 'assert') || n.kind === 'ExprCast' || (n.children ?? []).some(callsFunction)
 export const wordsOnly = (analysis) => ({ ...analysis, ast: { ...analysis.ast, children: (analysis.ast?.children ?? []).filter((n) => n.kind !== 'TestBlock' || !callsFunction(n)) } })
 
 export const pageOut = (id) => `public/widgets/${id}/index.html`
@@ -238,15 +241,18 @@ export function buildTool({ file, specText, analyze, gallery, root = SITE }) {
   const analysis = analyze(specText)
   const verdict = verdictOf(analysis)
   if (!verdict.typecheckOk || verdict.discarded > 0 || !verdict.hirOk) problems.push(`${file}: compiler verdict not clean (${JSON.stringify(verdict)})`)
-  problems.push(...compilerErrors(analysis).map((m) => `${file}: ${m}`))
+  // The compiler also lists its lint warnings here (a native page's writer has long parameter lists); a warning is not a refusal.
+  problems.push(...compilerErrors(analysis).filter((m) => !/^warning:/.test(m)).map((m) => `${file}: ${m}`))
   if (/[^\x00-\x7f]/.test(specText)) problems.push(`${file}: non-ASCII byte in the spec (L3)`)
   if (CYRILLIC.test(specText)) problems.push(`${file}: Cyrillic in the spec (LANG-EN)`)
   let consts = {}
-  try { consts = constsOf(analysis) } catch (e) { problems.push(`${file}: ${e.message}`) }
-  const native = isNative(root, consts.ID?.value ?? '')
+  // A native spec holds module `var`s (the page's state, any initialiser); they are not read as words.
+  let native = false
+  try { native = isNative(root, constsOf(withoutVars(analysis)).ID?.value ?? '') } catch { /* reported below */ }
+  try { consts = constsOf(native ? withoutVars(analysis) : analysis) } catch (e) { problems.push(`${file}: ${e.message}`) }
   if (native) consts = Object.fromEntries(Object.entries(consts).filter(([k]) => !isInternal(k, analysis)))
   // SAY_* are the tool's words and K_* its numbers (a [N]u16 array stays arr-u16); anything else is a name nobody reads.
-  const optional = Object.fromEntries(Object.entries(consts).filter(([k]) => /^(SAY|K)_[A-Z0-9_]+$/.test(k)).map(([k, v]) => [k, Array.isArray(v.value) ? (v.value.every((x) => typeof x === 'string') ? 'arr' : `arr-${String(v.type).replace(/^\[\d+\]/, '')}`) : typeof v.value === 'string' ? 'str' : v.type]))
+  const optional = Object.fromEntries(Object.entries(consts).filter(([k]) => /^(SAY|K)_[A-Z0-9_]+$/.test(k) || (native && DATA_NAME.test(k))).map(([k, v]) => [k, Array.isArray(v.value) ? (v.value.every((x) => typeof x === 'string') ? 'arr' : `arr-${String(v.type).replace(/^\[\d+\]/, '')}`) : typeof v.value === 'string' ? 'str' : v.type]))
   problems.push(...checkSchema(consts, TOOL_REQUIRED, optional, file))
   const fields = Object.fromEntries(Object.entries(consts).map(([k, v]) => [k, v.value]))
   const expected = moduleOf(fields.ID ?? '')

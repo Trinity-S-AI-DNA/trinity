@@ -46,10 +46,13 @@ test('a native tool (widget.wasm, no tool.js) loads the shared host and is refus
   const { tools } = await buildAll({ analyze })
   const native = tools.filter((t) => isNative(SITE, t.fields.ID))
   assert.ok(native.length >= 2, 'jtag-verdict and race-the-bee are native')
+  for (const id of ['lut-depth', 'lut-explain', 'gf16-calc']) assert.ok(native.some((t) => t.fields.ID === id && (t.fields.W_DATA_FILE || t.fields.W_DATA_FILES)), `${id} hands the host the files it fetches`)
   for (const t of native) {
     assert.match(t.page, /<script type="module" src="\.\.\/host\.js\?v=[0-9a-f]{12}"><\/script>/)
     assert.ok(!t.page.includes('./tool.js'), `${t.fields.ID} loads no tool.js`)
     assert.ok(!('IR_TEXT' in t.fields || 'DATA' in t.fields), `${t.fields.ID} hands the page no wasm state`)
+    // the wasm's own sizes (W_*) stay in the wasm; only the names of the files the host fetches for it go to the page
+    assert.deepEqual(Object.keys(t.fields).filter((k) => /^W_/.test(k) && !/^W_DATA_FILES?$/.test(k)), [], `${t.fields.ID} hands the page no W_ size`)
   }
   const f = native[0]
   const root = mkdtempSync(join(tmpdir(), 'native-'))
