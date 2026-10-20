@@ -52,7 +52,8 @@ export const isNative = (root, id) => existsSync(join(root, 'public/widgets', id
 // the spec's functions runs under t27c (the evaluator here reads constants only).
 // W_DATA_FILE / W_DATA_FILES are the exception: they name the files the shared host fetches for the wasm, so they stay in the page.
 export const DATA_NAME = /^W_DATA_FILES?$/
-export const isInternal = (name, analysis) => (/^W_[A-Z0-9_]+$/.test(name) && !DATA_NAME.test(name)) || (analysis.ast?.children ?? []).some((n) => n.kind === 'ConstDecl' && n.name === name && n.mutable === true)
+// Every other name a native spec declares (W_*, and the module's own tables and codes such as R_*, V_*) is the wasm's, not the page's.
+export const isInternal = (name, analysis) => (!(name in TOOL_REQUIRED) && !/^(SAY|K)_[A-Z0-9_]+$/.test(name) && !DATA_NAME.test(name)) || (analysis.ast?.children ?? []).some((n) => n.kind === 'ConstDecl' && n.name === name && n.mutable === true)
 const withoutVars = (analysis) => ({ ...analysis, ast: { ...analysis.ast, children: (analysis.ast?.children ?? []).filter((n) => !(n.kind === 'ConstDecl' && n.mutable === true)) } })
 const callsFunction = (n) => (n.kind === 'ExprCall' && n.name !== 'assert') || n.kind === 'ExprCast' || (n.children ?? []).some(callsFunction)
 export const wordsOnly = (analysis) => ({ ...analysis, ast: { ...analysis.ast, children: (analysis.ast?.children ?? []).filter((n) => n.kind !== 'TestBlock' || !callsFunction(n)) } })
@@ -261,7 +262,10 @@ export function buildTool({ file, specText, analyze, gallery, root = SITE }) {
   if (problems.length === 0) {
     problems.push(...toolProblems(fields, file, root))
     tests = runSpecTests(native ? wordsOnly(analysis) : analysis, fields)
-    if (tests.tests < 2) problems.push(`${file}: ${tests.tests} test block(s); a widget tests at least two of its own invariants`)
+    // A native spec's other tests call its functions and run under t27c; here they count as declared.
+    const declared = native ? (analysis.ast?.children ?? []).filter((n) => n.kind === 'TestBlock').length : 0
+    tests = { ...tests, declared }
+    if (Math.max(tests.tests, declared) < 2) problems.push(`${file}: ${tests.tests} test block(s); a widget tests at least two of its own invariants`)
     problems.push(...tests.failures.map((m) => `${file}: test ${m}`))
   }
   if (problems.length) return { problems, fields, tests, page: null, publicSpec: null }

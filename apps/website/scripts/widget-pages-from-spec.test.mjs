@@ -15,7 +15,7 @@ test('every tool spec builds clean and its page and spec copy are current', asyn
   for (const t of tools) {
     assert.equal(readFileSync(join(SITE, pageOut(t.fields.ID)), 'utf8'), t.page, `${t.fields.ID} page is current`)
     assert.equal(readFileSync(join(SITE, specOut(t.fields.ID)), 'utf8'), t.publicSpec, `${t.fields.ID} spec copy is current`)
-    assert.ok(t.tests.tests >= 2, `${t.fields.ID} tests at least two invariants`)
+    assert.ok(Math.max(t.tests.tests, t.tests.declared ?? 0) >= 2, `${t.fields.ID} tests at least two invariants`)
   }
 })
 
