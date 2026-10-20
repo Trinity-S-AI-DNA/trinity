@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # gf16-calc.py -- the 1200x630 share card for public/widgets/gf16-calc/.
-# Every number on the card comes from tool.js itself: node compiles specs/widgets/gf16-calc.t27,
-# hands its constants to tool.js's exported analyse(), and prints the result for phi. Nothing
-# numeric is typed here; only the words of the layout are.
+# Every number on the card is read from the page the native widget.wasm (specs/widgets/gf16_calc.t27)
+# writes for phi: widget-render.mjs loads it through the shared host protocol and prints the HTML,
+# scrape() below only reads it. Nothing numeric is computed or typed here; only the layout words are.
 # Run from apps/website: python3 scripts/widget-data/gf16-calc.py
-import json
 import os
+import re
 import subprocess
 from PIL import Image, ImageDraw, ImageFont
 
@@ -13,27 +13,32 @@ SITE = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 OUT = os.path.join(SITE, "public", "widgets", "gf16-calc", "card.png")
 BG, GREEN, GOLD, TEXT, MUTED, RED = "#000000", "#00ff88", "#ffd700", "#e8fff7", "#8fa9a0", "#ff4d6d"
 
-NODE = r"""
-import { readFileSync } from 'node:fs'
-import { join } from 'node:path'
-import { SITE, loadCompiler, constsOf } from './scripts/agents-from-specs.mjs'
-import * as G from './public/widgets/gf16-calc/tool.js'
-const analyze = await loadCompiler(readFileSync(join(SITE, 'public/t27/t27_compiler.wasm')))
-const c = Object.fromEntries(Object.entries(constsOf(analyze(readFileSync(join(SITE, 'specs/widgets/gf16-calc.t27'), 'utf8')))).map(([k, v]) => [k, v.value]))
-const L = G.layoutFromSpecText(readFileSync(join(SITE, 'public/widgets/gf16-calc', c.K_LAYOUT_FILE), 'utf8'), c.K_LAYOUT_NAMES) || G.layoutFromConstants(c)
-const a = G.analyse(c.K_DEFAULT_INPUT, c, L, c.K_DEFAULT_ROUNDING)
-const checks = G.runChecks(c, L)
-process.stdout.write(JSON.stringify({
-  input: c.K_DEFAULT_INPUT, hex: a.hex, bits: a.enc.bits, layout: L, decoded: a.decoded, err: a.err, rel: a.rel,
-  sign: a.dec.sign, exp: a.dec.exp, mant: a.dec.mant,
-  trits: a.ternary.trits, intTrits: a.ternary.intTrits, tapprox: a.ternary.approx, fracTrits: c.K_TERNARY_FRAC_TRITS,
-  ok: checks.vectors.filter((v) => v.ok).length, n: checks.vectors.length,
-}))
-"""
+RENDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "widget-render.mjs")
+
+
+def scrape(html):
+    """Read the numbers the card shows out of the page the native widget.wasm wrote (public/widgets/gf16-calc)."""
+    txt = lambda s: re.sub(r"<[^>]+>", "", s).replace("\u2212", "-")   # the page prints a true minus; the card keeps the ASCII one
+    card = lambda n: html.split("<section")[n]   # 1 the GF16 card, 2 the ternary card
+    facts = dict(zip(*[iter([txt(m) for m in re.findall(r"<d[td][^>]*>(.*?)</d[td]>", card(1))])] * 2))
+    hexs = re.search(r'g16-hex">0x([0-9A-F]+)<', html).group(1)
+    s, e, m, bias = map(int, re.search(r"S(\d+) E(\d+) M(\d+), bias (\d+)", html).groups())
+    glyph = {"T": -1, "0": 0, "1": 1}
+    t = [glyph[c] for c in re.findall(r'class="g16-trit [^"]*"[^>]*>([T01])<', html)]
+    ip = card(2).split('class="g16-point"')[0].count("g16-trit ")
+    ok = re.search(r"(\d+) of (\d+) vectors", html)
+    return {
+        "input": facts["you typed"], "hex": "0x" + hexs, "bits": int(hexs, 16),
+        "layout": {"s": s, "e": e, "m": m, "bits": s + e + m, "bias": bias},
+        "decoded": facts["decoded, exactly"], "err": facts["error"], "rel": facts["relative error"],
+        "exp": int(facts["exponent"].split(" ")[0]), "mant": int(facts["mantissa"].split(" ")[0]),
+        "trits": t, "intTrits": ip, "tapprox": re.search(r"about ([-\d.e+]+)", html).group(1),
+        "fracTrits": len(t) - ip, "ok": int(ok.group(1)), "n": int(ok.group(2)),
+    }
 
 
 def font(size, bold=False):
-    home = os.path.expanduser("~/Library/Fonts")
+    home = os.environ.get("T27_FONT_DIR") or os.path.expanduser("~/Library/Fonts")
     for path in [os.path.join(home, "DejaVuSansMono-Bold.ttf" if bold else "DejaVuSansMono.ttf"),
                  "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
                  "/System/Library/Fonts/Menlo.ttc"]:
@@ -43,10 +48,10 @@ def font(size, bold=False):
 
 
 def main():
-    run = subprocess.run(["node", "--input-type=module", "-e", NODE], cwd=SITE, capture_output=True, text=True)
+    run = subprocess.run(["node", RENDER, "gf16-calc"], cwd=SITE, capture_output=True, text=True)
     if run.returncode != 0:
         raise SystemExit(run.stderr)
-    r = json.loads(run.stdout)
+    r = scrape(run.stdout)
     L = r["layout"]
     img = Image.new("RGB", (1200, 630), BG)
     d = ImageDraw.Draw(img)
