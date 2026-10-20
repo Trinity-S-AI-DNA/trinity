@@ -212,10 +212,10 @@ export const QUEEN_WIDGETS = {
       "view": null,
       "image": "https://t27.ai/play/hello-world/verilog/card.png?v=ac89920ce957",
       "gif": null,
-      "preview": "play/embed.html?spec=specs%2Fdemos%2Fhello_world.t27&cast=t27c-hello-world&tab=term&backend=verilog&v=7cbe9ab0c960",
+      "preview": "play/embed.html?spec=specs%2Fdemos%2Fhello_world.t27&cast=t27c-hello-world&tab=term&backend=verilog&v=8abfdd0f8e2c",
       "commands": [],
       "recorded": null,
-      "iframe": "<iframe src=\"https://t27.ai/play/embed.html?spec=specs%2Fdemos%2Fhello_world.t27&amp;cast=t27c-hello-world&amp;tab=term&amp;backend=verilog&amp;v=7cbe9ab0c960\" width=\"640\" height=\"360\" loading=\"lazy\" style=\"border:0\" allow=\"clipboard-write\" title=\"hello_world.t27 to Verilog, in a terminal inside the post\"></iframe>",
+      "iframe": "<iframe src=\"https://t27.ai/play/embed.html?spec=specs%2Fdemos%2Fhello_world.t27&amp;cast=t27c-hello-world&amp;tab=term&amp;backend=verilog&amp;v=8abfdd0f8e2c\" width=\"640\" height=\"360\" loading=\"lazy\" style=\"border:0\" allow=\"clipboard-write\" title=\"hello_world.t27 to Verilog, in a terminal inside the post\"></iframe>",
       "markdown": "[![hello_world.t27 to Verilog, in a terminal inside the post](https://t27.ai/play/hello-world/verilog/card.png?v=ac89920ce957)](https://t27.ai/play/hello-world/verilog/)"
     },
     {
@@ -1847,10 +1847,10 @@ export const QUEEN_WIDGETS = {
       "view": null,
       "image": "https://t27.ai/play/hello-world/card.png?v=a52d019c491d",
       "gif": null,
-      "preview": "play/embed.html?spec=specs%2Fdemos%2Fhello_world.t27&cast=t27c-hello-world&v=7cbe9ab0c960",
+      "preview": "play/embed.html?spec=specs%2Fdemos%2Fhello_world.t27&cast=t27c-hello-world&v=8abfdd0f8e2c",
       "commands": [],
       "recorded": null,
-      "iframe": "<iframe src=\"https://t27.ai/play/embed.html?spec=specs%2Fdemos%2Fhello_world.t27&amp;cast=t27c-hello-world&amp;v=7cbe9ab0c960\" width=\"640\" height=\"360\" loading=\"lazy\" style=\"border:0\" allow=\"clipboard-write\" title=\"hello_world.t27, compiled inside the post\"></iframe>",
+      "iframe": "<iframe src=\"https://t27.ai/play/embed.html?spec=specs%2Fdemos%2Fhello_world.t27&amp;cast=t27c-hello-world&amp;v=8abfdd0f8e2c\" width=\"640\" height=\"360\" loading=\"lazy\" style=\"border:0\" allow=\"clipboard-write\" title=\"hello_world.t27, compiled inside the post\"></iframe>",
       "markdown": "[![hello_world.t27, compiled inside the post](https://t27.ai/play/hello-world/card.png?v=a52d019c491d)](https://t27.ai/play/hello-world/)"
     },
     {
@@ -1864,10 +1864,10 @@ export const QUEEN_WIDGETS = {
       "view": null,
       "image": "https://t27.ai/play/hello-world/rust/card.png?v=a5b20a3b7864",
       "gif": null,
-      "preview": "play/embed.html?spec=specs%2Fdemos%2Fhello_world.t27&cast=t27c-hello-world&tab=term&backend=rust&v=7cbe9ab0c960",
+      "preview": "play/embed.html?spec=specs%2Fdemos%2Fhello_world.t27&cast=t27c-hello-world&tab=term&backend=rust&v=8abfdd0f8e2c",
       "commands": [],
       "recorded": null,
-      "iframe": "<iframe src=\"https://t27.ai/play/embed.html?spec=specs%2Fdemos%2Fhello_world.t27&amp;cast=t27c-hello-world&amp;tab=term&amp;backend=rust&amp;v=7cbe9ab0c960\" width=\"640\" height=\"360\" loading=\"lazy\" style=\"border:0\" allow=\"clipboard-write\" title=\"hello_world.t27 to Rust, in a terminal inside the post\"></iframe>",
+      "iframe": "<iframe src=\"https://t27.ai/play/embed.html?spec=specs%2Fdemos%2Fhello_world.t27&amp;cast=t27c-hello-world&amp;tab=term&amp;backend=rust&amp;v=8abfdd0f8e2c\" width=\"640\" height=\"360\" loading=\"lazy\" style=\"border:0\" allow=\"clipboard-write\" title=\"hello_world.t27 to Rust, in a terminal inside the post\"></iframe>",
       "markdown": "[![hello_world.t27 to Rust, in a terminal inside the post](https://t27.ai/play/hello-world/rust/card.png?v=a5b20a3b7864)](https://t27.ai/play/hello-world/rust/)"
     },
     {
@@ -1881,10 +1881,10 @@ export const QUEEN_WIDGETS = {
       "view": null,
       "image": "https://t27.ai/play/hello-world/js/card.png?v=2c648964eea2",
       "gif": null,
-      "preview": "play/embed.html?spec=specs%2Fdemos%2Fhello_world.t27&cast=t27c-hello-world&tab=term&backend=js&v=7cbe9ab0c960",
+      "preview": "play/embed.html?spec=specs%2Fdemos%2Fhello_world.t27&cast=t27c-hello-world&tab=term&backend=js&v=8abfdd0f8e2c",
       "commands": [],
       "recorded": null,
-      "iframe": "<iframe src=\"https://t27.ai/play/embed.html?spec=specs%2Fdemos%2Fhello_world.t27&amp;cast=t27c-hello-world&amp;tab=term&amp;backend=js&amp;v=7cbe9ab0c960\" width=\"640\" height=\"360\" loading=\"lazy\" style=\"border:0\" allow=\"clipboard-write\" title=\"hello_world.t27 to JavaScript, in a terminal inside the post\"></iframe>",
+      "iframe": "<iframe src=\"https://t27.ai/play/embed.html?spec=specs%2Fdemos%2Fhello_world.t27&amp;cast=t27c-hello-world&amp;tab=term&amp;backend=js&amp;v=8abfdd0f8e2c\" width=\"640\" height=\"360\" loading=\"lazy\" style=\"border:0\" allow=\"clipboard-write\" title=\"hello_world.t27 to JavaScript, in a terminal inside the post\"></iframe>",
       "markdown": "[![hello_world.t27 to JavaScript, in a terminal inside the post](https://t27.ai/play/hello-world/js/card.png?v=2c648964eea2)](https://t27.ai/play/hello-world/js/)"
     },
     {
@@ -1996,10 +1996,10 @@ export const QUEEN_WIDGETS = {
       "view": null,
       "image": "https://t27.ai/play/e8m0/card.png?v=4e1fe56048a2",
       "gif": null,
-      "preview": "play/embed.html?spec=specs%2Fnumeric%2Fe8m0.t27&cast=t27c-e8m0&v=7cbe9ab0c960",
+      "preview": "play/embed.html?spec=specs%2Fnumeric%2Fe8m0.t27&cast=t27c-e8m0&v=8abfdd0f8e2c",
       "commands": [],
       "recorded": null,
-      "iframe": "<iframe src=\"https://t27.ai/play/embed.html?spec=specs%2Fnumeric%2Fe8m0.t27&amp;cast=t27c-e8m0&amp;v=7cbe9ab0c960\" width=\"640\" height=\"360\" loading=\"lazy\" style=\"border:0\" allow=\"clipboard-write\" title=\"e8m0.t27, the OCP MX scale byte, compiled inside the post\"></iframe>",
+      "iframe": "<iframe src=\"https://t27.ai/play/embed.html?spec=specs%2Fnumeric%2Fe8m0.t27&amp;cast=t27c-e8m0&amp;v=8abfdd0f8e2c\" width=\"640\" height=\"360\" loading=\"lazy\" style=\"border:0\" allow=\"clipboard-write\" title=\"e8m0.t27, the OCP MX scale byte, compiled inside the post\"></iframe>",
       "markdown": "[![e8m0.t27, the OCP MX scale byte, compiled inside the post](https://t27.ai/play/e8m0/card.png?v=4e1fe56048a2)](https://t27.ai/play/e8m0/)"
     },
     {
@@ -2039,10 +2039,10 @@ export const QUEEN_WIDGETS = {
       "view": null,
       "image": "https://t27.ai/play/gfternary/card.png?v=e394a4e370f1",
       "gif": null,
-      "preview": "play/embed.html?spec=specs%2Fnumeric%2Fgfternary.t27&cast=t27c-gfternary&v=7cbe9ab0c960",
+      "preview": "play/embed.html?spec=specs%2Fnumeric%2Fgfternary.t27&cast=t27c-gfternary&v=8abfdd0f8e2c",
       "commands": [],
       "recorded": null,
-      "iframe": "<iframe src=\"https://t27.ai/play/embed.html?spec=specs%2Fnumeric%2Fgfternary.t27&amp;cast=t27c-gfternary&amp;v=7cbe9ab0c960\" width=\"640\" height=\"360\" loading=\"lazy\" style=\"border:0\" allow=\"clipboard-write\" title=\"gfternary.t27, phi-scaled ternary weights, compiled inside the post\"></iframe>",
+      "iframe": "<iframe src=\"https://t27.ai/play/embed.html?spec=specs%2Fnumeric%2Fgfternary.t27&amp;cast=t27c-gfternary&amp;v=8abfdd0f8e2c\" width=\"640\" height=\"360\" loading=\"lazy\" style=\"border:0\" allow=\"clipboard-write\" title=\"gfternary.t27, phi-scaled ternary weights, compiled inside the post\"></iframe>",
       "markdown": "[![gfternary.t27, phi-scaled ternary weights, compiled inside the post](https://t27.ai/play/gfternary/card.png?v=e394a4e370f1)](https://t27.ai/play/gfternary/)"
     },
     {
@@ -2082,10 +2082,10 @@ export const QUEEN_WIDGETS = {
       "view": null,
       "image": "https://t27.ai/play/golden-sieve/card.png?v=6d05c91c19fe",
       "gif": null,
-      "preview": "play/embed.html?spec=specs%2Fnumeric%2Fgolden_sieve.t27&cast=t27c-golden-sieve&v=7cbe9ab0c960",
+      "preview": "play/embed.html?spec=specs%2Fnumeric%2Fgolden_sieve.t27&cast=t27c-golden-sieve&v=8abfdd0f8e2c",
       "commands": [],
       "recorded": null,
-      "iframe": "<iframe src=\"https://t27.ai/play/embed.html?spec=specs%2Fnumeric%2Fgolden_sieve.t27&amp;cast=t27c-golden-sieve&amp;v=7cbe9ab0c960\" width=\"640\" height=\"360\" loading=\"lazy\" style=\"border:0\" allow=\"clipboard-write\" title=\"golden_sieve.t27, the ternary sieve, compiled inside the post\"></iframe>",
+      "iframe": "<iframe src=\"https://t27.ai/play/embed.html?spec=specs%2Fnumeric%2Fgolden_sieve.t27&amp;cast=t27c-golden-sieve&amp;v=8abfdd0f8e2c\" width=\"640\" height=\"360\" loading=\"lazy\" style=\"border:0\" allow=\"clipboard-write\" title=\"golden_sieve.t27, the ternary sieve, compiled inside the post\"></iframe>",
       "markdown": "[![golden_sieve.t27, the ternary sieve, compiled inside the post](https://t27.ai/play/golden-sieve/card.png?v=6d05c91c19fe)](https://t27.ai/play/golden-sieve/)"
     },
     {
@@ -2126,10 +2126,10 @@ export const QUEEN_WIDGETS = {
       "view": null,
       "image": "https://t27.ai/play/tnf17/card.png?v=ece1a2ee4936",
       "gif": null,
-      "preview": "play/embed.html?spec=specs%2Fnumeric%2Ftnf17.t27&cast=t27c-tnf17&v=7cbe9ab0c960",
+      "preview": "play/embed.html?spec=specs%2Fnumeric%2Ftnf17.t27&cast=t27c-tnf17&v=8abfdd0f8e2c",
       "commands": [],
       "recorded": null,
-      "iframe": "<iframe src=\"https://t27.ai/play/embed.html?spec=specs%2Fnumeric%2Ftnf17.t27&amp;cast=t27c-tnf17&amp;v=7cbe9ab0c960\" width=\"640\" height=\"360\" loading=\"lazy\" style=\"border:0\" allow=\"clipboard-write\" title=\"tnf17.t27, a 17-bit ternary-exponent float, compiled inside the post\"></iframe>",
+      "iframe": "<iframe src=\"https://t27.ai/play/embed.html?spec=specs%2Fnumeric%2Ftnf17.t27&amp;cast=t27c-tnf17&amp;v=8abfdd0f8e2c\" width=\"640\" height=\"360\" loading=\"lazy\" style=\"border:0\" allow=\"clipboard-write\" title=\"tnf17.t27, a 17-bit ternary-exponent float, compiled inside the post\"></iframe>",
       "markdown": "[![tnf17.t27, a 17-bit ternary-exponent float, compiled inside the post](https://t27.ai/play/tnf17/card.png?v=ece1a2ee4936)](https://t27.ai/play/tnf17/)"
     },
     {
