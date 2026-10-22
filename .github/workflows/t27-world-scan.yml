@@ -26,6 +26,15 @@ on:
   schedule:
     - cron: '17 3 * * *'
   workflow_dispatch:
+    inputs:
+      verify:
+        description: 'Run the incremental-sync check instead of the scan: old script, then new cold, warm and forced-full runs, trees diffed, per-phase timings in the job summary. Commits nothing.'
+        type: boolean
+        default: false
+      baseline_ref:
+        description: 'Ref whose sync-t27-specs.mjs is the "before" in the check'
+        type: string
+        default: main
 
 permissions:
   contents: write
@@ -35,6 +44,7 @@ permissions:
 
 jobs:
   scan:
+    if: ${{ !inputs.verify }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     defaults:
@@ -192,3 +202,89 @@ jobs:
           # auto-merge armed, take it back -- a new head is unreviewed code.
           gh pr merge "$PR" --disable-auto >/dev/null 2>&1 || true
           echo "- PR #$PR is open and waits for a reviewer bee (bee-reviewed); this job does not merge it" >> "$GITHUB_STEP_SUMMARY"
+
+  # Proves sync-t27-specs.mjs is incremental without being different: the script as it stood
+  # on baseline_ref (which wipes and rebuilds everything) and the current one, cold, warm
+  # and forced full, must leave the same tree. Nothing is committed or opened.
+  verify-incremental:
+    if: ${{ inputs.verify }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: apps/website
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: apps/website/package-lock.json
+      - run: npm ci
+      - name: Old, cold, warm and forced-full syncs
+        run: |
+          set -euo pipefail
+          # Tree digest: every file under public/t27 except the manifest, then the manifest with
+          # the fields the incremental build adds removed, then the RU-audit exceptions file.
+          norm='del(.generatedFrom.analysisKey) | del(.specs[]?.sha256) | del(.duplicates[]?.sha256)'
+          snap() {
+            ( cd public/t27 && find . -type f ! -name manifest.json | sort | xargs sha256sum
+              jq -c "$norm" manifest.json | sha256sum | sed 's/-$/manifest-normalised/'
+              sha256sum < manifest.json | sed 's/-$/manifest-raw/' ) > "/tmp/$1.snap"
+            sha256sum qa/language-exceptions.json >> "/tmp/$1.snap"
+          }
+          timed() { local t0=$(date +%s); "$@" | tee "/tmp/$LABEL.log"; echo "$LABEL total $(( $(date +%s) - t0 ))s" >> /tmp/walls.txt; }
+
+          # t27 master moves during the hour this takes; the four runs must read the same commit.
+          export T27_REF=$(gh api repos/gHashTag/t27/commits/master --jq .sha)
+          export T27_OVERLAY_REFS=$(gh api repos/gHashTag/t27/commits/fix/reject-vibee-specs --jq .sha)
+          echo "t27 pinned at $T27_REF (overlay $T27_OVERLAY_REFS)"
+
+          git fetch --depth=1 origin "${{ inputs.baseline_ref }}"
+          git show FETCH_HEAD:apps/website/scripts/sync-t27-specs.mjs > scripts/sync-t27-specs.baseline.mjs
+          LABEL=old timed node scripts/sync-t27-specs.baseline.mjs
+          rm scripts/sync-t27-specs.baseline.mjs
+          snap old
+
+          LABEL=cold timed node scripts/sync-t27-specs.mjs
+          snap cold
+
+          # A removed spec and a damaged one: the warm run must delete the first, restore the second.
+          echo stale > public/t27/files/zz-removed-upstream.t27
+          victim=$(jq -r '[.specs[] | select(.repo != "t27")][0].path' public/t27/manifest.json)
+          echo tampered >> "public/t27/files/$victim"
+          LABEL=warm timed node scripts/sync-t27-specs.mjs
+          snap warm
+
+          LABEL=full T27_FULL=1 timed node scripts/sync-t27-specs.mjs
+          snap full
+
+          {
+            echo '### sync-t27-specs: before and after'
+            echo
+            echo '| run | wall | what it did |'
+            echo '| --- | --- | --- |'
+            for r in old cold warm full; do
+              echo "| $r | $(grep "^$r total" /tmp/walls.txt | cut -d' ' -f3) | $(grep -m1 'incremental:' /tmp/$r.log | sed 's/^ *//' || true) |"
+            done
+            echo
+            echo '#### Per-phase timings'
+            for r in cold warm full; do echo; echo "$r:"; echo '```'; grep 'timing:' /tmp/$r.log; echo '```'; done
+            echo; echo 'old (baseline script):'; echo '```'; grep -E 'sync-t27-specs:|duplicate files' /tmp/old.log || true; echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          rc=0
+          for pair in "old cold" "cold warm" "cold full"; do
+            set -- $pair
+            if [ "$1" = old ]; then
+              grep -v manifest-raw /tmp/$1.snap > /tmp/a.snap; grep -v manifest-raw /tmp/$2.snap > /tmp/b.snap
+            else
+              cp /tmp/$1.snap /tmp/a.snap; cp /tmp/$2.snap /tmp/b.snap
+            fi
+            if diff /tmp/a.snap /tmp/b.snap > /tmp/d.txt; then echo "$1 == $2: identical ($(wc -l < /tmp/b.snap) digests)" | tee -a "$GITHUB_STEP_SUMMARY"
+            else echo "$1 != $2:"; head -40 /tmp/d.txt; echo "**$1 != $2**" >> "$GITHUB_STEP_SUMMARY"; rc=1; fi
+          done
+          grep -q 'zz-removed-upstream' /tmp/warm.snap && { echo 'stale file survived the warm run'; rc=1; } || true
+          exit $rc

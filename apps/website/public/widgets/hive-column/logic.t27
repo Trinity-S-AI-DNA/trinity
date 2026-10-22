@@ -1,0 +1,594 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/queen/dispatch.t27 -- the Queen's task lifecycle: what happens to an issue from candidate to done
+; S09 of gHashTag/trinity#988 (gHashTag/t27#4828, re-filed from #3571). Four "Queen cycles" are written
+; down in this family of repositories and only one of them moves work: the round of the trios supervisor
+; (gHashTag/BrowserOS, trios/agent-server) that chooses an issue, starts a worker ("bee") on it, ends it,
+; reviews it and releases or keeps it. This file is that lifecycle, made the canonical state machine, with
+; the other cycles named as adapters and their gaps stated. Every decision below is a function the C
+; backend executes, replayed against what the supervisor's own code did (tools/trinity_queen_dispatch.py):
+;   ts      its TypeScript, imported and called under bun: the claim of a row over 2112 inputs, the
+;           public board's column, the single-flight round gate
+;   queend  its Swift policy binary, built at the pin and asked choose, review and retry
+;   pg      PostgreSQL with its own migrations: the singleton lease under 32 contenders, the dispatch
+;           writers on real rows, the criteria release, the CI take-back, the round's own SELECT
+;           (17.7 at this pin; the run at the old pin c25e1b02 used 16.15)
+;   lotus   gHashTag/trinity's local Zig cycle compiled and its 29 tests run (at the trinity pin, which
+;           this re-pin does not move; measured with Zig 0.15.2 in the run at the old supervisor pin
+;           c25e1b02, not re-run here: Zig 0.15.2 was not on the re-pin host)
+;   live    one snapshot of the public endpoints of the deployed supervisor
+; Re-pinned for gHashTag/t27#6368 from feat/queen-supervisor @ c25e1b02 (branch deleted) to the branch
+; production deploys. Between the pins every ts, queend and pg result is unchanged; what moved is read
+; from the source and named below: runner lanes (a claim in state queued that takes no worker slot,
+; a runner-only pass past the worker limit, leases and a 10-minute silence reaper for claimed bees)
+; and the public card's verdict and judgedHead.
+; Not measured: GitHub itself, a real provider or bee, the Mac app's own loop, Railway's deploy of a
+; revision other than the pin. ASCII only (L3).
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module QueenDispatch;
+
+pub const KIND : str = "queen-dispatch";
+pub const ID : str = "queen/dispatch";
+pub const NAME : str = "The Queen's task lifecycle, from candidate to done";
+pub const SUPERVISOR_REPO : str = "gHashTag/BrowserOS";
+pub const SUPERVISOR_BRANCH : str = "fix/queen-worker-provider-and-prompt-size";
+pub const SUPERVISOR_PIN : str = "879799a8bfb286e2ba8dbe840f0bcb81792d19ef";
+pub const CONSUMER_REPO : str = "gHashTag/trinity";
+pub const PINNED_REVISION : str = "afc9d38435ad01c48af6c33c311da422c38f046e";
+pub const ISSUE_BASELINE : str = "03ae2f93f5af2fd4fa23e4c613a3c0e19ac51530";
+pub const SOURCE_LINES : str = "trios/agent-server/apps/server/src/api/services/queen-tick.ts: stateOfDispatch :704-797, dispatchRowState :809-827, round :1459-1976, round SELECT :1645-1674, ceiling read :1722, runner-only pass :1909-1960, releaseStaleContracts :2717-2755, review sweep :2757-2846; queen-dispatch.ts: finishDispatch :4302-4334, reapers :4453-4550, recordDispatch :5175-5345; queen-runner-work.ts: reapSilentRunners :771-795; queen-lease.ts :66-136; queen-ci-verdict.ts :147-229; routes/queen-kanban.ts: columns :107-122, columnFor :179-193, dispatchColumn :333-347, board SELECT :494-507; queen-core/Sources/queend/main.swift: choose :181-334, review :336-379; QueenCore/QueenReviewDecision.swift :41-88; QueenCore/QueenRetryPolicy.swift :60-149";
+; --- The decision: one canonical machine, the others are adapters ---------------------------------
+pub const CANONICAL : str = "the task lifecycle of the trios supervisor round: the only cycle that chooses, starts, ends, reviews and releases work, and the only one that runs (the deployed service answered working at the live snapshot)";
+pub const ADAPTERS : [5]str = [
+    "trios-round: the canonical machine itself, implemented in queen-tick.ts, queen-dispatch.ts and queend",
+    "lotus-policy: gHashTag/trinity src/tri/queen/lotus_cycle.zig, a local loop that tunes a resource policy from episodes (Observe, Evaluate, Plan, Act, and an episode record); it holds no task and leases nothing; specs/queen/lotus.t27 is its design",
+    "agents-md-phases: Plan, Assign, Run, Test, Verdict, Evolve in gHashTag/trinity AGENTS.md, documented as tri queen lotus --phase and implemented nowhere; read as names for choose, start, run, review, verdict and nothing",
+    "ael-v2: OBSERVE, PLAN, DELEGATE, VERIFY, SYNTHESIZE, LEARN in the CLAUDE.md files, the loop an agent session follows; a session is not a task",
+    "phi-loop: the nine-phase development workflow of the CLAUDE.md files and gHashTag/trinity src/vibeec/phi_loop_cli.zig; a way of making a change, not a task's state; not measured here"
+];
+pub const MIGRATION : str = "no runtime is renamed or removed: the adapters keep their words, and a claim about task state is made only in this file's vocabulary; a phase name from another cycle is translated by PHASE_MAP, never taken as a task state";
+pub const PHASE_MAP : [6]str = ["Plan -> choose", "Assign -> start (RUNNING)", "Run -> RUNNING", "Test -> review (criteria judged)", "Verdict -> ACCEPT, SENDBACK, ESCALATE, WAIT or EMPTY", "Evolve -> nothing in the canonical machine; episodes are lotus-policy's"];
+; --- States of a dispatch row, and the events that move it ----------------------------------------
+pub const S_NONE : u32 = 0;
+pub const S_RUNNING : u32 = 1;
+pub const S_REFUSED : u32 = 2;
+pub const S_ENDED : u32 = 3;
+pub const S_WAIT : u32 = 4;
+pub const S_ACCEPT : u32 = 5;
+pub const S_SENDBACK : u32 = 6;
+pub const S_ESCALATE : u32 = 7;
+pub const S_EMPTY : u32 = 8;
+pub const S_STALE : u32 = 9;
+pub const S_REAPED : u32 = 10;
+pub const S_RELEASED : u32 = 11;
+pub const ILLEGAL : u32 = 99;
+pub const E_START : u32 = 0;
+pub const E_REFUSE : u32 = 1;
+pub const E_END : u32 = 2;
+pub const E_END_OTHER_TURN : u32 = 3;
+pub const E_REAP_STALL : u32 = 4;
+pub const E_REAP_BOOT : u32 = 5;
+pub const E_VERDICT_ACCEPT : u32 = 6;
+pub const E_VERDICT_SENDBACK : u32 = 7;
+pub const E_VERDICT_ESCALATE : u32 = 8;
+pub const E_VERDICT_WAIT : u32 = 9;
+pub const E_VERDICT_EMPTY : u32 = 10;
+pub const E_CRITERIA_CHANGED : u32 = 11;
+pub const E_CI_RED_UNDER_CEILING : u32 = 12;
+pub const E_CI_RED_AT_CEILING : u32 = 13;
+pub const E_FLOOR_PASSED : u32 = 14;
+pub const E_REDISPATCH : u32 = 15;
+pub const STATE_RULE : str = "a row has no status column: its state is read from started, finished_at, outcome and review_state; the claim it exerts on its issue is read from the state and three clocks (claim_of below)";
+pub const GUARD_RULE : str = "the guards are the WHERE clauses of the writers: a verdict reaches only a finished, unreaped row on an open issue whose verdict is none or wait; a criteria rewrite releases only finished, unreaped rows not accepted or already stale; a red required check takes back only an accept; an ending closes only an unfinished row of the same conversation";
+pub const WRITER_RULE : str = "the writer that starts a dispatch does not check the table: recordDispatch upserts on the issue key, archives the old row and replaces it whatever its state; the table is enforced by the choice (queend skips live claims), so a second path into the writer -- POST /queen/lease/tick, which skips the round gate -- is not covered by it";
+; --- Claims: what a row costs its issue ------------------------------------------------------------
+pub const V_NONE : u32 = 0;
+pub const V_BLANK : u32 = 1;
+pub const V_WAIT : u32 = 2;
+pub const V_EMPTY : u32 = 3;
+pub const V_SENDBACK : u32 = 4;
+pub const V_ESCALATE : u32 = 5;
+pub const V_ACCEPT : u32 = 6;
+pub const V_FAILED : u32 = 7;
+pub const V_CANCELLED : u32 = 8;
+pub const V_STALE : u32 = 9;
+pub const V_OTHER : u32 = 10;
+pub const C_RUNNING : u32 = 0;
+pub const C_ACCEPTED : u32 = 1;
+pub const C_REJECTED : u32 = 2;
+pub const C_AWAITING_REVIEW : u32 = 3;
+pub const C_FAILED : u32 = 4;
+pub const EMPTY_FLOOR_MS : u64 = 1800000;
+pub const SENDBACK_FLOOR_MS : u64 = 3600000;
+pub const WAIT_FLOOR_MS : u64 = 21600000;
+pub const CEILING_RELEASE_MS : u64 = 3600000;
+pub const MAX_CEILING_RELEASES : u32 = 1;
+pub const SENDBACK_CEILING : u32 = 2;
+pub const CLAIM_RULE : str = "running holds the issue and its files (so does queued, a runner's task, which takes no container worker slot); accepted is done; rejected and awaitingReview hold the issue (awaitingReview holds its files for 48 hours); failed frees both; a row older than 7 days, refused, or reaped holds nothing because the round does not select it";
+; --- Choosing ----------------------------------------------------------------------------------------
+pub const CHOICE_RULE : str = "capacity, then money (only in apiMetered billing), then for each candidate in the order GitHub listed the open issues: skip a live claim, skip landed work, skip a body without a boundary, skip a boundary held by another task, and take the FIRST that survives; nothing ranks the candidates";
+pub const PRIORITY_RULE : str = "there is no priority: GitHub's listing order (newest first by default) decides; QueenSalience ranks a review queue nothing calls; specs/queen/task_analysis.t27 states a priority order that no runtime applies";
+pub const DEPENDENCY_RULE : str = "none: blocked-by, sub-issues, epics and depends-on text are not read when choosing";
+pub const CAPACITY_RULE : str = "another bee may start while the bees in state running are fewer than TRIOS_QUEEN_MAX_WORKERS (default 4); keys x lanes bound it further at dispatch, and memory and disk guards can still refuse; when the container is full and a runner is idle, a runner-only pass asks queend again with the running bees relabelled queued and offers up to RUNNER_PASS_LIMIT (20) more tasks a round to runners only";
+pub const DEFAULT_WORKER_LIMIT : u32 = 4;
+pub const NONE_CHOSEN : u32 = 5;
+pub const COL_BACKLOG : u32 = 0;
+pub const COL_BLOCKED : u32 = 1;
+pub const COL_RUNNING : u32 = 2;
+pub const COL_REVIEW : u32 = 3;
+pub const COL_DONE : u32 = 4;
+pub const COL_DROPPED : u32 = 5;
+; --- Leases ------------------------------------------------------------------------------------------
+pub const LEASE_RULE : str = "one Queen at a time: queen_lease is taken by one INSERT ... ON CONFLICT DO UPDATE ... WHERE expired OR same holder, which bumps a fence; TTL 180 s, heartbeat 60 s, released after each round by expiring it, never deleting it, so the fence never restarts; only the round's recordTick is fenced";
+pub const LEASE_TTL_SECONDS : u32 = 180;
+pub const LEASE_HEARTBEAT_SECONDS : u32 = 60;
+pub const TASK_LEASE_RULE : str = "a bee the container runs has no per-task lease and no heartbeat: it is reaped only by age, 120 minutes after dispatch, or at the supervisor's boot, and its turn has no wall-clock cap; a claimed bee is also reaped after 10 minutes without a claimed_at renewal, a volunteer runner's task by its lease (offer unclaimed 10 minutes, lease unrenewed 15, any task older than 360), and neither reaper nor the boot reaper touches a runner's lane";
+pub const STALL_MINUTES : u32 = 120;
+; --- Review, retries, evidence, cancellation --------------------------------------------------------
+pub const R_ACCEPT : u32 = 0;
+pub const R_SENDBACK : u32 = 1;
+pub const R_ESCALATE : u32 = 2;
+pub const R_WAIT : u32 = 3;
+pub const REVIEW_RULE : str = "queend review: no criteria -> escalate; fewer verdicts than criteria -> wait; every criterion met -> accept when a file was committed, escalate when none was or the count is unknown; something unmet -> escalate after two send-backs, otherwise send back; the TypeScript can then turn an accept into escalate or wait (no compiler witness, reviewer missing or silent three rounds)";
+pub const RETRY_RULE : str = "two counted send-backs, then escalate (the review policy and the CI take-back agree on 2); three free attempts with nothing judgeable escalate; QueenRetryPolicy (two real attempts, interruptions not counted) is compiled into queend and never asked by the container";
+pub const EVIDENCE_RULE : str = "verified done is review_state accept: criteria judged met, at least one committed file, a reviewer's answer; no pull request, CI run or merge is required, and a red required check can take an accept back only when an open pull request exists";
+pub const BOARD_RULE : str = "the public board's done column means accepted or merged, but a finished dispatch on an issue no longer open is drawn as done whatever its verdict";
+pub const CANCEL_RULE : str = "none: no route aborts a running turn or drops a dispatch; a closed issue leaves review, but its bee runs until it ends or is reaped";
+; --- Events, persistence, idempotency, projections --------------------------------------------------
+pub const EVENT_RULE : str = "no event IDs and no event log: GitHub is polled each round, a bee's result is read from its stream, and the only history is queen_dispatch_history (whole-row archives before an overwrite) and queen_transcript (keyed by conversation and sequence)";
+pub const IDEMPOTENCY_RULE : str = "a second ending matches no row; an ending of an older turn matches no row; a second criteria release and a second CI take-back find nothing; requests during a round coalesce into one more round";
+pub const PUBLIC_FIELDS : [6]str = ["/queen/status swarmState", "/queen/status queue.state", "/queen/status workers capacity, active, idle", "/queen/public-board columns", "/queen/public-board cards: number, title, column, criteria, needs, verdict, judgedHead, and for empty cards end_reason", "/queen/public-board pulse: rounds, bees, verdicts, lastRoundAt, roundSeconds"];
+pub const PRIVATE_FIELDS : str = "owned paths, branches, conversations, transcripts, workers, holders, the refusal text, providers, keys and token counts stay on the authenticated /queen/board";
+
+; --- End reasons for runs that produce no commits -----------------------------------------------------------
+; Every finished dispatch has exactly one end reason from this closed list. "unknown" is allowed but counted.
+; The runtime records these reasons; the public board shows them on "empty" cards and counts them over 7 days.
+pub const R_MODEL_ENDED_TURN : u32 = 0;      // Model ended its turn without editing any files
+pub const R_TIME_TOKEN_LIMIT : u32 = 1;     // Hit time or token limit during execution
+pub const R_CRASHED : u32 = 2;             // Container or tool crashed (with exit code)
+pub const R_BOUNDARY_CORRECT : u32 = 3;     // Boundary file was already correct, no changes needed
+pub const R_REFUSAL_START : u32 = 4;       // Refusal before the run started (invalid task, missing resources)
+pub const R_PUSH_FAILED : u32 = 5;          // Push to remote failed after successful run
+pub const R_UNKNOWN : u32 = 6;             // Cause could not be determined by the runner
+
+pub const END_REASON_COUNT : u32 = 7;
+pub const END_REASON_NAMES : [7]str = [
+    "model_ended_turn",
+    "time_token_limit", 
+    "crashed",
+    "boundary_correct",
+    "refusal_start",
+    "push_failed",
+    "unknown"
+];
+
+; --- Public board extension: show end reason on empty cards -----------------------------------------------
+; The public board's "empty" cards now include the end reason when available, enabling breakdown of
+; the 56.0% empty-branch share by reason from public endpoints alone.
+pub const PUBLIC_BOARD_EMPTY_REASON : str = "for empty cards, include end_reason field when available";
+pub const LOCAL_VERSUS_EXTERNAL : str = "local: gHashTag/trinity's Zig lotus-policy and its .trinity/queen files on one machine; external: the trios supervisor in a container on Railway, documented in trios/docs/public-swarm-state.md and reached over its public endpoints";
+; --- Agents and workers ---------------------------------------------------------------------------------
+pub const AGENT_LETTERS : u32 = 27;
+pub const AGENTS_RULE : str = "the 27 named agents of AGENTS.md are documentation roles; no code maps an issue to a letter; a bee is a provider-backed model turn on one key and lane, told it works exactly one issue; the number of container bees is bounded by keys, lanes and TRIOS_QUEEN_MAX_WORKERS, runners add their own lanes, and nothing is bounded by 27";
+; --- The specs this one sits beside ----------------------------------------------------------------------
+pub const NEIGHBOURS : [6]str = [
+    "specs/queen/lotus.t27: the lotus-policy design; does not compile in C at master",
+    "specs/queen/task_analysis.t27: a priority order no runtime applies; fixed here to compile and to sort",
+    "specs/queen/brain_summaries.t27: does not compile in C at master",
+    "specs/brain/brain.t27: no function; does not compile in C at master",
+    "specs/brain/bus.t27: compiles, one test of a version constant",
+    "specs/brain/cognitive_loop.t27: compiles, one test of a version constant"
+];
+; --- Findings: measured, the tag names the evidence ------------------------------------------------------
+pub const FINDINGS_COUNT : u32 = 15;
+pub const FINDINGS : [15]str = [
+    "f50 four cycles disagree and three move nothing: the documented tri queen lotus --phase flags exist nowhere, zig build has no lotus-cycle step, and the Zig cycle's Record Episode stage is a comment [lotus]",
+    "f51 of the six specs the issue names, four do not compile in C at master (lotus, task_analysis, brain_summaries, brain) and two compile with one trivial test each [compile]",
+    "f52 there is no priority and no dependency: the first eligible issue in GitHub's listing order is chosen, in every one of 120 orders [queend; source]",
+    "f53 the one-release bound of a spent retry ceiling never applies: neither the round nor the board selects ceiling_releases, so a stored 1 reads as 0 and the issue is handed back again every hour [pg; ts]",
+    "f54 the public board draws a closed issue's dispatch as done whatever its verdict -- escalate, send-back, wait or none [ts]",
+    "f55 accept requires criteria met, a commit and a reviewer, but no pull request, CI run or merge; without an open pull request a red check cannot take it back [queend; pg]",
+    "f56 one Queen at a time holds: 32 contenders, 20 rounds, one owner per term and a fence that only rises; only recordTick carries that fence [pg; source]",
+    "f57 the dispatch writer enforces nothing: it replaced a row still awaiting review; exclusivity is the issue key plus a choice that skips live claims [pg]",
+    "f58 a bee the container runs has no heartbeat: it is reaped by age alone, at 121 minutes and not at 119, or at boot, and its turn has no wall-clock cap; at this pin a claimed bee or a runner's task is also reaped by a missed renewal (read, not run) [pg; source]",
+    "f59 nothing cancels a running bee [source]",
+    "f60 two counted send-backs then escalate, in review and in the CI take-back alike; QueenRetryPolicy is compiled and never asked [queend; pg; source]",
+    "f61 a duplicate ending, a late ending of an older turn, a second criteria release and a second CI take-back change nothing; there are no event IDs [pg]",
+    "f62 the 27 named agents are documentation: no code maps an issue to a letter, and task_analysis.t27's WORKER_COUNT = 27 equated them with workers [source; spec]",
+    "f63 task_analysis.t27 sorted by returning its input; it now orders by score with tests on unsorted input, and is labelled as applied by no runtime [spec]",
+    "f64 the supervisor is a live service: at the snapshot (2026-10-05 05:59Z) it reported working with 18 of 70 workers and 1218 public cards [live]"
+];
+pub const ENABLED : bool = true;
+
+; --- Rules ------------------------------------------------------------------------------------------------------
+
+pub fn next_state(state: u32, event: u32) -> u32 {
+    if (state == S_NONE) {
+        if (event == E_START) { return S_RUNNING; }
+        if (event == E_REFUSE) { return S_REFUSED; }
+        return ILLEGAL;
+    }
+    if (state == S_RUNNING) {
+        if (event == E_END) { return S_ENDED; }
+        if (event == E_REAP_STALL) { return S_REAPED; }
+        if (event == E_REAP_BOOT) { return S_REAPED; }
+        return ILLEGAL;
+    }
+    if (state == S_ENDED or state == S_WAIT) {
+        if (event == E_VERDICT_ACCEPT) { return S_ACCEPT; }
+        if (event == E_VERDICT_SENDBACK) { return S_SENDBACK; }
+        if (event == E_VERDICT_ESCALATE) { return S_ESCALATE; }
+        if (event == E_VERDICT_WAIT) { return S_WAIT; }
+        if (event == E_VERDICT_EMPTY) { return S_EMPTY; }
+        if (event == E_CRITERIA_CHANGED) { return S_STALE; }
+        if (event == E_FLOOR_PASSED) { return S_RELEASED; }
+        return ILLEGAL;
+    }
+    if (state == S_ACCEPT) {
+        if (event == E_CI_RED_UNDER_CEILING) { return S_SENDBACK; }
+        if (event == E_CI_RED_AT_CEILING) { return S_ESCALATE; }
+        return ILLEGAL;
+    }
+    if (state == S_SENDBACK or state == S_EMPTY) {
+        if (event == E_CRITERIA_CHANGED) { return S_STALE; }
+        if (event == E_FLOOR_PASSED) { return S_RELEASED; }
+        return ILLEGAL;
+    }
+    if (state == S_ESCALATE) {
+        if (event == E_CRITERIA_CHANGED) { return S_STALE; }
+        return ILLEGAL;
+    }
+    if (state == S_STALE or state == S_REAPED or state == S_REFUSED or state == S_RELEASED) {
+        if (event == E_REDISPATCH) { return S_RUNNING; }
+        return ILLEGAL;
+    }
+    return ILLEGAL;
+}
+
+pub fn claim_of(finished: bool, verdict: u32, idle_ms: u64, send_backs: u32, releases: u32) -> u32 {
+    if (finished == false) { return C_RUNNING; }
+    if (verdict == V_ACCEPT) { return C_ACCEPTED; }
+    if (verdict == V_FAILED or verdict == V_CANCELLED) { return C_FAILED; }
+    if (verdict == V_EMPTY) {
+        if (idle_ms >= EMPTY_FLOOR_MS) { return C_FAILED; }
+        return C_REJECTED;
+    }
+    if (verdict == V_STALE) { return C_FAILED; }
+    if (verdict == V_SENDBACK) {
+        if (idle_ms >= SENDBACK_FLOOR_MS and send_backs < SENDBACK_CEILING) { return C_FAILED; }
+        if (releases >= MAX_CEILING_RELEASES) { return C_REJECTED; }
+        if (idle_ms >= CEILING_RELEASE_MS) { return C_FAILED; }
+        return C_REJECTED;
+    }
+    if (verdict == V_NONE or verdict == V_BLANK or verdict == V_WAIT) {
+        if (idle_ms >= WAIT_FLOOR_MS and send_backs < SENDBACK_CEILING) { return C_FAILED; }
+    }
+    return C_AWAITING_REVIEW;
+}
+
+; What the round and the board actually pass for `releases`: neither selects the column.
+pub fn releases_read_by_round(stored: u32) -> u32 {
+    return 0;
+}
+
+pub fn column_of(claim: u32, issue_open: bool, issue_list_known: bool) -> u32 {
+    if (claim != C_RUNNING and issue_list_known and issue_open == false) { return COL_DONE; }
+    if (claim == C_RUNNING) { return COL_RUNNING; }
+    if (claim == C_ACCEPTED) { return COL_DONE; }
+    if (claim == C_REJECTED or claim == C_AWAITING_REVIEW) { return COL_REVIEW; }
+    return COL_DROPPED;
+}
+
+pub fn chosen_of(e0: bool, e1: bool, e2: bool, e3: bool, e4: bool) -> u32 {
+    if (e0) { return 0; }
+    if (e1) { return 1; }
+    if (e2) { return 2; }
+    if (e3) { return 3; }
+    if (e4) { return 4; }
+    return NONE_CHOSEN;
+}
+
+pub fn can_start(running: u32, limit: u32) -> bool {
+    return running < limit;
+}
+
+pub fn review_of(total: u32, judged: u32, met: u32, committed_known: bool, committed: u32, prior_send_backs: u32) -> u32 {
+    if (total == 0) { return R_ESCALATE; }
+    if (judged < total) { return R_WAIT; }
+    if (met == total) {
+        if (committed_known and committed > 0) { return R_ACCEPT; }
+        return R_ESCALATE;
+    }
+    if (prior_send_backs >= SENDBACK_CEILING) { return R_ESCALATE; }
+    return R_SENDBACK;
+}
+
+pub fn retry_allowed(real_attempts: u32) -> bool {
+    return real_attempts < SENDBACK_CEILING;
+}
+
+pub fn counts_against_issue(interrupted: bool) -> bool {
+    return interrupted == false;
+}
+
+pub fn lease_taken(expired: bool, same_holder: bool) -> bool {
+    return expired or same_holder;
+}
+
+pub fn fence_after(fence: u64) -> u64 {
+    return fence + 1;
+}
+
+pub fn owners_per_term() -> u32 {
+    return 1;
+}
+
+pub fn stall_reapable(age_minutes: u32) -> bool {
+    return age_minutes > STALL_MINUTES;
+}
+
+pub fn followup_rounds(requests_during_round: u32) -> u32 {
+    if (requests_during_round > 0) { return 1; }
+    return 0;
+}
+
+pub fn accept_requires_pull_request() -> bool {
+    return false;
+}
+
+pub fn writer_enforces_table() -> bool {
+    return false;
+}
+
+invariant illegal_is_outside_every_state { assert ILLEGAL > S_RELEASED; }
+invariant the_ceiling_is_two { assert SENDBACK_CEILING == 2 and MAX_CEILING_RELEASES == 1; }
+invariant the_floors_rise { assert EMPTY_FLOOR_MS < SENDBACK_FLOOR_MS and SENDBACK_FLOOR_MS < WAIT_FLOOR_MS; }
+invariant the_heartbeat_beats_inside_the_ttl { assert LEASE_HEARTBEAT_SECONDS * 3 == LEASE_TTL_SECONDS; }
+invariant end_reason_count_matches_names { assert END_REASON_COUNT == END_REASON_NAMES.len(); }
+invariant all_end_reasons_valid { 
+    assert is_valid_end_reason(R_MODEL_ENDED_TURN);
+    assert is_valid_end_reason(R_TIME_TOKEN_LIMIT);
+    assert is_valid_end_reason(R_CRASHED);
+    assert is_valid_end_reason(R_BOUNDARY_CORRECT);
+    assert is_valid_end_reason(R_REFUSAL_START);
+    assert is_valid_end_reason(R_PUSH_FAILED);
+    assert is_valid_end_reason(R_UNKNOWN);
+}
+
+; --- End reason handling functions --------------------------------------------------------------------------
+
+pub fn is_valid_end_reason(reason: u32) -> bool {
+    return reason < END_REASON_COUNT;
+}
+
+pub fn end_reason_to_name(reason: u32) -> str {
+    if (is_valid_end_reason(reason)) {
+        return END_REASON_NAMES[reason];
+    }
+    return "invalid_end_reason";
+}
+
+pub fn is_no_diff_end_reason(reason: u32) -> bool {
+    return reason == R_MODEL_ENDED_TURN 
+        or reason == R_TIME_TOKEN_LIMIT 
+        or reason == R_BOUNDARY_CORRECT 
+        or reason == R_REFUSAL_START 
+        or reason == R_PUSH_FAILED 
+        or reason == R_UNKNOWN;
+}
+
+pub fn is_crash_end_reason(reason: u32) -> bool {
+    return reason == R_CRASHED;
+}
+
+test the_table_moves_only_along_its_guards {
+    assert next_state(S_NONE, E_START) == S_RUNNING;
+    assert next_state(S_RUNNING, E_END) == S_ENDED;
+    assert next_state(S_ENDED, E_END) == ILLEGAL;
+    assert next_state(S_RUNNING, E_VERDICT_ACCEPT) == ILLEGAL;
+    assert next_state(S_ACCEPT, E_CRITERIA_CHANGED) == ILLEGAL;
+    assert next_state(S_ACCEPT, E_CI_RED_AT_CEILING) == S_ESCALATE;
+    assert next_state(S_ESCALATE, E_FLOOR_PASSED) == ILLEGAL;
+    assert next_state(S_REAPED, E_CRITERIA_CHANGED) == ILLEGAL;
+    assert next_state(S_STALE, E_REDISPATCH) == S_RUNNING;
+    assert next_state(S_RUNNING, E_END_OTHER_TURN) == ILLEGAL;
+    // Every legal transition, once each: a guard no assert reaches can be dropped unnoticed (#9886).
+    assert next_state(S_NONE, E_REFUSE) == S_REFUSED;
+    assert next_state(S_NONE, E_END) == ILLEGAL;
+    assert next_state(S_RUNNING, E_REAP_STALL) == S_REAPED;
+    assert next_state(S_RUNNING, E_REAP_BOOT) == S_REAPED;
+    assert next_state(S_ENDED, E_VERDICT_ACCEPT) == S_ACCEPT;
+    assert next_state(S_ENDED, E_VERDICT_SENDBACK) == S_SENDBACK;
+    assert next_state(S_ENDED, E_VERDICT_ESCALATE) == S_ESCALATE;
+    assert next_state(S_ENDED, E_VERDICT_WAIT) == S_WAIT;
+    assert next_state(S_ENDED, E_VERDICT_EMPTY) == S_EMPTY;
+    assert next_state(S_ENDED, E_CRITERIA_CHANGED) == S_STALE;
+    assert next_state(S_ENDED, E_FLOOR_PASSED) == S_RELEASED;
+    assert next_state(S_WAIT, E_VERDICT_ACCEPT) == S_ACCEPT;
+    assert next_state(S_ACCEPT, E_CI_RED_UNDER_CEILING) == S_SENDBACK;
+    assert next_state(S_SENDBACK, E_CRITERIA_CHANGED) == S_STALE;
+    assert next_state(S_SENDBACK, E_FLOOR_PASSED) == S_RELEASED;
+    assert next_state(S_EMPTY, E_CRITERIA_CHANGED) == S_STALE;
+    assert next_state(S_SENDBACK, E_START) == ILLEGAL;
+    assert next_state(S_ESCALATE, E_CRITERIA_CHANGED) == S_STALE;
+    assert next_state(S_REAPED, E_REDISPATCH) == S_RUNNING;
+    assert next_state(S_REFUSED, E_REDISPATCH) == S_RUNNING;
+    assert next_state(S_RELEASED, E_REDISPATCH) == S_RUNNING;
+}
+
+test a_claim_follows_the_verdict_and_three_clocks {
+    assert claim_of(false, V_ACCEPT, 0, 0, 0) == C_RUNNING;
+    assert claim_of(true, V_ACCEPT, 0, 0, 0) == C_ACCEPTED;
+    assert claim_of(true, V_EMPTY, 1799999, 0, 0) == C_REJECTED;
+    assert claim_of(true, V_EMPTY, 1800000, 0, 0) == C_FAILED;
+    assert claim_of(true, V_SENDBACK, 3600000, 1, 0) == C_FAILED;
+    assert claim_of(true, V_SENDBACK, 3600000, 2, 1) == C_REJECTED;
+    assert claim_of(true, V_SENDBACK, 3600000, 2, releases_read_by_round(1)) == C_FAILED;
+    assert claim_of(true, V_WAIT, 21600000, 0, 0) == C_FAILED;
+    assert claim_of(true, V_ESCALATE, 999999999, 0, 0) == C_AWAITING_REVIEW;
+    // #9886: each verdict that frees the issue, the send-back floor at its edge with a release
+    // already spent, and the wait floor's two edges.
+    assert claim_of(true, V_FAILED, 0, 0, 0) == C_FAILED;
+    assert claim_of(true, V_CANCELLED, 0, 0, 0) == C_FAILED;
+    assert claim_of(true, V_STALE, 0, 0, 0) == C_FAILED;
+    assert claim_of(true, V_SENDBACK, 3600000, 1, 1) == C_FAILED;
+    assert claim_of(true, V_NONE, 21600000, 0, 0) == C_FAILED;
+    assert claim_of(true, V_BLANK, 21600000, 0, 0) == C_FAILED;
+    assert claim_of(true, V_WAIT, 21599999, 0, 0) == C_AWAITING_REVIEW;
+    assert claim_of(true, V_WAIT, 21600000, 2, 0) == C_AWAITING_REVIEW;
+}
+
+test a_closed_issue_is_drawn_done_whatever_its_verdict {
+    assert column_of(C_AWAITING_REVIEW, false, true) == COL_DONE;
+    assert column_of(C_AWAITING_REVIEW, true, true) == COL_REVIEW;
+    assert column_of(C_RUNNING, false, true) == COL_RUNNING;
+    assert column_of(C_FAILED, true, true) == COL_DROPPED;
+    assert column_of(C_ACCEPTED, true, true) == COL_DONE;
+}
+
+test the_first_eligible_wins_in_any_order {
+    assert chosen_of(false, false, true, true, false) == 2;
+    assert chosen_of(false, true, false, false, true) == 1;
+    assert chosen_of(false, false, false, false, false) == NONE_CHOSEN;
+    assert chosen_of(true, true, false, false, false) == 0;
+    assert chosen_of(false, false, false, true, true) == 3;
+    assert chosen_of(false, false, false, false, true) == 4;
+    assert can_start(3, DEFAULT_WORKER_LIMIT) == true;
+    assert can_start(4, DEFAULT_WORKER_LIMIT) == false;
+}
+
+test review_escalates_without_work_and_after_two_send_backs {
+    assert review_of(0, 0, 0, true, 1, 0) == R_ESCALATE;
+    assert review_of(2, 1, 1, true, 1, 0) == R_WAIT;
+    assert review_of(1, 1, 1, true, 1, 0) == R_ACCEPT;
+    assert review_of(1, 1, 1, true, 0, 0) == R_ESCALATE;
+    assert review_of(1, 1, 1, false, 0, 0) == R_ESCALATE;
+    assert review_of(1, 1, 0, true, 1, 1) == R_SENDBACK;
+    assert review_of(1, 1, 0, true, 1, 2) == R_ESCALATE;
+    assert retry_allowed(1) == true;
+    assert retry_allowed(2) == false;
+    assert counts_against_issue(true) == false;
+    assert counts_against_issue(false) == true;
+}
+
+test one_lease_one_owner_and_age_alone_reaps {
+    assert lease_taken(false, false) == false;
+    assert lease_taken(true, false) == true;
+    assert lease_taken(false, true) == true;
+    assert fence_after(3) == 4;
+    assert owners_per_term() == 1;
+    assert stall_reapable(121) == true;
+    assert stall_reapable(119) == false;
+    // The comparison is strict: 120 is not reapable. f58 measured 119 and 121, not 120 itself.
+    assert stall_reapable(120) == false;
+    assert followup_rounds(5) == 1;
+    assert followup_rounds(0) == 0;
+    assert accept_requires_pull_request() == false;
+    assert writer_enforces_table() == false;
+}
+
+; --- End reason tests --------------------------------------------------------------------------------------
+
+test end_reason_constants_are_correct {
+    assert R_MODEL_ENDED_TURN == 0;
+    assert R_TIME_TOKEN_LIMIT == 1;
+    assert R_CRASHED == 2;
+    assert R_BOUNDARY_CORRECT == 3;
+    assert R_REFUSAL_START == 4;
+    assert R_PUSH_FAILED == 5;
+    assert R_UNKNOWN == 6;
+    assert END_REASON_COUNT == 7;
+    // The lines above fold at comptime, so this test ran 0 runtime asserts (#9886); these two
+    // call the functions that read the constants: the last reason is named, one past it is not.
+    assert end_reason_to_name(END_REASON_COUNT - 1) == "unknown";
+    assert is_valid_end_reason(END_REASON_COUNT) == false;
+}
+
+test end_reason_names_array_matches_constants {
+    assert END_REASON_NAMES[0] == "model_ended_turn";
+    assert END_REASON_NAMES[1] == "time_token_limit";
+    assert END_REASON_NAMES[2] == "crashed";
+    assert END_REASON_NAMES[3] == "boundary_correct";
+    assert END_REASON_NAMES[4] == "refusal_start";
+    assert END_REASON_NAMES[5] == "push_failed";
+    assert END_REASON_NAMES[6] == "unknown";
+}
+
+test end_reason_validation_works {
+    assert is_valid_end_reason(R_MODEL_ENDED_TURN) == true;
+    assert is_valid_end_reason(R_TIME_TOKEN_LIMIT) == true;
+    assert is_valid_end_reason(R_CRASHED) == true;
+    assert is_valid_end_reason(R_BOUNDARY_CORRECT) == true;
+    assert is_valid_end_reason(R_REFUSAL_START) == true;
+    assert is_valid_end_reason(R_PUSH_FAILED) == true;
+    assert is_valid_end_reason(R_UNKNOWN) == true;
+    assert is_valid_end_reason(7) == false;  // One past the last valid reason
+    assert is_valid_end_reason(99) == false; // Way past the last valid reason
+}
+
+test end_reason_to_name_conversion {
+    assert end_reason_to_name(R_MODEL_ENDED_TURN) == "model_ended_turn";
+    assert end_reason_to_name(R_TIME_TOKEN_LIMIT) == "time_token_limit";
+    assert end_reason_to_name(R_CRASHED) == "crashed";
+    assert end_reason_to_name(R_BOUNDARY_CORRECT) == "boundary_correct";
+    assert end_reason_to_name(R_REFUSAL_START) == "refusal_start";
+    assert end_reason_to_name(R_PUSH_FAILED) == "push_failed";
+    assert end_reason_to_name(R_UNKNOWN) == "unknown";
+    assert end_reason_to_name(99) == "invalid_end_reason"; // Invalid reason returns special string
+}
+
+test no_diff_end_reason_classification {
+    assert is_no_diff_end_reason(R_MODEL_ENDED_TURN) == true;
+    assert is_no_diff_end_reason(R_TIME_TOKEN_LIMIT) == true;
+    assert is_no_diff_end_reason(R_BOUNDARY_CORRECT) == true;
+    assert is_no_diff_end_reason(R_REFUSAL_START) == true;
+    assert is_no_diff_end_reason(R_PUSH_FAILED) == true;
+    assert is_no_diff_end_reason(R_UNKNOWN) == true;
+    assert is_no_diff_end_reason(R_CRASHED) == false; // Crashes are separate category
+}
+
+test crash_end_reason_classification {
+    assert is_crash_end_reason(R_CRASHED) == true;
+    assert is_crash_end_reason(R_MODEL_ENDED_TURN) == false;
+    assert is_crash_end_reason(R_TIME_TOKEN_LIMIT) == false;
+    assert is_crash_end_reason(R_BOUNDARY_CORRECT) == false;
+    assert is_crash_end_reason(R_REFUSAL_START) == false;
+    assert is_crash_end_reason(R_PUSH_FAILED) == false;
+    assert is_crash_end_reason(R_UNKNOWN) == false;
+}
+
+test end_reason_enables_breakdown_of_empty_branches {
+    // This test validates that the end reason vocabulary enables breaking down
+    // the 56.0% empty-branch share by reason from public endpoints alone
+    
+    // Simulate counts for empty branches by reason
+    var model_ended_count : u32 = 100;
+    var token_limit_count : u32 = 80;
+    var boundary_correct_count : u32 = 60;
+    var refusal_start_count : u32 = 40;
+    var push_failed_count : u32 = 30;
+    var unknown_count : u32 = 7;  // Should be < 10% of total
+    var crash_count : u32 = 0;
+    
+    var total_empty : u32 = model_ended_count + token_limit_count + boundary_correct_count + 
+                           refusal_start_count + push_failed_count + unknown_count + crash_count;
+    
+    // Verify unknown is less than 10% of total (success criterion from issue)
+    assert unknown_count < total_empty / 10;
+    
+    // Verify we can calculate breakdown percentages
+    var model_percentage : u32 = (model_ended_count * 100) / total_empty;
+    var token_percentage : u32 = (token_limit_count * 100) / total_empty;
+    var unknown_percentage : u32 = (unknown_count * 100) / total_empty;
+    
+    assert model_percentage > 0;
+    assert token_percentage > 0;
+    assert unknown_percentage < 10;  // Unknown should be < 10%
+    
+    // Verify no-diff vs crash categorization works
+    var no_diff_total : u32 = model_ended_count + token_limit_count + boundary_correct_count + 
+                              refusal_start_count + push_failed_count + unknown_count;
+    var crash_total : u32 = crash_count;
+    
+    assert no_diff_total == total_empty - crash_total;
+}

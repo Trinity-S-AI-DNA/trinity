@@ -22,13 +22,22 @@
 import { useCallback, useEffect, useRef, useState, type RefObject } from 'react'
 import { useI18n } from '../i18n/context'
 import { QUEEN_FRAME_NAME, isQueenFrameMessage } from '../lib/queenFrame'
-import { SELECTION_KEY, explorerFrameHash, explorerRouteOf, validSelection, type ExplorerTab } from '../lib/queenEmbed'
+import { SELECTION_KEY, SPEC_VIEW_KEY, explorerFrameHash, explorerRouteOf, specViewOf, validSelection, type ExplorerTab, type SpecView } from '../lib/queenEmbed'
 
-/** Whether the Queen address is on `tab` now, and the card it names there (null: none, or refused). */
-function addressFor(tab: ExplorerTab): { onTab: boolean; card: string | null } {
+/** Whether the Queen address is on `tab` now, the card it names there (null: none, or refused) and, on SPECS, the layer (view=graph). */
+function addressFor(tab: ExplorerTab): { onTab: boolean; card: string | null; view: SpecView } {
   const params = new URLSearchParams(window.location.hash.split('?')[1] ?? '')
   const onTab = params.get('tab') === tab
-  return { onTab, card: onTab ? validSelection(tab, params.get(SELECTION_KEY[tab])) : null }
+  return { onTab, card: onTab ? validSelection(tab, params.get(SELECTION_KEY[tab])) : null, view: onTab && tab === 'specs' ? specViewOf(params) : null }
+}
+
+/** The frame reported its layer: the Queen address takes it. The address is written at once and fires no hashchange, as the Queen's own writes. */
+function writeView(view: SpecView): void {
+  const [path, query = ''] = window.location.hash.split('?')
+  const params = new URLSearchParams(query)
+  if (view) params.set(SPEC_VIEW_KEY, view)
+  else params.delete(SPEC_VIEW_KEY)
+  window.history.replaceState(window.history.state, '', `${path}?${params}`)
 }
 
 /**
@@ -47,22 +56,22 @@ export function useQueenExplorerFrame(
   const identity = `${tab}:${lang}`
   // The world is part of the boot route, not of the frame's identity: a new world
   // moves the loaded frame (below) rather than booting another one.
-  const [boot, setBoot] = useState(() => ({ identity, card: addressFor(tab).card, world }))
+  const [boot, setBoot] = useState(() => ({ identity, card: addressFor(tab).card, world, view: addressFor(tab).view }))
   const [card, setCard] = useState(boot.card)
   if (boot.identity !== identity) {
     const next = addressFor(tab).card
-    setBoot({ identity, card: next, world })
+    setBoot({ identity, card: next, world, view: addressFor(tab).view })
     setCard(next)
   }
   // ?lang= rides in the search, where the i18n provider reads it, so the frame follows
   // the shell's language instead of whatever localStorage held.
-  const src = `${window.location.pathname}?lang=${lang}${explorerFrameHash(tab, boot.card, boot.world)}`
+  const src = `${window.location.pathname}?lang=${lang}${explorerFrameHash(tab, boot.card, boot.world, boot.view)}`
   // The frame whose load event has been handled, by identity. Until then the frame is
   // booting, and its load event, not its reports, brings it in line with the address.
   const loaded = useRef<string | null>(null)
 
   /** The frame's location, the card of this tab and the world its address names; null while it is still about:blank. */
-  const frameAddress = useCallback((): { here: Location; id: string | null; world: string | null } | null => {
+  const frameAddress = useCallback((): { here: Location; id: string | null; world: string | null; view: SpecView } | null => {
     let here: Location | undefined
     try {
       here = frameRef.current?.contentWindow?.location
@@ -71,7 +80,7 @@ export function useQueenExplorerFrame(
     }
     if (!here || here.pathname !== window.location.pathname) return null
     const shown = explorerRouteOf(here.hash)
-    return { here, id: shown?.tab === tab ? shown.id : null, world: new URLSearchParams(here.hash.split('?')[1] ?? '').get('world') }
+    return { here, id: shown?.tab === tab ? shown.id : null, world: new URLSearchParams(here.hash.split('?')[1] ?? '').get('world'), view: shown?.tab === tab ? shown.view : null }
   }, [tab, frameRef])
 
   // Replace the frame's fragment rather than assign it: an assignment adds an entry to
@@ -80,8 +89,9 @@ export function useQueenExplorerFrame(
   const moveFrame = useCallback(
     (wanted: string | null) => {
       const frame = frameAddress()
-      if (!frame || (frame.id === wanted && frame.world === frameWorld)) return
-      frame.here.replace(`${frame.here.href.split('#')[0]}${explorerFrameHash(tab, wanted, frameWorld)}`)
+      const view = addressFor(tab).view
+      if (!frame || (frame.id === wanted && frame.world === frameWorld && frame.view === view)) return
+      frame.here.replace(`${frame.here.href.split('#')[0]}${explorerFrameHash(tab, wanted, frameWorld, view)}`)
     },
     [tab, frameAddress, frameWorld],
   )
@@ -153,6 +163,7 @@ export function useQueenExplorerFrame(
         // has since been moved past no longer names the card its address does: stale.
         if (loaded.current !== identity || frameAddress()?.id !== route.id) return
         setCard(route.id)
+        if (route.view !== addressFor(tab).view) writeView(route.view)
         if (route.id !== addressFor(tab).card) navigate(tab, route.id)
       } else if (route.tab !== tab) {
         navigate(route.tab, route.id)

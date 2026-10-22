@@ -241,13 +241,20 @@ npm run check:discovery                                                 # кон
 A static page, `public/t27f/graph/`, that draws the T27F graph of a `.t27` spec: one box per node,
 one line per edge, labelled with kind, name, source lines and inference label. The graph comes from
 `specs/t27f/spec_graph_export.t27` and the layout from `specs/t27f/spec_graph_view.t27`, both
-compiled to `t27f.wasm`; `graph.js` is only the glue (loads the wasm, feeds the bytes, emits SVG).
+compiled to `t27f.wasm`; `t27f_graph.js` is only the glue (loads the wasm, feeds the bytes, emits SVG),
+shared by this page and by the Spec Explorer's Graph layer (below); `graph.js` just fetches the picked spec.
 A spec over the graph's cap (192 nodes, 254 edges) is refused with the verdict, never truncated.
 The page is in the site's own style (the tokens of `src/index.css`, not `docs/BRAND-KIT.md`). The
 colour of every box and line lives in `spec_graph_view.t27` (change it there, in gHashTag/t27, then
 regenerate `t27f.wasm`); the CSS in `index.html` styles the page chrome only.
 `PROVENANCE.txt` in that directory records the t27 commit, the compiler, the checksums and how to
 rebuild. To add a spec to the picker, copy it from t27 into `specs/` there and add an `<option>`.
+
+The Spec Explorer (`/game/specs`, `#/specs`) has the same graph as a **Graph** layer next to the source:
+`src/components/SpecGraphView.tsx` imports `t27f_graph.js` on first use (document-relative, so the Queen's
+`/queen/` frame finds it) and draws the open spec's text, the bytes the Explorer already fetched. Clicking a
+box returns to the source with that box's line span selected. The layer is in the address as `view=graph`
+(`#/specs?spec=...&view=graph`, and `#/queen?tab=specs&spec=...&view=graph`).
 
 ### Проверки
 

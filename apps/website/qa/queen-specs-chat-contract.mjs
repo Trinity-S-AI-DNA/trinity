@@ -128,7 +128,7 @@ const PINS = {
   'the chat mount writes no spec path of its own': ['queen', (src) =>
     chatMount(src).includes('<QueenChat') && !/["'`]specs\/[^"'`]*\.t27["'`]/.test(chatMount(src))],
   "the frame's route asks specsCardShown": ['embed', (src) =>
-    /if \(tab === 'specs'\) return specExplorerHash\(specsCardShown\(id\), \{ embedded: true, world \}\)/.test(frameHashBody(src))],
+    /if \(tab === 'specs'\) return specExplorerHash\(specsCardShown\(id\), \{ embedded: true, world, view \}\)/.test(frameHashBody(src))],
   'specsChatSpec puts the spec on show through the guide': ['lib', (src) =>
     /return guideSpecOf\(specsCardShown\(raw \?\? null\)\)/.test(src)],
   "the context line carries spec=": ['chat', (src) =>

@@ -3,13 +3,14 @@ import {validCoreRepo} from './sharedSpecCore.ts';
 
 /** One public address per source; embed and revision pins are viewing context. */
 /** `world` narrows the Explorer's list to one source repository, in the atlas's key (`ghashtag/t27`): the world the Queen's header has chosen. */
-export function specExplorerHash(path:string,options:{embedded?:boolean;sha256?:string;world?:string|null}={}):string {
+export function specExplorerHash(path:string,options:{embedded?:boolean;sha256?:string;world?:string|null;view?:'graph'|null}={}):string {
   if(!path.endsWith('.t27')||/[\\%?#:]/.test(path)||Array.from(path).some(c=>c.charCodeAt(0)<32||c.charCodeAt(0)===127)||path.split('/').some(p=>!p||p==='.'||p==='..'))throw new Error('Invalid catalog spec path');
   if(options.sha256!==undefined&&!/^[a-f0-9]{64}$/.test(options.sha256))throw new Error('Invalid catalog SHA-256');
   const params=new URLSearchParams({spec:path});
   if(options.embedded)params.set('embed','1');
   if(options.sha256)params.set('sha256',options.sha256);
   if(options.world){if(!validCoreRepo(options.world))throw new Error('Invalid catalog world');params.set('world',options.world);}
+  if(options.view==='graph')params.set('view','graph');
   return `#/specs?${params}`;
 }
 

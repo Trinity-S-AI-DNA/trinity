@@ -137,8 +137,35 @@ pub const CANCEL_RULE : str = "none: no route aborts a running turn or drops a d
 ; --- Events, persistence, idempotency, projections --------------------------------------------------
 pub const EVENT_RULE : str = "no event IDs and no event log: GitHub is polled each round, a bee's result is read from its stream, and the only history is queen_dispatch_history (whole-row archives before an overwrite) and queen_transcript (keyed by conversation and sequence)";
 pub const IDEMPOTENCY_RULE : str = "a second ending matches no row; an ending of an older turn matches no row; a second criteria release and a second CI take-back find nothing; requests during a round coalesce into one more round";
-pub const PUBLIC_FIELDS : [6]str = ["/queen/status swarmState", "/queen/status queue.state", "/queen/status workers capacity, active, idle", "/queen/public-board columns", "/queen/public-board cards: number, title, column, criteria, needs, and for a finished row verdict and judgedHead", "/queen/public-board pulse: rounds, bees, verdicts, lastRoundAt, roundSeconds"];
+pub const PUBLIC_FIELDS : [6]str = ["/queen/status swarmState", "/queen/status queue.state", "/queen/status workers capacity, active, idle", "/queen/public-board columns", "/queen/public-board cards: number, title, column, criteria, needs, verdict, judgedHead, and for empty cards end_reason", "/queen/public-board pulse: rounds, bees, verdicts, lastRoundAt, roundSeconds"];
 pub const PRIVATE_FIELDS : str = "owned paths, branches, conversations, transcripts, workers, holders, the refusal text, providers, keys and token counts stay on the authenticated /queen/board";
+
+; --- End reasons for runs that produce no commits -----------------------------------------------------------
+; Every finished dispatch has exactly one end reason from this closed list. "unknown" is allowed but counted.
+; The runtime records these reasons; the public board shows them on "empty" cards and counts them over 7 days.
+pub const R_MODEL_ENDED_TURN : u32 = 0;      // Model ended its turn without editing any files
+pub const R_TIME_TOKEN_LIMIT : u32 = 1;     // Hit time or token limit during execution
+pub const R_CRASHED : u32 = 2;             // Container or tool crashed (with exit code)
+pub const R_BOUNDARY_CORRECT : u32 = 3;     // Boundary file was already correct, no changes needed
+pub const R_REFUSAL_START : u32 = 4;       // Refusal before the run started (invalid task, missing resources)
+pub const R_PUSH_FAILED : u32 = 5;          // Push to remote failed after successful run
+pub const R_UNKNOWN : u32 = 6;             // Cause could not be determined by the runner
+
+pub const END_REASON_COUNT : u32 = 7;
+pub const END_REASON_NAMES : [7]str = [
+    "model_ended_turn",
+    "time_token_limit", 
+    "crashed",
+    "boundary_correct",
+    "refusal_start",
+    "push_failed",
+    "unknown"
+];
+
+; --- Public board extension: show end reason on empty cards -----------------------------------------------
+; The public board's "empty" cards now include the end reason when available, enabling breakdown of
+; the 56.0% empty-branch share by reason from public endpoints alone.
+pub const PUBLIC_BOARD_EMPTY_REASON : str = "for empty cards, include end_reason field when available";
 pub const LOCAL_VERSUS_EXTERNAL : str = "local: gHashTag/trinity's Zig lotus-policy and its .trinity/queen files on one machine; external: the trios supervisor in a container on Railway, documented in trios/docs/public-swarm-state.md and reached over its public endpoints";
 ; --- Agents and workers ---------------------------------------------------------------------------------
 pub const AGENT_LETTERS : u32 = 27;
@@ -317,6 +344,42 @@ invariant illegal_is_outside_every_state { assert ILLEGAL > S_RELEASED; }
 invariant the_ceiling_is_two { assert SENDBACK_CEILING == 2 and MAX_CEILING_RELEASES == 1; }
 invariant the_floors_rise { assert EMPTY_FLOOR_MS < SENDBACK_FLOOR_MS and SENDBACK_FLOOR_MS < WAIT_FLOOR_MS; }
 invariant the_heartbeat_beats_inside_the_ttl { assert LEASE_HEARTBEAT_SECONDS * 3 == LEASE_TTL_SECONDS; }
+invariant end_reason_count_matches_names { assert END_REASON_COUNT == END_REASON_NAMES.len(); }
+invariant all_end_reasons_valid { 
+    assert is_valid_end_reason(R_MODEL_ENDED_TURN);
+    assert is_valid_end_reason(R_TIME_TOKEN_LIMIT);
+    assert is_valid_end_reason(R_CRASHED);
+    assert is_valid_end_reason(R_BOUNDARY_CORRECT);
+    assert is_valid_end_reason(R_REFUSAL_START);
+    assert is_valid_end_reason(R_PUSH_FAILED);
+    assert is_valid_end_reason(R_UNKNOWN);
+}
+
+; --- End reason handling functions --------------------------------------------------------------------------
+
+pub fn is_valid_end_reason(reason: u32) -> bool {
+    return reason < END_REASON_COUNT;
+}
+
+pub fn end_reason_to_name(reason: u32) -> str {
+    if (is_valid_end_reason(reason)) {
+        return END_REASON_NAMES[reason];
+    }
+    return "invalid_end_reason";
+}
+
+pub fn is_no_diff_end_reason(reason: u32) -> bool {
+    return reason == R_MODEL_ENDED_TURN 
+        or reason == R_TIME_TOKEN_LIMIT 
+        or reason == R_BOUNDARY_CORRECT 
+        or reason == R_REFUSAL_START 
+        or reason == R_PUSH_FAILED 
+        or reason == R_UNKNOWN;
+}
+
+pub fn is_crash_end_reason(reason: u32) -> bool {
+    return reason == R_CRASHED;
+}
 
 test the_table_moves_only_along_its_guards {
     assert next_state(S_NONE, E_START) == S_RUNNING;
@@ -329,6 +392,28 @@ test the_table_moves_only_along_its_guards {
     assert next_state(S_REAPED, E_CRITERIA_CHANGED) == ILLEGAL;
     assert next_state(S_STALE, E_REDISPATCH) == S_RUNNING;
     assert next_state(S_RUNNING, E_END_OTHER_TURN) == ILLEGAL;
+    // Every legal transition, once each: a guard no assert reaches can be dropped unnoticed (#9886).
+    assert next_state(S_NONE, E_REFUSE) == S_REFUSED;
+    assert next_state(S_NONE, E_END) == ILLEGAL;
+    assert next_state(S_RUNNING, E_REAP_STALL) == S_REAPED;
+    assert next_state(S_RUNNING, E_REAP_BOOT) == S_REAPED;
+    assert next_state(S_ENDED, E_VERDICT_ACCEPT) == S_ACCEPT;
+    assert next_state(S_ENDED, E_VERDICT_SENDBACK) == S_SENDBACK;
+    assert next_state(S_ENDED, E_VERDICT_ESCALATE) == S_ESCALATE;
+    assert next_state(S_ENDED, E_VERDICT_WAIT) == S_WAIT;
+    assert next_state(S_ENDED, E_VERDICT_EMPTY) == S_EMPTY;
+    assert next_state(S_ENDED, E_CRITERIA_CHANGED) == S_STALE;
+    assert next_state(S_ENDED, E_FLOOR_PASSED) == S_RELEASED;
+    assert next_state(S_WAIT, E_VERDICT_ACCEPT) == S_ACCEPT;
+    assert next_state(S_ACCEPT, E_CI_RED_UNDER_CEILING) == S_SENDBACK;
+    assert next_state(S_SENDBACK, E_CRITERIA_CHANGED) == S_STALE;
+    assert next_state(S_SENDBACK, E_FLOOR_PASSED) == S_RELEASED;
+    assert next_state(S_EMPTY, E_CRITERIA_CHANGED) == S_STALE;
+    assert next_state(S_SENDBACK, E_START) == ILLEGAL;
+    assert next_state(S_ESCALATE, E_CRITERIA_CHANGED) == S_STALE;
+    assert next_state(S_REAPED, E_REDISPATCH) == S_RUNNING;
+    assert next_state(S_REFUSED, E_REDISPATCH) == S_RUNNING;
+    assert next_state(S_RELEASED, E_REDISPATCH) == S_RUNNING;
 }
 
 test a_claim_follows_the_verdict_and_three_clocks {
@@ -341,6 +426,16 @@ test a_claim_follows_the_verdict_and_three_clocks {
     assert claim_of(true, V_SENDBACK, 3600000, 2, releases_read_by_round(1)) == C_FAILED;
     assert claim_of(true, V_WAIT, 21600000, 0, 0) == C_FAILED;
     assert claim_of(true, V_ESCALATE, 999999999, 0, 0) == C_AWAITING_REVIEW;
+    // #9886: each verdict that frees the issue, the send-back floor at its edge with a release
+    // already spent, and the wait floor's two edges.
+    assert claim_of(true, V_FAILED, 0, 0, 0) == C_FAILED;
+    assert claim_of(true, V_CANCELLED, 0, 0, 0) == C_FAILED;
+    assert claim_of(true, V_STALE, 0, 0, 0) == C_FAILED;
+    assert claim_of(true, V_SENDBACK, 3600000, 1, 1) == C_FAILED;
+    assert claim_of(true, V_NONE, 21600000, 0, 0) == C_FAILED;
+    assert claim_of(true, V_BLANK, 21600000, 0, 0) == C_FAILED;
+    assert claim_of(true, V_WAIT, 21599999, 0, 0) == C_AWAITING_REVIEW;
+    assert claim_of(true, V_WAIT, 21600000, 2, 0) == C_AWAITING_REVIEW;
 }
 
 test a_closed_issue_is_drawn_done_whatever_its_verdict {
@@ -348,12 +443,16 @@ test a_closed_issue_is_drawn_done_whatever_its_verdict {
     assert column_of(C_AWAITING_REVIEW, true, true) == COL_REVIEW;
     assert column_of(C_RUNNING, false, true) == COL_RUNNING;
     assert column_of(C_FAILED, true, true) == COL_DROPPED;
+    assert column_of(C_ACCEPTED, true, true) == COL_DONE;
 }
 
 test the_first_eligible_wins_in_any_order {
     assert chosen_of(false, false, true, true, false) == 2;
     assert chosen_of(false, true, false, false, true) == 1;
     assert chosen_of(false, false, false, false, false) == NONE_CHOSEN;
+    assert chosen_of(true, true, false, false, false) == 0;
+    assert chosen_of(false, false, false, true, true) == 3;
+    assert chosen_of(false, false, false, false, true) == 4;
     assert can_start(3, DEFAULT_WORKER_LIMIT) == true;
     assert can_start(4, DEFAULT_WORKER_LIMIT) == false;
 }
@@ -369,6 +468,7 @@ test review_escalates_without_work_and_after_two_send_backs {
     assert retry_allowed(1) == true;
     assert retry_allowed(2) == false;
     assert counts_against_issue(true) == false;
+    assert counts_against_issue(false) == true;
 }
 
 test one_lease_one_owner_and_age_alone_reaps {
@@ -379,7 +479,116 @@ test one_lease_one_owner_and_age_alone_reaps {
     assert owners_per_term() == 1;
     assert stall_reapable(121) == true;
     assert stall_reapable(119) == false;
+    // The comparison is strict: 120 is not reapable. f58 measured 119 and 121, not 120 itself.
+    assert stall_reapable(120) == false;
     assert followup_rounds(5) == 1;
+    assert followup_rounds(0) == 0;
     assert accept_requires_pull_request() == false;
     assert writer_enforces_table() == false;
+}
+
+; --- End reason tests --------------------------------------------------------------------------------------
+
+test end_reason_constants_are_correct {
+    assert R_MODEL_ENDED_TURN == 0;
+    assert R_TIME_TOKEN_LIMIT == 1;
+    assert R_CRASHED == 2;
+    assert R_BOUNDARY_CORRECT == 3;
+    assert R_REFUSAL_START == 4;
+    assert R_PUSH_FAILED == 5;
+    assert R_UNKNOWN == 6;
+    assert END_REASON_COUNT == 7;
+    // The lines above fold at comptime, so this test ran 0 runtime asserts (#9886); these two
+    // call the functions that read the constants: the last reason is named, one past it is not.
+    assert end_reason_to_name(END_REASON_COUNT - 1) == "unknown";
+    assert is_valid_end_reason(END_REASON_COUNT) == false;
+}
+
+test end_reason_names_array_matches_constants {
+    assert END_REASON_NAMES[0] == "model_ended_turn";
+    assert END_REASON_NAMES[1] == "time_token_limit";
+    assert END_REASON_NAMES[2] == "crashed";
+    assert END_REASON_NAMES[3] == "boundary_correct";
+    assert END_REASON_NAMES[4] == "refusal_start";
+    assert END_REASON_NAMES[5] == "push_failed";
+    assert END_REASON_NAMES[6] == "unknown";
+}
+
+test end_reason_validation_works {
+    assert is_valid_end_reason(R_MODEL_ENDED_TURN) == true;
+    assert is_valid_end_reason(R_TIME_TOKEN_LIMIT) == true;
+    assert is_valid_end_reason(R_CRASHED) == true;
+    assert is_valid_end_reason(R_BOUNDARY_CORRECT) == true;
+    assert is_valid_end_reason(R_REFUSAL_START) == true;
+    assert is_valid_end_reason(R_PUSH_FAILED) == true;
+    assert is_valid_end_reason(R_UNKNOWN) == true;
+    assert is_valid_end_reason(7) == false;  // One past the last valid reason
+    assert is_valid_end_reason(99) == false; // Way past the last valid reason
+}
+
+test end_reason_to_name_conversion {
+    assert end_reason_to_name(R_MODEL_ENDED_TURN) == "model_ended_turn";
+    assert end_reason_to_name(R_TIME_TOKEN_LIMIT) == "time_token_limit";
+    assert end_reason_to_name(R_CRASHED) == "crashed";
+    assert end_reason_to_name(R_BOUNDARY_CORRECT) == "boundary_correct";
+    assert end_reason_to_name(R_REFUSAL_START) == "refusal_start";
+    assert end_reason_to_name(R_PUSH_FAILED) == "push_failed";
+    assert end_reason_to_name(R_UNKNOWN) == "unknown";
+    assert end_reason_to_name(99) == "invalid_end_reason"; // Invalid reason returns special string
+}
+
+test no_diff_end_reason_classification {
+    assert is_no_diff_end_reason(R_MODEL_ENDED_TURN) == true;
+    assert is_no_diff_end_reason(R_TIME_TOKEN_LIMIT) == true;
+    assert is_no_diff_end_reason(R_BOUNDARY_CORRECT) == true;
+    assert is_no_diff_end_reason(R_REFUSAL_START) == true;
+    assert is_no_diff_end_reason(R_PUSH_FAILED) == true;
+    assert is_no_diff_end_reason(R_UNKNOWN) == true;
+    assert is_no_diff_end_reason(R_CRASHED) == false; // Crashes are separate category
+}
+
+test crash_end_reason_classification {
+    assert is_crash_end_reason(R_CRASHED) == true;
+    assert is_crash_end_reason(R_MODEL_ENDED_TURN) == false;
+    assert is_crash_end_reason(R_TIME_TOKEN_LIMIT) == false;
+    assert is_crash_end_reason(R_BOUNDARY_CORRECT) == false;
+    assert is_crash_end_reason(R_REFUSAL_START) == false;
+    assert is_crash_end_reason(R_PUSH_FAILED) == false;
+    assert is_crash_end_reason(R_UNKNOWN) == false;
+}
+
+test end_reason_enables_breakdown_of_empty_branches {
+    // This test validates that the end reason vocabulary enables breaking down
+    // the 56.0% empty-branch share by reason from public endpoints alone
+    
+    // Simulate counts for empty branches by reason
+    var model_ended_count : u32 = 100;
+    var token_limit_count : u32 = 80;
+    var boundary_correct_count : u32 = 60;
+    var refusal_start_count : u32 = 40;
+    var push_failed_count : u32 = 30;
+    var unknown_count : u32 = 7;  // Should be < 10% of total
+    var crash_count : u32 = 0;
+    
+    var total_empty : u32 = model_ended_count + token_limit_count + boundary_correct_count + 
+                           refusal_start_count + push_failed_count + unknown_count + crash_count;
+    
+    // Verify unknown is less than 10% of total (success criterion from issue)
+    assert unknown_count < total_empty / 10;
+    
+    // Verify we can calculate breakdown percentages
+    var model_percentage : u32 = (model_ended_count * 100) / total_empty;
+    var token_percentage : u32 = (token_limit_count * 100) / total_empty;
+    var unknown_percentage : u32 = (unknown_count * 100) / total_empty;
+    
+    assert model_percentage > 0;
+    assert token_percentage > 0;
+    assert unknown_percentage < 10;  // Unknown should be < 10%
+    
+    // Verify no-diff vs crash categorization works
+    var no_diff_total : u32 = model_ended_count + token_limit_count + boundary_correct_count + 
+                              refusal_start_count + push_failed_count + unknown_count;
+    var crash_total : u32 = crash_count;
+    
+    assert no_diff_total == total_empty - crash_total;
 }

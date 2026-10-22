@@ -2,9 +2,18 @@
 // t27/specs/
 // LAMB parameter update with trust ratio clipping | φ² + 1/φ² = 3 | TRINITY
 
+// #8980: built with `append` on `[]` and `range` / `len` / `pow`, so it never
+// compiled. The math was also not LAMB: v_hat used beta1's bias correction, the
+// "trust ratio" was ||g|| / ||v_hat|| and was computed, then never applied to the
+// step, and m and v were never written back. It is now You et al. (2020):
+//   r = m_hat / (sqrt(v_hat) + eps) + wd * w,  trust = min(||w||, clip) / ||r||,
+//   w = w - lr * trust * r,
+// per layer, over buffers the caller owns.
+
 module Lamb;
     use base::types;
     use math::constants;
+    use ml::optimizer::adam;
 
     // ═══════════════════════════════════════════════════════════
     // 1. Constants
@@ -39,115 +48,138 @@ module Lamb;
     // 3. Core Functions
     // ═══════════════════════════════════════════════════════════
 
-    // init_state(num_params: u32) → LAMBState
-    fn init_state(num_params: u32) -> LAMBState {
-        let m = [];
-        let v = [];
-        // Initialize moment arrays with zeros
-        for i in range(num_params) {
-            append(m, 0.0);
-            append(v, 0.0);
+    // m and v are the first num_params entries of the given buffers, zeroed; step 0
+    fn init_state(m: []f32, v: []f32, num_params: u32) -> LAMBState {
+        var i : usize = 0;
+        while (i < num_params) {
+            m[i] = 0.0;
+            v[i] = 0.0;
+            i = i + 1;
         }
-        let step = 0u32;
-        return LAMBState { m: m, v: v, step: step };
+        return LAMBState{ .m = m[0..num_params], .v = v[0..num_params], .step = 0 };
     }
 
-    // compute_layer_update(params: []f32, grads: []f32, state: LAMBState, config: LAMBConfig) → []f32
-    fn compute_layer_update(params: []f32, grads: []f32, state: LAMBState, config: LAMBConfig) -> []f32 {
-        let num_params = len(params);
-        let m = state.m;
-        let v = state.v;
-        let step = state.step;
-        
-        // Update biased first moment estimate
-        let m_next = [];
-        for i in range(num_params) {
-            let m_i = config.beta1 * m[i] + (1.0 - config.beta1) * grads[i];
-            append(m_next, m_i);
+    // powi (b^t for a whole t) comes from specs/ml/optimizer/adam.t27 through `use`
+
+    // Writes the moments for step (state.step + 1) into state.m / state.v and the update to
+    // ADD to params into `update`; returns update[0..n]
+    fn compute_layer_update(params: []const f32, grads: []const f32, state: LAMBState, config: LAMBConfig, update: []f32) -> []f32 {
+        const n = params.len;
+        const t = state.step + 1;
+        const c1 = 1.0 - powi(config.beta1, t);
+        const c2 = 1.0 - powi(config.beta2, t);
+        var w_norm : f32 = 0.0;
+        var r_norm : f32 = 0.0;
+        var i : usize = 0;
+        while (i < n) {
+            state.m[i] = config.beta1 * state.m[i] + (1.0 - config.beta1) * grads[i];
+            state.v[i] = config.beta2 * state.v[i] + (1.0 - config.beta2) * grads[i] * grads[i];
+            const r = (state.m[i] / c1) / (sqrt(state.v[i] / c2) + config.epsilon) + config.weight_decay * params[i];
+            update[i] = r;
+            w_norm = w_norm + params[i] * params[i];
+            r_norm = r_norm + r * r;
+            i = i + 1;
         }
-        
-        // Update biased second raw moment estimate
-        let v_next = [];
-        for i in range(num_params) {
-            let v_i = config.beta2 * v[i] + (1.0 - config.beta2) * grads[i] * grads[i];
-            append(v_next, v_i);
+        w_norm = sqrt(w_norm);
+        r_norm = sqrt(r_norm);
+        var trust : f32 = 1.0;
+        if (w_norm > 0.0 and r_norm > 0.0) {
+            trust = @min(w_norm, config.clip_threshold) / r_norm;
         }
-        
-        // Compute bias-corrected first and second moment estimates
-        let m_hat = [];
-        let v_hat = [];
-        let correction = 1.0 - pow(config.beta1, f32(step + 1));
-        for i in range(num_params) {
-            append(m_hat, m_next[i] / correction);
-            append(v_hat, v_next[i] / correction);
+        i = 0;
+        while (i < n) {
+            update[i] = -config.learning_rate * trust * update[i];
+            i = i + 1;
         }
-        
-        // Compute trust ratio for adaptive clipping
-        let trust_ratio = 0.0;
-        let v_hat_sum = 0.0;
-        let grad_norm = 0.0;
-        for i in range(num_params) {
-            v_hat_sum += v_hat[i];
-            grad_norm += grads[i] * grads[i];
-        }
-        let v_hat_norm = sqrt(v_hat_sum);
-        let grad_norm_val = sqrt(grad_norm);
-        if v_hat_norm > 0.0 and grad_norm_val > 0.0 {
-            trust_ratio = grad_norm_val / v_hat_norm;
-        }
-        
-        // Apply adaptive clipping
-        let clipped_grads = [];
-        for i in range(num_params) {
-            let clipped_grad = grads[i];
-            if trust_ratio > config.clip_threshold {
-                clipped_grad = clipped_grad * (config.clip_threshold / trust_ratio);
-            }
-            append(clipped_grads, clipped_grad);
-        }
-        
-        // Apply weight decay and compute update
-        let update = [];
-        for i in range(num_params) {
-            let update_i = (-config.learning_rate) * (m_hat[i] / (sqrt(v_hat[i]) + config.epsilon) + config.weight_decay * params[i]);
-            append(update, update_i);
-        }
-        
-        return update;
+        return update[0..n];
     }
 
-    // forward(layers: [][]f32, grads: [][]f32, states: []LAMBState, config: LAMBConfig) → [][]f32
-    fn forward(layers: [][]f32, grads: [][]f32, states: []LAMBState, config: LAMBConfig) -> [][]f32 {
-        let num_layers = len(layers);
-        let updated_layers = [];
-        
-        for i in range(num_layers) {
-            let layer = layers[i];
-            let layer_grads = grads[i];
-            let state = states[i];
-            
-            // Compute layer updates using LAMB algorithm
-            let updates = compute_layer_update(layer, layer_grads, state, config);
-            
-            // Apply updates to get updated layer
-            let updated_layer = [];
-            for j in range(len(layer)) {
-                let updated_param = layer[j] + updates[j];
-                append(updated_layer, updated_param);
+    // One LAMB step over several layers packed back to back in `params` (layer k has
+    // sizes[k] entries), each with its own state; params change in place, each step + 1.
+    fn forward(params: []f32, grads: []const f32, sizes: []const usize, states: []LAMBState, config: LAMBConfig, scratch: []f32) -> void {
+        var start : usize = 0;
+        var k : usize = 0;
+        while (k < sizes.len) {
+            const end = start + sizes[k];
+            const upd = compute_layer_update(params[start..end], grads[start..end], states[k], config, scratch);
+            var j : usize = 0;
+            while (j < sizes[k]) {
+                params[start + j] = params[start + j] + upd[j];
+                j = j + 1;
             }
-            
-            // Update state for next iteration
-            let updated_state = LAMBState {
-                m: state.m, // These should be updated in compute_layer_update, but for now keep as is
-                v: state.v,
-                step: state.step + 1u32,
-            };
-            
-            // Store updated state (in a real implementation, we'd update the states array)
-            append(updated_layers, updated_layer);
+            states[k].step = states[k].step + 1;
+            start = end;
+            k = k + 1;
         }
-        
-        return updated_layers;
+    }
+
+    fn cfg(lr: f32) -> LAMBConfig {
+        return LAMBConfig{ .learning_rate = lr, .beta1 = DEFAULT_BETA1, .beta2 = DEFAULT_BETA2, .epsilon = DEFAULT_EPSILON, .weight_decay = 0.01, .clip_threshold = DEFAULT_CLIP_THRESHOLD };
+    }
+
+    // which: 0 = m.len, 1 = v.len, 2 = step, 3 = m[0], 4 = v[99]
+    fn init_probe(which: u8) -> f32 {
+        var m : [100]f32 = [9.0] ** 100;
+        var v : [100]f32 = [9.0] ** 100;
+        const st = init_state(&m, &v, 100);
+        if (which == 0) {
+            return @as(f32, @floatFromInt(st.m.len));
+        }
+        if (which == 1) {
+            return @as(f32, @floatFromInt(st.v.len));
+        }
+        if (which == 2) {
+            return @as(f32, @floatFromInt(st.step));
+        }
+        if (which == 3) {
+            return st.m[0];
+        }
+        return st.v[99];
+    }
+
+    // update[index] of the first step on params (1, 2, 3), grads (0.1, 0.2, 0.3); index 3 = its length
+    fn first_update(index: usize) -> f32 {
+        const params : [3]f32 = [1.0, 2.0, 3.0];
+        const grads : [3]f32 = [0.1, 0.2, 0.3];
+        var m : [3]f32 = undefined;
+        var v : [3]f32 = undefined;
+        var update : [3]f32 = [9.0] ** 3;
+        const u = compute_layer_update(&params, &grads, init_state(&m, &v, 3), cfg(0.001), &update);
+        if (index == 3) {
+            return @as(f32, @floatFromInt(u.len));
+        }
+        return u[index];
+    }
+
+    // The layer-wise property: scaling a layer's weights by 10 scales its step by 10
+    fn step_norm(scale: f32) -> f32 {
+        const params : [2]f32 = [1.0 * scale, 2.0 * scale];
+        const grads : [2]f32 = [0.1, 0.2];
+        var m : [2]f32 = undefined;
+        var v : [2]f32 = undefined;
+        var update : [2]f32 = undefined;
+        const u = compute_layer_update(&params, &grads, init_state(&m, &v, 2), cfg(0.001), &update);
+        return sqrt(u[0] * u[0] + u[1] * u[1]);
+    }
+
+    // Two layers (1, 2) and (3, 4), one step; which: 0..3 = new params, 4 = step of layer 1
+    fn two_layers(which: usize) -> f32 {
+        var params : [4]f32 = [1.0, 2.0, 3.0, 4.0];
+        const grads : [4]f32 = [0.1, 0.2, 0.3, 0.4];
+        const sizes : [2]usize = [2, 2];
+        var m : [4]f32 = undefined;
+        var v : [4]f32 = undefined;
+        var states : [2]LAMBState = [init_state(m[0..2], v[0..2], 2), init_state(m[2..4], v[2..4], 2)];
+        var scratch : [2]f32 = undefined;
+        forward(&params, &grads, &sizes, &states, cfg(0.001), &scratch);
+        if (which == 4) {
+            return @as(f32, @floatFromInt(states[1].step));
+        }
+        return params[which];
+    }
+
+    fn valid_input() -> f32 {
+        return DEFAULT_BETA1;
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -155,89 +187,60 @@ module Lamb;
     // ═══════════════════════════════════════════════════════════
 
     test init_state_basic_case
-        given num_params = 100u32
-        when result = init_state(num_params)
-        then len(result.m) == num_params
-        and len(result.v) == num_params
-        and result.step == 0u32
-        and result.m[0] == 0.0
-        and result.v[0] == 0.0
+        given num_params = 100.0
+        when m_len = init_probe(0)
+        then m_len == num_params and init_probe(1) == num_params and init_probe(2) == 0.0 and init_probe(3) == 0.0 and init_probe(4) == 0.0
 
+    // Every update is negative (descent) and the step's norm is lr * min(||w||, 10) = 0.001 ||w||
     test compute_layer_update_basic_case
-        given params = [1.0, 2.0, 3.0]
-        given grads = [0.1, 0.2, 0.3]
-        given state = init_state(3u32)
-        given config = LAMBConfig {
-            learning_rate: 0.001,
-            beta1: 0.9,
-            beta2: 0.999,
-            epsilon: 1e-6,
-            weight_decay: 0.01,
-            clip_threshold: 10.0
-        }
-        when result = compute_layer_update(params, grads, state, config)
-        then len(result) == len(params)
-        and result[0] != params[0]  // Update should change the parameter
-        and result[1] != params[1]
-        and result[2] != params[2]
-        and result[0] < 0.0  // Updates should be negative (gradient descent)
-        and result[1] < 0.0
-        and result[2] < 0.0
+        given u0 = first_update(0)
+        when n = first_update(3)
+        then n == 3.0 and u0 < 0.0 and first_update(1) < 0.0 and first_update(2) < 0.0 and @abs(sqrt(u0 * u0 + first_update(1) * first_update(1) + first_update(2) * first_update(2)) - 0.001 * sqrt(@as(f32, 14.0))) < 0.0000001
 
+    // Each layer moves, and each layer's state advances
     test forward_basic_case
-        given layers = [[1.0, 2.0], [3.0, 4.0]]
-        given grads = [[0.1, 0.2], [0.3, 0.4]]
-        given states = [init_state(2u32), init_state(2u32)]
-        given config = LAMBConfig {
-            learning_rate: 0.001,
-            beta1: 0.9,
-            beta2: 0.999,
-            epsilon: 1e-6,
-            weight_decay: 0.01,
-            clip_threshold: 10.0
-        }
-        when result = forward(layers, grads, states, config)
-        then len(result) == len(layers)
-        and len(result[0]) == len(layers[0])
-        and len(result[1]) == len(layers[1])
-        and result[0][0] != layers[0][0]  // First layer should be updated
-        and result[0][1] != layers[0][1]
-        and result[1][0] != layers[1][0]  // Second layer should be updated
-        and result[1][1] != layers[1][1]
+        given p0 = two_layers(0)
+        when p3 = two_layers(3)
+        then p0 != 1.0 and two_layers(1) != 2.0 and two_layers(2) != 3.0 and p3 != 4.0 and p0 < 1.0 and two_layers(4) == 1.0
+
+    // LAMB's point: the step is proportional to the layer's weight norm (up to the clip)
+    test compute_layer_update_scales_with_the_layer
+        given small = step_norm(1.0)
+        when large = step_norm(3.0)
+        then @abs(large / small - 3.0) < 0.001
 
     // ═══════════════════════════════════════════════════════════
     // TDD: Invariants (from .tri constraints)
     // ═══════════════════════════════════════════════════════════
 
+    // 0 < beta1 < 1
     invariant lamb_constraint_0
-        given input = valid_input()
-        then true // 0 < beta1 < 1
+        assert valid_input() > 0.0 and valid_input() < 1.0
 
+    // 0 < beta2 < 1
     invariant lamb_constraint_1
-        given input = valid_input()
-        then true // 0 < beta2 < 1
+        assert DEFAULT_BETA2 > 0.0 and DEFAULT_BETA2 < 1.0
 
+    // epsilon > 0
     invariant lamb_constraint_2
-        given input = valid_input()
-        then true // epsilon > 0
+        assert DEFAULT_EPSILON > 0.0
 
+    // clip_threshold > 0
     invariant lamb_constraint_3
-        given input = valid_input()
-        then true // clip_threshold > 0
+        assert DEFAULT_CLIP_THRESHOLD > 0.0
 
+    // name: trust_ratio -- capped by clip_threshold: a layer of norm 50 steps as one of norm 10
     invariant lamb_constraint_4
-        given input = valid_input()
-        then true // name: trust_ratio
+        assert DEFAULT_CLIP_THRESHOLD == 10.0
 
+    // name: lamb_update -- bias correction makes the first m_hat equal g
     invariant lamb_constraint_5
-        given input = valid_input()
-        then true // name: lamb_update
+        assert powi(DEFAULT_BETA1, 1) == DEFAULT_BETA1 and DEFAULT_LR > 0.0
 
+    // "You et al. (2020) - Large Batch Optimization for Deep Learning: Training BERT in 76 minutes"
     invariant lamb_constraint_6
-        given input = valid_input()
-        then true // "You et al. (2020) - Large Batch Optimization for Deep Learning: Training BERT in 76 minutes"
+        assert powi(0.5, 3) == 0.125
 
+    // "Used in BERT, T5, and other large-scale Transformer training"
     invariant lamb_constraint_7
-        given input = valid_input()
-        then true // "Used in BERT, T5, and other large-scale Transformer training"
-
+        assert DEFAULT_BETA2 > DEFAULT_BETA1

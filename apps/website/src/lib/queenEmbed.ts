@@ -47,6 +47,10 @@ export const SELECTION_KEY: Readonly<Record<ExplorerTab, string>> = {
   project: 'chapter',
 }
 
+/** The Queen address's `view=graph`: SPECS' frame opens its Graph layer (the Explorer's own `view=`). */
+export const SPEC_VIEW_KEY = 'view'
+export type SpecView = 'graph' | null
+
 /**
  * A tab switch: drop every Explorer tab's card except the spec. The comb and
  * SPECS show one corpus, so its selected spec is the corpus's, not a tab's --
@@ -55,6 +59,7 @@ export const SELECTION_KEY: Readonly<Record<ExplorerTab, string>> = {
  */
 export function leaveTabSelections(params: URLSearchParams): URLSearchParams {
   for (const [tab, key] of Object.entries(SELECTION_KEY)) if (tab !== 'specs') params.delete(key)
+  params.delete(SPEC_VIEW_KEY) // a layer of the Spec Explorer, not of the tab you are going to
   return params
 }
 
@@ -109,19 +114,24 @@ export function specsCardShown(id: string | null): string {
  * is missing or refused. `world` is the Queen's chosen world (lib/queenCorpusCheck
  * worldParam); SPECS narrows its list to it, every other Explorer has no worlds.
  */
-export function explorerFrameHash(tab: ExplorerTab, id: string | null, world: string | null = null): string {
-  if (tab === 'specs') return specExplorerHash(specsCardShown(id), { embedded: true, world })
+export function explorerFrameHash(tab: ExplorerTab, id: string | null, world: string | null = null, view: SpecView = null): string {
+  if (tab === 'specs') return specExplorerHash(specsCardShown(id), { embedded: true, world, view })
   const valid = validSelection(tab, id)
   if (valid) return cardHash(tab, valid)
   if (tab === 'project') return systemDocsHash(FIRST_CHAPTER, { embedded: true })
   return `#/${tab}?embed=1`
 }
 
+/** The view a query names: only the Graph is addressed. */
+export function specViewOf(query: URLSearchParams): SpecView {
+  return query.get(SPEC_VIEW_KEY) === 'graph' ? 'graph' : null
+}
+
 /** The Queen tab and card an Explorer route names, or null when the hash is not an Explorer route. */
-export function explorerRouteOf(hash: string): { tab: ExplorerTab; id: string | null } | null {
+export function explorerRouteOf(hash: string): { tab: ExplorerTab; id: string | null; view: SpecView } | null {
   const parts = explorerRouteParts(hash)
   if (!parts) return null
-  if (parts.route === 'docs') return { tab: 'project', id: validSelection('project', parts.sub || parts.query.get('chapter')) }
+  if (parts.route === 'docs') return { tab: 'project', id: validSelection('project', parts.sub || parts.query.get('chapter')), view: null }
   const tab = parts.route as ExplorerTab
-  return { tab, id: validSelection(tab, parts.query.get(SELECTION_KEY[tab])) }
+  return { tab, id: validSelection(tab, parts.query.get(SELECTION_KEY[tab])), view: tab === 'specs' ? specViewOf(parts.query) : null }
 }

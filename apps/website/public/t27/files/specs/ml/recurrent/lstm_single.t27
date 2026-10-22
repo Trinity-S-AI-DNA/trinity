@@ -2,6 +2,15 @@
 // t27/specs/
 // LSTM solves vanishing gradient problem | φ² + 1/φ² = 3 | TRINITY
 
+// #8980: called `@sigmoid` and `@tanh`, which Zig does not have; each gate weight
+// was one number per INPUT, indexed `i % hidden_size`, so it was not an LSTM; and
+// every test asserted `true`. Now each gate has its own matrices, W_x
+// (hidden x input) and W_h (hidden x hidden), and a bias:
+//   i = s(z_i), f = s(z_f), g = tanh(z_g), o = s(z_o),  z = W_x x + W_h h + b
+//   c' = f c + i g,  h' = o tanh(c')
+// backward gives every gradient of one step, and the tests check it against finite
+// differences.
+
 module LstmCell;
     use base::types;
     use math::constants;
@@ -45,190 +54,272 @@ module LstmCell;
     // 3. Core Functions
     // ═══════════════════════════════════════════════════════════
 
-    // forward(input: []const f32, state: LSTMState, weights: LSTMWeights, output_state: LSTMState, config: LSTMConfig) -> void
+    fn sigmoid(z: f32) -> f32 {
+        return 1.0 / (1.0 + exp(-z));
+    }
+
+    // Pre-activation of one gate for hidden unit u: W_x[u] . x + W_h[u] . h + b[u]
+    fn pre(w_x: []const f32, w_h: []const f32, b: []const f32, x: []const f32, h: []const f32, u: usize, config: LSTMConfig) -> f32 {
+        var z : f32 = b[u];
+        var j : usize = 0;
+        while (j < config.input_size) {
+            z = z + w_x[u * config.input_size + j] * x[j];
+            j = j + 1;
+        }
+        var k : usize = 0;
+        while (k < config.hidden_size) {
+            z = z + w_h[u * config.hidden_size + k] * h[k];
+            k = k + 1;
+        }
+        return z;
+    }
+
     fn forward(input: []const f32, state: LSTMState, weights: LSTMWeights, output_state: LSTMState, config: LSTMConfig) -> void {
-        // LSTM forward pass implementation
-        // Compute input, forget, output, and cell gates
-        for (0..config.input_size) |i| {
-            var input_val:f32 = input[i];
-            
-            // Input gate: i = σ(W_ii * x + W_hi * h + b_i)
-            var input_gate:f32 = @sigmoid(weights.W_ii[i] * input_val + weights.W_hi[i] * state.h[i % config.hidden_size] + weights.b_i[i % config.hidden_size]);
-            
-            // Forget gate: f = σ(W_if * x + W_hf * h + b_f)
-            var forget_gate:f32 = @sigmoid(weights.W_if[i] * input_val + weights.W_hf[i] * state.h[i % config.hidden_size] + weights.b_f[i % config.hidden_size]);
-            
-            // Output gate: o = σ(W_io * x + W_ho * h + b_o)
-            var output_gate:f32 = @sigmoid(weights.W_io[i] * input_val + weights.W_ho[i] * state.h[i % config.hidden_size] + weights.b_o[i % config.hidden_size]);
-            
-            // Cell gate candidate: g = tanh(W_ig * x + W_hg * h + b_g)
-            var cell_candidate:f32 = @tanh(weights.W_ig[i] * input_val + weights.W_hg[i] * state.h[i % config.hidden_size] + weights.b_g[i % config.hidden_size]);
-            
-            // Update cell state: c = f * c + i * g
-            output_state.c[i % config.hidden_size] = forget_gate * state.c[i % config.hidden_size] + input_gate * cell_candidate;
-            
-            // Update hidden state: h = o * tanh(c)
-            output_state.h[i % config.hidden_size] = output_gate * @tanh(output_state.c[i % config.hidden_size]);
+        var u : usize = 0;
+        while (u < config.hidden_size) {
+            const ig = sigmoid(pre(weights.W_ii, weights.W_hi, weights.b_i, input, state.h, u, config));
+            const fg = sigmoid(pre(weights.W_if, weights.W_hf, weights.b_f, input, state.h, u, config));
+            const gg = tanh(pre(weights.W_ig, weights.W_hg, weights.b_g, input, state.h, u, config));
+            const og = sigmoid(pre(weights.W_io, weights.W_ho, weights.b_o, input, state.h, u, config));
+            output_state.c[u] = fg * state.c[u] + ig * gg;
+            output_state.h[u] = og * tanh(output_state.c[u]);
+            u = u + 1;
         }
     }
 
-    // backward(grad_output: []const f32, grad_cell: []const f32, input: []const f32, state: LSTMState, weights: LSTMWeights, grad_input: []f32, grad_state: LSTMState, grad_weights: LSTMWeights) -> void
-    fn backward(grad_output: []const f32, grad_cell: []const f32, input: []const f32, state: LSTMState, weights: LSTMWeights, grad_input: []f32, grad_state: LSTMState, grad_weights: LSTMWeights) -> void {
-        // LSTM backward pass implementation
-        var config:LSTMConfig = LSTMConfig{
-            .input_size = input.size(),
-            .hidden_size = state.h.size(),
+    // Adds dz * (x, h, 1) into one gate's weight gradients, and dz * W into grad_input / grad_state.h
+    fn spread(dz: f32, w_x: []const f32, w_h: []const f32, gw_x: []f32, gw_h: []f32, gb: []f32, x: []const f32, h: []const f32, u: usize, config: LSTMConfig, grad_input: []f32, grad_h: []f32) -> void {
+        var j : usize = 0;
+        while (j < config.input_size) {
+            gw_x[u * config.input_size + j] = gw_x[u * config.input_size + j] + dz * x[j];
+            grad_input[j] = grad_input[j] + dz * w_x[u * config.input_size + j];
+            j = j + 1;
+        }
+        var k : usize = 0;
+        while (k < config.hidden_size) {
+            gw_h[u * config.hidden_size + k] = gw_h[u * config.hidden_size + k] + dz * h[k];
+            grad_h[k] = grad_h[k] + dz * w_h[u * config.hidden_size + k];
+            k = k + 1;
+        }
+        gb[u] = gb[u] + dz;
+    }
+
+    // One step back. grad_output = dL/dh', grad_cell = dL/dc' from later steps. Writes
+    // dL/dx, dL/dh, dL/dc and ADDS the weight gradients into grad_weights.
+    //   do = dh' tanh(c');  dc = dh' o (1 - tanh^2 c') + grad_cell
+    //   dz_o = do o (1 - o), dz_f = dc c f (1 - f), dz_i = dc g i (1 - i), dz_g = dc i (1 - g^2)
+    //   dL/dc = dc f
+    fn backward(grad_output: []const f32, grad_cell: []const f32, input: []const f32, state: LSTMState, weights: LSTMWeights, config: LSTMConfig, grad_input: []f32, grad_state: LSTMState, grad_weights: LSTMWeights) -> void {
+        var j : usize = 0;
+        while (j < config.input_size) {
+            grad_input[j] = 0.0;
+            j = j + 1;
+        }
+        var u : usize = 0;
+        while (u < config.hidden_size) {
+            grad_state.h[u] = 0.0;
+            u = u + 1;
+        }
+        u = 0;
+        while (u < config.hidden_size) {
+            const ig = sigmoid(pre(weights.W_ii, weights.W_hi, weights.b_i, input, state.h, u, config));
+            const fg = sigmoid(pre(weights.W_if, weights.W_hf, weights.b_f, input, state.h, u, config));
+            const gg = tanh(pre(weights.W_ig, weights.W_hg, weights.b_g, input, state.h, u, config));
+            const og = sigmoid(pre(weights.W_io, weights.W_ho, weights.b_o, input, state.h, u, config));
+            const c_new = fg * state.c[u] + ig * gg;
+            const tc = tanh(c_new);
+            const dc = grad_output[u] * og * (1.0 - tc * tc) + grad_cell[u];
+            const dz_o = grad_output[u] * tc * og * (1.0 - og);
+            const dz_f = dc * state.c[u] * fg * (1.0 - fg);
+            const dz_i = dc * gg * ig * (1.0 - ig);
+            const dz_g = dc * ig * (1.0 - gg * gg);
+            grad_state.c[u] = dc * fg;
+            spread(dz_i, weights.W_ii, weights.W_hi, grad_weights.W_ii, grad_weights.W_hi, grad_weights.b_i, input, state.h, u, config, grad_input, grad_state.h);
+            spread(dz_f, weights.W_if, weights.W_hf, grad_weights.W_if, grad_weights.W_hf, grad_weights.b_f, input, state.h, u, config, grad_input, grad_state.h);
+            spread(dz_g, weights.W_ig, weights.W_hg, grad_weights.W_ig, grad_weights.W_hg, grad_weights.b_g, input, state.h, u, config, grad_input, grad_state.h);
+            spread(dz_o, weights.W_io, weights.W_ho, grad_weights.W_io, grad_weights.W_ho, grad_weights.b_o, input, state.h, u, config, grad_input, grad_state.h);
+            u = u + 1;
+        }
+    }
+
+    // The fixture: input 3, hidden 2. All 48 weights live in one buffer, per gate
+    // W_x (6), W_h (4), b (2), in the gate order i, f, g, o.
+    fn cfg() -> LSTMConfig {
+        return LSTMConfig{ .input_size = 3, .hidden_size = 2 };
+    }
+
+    fn weights_of(w: []f32) -> LSTMWeights {
+        return LSTMWeights{
+            .W_ii = w[0..6], .W_hi = w[6..10], .b_i = w[10..12],
+            .W_if = w[12..18], .W_hf = w[18..22], .b_f = w[22..24],
+            .W_ig = w[24..30], .W_hg = w[30..34], .b_g = w[34..36],
+            .W_io = w[36..42], .W_ho = w[42..46], .b_o = w[46..48],
         };
-        
-        // Initialize gradients to zero
-        for (0..grad_input.size()) |i| {
-            grad_input[i] = 0.0;
+    }
+
+    // Deterministic weights in [-0.5, 0.5]; the forget biases start at FORGET_BIAS_INIT
+    fn fill(w: []f32) -> void {
+        var k : usize = 0;
+        while (k < 48) {
+            w[k] = @as(f32, @floatFromInt((k * 7 + 3) % 11)) / 10.0 - 0.5;
+            k = k + 1;
         }
-        
-        for (0..grad_state.h.size()) |i| {
-            grad_state.h[i] = 0.0;
-            grad_state.c[i] = 0.0;
+        w[22] = FORGET_BIAS_INIT;
+        w[23] = FORGET_BIAS_INIT;
+    }
+
+    // L = 0.5 h'_0 - 0.3 h'_1 + 0.2 c'_0 + 0.1 c'_1 after one step, with one input, one h or
+    // one c entry moved by `delta` (which: 0 = none, 1 + j = x_j, 4 + k = h_k, 6 + k = c_k,
+    // 8 = b_f[1])
+    fn loss(which: usize, delta: f32) -> f32 {
+        var w : [48]f32 = undefined;
+        fill(&w);
+        var x : [3]f32 = [1.0, 2.0, 3.0];
+        var h : [2]f32 = [0.1, 0.2];
+        var c : [2]f32 = [0.3, 0.4];
+        if (which >= 1 and which <= 3) {
+            x[which - 1] = x[which - 1] + delta;
         }
-        
-        // Backward pass through LSTM cell
-        for (0..config.input_size) |i| {
-            var input_val:f32 = input[i];
-            
-            // Compute forward pass gates (needed for backward pass)
-            var input_gate:f32 = @sigmoid(weights.W_ii[i] * input_val + weights.W_hi[i] * state.h[i % config.hidden_size] + weights.b_i[i % config.hidden_size]);
-            var forget_gate:f32 = @sigmoid(weights.W_if[i] * input_val + weights.W_hf[i] * state.h[i % config.hidden_size] + weights.b_f[i % config.hidden_size]);
-            var output_gate:f32 = @sigmoid(weights.W_io[i] * input_val + weights.W_ho[i] * state.h[i % config.hidden_size] + weights.b_o[i % config.hidden_size]);
-            var cell_candidate:f32 = @tanh(weights.W_ig[i] * input_val + weights.W_hg[i] * state.h[i % config.hidden_size] + weights.b_g[i % config.hidden_size]);
-            
-            // Compute derivatives
-            var cell_derivative:f32 = 1.0 - @tanh(state.c[i % config.hidden_size]) * @tanh(state.c[i % config.hidden_size]);
-            var cell_candidate_derivative:f32 = 1.0 - cell_candidate * cell_candidate;
-            
-            // Backpropagate through output gate
-            var output_grad:f32 = grad_output[i % config.hidden_size] * @tanh(state.c[i % config.hidden_size]) * output_gate * (1.0 - output_gate);
-            
-            // Backpropagate through cell state
-            var cell_grad:f32 = grad_output[i % config.hidden_size] * output_gate * cell_derivative + grad_cell[i % config.hidden_size];
-            
-            // Backpropagate through forget gate
-            var forget_grad:f32 = cell_grad * state.c[i % config.hidden_size] * forget_gate * (1.0 - forget_gate);
-            
-            // Backpropagate through input gate
-            var input_grad:f32 = cell_grad * cell_candidate * input_gate * (1.0 - input_gate);
-            
-            // Accumulate gradients for input
-            grad_input[i] += input_grad * weights.W_ii[i] + forget_grad * weights.W_if[i] + output_grad * weights.W_io[i] + cell_grad * cell_candidate_derivative * weights.W_ig[i];
-            
-            // Accumulate gradients for hidden state
-            grad_state.h[i % config.hidden_size] += input_grad * weights.W_hi[i] + forget_grad * weights.W_hf[i] + output_grad * weights.W_ho[i] + cell_grad * cell_candidate_derivative * weights.W_hg[i];
-            
-            // Accumulate gradients for weights (simplified - in practice we'd sum over batch)
-            grad_weights.b_i[i % config.hidden_size] += input_grad;
-            grad_weights.b_f[i % config.hidden_size] += forget_grad;
-            grad_weights.b_o[i % config.hidden_size] += output_grad;
-            grad_weights.b_g[i % config.hidden_size] += cell_grad * cell_candidate_derivative;
+        if (which >= 4 and which <= 5) {
+            h[which - 4] = h[which - 4] + delta;
         }
+        if (which >= 6 and which <= 7) {
+            c[which - 6] = c[which - 6] + delta;
+        }
+        if (which == 8) {
+            w[23] = w[23] + delta;
+        }
+        var h_out : [2]f32 = [0.0] ** 2;
+        var c_out : [2]f32 = [0.0] ** 2;
+        forward(&x, LSTMState{ .h = &h, .c = &c }, weights_of(&w), LSTMState{ .h = &h_out, .c = &c_out }, cfg());
+        return 0.5 * h_out[0] - 0.3 * h_out[1] + 0.2 * c_out[0] + 0.1 * c_out[1];
+    }
+
+    // The analytic gradient of that loss, same `which` numbering
+    fn grad(which: usize) -> f32 {
+        var w : [48]f32 = undefined;
+        fill(&w);
+        const x : [3]f32 = [1.0, 2.0, 3.0];
+        var h : [2]f32 = [0.1, 0.2];
+        var c : [2]f32 = [0.3, 0.4];
+        const grad_output : [2]f32 = [0.5, -0.3];
+        const grad_cell : [2]f32 = [0.2, 0.1];
+        var gx : [3]f32 = [0.0] ** 3;
+        var gh : [2]f32 = [0.0] ** 2;
+        var gc : [2]f32 = [0.0] ** 2;
+        var gw : [48]f32 = [0.0] ** 48;
+        backward(&grad_output, &grad_cell, &x, LSTMState{ .h = &h, .c = &c }, weights_of(&w), cfg(), &gx, LSTMState{ .h = &gh, .c = &gc }, weights_of(&gw));
+        if (which >= 1 and which <= 3) {
+            return gx[which - 1];
+        }
+        if (which >= 4 and which <= 5) {
+            return gh[which - 4];
+        }
+        if (which >= 6 and which <= 7) {
+            return gc[which - 6];
+        }
+        return gw[23];
+    }
+
+    // Sum of |every gradient| when grad_output and grad_cell are both 0
+    fn zero_upstream_total() -> f32 {
+        var w : [48]f32 = undefined;
+        fill(&w);
+        const x : [3]f32 = [1.0, 2.0, 3.0];
+        var h : [2]f32 = [0.1, 0.2];
+        var c : [2]f32 = [0.3, 0.4];
+        const zeros : [2]f32 = [0.0, 0.0];
+        var gx : [3]f32 = [0.0] ** 3;
+        var gh : [2]f32 = [0.0] ** 2;
+        var gc : [2]f32 = [0.0] ** 2;
+        var gw : [48]f32 = [0.0] ** 48;
+        backward(&zeros, &zeros, &x, LSTMState{ .h = &h, .c = &c }, weights_of(&w), cfg(), &gx, LSTMState{ .h = &gh, .c = &gc }, weights_of(&gw));
+        var total : f32 = @abs(gx[0]) + @abs(gx[1]) + @abs(gx[2]) + @abs(gh[0]) + @abs(gh[1]) + @abs(gc[0]) + @abs(gc[1]);
+        var k : usize = 0;
+        while (k < 48) {
+            total = total + @abs(gw[k]);
+            k = k + 1;
+        }
+        return total;
+    }
+
+    fn slope(which: usize) -> f32 {
+        return (loss(which, 0.001) - loss(which, -0.001)) / 0.002;
+    }
+
+    // which: 0 = h'_0, 1 = c'_0 for a 1-unit cell with every weight 0 and the given biases
+    fn bias_only(b_i: f32, b_f: f32, b_g: f32, b_o: f32, c_prev: f32, which: u8) -> f32 {
+        var w : [48]f32 = [0.0] ** 48;
+        w[10] = b_i;
+        w[22] = b_f;
+        w[34] = b_g;
+        w[46] = b_o;
+        const x : [3]f32 = [1.0, 2.0, 3.0];
+        var h : [2]f32 = [0.0, 0.0];
+        var c : [2]f32 = [c_prev, 0.0];
+        var h_out : [2]f32 = [9.0] ** 2;
+        var c_out : [2]f32 = [9.0] ** 2;
+        forward(&x, LSTMState{ .h = &h, .c = &c }, weights_of(&w), LSTMState{ .h = &h_out, .c = &c_out }, cfg());
+        if (which == 0) {
+            return h_out[0];
+        }
+        return c_out[0];
+    }
+
+    fn valid_input() -> usize {
+        return cfg().input_size;
     }
 
     // ═══════════════════════════════════════════════════════════
     // TDD: Tests (from .tri behaviors)
     // ═══════════════════════════════════════════════════════════
 
+    // All weights 0: every gate is s(0) = 0.5 or tanh(0) = 0, so c' = 0.5 c and h' = 0.5 tanh(c')
     test forward_basic_case
-        given input = [1.0f32, 2.0f32, 3.0f32]
-        when result = forward(input)
-        then true // Forward pass completes without error
+        given c_new = bias_only(0.0, 0.0, 0.0, 0.0, 0.8, 1)
+        when h_new = bias_only(0.0, 0.0, 0.0, 0.0, 0.8, 0)
+        then @abs(c_new - 0.4) < 0.000001 and @abs(h_new - 0.5 * tanh(c_new)) < 0.000001 and @abs(h_new - 0.1899745) < 0.000001
 
-    test backward_basic_case
-        given grad_output = [0.5f32, -0.3f32, 0.2f32]
-        when result = backward(grad_output)
-        then true // Backward pass completes without error
-
-    test forward_with_empty_input
-        given input = []f32
-        when result = forward(input)
-        then true // Handles empty input gracefully
-
-    test backward_with_empty_grad
-        given grad_output = []f32
-        when result = backward(grad_output)
-        then true // Handles empty gradient input gracefully
-
+    // A closed forget gate (b_f = -30) erases the old cell; an open one (b_f = 30) keeps it
     test forward_basic_lstm
-        given 
-            input = [1.0f32, 2.0f32, 3.0f32]
-            state = LSTMState{.h = [0.1f32, 0.2f32], .c = [0.3f32, 0.4f32]}
-            weights = LSTMWeights{
-                .W_ii = [0.1f32, 0.2f32, 0.3f32],
-                .W_hi = [0.4f32, 0.5f32],
-                .b_i = [0.6f32, 0.7f32],
-                .W_if = [0.8f32, 0.9f32, 1.0f32],
-                .W_hf = [1.1f32, 1.2f32],
-                .b_f = [1.3f32, 1.4f32],
-                .W_ig = [1.5f32, 1.6f32, 1.7f32],
-                .W_hg = [1.8f32, 1.9f32],
-                .b_g = [2.0f32, 2.1f32],
-                .W_io = [2.2f32, 2.3f32, 2.4f32],
-                .W_ho = [2.5f32, 2.6f32],
-                .b_o = [2.7f32, 2.8f32],
-            }
-            output_state = LSTMState{.h = [0.0f32, 0.0f32], .c = [0.0f32, 0.0f32]}
-            config = LSTMConfig{.input_size = 3, .hidden_size = 2}
-        when result = forward(input, state, weights, output_state, config)
-        then true // Forward pass completes without error
+        given erased = bias_only(0.0, -30.0, 0.0, 0.0, 0.8, 1)
+        when kept = bias_only(-30.0, 30.0, 0.0, 0.0, 0.8, 1)
+        then @abs(erased) < 0.000001 and @abs(kept - 0.8) < 0.000001
 
+    // A closed input gate and forget gate leave c' = 0, so h' = 0 whatever the output gate does
+    test forward_with_empty_input
+        given h_new = bias_only(-30.0, -30.0, 1.0, 30.0, 0.8, 0)
+        then @abs(h_new) < 0.000001
+
+    // dL/dx_j against central differences
+    test backward_basic_case
+        given g0 = grad(1)
+        when g2 = grad(3)
+        then @abs(g0 - slope(1)) < 0.0005 and @abs(grad(2) - slope(2)) < 0.0005 and @abs(g2 - slope(3)) < 0.0005
+
+    // dL/dh_k, dL/dc_k and dL/db_f[1] against central differences
     test backward_basic_lstm
-        given 
-            grad_output = [0.5f32, -0.3f32]
-            grad_cell = [0.2f32, 0.1f32]
-            input = [1.0f32, 2.0f32, 3.0f32]
-            state = LSTMState{.h = [0.1f32, 0.2f32], .c = [0.3f32, 0.4f32]}
-            weights = LSTMWeights{
-                .W_ii = [0.1f32, 0.2f32, 0.3f32],
-                .W_hi = [0.4f32, 0.5f32],
-                .b_i = [0.6f32, 0.7f32],
-                .W_if = [0.8f32, 0.9f32, 1.0f32],
-                .W_hf = [1.1f32, 1.2f32],
-                .b_f = [1.3f32, 1.4f32],
-                .W_ig = [1.5f32, 1.6f32, 1.7f32],
-                .W_hg = [1.8f32, 1.9f32],
-                .b_g = [2.0f32, 2.1f32],
-                .W_io = [2.2f32, 2.3f32, 2.4f32],
-                .W_ho = [2.5f32, 2.6f32],
-                .b_o = [2.7f32, 2.8f32],
-            }
-            grad_input = [0.0f32, 0.0f32, 0.0f32]
-            grad_state = LSTMState{.h = [0.0f32, 0.0f32], .c = [0.0f32, 0.0f32]}
-            grad_weights = LSTMWeights{
-                .W_ii = [0.0f32, 0.0f32, 0.0f32],
-                .W_hi = [0.0f32, 0.0f32],
-                .b_i = [0.0f32, 0.0f32],
-                .W_if = [0.0f32, 0.0f32, 0.0f32],
-                .W_hf = [0.0f32, 0.0f32],
-                .b_f = [0.0f32, 0.0f32],
-                .W_ig = [0.0f32, 0.0f32, 0.0f32],
-                .W_hg = [0.0f32, 0.0f32],
-                .b_g = [0.0f32, 0.0f32],
-                .W_io = [0.0f32, 0.0f32, 0.0f32],
-                .W_ho = [0.0f32, 0.0f32],
-                .b_o = [0.0f32, 0.0f32],
-            }
-        when result = backward(grad_output, grad_cell, input, state, weights, grad_input, grad_state, grad_weights)
-        then true // Backward pass completes without error
+        given gh0 = grad(4)
+        when gc1 = grad(7)
+        then @abs(gh0 - slope(4)) < 0.0005 and @abs(grad(5) - slope(5)) < 0.0005 and @abs(grad(6) - slope(6)) < 0.0005 and @abs(gc1 - slope(7)) < 0.0005 and @abs(grad(8) - slope(8)) < 0.0005
+
+    // With no upstream gradient nothing flows back
+    test backward_with_empty_grad
+        given total = zero_upstream_total()
+        then total == 0.0 and @abs(grad(1)) > 0.0
 
     // ═══════════════════════════════════════════════════════════
     // TDD: Invariants (from .tri constraints)
     // ═══════════════════════════════════════════════════════════
 
+    // input.size() == config.input_size
     invariant lstm_cell_constraint_0
-        given input = valid_input()
-        then true // input.size() == config.input_size
+        assert valid_input() == 3
 
+    // state.h.size() == config.hidden_size
     invariant lstm_cell_constraint_1
-        given input = valid_input()
-        then true // state.h.size() == config.hidden_size
+        assert cfg().hidden_size == 2
 
+    // state.c.size() == config.hidden_size; the forget bias starts open
     invariant lstm_cell_constraint_2
-        given input = valid_input()
-        then true // state.c.size() == config.hidden_size
-
+        assert FORGET_BIAS_INIT > 0.0

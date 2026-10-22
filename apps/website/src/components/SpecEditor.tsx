@@ -36,9 +36,11 @@ interface Props {
   lines: Span[][]
   onRun: () => void
   ariaLabel: string
+  /** Select lines `from`-`to` (1-based) and scroll them into view; `seq` re-fires the same range. */
+  reveal?: { from: number; to: number; seq: number } | null
 }
 
-function SpecEditorImpl({ value, onChange, lines, onRun, ariaLabel }: Props) {
+function SpecEditorImpl({ value, onChange, lines, onRun, ariaLabel, reveal }: Props) {
   const taRef = useRef<HTMLTextAreaElement>(null)
   const preRef = useRef<HTMLPreElement>(null)
 
@@ -53,6 +55,23 @@ function SpecEditorImpl({ value, onChange, lines, onRun, ariaLabel }: Props) {
   }, [])
 
   useLayoutEffect(sync, [value, sync])
+
+  // The highlight layer wraps exactly as the textarea does, so a line's top in it is the line's top in both:
+  // no line-height arithmetic, which wrapped lines would break.
+  useLayoutEffect(() => {
+    const ta = taRef.current
+    const first = preRef.current?.children[(reveal?.from ?? 0) - 1] as HTMLElement | undefined
+    if (!reveal || !ta || !first) return
+    // The textarea holds LF only, so a CRLF spec counts one character per line break.
+    const rows = value.split(/\r?\n/)
+    const start = rows.slice(0, reveal.from - 1).reduce((n, r) => n + r.length + 1, 0)
+    const end = rows.slice(0, reveal.to).reduce((n, r) => n + r.length + 1, 0) - 1
+    ta.focus({ preventScroll: true })
+    ta.setSelectionRange(start, Math.max(start, end))
+    ta.scrollTop = Math.max(0, first.offsetTop - 40)
+    sync()
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- re-run for a new request, not for every keystroke
+  }, [reveal?.seq])
 
   return (
     // data-lang-exempt: this renders .t27 source verbatim, in whatever

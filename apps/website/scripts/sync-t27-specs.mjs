@@ -13,11 +13,19 @@
 //
 //   node scripts/sync-t27-specs.mjs
 //
+// Incremental: a run reads the manifest it is about to replace and trusts a spec's
+// stored row when the sha256 of its bytes is unchanged -- no analyze(), no write.
+// Files that left the corpus are deleted one by one instead of wiping the tree, and a
+// source repository whose head commit has not moved is not downloaded at all.
+// The key under which stored rows are trusted is the hash of the wasm and of
+// t27-corpus.mjs, so a compiler or deriver change re-analyzes everything.
+// T27_FULL=1 ignores the stored rows and rebuilds from scratch.
+//
 // Requires the wasm bridge to be built first:
 //   cd /Users/playom/t27/bindings/wasm-explorer
 //   cargo build --target wasm32-unknown-unknown --release
 
-import { readFileSync, writeFileSync, mkdirSync, rmSync, cpSync, existsSync, mkdtempSync } from 'node:fs'
+import { readFileSync, writeFileSync, mkdirSync, rmSync, cpSync, existsSync, mkdtempSync, readdirSync, unlinkSync, rmdirSync, statSync } from 'node:fs'
 import { execFileSync } from 'node:child_process'
 import { join, relative, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -86,6 +94,11 @@ else if (existsSync(VENDORED_WASM)) {
   console.log('        set T27_ROOT if your t27 checkout is somewhere else')
 }
 else fail(`no compiler wasm.\n  cd ${T27}/bindings/wasm-explorer\n  cargo build --target wasm32-unknown-unknown --release`)
+
+const T_START = Date.now()
+let tLap = T_START
+const lap = (what) => { const now = Date.now(); console.log(`  timing: ${what} ${((now - tLap) / 1000).toFixed(1)}s`); tLap = now }
+const sha256 = (x) => createHash('sha256').update(x).digest('hex')
 
 const gh = (args) => execFileSync('gh', args, { encoding: 'utf8', timeout: 120000, maxBuffer: 60 * 1024 * 1024 }).trim()
 
@@ -222,7 +235,53 @@ const EXTRA_REPOS = (process.env.T27_SKIP_REMOTE ? [] : [
   'dmitrii-f-t27/trinity-memory',
 ])
 
+lap('t27 tarball + overlays')
+
+// What the previous run left behind, read before anything is touched.
+//
+// Provenance this script does not compute comes from here too (see the long comment
+// further down), and so does the incremental decision: a stored row is trusted only
+// when the compiler and the deriver that produced it are the ones running now.
+const priorManifestPath = join(OUT_DIR, 'manifest.json')
+const priorManifest = existsSync(priorManifestPath) ? JSON.parse(readFileSync(priorManifestPath, 'utf8')) : null
+const analysisKey = sha256(Buffer.concat([wasmBuf, readFileSync(join(HERE, 't27-corpus.mjs'))]))
+const FULL = process.env.T27_FULL === '1' || process.env.T27_FULL === 'true'
+const warm = !FULL && priorManifest?.generatedFrom?.analysisKey === analysisKey
+// repo + path -> the stored row; only rows that carry the hash of the bytes they describe.
+const priorEntries = new Map()
+const priorDupes = new Map() // repo -> [{ path, sha256, sameAs }]
+if (warm) {
+  for (const e of priorManifest.specs ?? []) if (e.sha256) priorEntries.set(`${e.repo}\0${e.path}`, e)
+  for (const d of priorManifest.duplicates ?? []) {
+    if (!d.sha256) continue
+    if (!priorDupes.has(d.repo)) priorDupes.set(d.repo, [])
+    priorDupes.get(d.repo).push(d)
+  }
+}
+console.log(`  incremental: ${warm ? `warm, ${priorEntries.size} stored rows` : FULL ? 'T27_FULL set, rebuilding everything' : 'cold, no stored rows for this compiler'}`)
+
+// A repository whose head commit is the one the stored manifest records, and whose every
+// file the manifest knows by hash (kept rows and skipped duplicates both), is not
+// downloaded: its inventory is rebuilt from the manifest. Dedup still runs over that
+// inventory in the same order, so a file that became a duplicate of another repository's
+// change is dropped, and one that stopped being a duplicate downloads the repo after all.
+function inventoryFromManifest(repo, commit) {
+  if (!warm) return null
+  const row = (priorManifest.repos ?? []).find((r) => r.repo === repo)
+  if (!row || row.commit !== commit) return null
+  const kept = [...priorEntries.values()].filter((e) => e.repo === repo)
+  const all = (priorManifest.specs ?? []).filter((e) => e.repo === repo)
+  const dupes = priorDupes.get(repo) ?? []
+  const allDupes = (priorManifest.duplicates ?? []).filter((d) => d.repo === repo)
+  if (kept.length !== all.length || kept.length !== row.specs || dupes.length !== allDupes.length) return null
+  const prefix = `${repo}/`
+  const items = [...kept.map((e) => ({ rel: e.path, hash: e.sha256 })), ...dupes.map((d) => ({ rel: d.path, hash: d.sha256 }))]
+  if (items.some((i) => !i.rel.startsWith(prefix))) return null
+  return items.map((i) => ({ ...i, inRepo: i.rel.slice(prefix.length) })).sort((a, b) => (a.rel < b.rel ? -1 : a.rel > b.rel ? 1 : 0))
+}
+
 const sources = [{ repo: 't27', root: t27Root, files: t27Files, commit: FROM_LOCAL ? null : sha, tmp: t27Tmp }]
+let reposSkipped = 0
 
 for (const slug of EXTRA_REPOS) {
   const [owner, name] = slug.split('/')
@@ -250,6 +309,15 @@ for (const slug of EXTRA_REPOS) {
     continue
   }
   const sha = gh(['api', `repos/${slug}/commits/${branch}`, '--jq', '.sha'])
+  const inventory = inventoryFromManifest(repo, sha)
+  if (inventory) {
+    // Same commit as the stored manifest: nothing to download unless the dedup pass finds
+    // it needs bytes it does not have (see `materialize`).
+    sources.push({ repo, slug, branch, root: null, files: null, commit: sha, tmp: null, inventory })
+    reposSkipped++
+    console.log(`  ${slug}: head ${sha.slice(0, 9)} unchanged, tarball skipped`)
+    continue
+  }
   let pulled
   try {
     pulled = tarball(slug, branch)
@@ -257,7 +325,18 @@ for (const slug of EXTRA_REPOS) {
     lost('tarball failed after 3 attempts', e)
     continue
   }
-  sources.push({ repo, root: pulled.root, files: specFiles(pulled.root), commit: sha, tmp: pulled.dir })
+  sources.push({ repo, slug, branch, root: pulled.root, files: specFiles(pulled.root), commit: sha, tmp: pulled.dir })
+}
+lap(`other repositories (${EXTRA_REPOS.length - reposSkipped} downloaded, ${reposSkipped} unchanged)`)
+
+// A skipped repository that turns out to need its bytes after all.
+function materialize(src) {
+  if (src.root) return
+  console.log(`  ${src.slug}: needs file bytes after all, downloading`)
+  const pulled = tarball(src.slug, src.branch)
+  src.root = pulled.root
+  src.tmp = pulled.dir
+  src.files = specFiles(pulled.root)
 }
 
 // Provenance this script does not compute, read before the wipe removes it.
@@ -278,8 +357,6 @@ for (const slug of EXTRA_REPOS) {
 // file, and a preserved commit sitting beside a freshly pulled repos[].commit
 // is a manifest that contradicts itself. A world this script no longer pulls
 // drops out rather than lingering as provenance for specs that are gone.
-const priorManifestPath = join(OUT_DIR, 'manifest.json')
-const priorManifest = existsSync(priorManifestPath) ? JSON.parse(readFileSync(priorManifestPath, 'utf8')) : null
 const discoveredAt = new Map((priorManifest?.repos ?? []).filter((r) => r.discoveredAt).map((r) => [r.repo, r.discoveredAt]))
 const priorDiscovery = priorManifest?.discovery ?? null
 
@@ -305,13 +382,69 @@ for (const rel of lessonSpecPaths(join(WEBSITE, 'specs/course'))) {
   const at = join(SPECS_OUT, rel)
   if (existsSync(at)) pinned.set(rel, readFileSync(at, 'utf8'))
 }
-const keptDir = mkdtempSync(join(tmpdir(), 't27-kept-'))
-for (const d of KEPT) if (existsSync(join(SPECS_OUT, d))) cpSync(join(SPECS_OUT, d), join(keptDir, d), { recursive: true })
-rmSync(SPECS_OUT, { recursive: true, force: true })
-rmSync(join(OUT_DIR, 'manifest.json'), { force: true })
 mkdirSync(SPECS_OUT, { recursive: true })
-for (const d of KEPT) if (existsSync(join(keptDir, d))) cpSync(join(keptDir, d), join(SPECS_OUT, d), { recursive: true })
-rmSync(keptDir, { recursive: true, force: true })
+
+// Nothing is wiped any more: the tree already on disk is the previous run's output, and this
+// run leaves it alone wherever the bytes are the same. `put` writes a file only when it
+// differs and records it; `sweep` (below) then deletes whatever this run did not record,
+// which is exactly the set the old wipe removed and this run did not recreate. KEPT
+// directories are the one thing the sweep never touches, as the wipe never did.
+const written = new Set()
+const stats = { analyzed: 0, reused: 0, written: 0, unchanged: 0 }
+function mark(rel) {
+  written.add(rel)
+  for (let d = dirname(rel); d !== '.' && d !== '/'; d = dirname(d)) written.add(d)
+}
+function ensureDir(dir) {
+  try { mkdirSync(dir, { recursive: true }) } catch {
+    // A file squats where a directory is needed (a path changed kind between runs).
+    for (let d = dir; d.startsWith(SPECS_OUT) && d !== SPECS_OUT; d = dirname(d)) if (existsSync(d) && !statSync(d).isDirectory()) rmSync(d, { force: true })
+    mkdirSync(dir, { recursive: true })
+  }
+}
+function put(rel, data) {
+  const dest = join(SPECS_OUT, rel)
+  const buf = Buffer.isBuffer(data) ? data : Buffer.from(data, 'utf8')
+  mark(rel)
+  if (existsSync(dest)) {
+    if (statSync(dest).isDirectory()) rmSync(dest, { recursive: true, force: true })
+    else if (readFileSync(dest).equals(buf)) { stats.unchanged++; return false }
+  }
+  ensureDir(dirname(dest))
+  writeFileSync(dest, buf)
+  stats.written++
+  return true
+}
+function filesUnder(rel) {
+  const out = []
+  const walk = (r) => {
+    const abs = join(SPECS_OUT, r)
+    if (!existsSync(abs)) return
+    if (!statSync(abs).isDirectory()) { out.push(r); return }
+    for (const n of readdirSync(abs)) walk(r ? `${r}/${n}` : n)
+  }
+  walk(rel)
+  return out
+}
+function sweep() {
+  let removed = 0
+  const isKept = (r) => KEPT.some((k) => r === k || r.startsWith(`${k}/`) || k.startsWith(`${r}/`))
+  const walk = (r) => {
+    const abs = r ? join(SPECS_OUT, r) : SPECS_OUT
+    for (const n of readdirSync(abs)) {
+      const child = r ? `${r}/${n}` : n
+      if (isKept(child)) continue
+      if (statSync(join(SPECS_OUT, child)).isDirectory()) {
+        walk(child)
+        if (!readdirSync(join(SPECS_OUT, child)).length) rmdirSync(join(SPECS_OUT, child))
+      } else if (!written.has(child)) { unlinkSync(join(SPECS_OUT, child)); removed++ }
+    }
+  }
+  walk('')
+  return removed
+}
+// What a KEPT directory holds is part of the tree as far as the companion check is concerned.
+for (const d of KEPT) for (const f of filesUnder(d)) mark(f)
 
 // Run the same wasm the browser runs, here, over the whole corpus. Health has
 // to be known before a row is drawn -- the alternative is compiling 667 specs
@@ -341,28 +474,48 @@ let duplicates = 0
 // not written now nothing downstream can reconstruct it.
 const duplicatePairs = []
 
+// A stored row stands in for analyze() when the bytes it describes are the bytes in hand.
+// Fields added after the loop (tutorial order, featured) are derived again below.
+const reusable = (stored) => { const { tutorial: _t, lesson: _l, featured: _f, ...rest } = stored; return rest }
+const diskHash = (rel) => { try { return sha256(readFileSync(join(SPECS_OUT, rel), 'utf8')) } catch { return null } }
+
 for (const src of sources) {
-for (const abs of src.files) {
-  // Namespaced by repo, then the path inside it, so a spec's real home stays
-  // visible instead of being flattened into one bucket.
-  const inRepo = relative(src.root, abs)
-  const rel = src.repo === 't27' ? inRepo : `${src.repo}/${inRepo}`
-  const text = readFileSync(abs, 'utf8')
+  const items = src.inventory ?? src.files.map((abs) => ({ inRepo: relative(src.root, abs) }))
+  for (const item of items) {
+    // Namespaced by repo, then the path inside it, so a spec's real home stays
+    // visible instead of being flattened into one bucket.
+    const rel = src.repo === 't27' ? item.inRepo : `${src.repo}/${item.inRepo}`
+    let text = null
+    const textOf = () => {
+      if (text === null) {
+        if (!src.root) materialize(src)
+        text = readFileSync(join(src.root, item.inRepo), 'utf8')
+      }
+      return text
+    }
 
-  // Same bytes as something already taken? Skip it. t27 vendors three whole
-  // chip repos, so without this the library would carry 147 phantom entries.
-  const hash = createHash('sha256').update(text).digest('hex')
-  const already = seenContent.get(hash)
-  if (already) { duplicates++; duplicatePairs.push({ path: rel, repo: src.repo, sameAs: already }); continue }
-  seenContent.set(hash, rel)
+    // Same bytes as something already taken? Skip it. t27 vendors three whole
+    // chip repos, so without this the library would carry 147 phantom entries.
+    const hash = item.hash ?? sha256(textOf())
+    const already = seenContent.get(hash)
+    if (already) { duplicates++; duplicatePairs.push({ path: rel, repo: src.repo, sameAs: already, sha256: hash }); continue }
+    seenContent.set(hash, rel)
 
-  const dest = join(SPECS_OUT, rel)
-  mkdirSync(dirname(dest), { recursive: true })
-  writeFileSync(dest, text)
-
-  entries.push(corpusEntry(rel, src.repo, text, analyze))
+    const stored = warm ? priorEntries.get(`${src.repo}\0${rel}`) : undefined
+    if (stored && stored.sha256 === hash) {
+      // Unchanged bytes: keep the row. A file we never downloaded must still be on disk, intact.
+      if (text !== null || !src.inventory || diskHash(rel) !== hash) put(rel, textOf())
+      else mark(rel)
+      entries.push(reusable(stored))
+      stats.reused++
+    } else {
+      entries.push({ ...corpusEntry(rel, src.repo, textOf(), analyze), sha256: hash })
+      put(rel, textOf())
+      stats.analyzed++
+    }
+  }
 }
-}
+lap(`analyze + write (${stats.analyzed} analyzed, ${stats.reused} reused, ${stats.written} files written, ${stats.unchanged} unchanged)`)
 
 // Each lesson spec settles here. A scanned copy a lesson can show (teachable:
 // the course check's own rule) stays, so t27's newer version reaches the lesson
@@ -373,7 +526,7 @@ for (const abs of src.files) {
 let keptMissing = 0, keptUnclean = 0, fresher = 0
 for (const [rel, text] of pinned) {
   const dest = join(SPECS_OUT, rel)
-  const scanned = existsSync(dest) ? readFileSync(dest, 'utf8') : null
+  const scanned = written.has(rel) ? readFileSync(dest, 'utf8') : null
   if (scanned === text) continue
   if (scanned !== null) {
     let a = null
@@ -381,9 +534,8 @@ for (const [rel, text] of pinned) {
     if (teachable(a)) { fresher++; continue }
   }
   const row = entries.findIndex((e) => e.path === rel)
-  if (row >= 0) entries[row] = corpusEntry(rel, entries[row].repo, text, analyze)
-  mkdirSync(dirname(dest), { recursive: true })
-  writeFileSync(dest, text)
+  if (row >= 0) entries[row] = { ...corpusEntry(rel, entries[row].repo, text, analyze), sha256: sha256(text) }
+  put(rel, text)
   if (scanned === null) keptMissing++
   else keptUnclean++
 }
@@ -411,6 +563,13 @@ const STRING_DECL = /\b[A-Z][A-Z0-9_]*\s*:\s*str\s*=\s*"([^"]+)"/g
 const TEXT_FILE = /\.(md|markdown|txt|rst|adoc|csv|json|toml|ya?ml)$/i
 let companions = 0
 for (const src of sources) {
+  if (!src.root) {
+    // Never downloaded: its companions were vendored by the run that saw this same commit and
+    // are still on disk. Everything under its prefix that is not a spec is one of them.
+    const specRels = new Set(src.inventory.map((i) => i.rel))
+    for (const f of filesUnder(src.repo)) if (!specRels.has(f)) mark(f)
+    continue
+  }
   for (const abs of src.files) {
     const text = readFileSync(abs, 'utf8')
     const decl = SOURCES_DECL.exec(text)
@@ -422,10 +581,12 @@ for (const src of sources) {
       if (rel.startsWith('trinity:') || rel.endsWith('.t27') || rel.includes('..') || rel.startsWith('/')) continue
       const from = join(src.root, rel)
       if (!existsSync(from)) continue
-      const dest = join(SPECS_OUT, src.repo === 't27' ? rel : `${src.repo}/${rel}`)
-      if (existsSync(dest)) continue
-      mkdirSync(dirname(dest), { recursive: true })
-      cpSync(from, dest, { recursive: true })
+      const dest = src.repo === 't27' ? rel : `${src.repo}/${rel}`
+      if (written.has(dest)) continue
+      if (statSync(from).isDirectory()) {
+        const walk = (r) => { for (const n of readdirSync(join(from, r))) { const c = r ? `${r}/${n}` : n; if (statSync(join(from, c)).isDirectory()) walk(c); else put(`${dest}/${c}`, readFileSync(join(from, c))) } }
+        walk('')
+      } else put(dest, readFileSync(from))
       companions += 1
     }
   }
@@ -434,6 +595,9 @@ if (companions) console.log(`  companions: ${companions} non-spec file(s) cited 
 
 // Tarballs were extracted to temp dirs; nothing should outlive this run.
 for (const s of sources) if (s.tmp) rmSync(s.tmp, { recursive: true, force: true })
+const swept = sweep()
+console.log(`  tree: ${stats.written} file(s) written, ${stats.unchanged} already identical, ${swept} stale removed`)
+lap('companions + sweep')
 
 // Spec descriptions are comments quoted verbatim out of the source files, in the language
 // their authors wrote them in; qa/ru_audit.mjs must not flag them as untranslated UI. The
@@ -539,6 +703,9 @@ writeFileSync(join(OUT_DIR, 'manifest.json'), JSON.stringify({
     source: FROM_LOCAL ? 'local working copy' : `github tarball gHashTag/t27@${T27_REF}`,
     overlayRefs: overlayUsed.map(({ ref, commit, added }) => ({ ref, commit, added })),
     wasmSource: wasmFrom,
+    // Which compiler and deriver produced each row's analysis: a stored row is reused only
+    // while this is unchanged (see the incremental block near the top).
+    analysisKey,
   },
   wasmBytes,
   specCount: entries.length,
@@ -574,6 +741,8 @@ writeFileSync(join(OUT_DIR, 'manifest.json'), JSON.stringify({
   specs: entries,
 }, null, 0))
 
+lap('aggregate + manifest')
+console.log(`  timing: total ${((Date.now() - T_START) / 1000).toFixed(1)}s`)
 console.log(`sync-t27-specs: ${entries.length} specs, ${Object.keys(categories).length} categories`)
 console.log(`  sources: ${sources.map((s) => s.repo).join(', ')}  (${duplicates} duplicate files skipped by content hash)`)
 // Over modules, and the line says so. These three used to cover every vendored

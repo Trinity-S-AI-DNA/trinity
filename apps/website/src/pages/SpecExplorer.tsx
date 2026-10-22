@@ -21,6 +21,7 @@ import { SpecCodeView } from '../components/SpecCodeView'
 import { SpecChipView } from '../components/SpecChipView'
 import LanguageSwitcher from '../components/LanguageSwitcher'
 import { SpecEditor } from '../components/SpecEditor'
+import { SpecGraphView, type GraphNodeClick } from '../components/SpecGraphView'
 import { SpecMetrics } from '../components/SpecMetrics'
 import { SpecShare } from '../components/SpecShare'
 import { SpecContribute } from '../components/SpecContribute'
@@ -65,6 +66,7 @@ const UI = {
     world: 'World',
     worldClear: 'Show every world',
     loading: 'Loading compiler…',
+    graphLoading: 'Loading the graph…',
     compiling: 'Analysing…',
     back: '← Home',
     backToLibrary: 'All specs',
@@ -171,6 +173,7 @@ const UI = {
     world: 'Мир',
     worldClear: 'Показать все миры',
     loading: 'Загрузка компилятора…',
+    graphLoading: 'Загрузка графа…',
     compiling: 'Анализ…',
     back: '← На главную',
     backToLibrary: 'Все спеки',
@@ -327,6 +330,7 @@ function kindColor(kind: string): string {
 
 const LAYERS = [
   { id: 'source', kind: 'source' },
+  { id: 'graph', kind: 'graph' },
   { id: 'tokens', kind: 'tokens' },
   { id: 'ast', kind: 'ast' },
   { id: 'typecheck', kind: 'typecheck' },
@@ -355,6 +359,7 @@ void _everyBackendHasALayer
 // page that names t27's outputs reads too -- one list, not one per page.
 const LAYER_LABEL: Record<LayerId, string> = {
   source: 'Source',
+  graph: 'Graph',
   tokens: 'Tokens',
   ast: 'AST',
   typecheck: 'Types',
@@ -522,7 +527,12 @@ export default function SpecExplorer() {
   const [err, setErr] = useState<string | null>(null)
   // Source first: the page is an input surface, so what loads is the thing you
   // can type into. Every other layer is one click away and already computed.
-  const [layer, setLayer] = useState<LayerId>('source')
+  // `view=graph` in the address opens the Graph layer (T27F, public/t27f/graph); no other layer is addressed.
+  const [layer, setLayer] = useState<LayerId>(() => (new URLSearchParams(window.location.hash.split('?')[1] || '').get('view') === 'graph' ? 'graph' : 'source'))
+  const layerRef = useRef(layer)
+  layerRef.current = layer
+  /** The lines a click on a graph box asked the Source layer to show. */
+  const [reveal, setReveal] = useState<{ from: number; to: number; seq: number } | null>(null)
   const [open, setOpen] = useState<Set<string>>(new Set())
   const [, setHoverLine] = useState<number | null>(null)
   const [kindFilter, setKindFilter] = useState('')
@@ -730,7 +740,7 @@ export default function SpecExplorer() {
     const expectedSha256=spec.path===viewContext.path?viewContext.sha256:undefined
     setBusy(true)
     try {
-      const address=specExplorerHash(spec.path,{embedded,sha256:expectedSha256,world})
+      const address=specExplorerHash(spec.path,{embedded,sha256:expectedSha256,world,view:layerRef.current==='graph'?'graph':null})
       window.history.replaceState(null,'',address)
       reportExplorerAddress(address)
       const text = await loadSpecSource(spec.path,expectedSha256)
@@ -760,6 +770,33 @@ export default function SpecExplorer() {
   }, [embedded,viewContext,world])
 
   pickRef.current = pick
+
+  // The address names the layer only for the Graph (view=graph), so a link, a reload and the Queen's frame keep it.
+  // replaceState fires no hashchange, so this does not feed the listener below.
+  useEffect(() => {
+    if (!selected) return
+    const expectedSha256 = selected.path === viewContext.path ? viewContext.sha256 : undefined
+    const address = specExplorerHash(selected.path, { embedded, sha256: expectedSha256, world, view: layer === 'graph' ? 'graph' : null })
+    if (window.location.hash === address) return
+    window.history.replaceState(null, '', address)
+    reportExplorerAddress(address)
+  }, [layer, selected, embedded, viewContext, world])
+
+  // The Queen moves its frame by the fragment: follow a view= it changed.
+  useEffect(() => {
+    const onHash = () => {
+      const graph = new URLSearchParams(window.location.hash.split('?')[1] || '').get('view') === 'graph'
+      setLayer((l) => (graph ? 'graph' : l === 'graph' ? 'source' : l))
+    }
+    window.addEventListener('hashchange', onHash)
+    return () => window.removeEventListener('hashchange', onHash)
+  }, [])
+
+  /** A click on a graph box: open the Source layer with that box's lines selected. */
+  const showLines = useCallback((n: GraphNodeClick) => {
+    setLayer('source')
+    setReveal((r) => ({ from: n.line, to: n.end, seq: (r?.seq ?? 0) + 1 }))
+  }, [])
 
   /** Run the real compiler over the edited source. */
   const run = useCallback(async () => {
@@ -1763,6 +1800,7 @@ export default function SpecExplorer() {
                         lines={sourceSpans}
                         onRun={() => void run()}
                         ariaLabel={ui.source}
+                        reveal={reveal}
                       />
                       {cast && (
                         <div style={{ padding: '12px 10px', borderTop: `1px solid ${C.border}`, display: 'flex', flexDirection: 'column', gap: 6 }}>
@@ -1781,6 +1819,9 @@ export default function SpecExplorer() {
                       )}
                     </div>
                   )}
+
+                  {/* graph -- the T27F view of the open spec, drawn by t27f.wasm (components/SpecGraphView) */}
+                  {layer === 'graph' && <SpecGraphView path={selected.path} text={editorText} onNode={showLines} loading={ui.graphLoading} />}
 
                   {/* tokens */}
                   {layer === 'tokens' && result && (
