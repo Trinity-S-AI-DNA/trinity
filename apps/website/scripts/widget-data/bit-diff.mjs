@@ -17,7 +17,7 @@ import { createHash } from 'node:crypto'
 import { readFileSync, readdirSync, writeFileSync, existsSync } from 'node:fs'
 import { basename, dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import * as B from '../../public/widgets/bit-diff/bitparse.js'
+import * as B from './bit-diff-bitparse.js'
 
 const SITE = join(dirname(fileURLToPath(import.meta.url)), '..', '..')
 const OUT_DIR = join(SITE, 'public/widgets/bit-diff')

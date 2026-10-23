@@ -35,7 +35,7 @@ import { basename, dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { constsOf, loadCompiler, sha256 } from '../agents-from-specs.mjs'
 import { runSpecTests } from '../viewport-from-spec.mjs'
-import { leavesOf, listsOf, METRICS, moduleRows, parseHier, sameTotals, totalsOf, viewTree } from '../../public/widgets/lut-treemap/treemap.js'
+import { leavesOf, listsOf, METRICS, moduleRows, parseHier, sameTotals, totalsOf, viewTree } from './lut-treemap-treemap.js'
 
 const SITE = join(dirname(fileURLToPath(import.meta.url)), '..', '..')
 const REPO = join(SITE, '..', '..')
