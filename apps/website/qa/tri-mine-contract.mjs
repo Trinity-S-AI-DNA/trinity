@@ -3,9 +3,11 @@
 // Pure, no browser. Holds the "Copy to agent" prompt and the block to:
 //   1  the prompt carries the token's honest status in both languages:
 //      testnet only, no price and no market, NOT trustless, no mainnet TRI
-//   2  it names who earns (the spec author by GitHub login, or a provider of
-//      compute) and the guard rails: the human says yes before a PR, no
-//      provider key in a PR or a chat, no invented acceptance
+//   2  it names who earns (the spec author by GitHub login, with the creator's
+//      bees under that same login) and that lanes never earn (owner,
+//      2026-10-10: only .t27 spec creators and their bees count), plus the
+//      guard rails: the human says yes before a PR, no provider key in a PR
+//      or a chat, no invented acceptance
 //   3  a live rate is quoted with "the ledger states it"; a missing, zero,
 //      negative or NaN rate is never printed and the agent is sent to the
 //      ledger address instead; the same for minted and cap
@@ -18,8 +20,9 @@
 //      rate check are the token tab's, quoted, never restated; how to withdraw
 //      is pointed at, not copied; the rate is gated once, at readTriCounts, so
 //      the landing card cannot print a rate the tab refuses
-//   7  consent: every step that acts for the person (the pull request, the
-//      runner) waits for their "yes", and withdrawing stays the person's
+//   7  consent: the step that acts for the person (the pull request) waits for
+//      their "yes", and withdrawing stays the person's; running hardware is
+//      the person's own business, not a step of this prompt
 //
 //   node --experimental-strip-types qa/tri-mine-contract.mjs
 
@@ -54,12 +57,15 @@ for (const [name, p] of [['en', en], ['ru', ru]]) {
 
 // 2  who earns, and the guard rails
 ok(/GitHub login/.test(en) && /логину GitHub/.test(ru), 'names the GitHub login as the one that earns')
-ok(/proof of compute/.test(en) && /proof of compute/.test(ru), 'names proof of compute')
-ok(/CPU, FPGA or GPU/.test(en) && /CPU, FPGA или GPU/.test(ru), 'names the three kinds of compute')
+ok(/bees/.test(en) && /пчёлы/.test(ru), 'names the bees, under the creator\'s login (quoted from the rule)')
+ok(/Lanes are not counted/.test(en) && /Полосы не считаются/.test(ru), 'says lanes are not counted (owner, 2026-10-10)')
 ok(/Only after my "yes"/.test(en) && /после моего «да»/.test(ru), 'the human says yes before a PR')
 ok(/Never put a provider key/.test(en) && /Никогда не вставляй ключ провайдера/.test(ru), 'no provider key in a PR or chat')
 ok(/Do not invent an acceptance/.test(en) && /Не выдумывай приёмку/.test(ru), 'no invented acceptance')
 ok(/## Boundary/.test(en) && /## Boundary/.test(ru), 'the issue must declare a .t27 file in its boundary')
+const steps = (p) => p.split('\n').filter((l) => /^\d+\. /.test(l))
+assert.equal(steps(en).length, 6, 'the prompt is six steps: the runner road is gone (owner, 2026-10-10)'); checks++
+ok(!/proof of compute|my own hardware|my hardware/.test(en + ru), 'no lane-earning road left in the prompt')
 
 // 3  live figures, and their absence
 ok(en.includes(TOKEN_COPY.en.rate(27)), 'en quotes the live rate in the token tab’s words')
@@ -125,10 +131,9 @@ ok(/setEarners\(boardOf\(counts\)\.rows\.length\)/.test(block), 'earners are exa
 for (const [lang, p, yes] of [['en', en, /only after my "yes"|Only after my "yes"/], ['ru', ru, /после моего «да»/]]) {
   const step = (n) => p.split('\n').find((l) => l.startsWith(`${n}. `)) ?? ''
   ok(yes.test(step(4)), `${lang}: the pull request waits for the person's yes`)
-  ok(yes.test(step(6)), `${lang}: the runner waits for the person's yes`)
-  ok(/mine to do|делаю я сам/.test(step(7)) && step(7).includes(MINE_LINKS.token), `${lang}: withdrawing is the person's, pointed at the token tab`)
+  ok(/under my GitHub login|под моим логином GitHub/.test(step(5)), `${lang}: the earning lands under the person's login`)
+  ok(/mine to do|делаю я сам/.test(step(6)) && step(6).includes(MINE_LINKS.token), `${lang}: withdrawing is the person's, pointed at the token tab`)
+  ok(!step(7), `${lang}: there is no seventh step`)
 }
-ok(en.includes('The provider key stays on my machine') && ru.includes('Ключ провайдера остаётся на моей машине'), 'both languages keep the key on the person’s machine')
-ok(!/your own hardware/.test(en), 'the person speaks: my hardware, not yours')
 
 console.log(`tri-mine contract: ${checks} checks OK`)
