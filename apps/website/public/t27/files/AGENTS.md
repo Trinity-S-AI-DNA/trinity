@@ -204,7 +204,10 @@ measure it are written in **t27**, not in Rust or Python by hand.
   whose plan is `specs/tri/t27b/slice_lit_plan.t27`, -34 and -8 on master
   3d7130691's 14876 plus 7874; 14885 plus 7924 after #7740's glue for the
   `type mismatch` family, whose plan is `specs/tri/t27b/coerce_plan.t27`,
-  +12 and +19 on master b8cb93f34's 14873 plus 7905),
+  +12 and +19 on master b8cb93f34's 14873 plus 7905; 14905 plus 7942 after
+  #7690's glue for a local bound to a void fn's result, whose plan is
+  `specs/tri/t27b/void_bind_plan.t27`, +20 and +18 on master 1d9c5960d's
+  14885 plus 7924),
   `scripts/tri_loop/t27b.py` 1829
   (Python, `tri t27b`; 894 at c532fcae5, 1481 after #6317's `next`, 1568 after #6334's master look-back, 1829 after #6445's `reduce` wiring), `scripts/tri_loop/t27b_reduce.py` 632 (Python, `tri t27b reduce`, #6445; its decisions are `specs/tri/t27b/reduce.t27`), and `contrib/railway/t27b-lab/lab.py` 608 (Python, the
   Railway lab; 956 on master 0fbb0a033, 986 after #7672's lane requests). Update these numbers in the PR that moves them.
