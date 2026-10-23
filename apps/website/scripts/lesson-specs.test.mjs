@@ -49,15 +49,23 @@ test('teachable is the course check: discarded lines alone make a spec unteachab
   assert.equal(teachable(null), false)
 })
 
-test('the scan reads lesson specs before its wipe and settles them after it', async () => {
+test('the incremental scan reads lesson specs before it deletes and settles them after it', async () => {
   const { readFileSync } = await import('node:fs')
   const sync = readFileSync(join(WEBSITE, 'scripts/sync-t27-specs.mjs'), 'utf8')
   const read = sync.indexOf('lessonSpecPaths(')
-  const wipe = sync.indexOf('rmSync(SPECS_OUT,')
-  const write = sync.indexOf('writeFileSync(dest, text)')
+  // Since #1687 the scan is incremental, keyed by content hash: there is no
+  // wholesale rmSync(SPECS_OUT) any more, only per-file writes and removal of
+  // files the scan did not write. The lifecycle property is the same as before:
+  // the lesson specs are READ before the scan writes or removes anything in
+  // SPECS_OUT, and the pinned lesson copies settle after the scan's writes.
+  const write = sync.indexOf('writeFileSync(dest, buf)')
+  const remove = sync.indexOf('unlinkSync(join(SPECS_OUT, child))')
   const settle = sync.indexOf('for (const [rel, text] of pinned)')
-  assert.ok(read > -1 && read < wipe, 'the lesson specs are read before the wipe')
-  assert.ok(settle > write, 'the lesson specs settle after the scan has written its copies')
+  assert.ok(read > -1 && read < write, 'the lesson specs are read before the scan writes its copies')
+  assert.ok(remove > write, 'the scan removes only files it did not write, after its writes')
+  assert.ok(settle > remove, 'the lesson specs settle after the scan has written its copies')
+  // The wholesale wipe stays gone: a lesson spec can never vanish mid-run.
+  assert.ok(!sync.includes('rmSync(SPECS_OUT'), 'the sync must never delete the whole SPECS_OUT tree')
   // The scanned copy stays only when a lesson can show it.
   assert.match(sync.slice(settle), /if \(teachable\(a\)\) \{ fresher\+\+; continue \}/)
 })
