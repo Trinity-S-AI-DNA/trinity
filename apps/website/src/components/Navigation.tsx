@@ -43,8 +43,9 @@ const PAGES: PageLink[] = [
   // number that the game exists to build has a page of its own.
   { href: '#/trinity', en: 'The number', ru: 'Число', note: 'r² = r + 1, the format claim, and the evidence under it', noteRu: 'r² = r + 1, заявление о формате и свидетельства под ним' },
   { href: '#/cases', en: 'Case studies', ru: 'Работы', note: 'Verification runs on other people’s RTL', noteRu: 'Прогоны чужого RTL' },
-  // The catalog first: every course on one page, with what each press will do (owner, 2026-10-13).
-  { href: '#/courses', en: 'Courses', ru: 'Курсы', note: 'Every course, any three free', noteRu: 'Все курсы, любые три бесплатно' },
+  // The catalog first: every course on one page (owner, 2026-10-13). Its note is the ladder spec's
+  // advert (specs/ladder/course-ladder.t27 SAY_PROMO_TITLE and its Russian): every course is free.
+  { href: '#/courses', en: 'Courses', ru: 'Курсы', note: LADDER.say.en.PROMO_TITLE, noteRu: LADDER.say.ru.PROMO_TITLE },
   { href: '#/t27-basics', en: 'Course: t27 basics', ru: 'Курс: основы t27', note: 'The language itself, 27 lessons', noteRu: 'Сам язык, 27 уроков' },
   { href: '#/course', en: 'Course: FPGA', ru: 'Курс: FPGA', note: 'From zero to a chip, 27 lessons', noteRu: 'С нуля до чипа, 27 уроков' },
   { href: '#/ai-numbers', en: 'Course: AI numbers', ru: 'Курс: ИИ-числа', note: 'How AI chips store numbers, 27 lessons', noteRu: 'Как ИИ-чипы хранят числа, 27 уроков' },

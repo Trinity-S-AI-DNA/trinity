@@ -12,8 +12,12 @@
 // The WORDS are specs/ladder/course-ladder.t27 (English) and i18n/course-ladder.ru.json
 // (Russian: every SAY_ key, no other key, the same {placeholders} and digits).
 //
+// The TRI CLAW links are joined here from the two specs, so neither restates the other: the bot
+// is BOT of the rules, the routes and the App are the words spec's. CLAW_APP_PUBLIC picks the
+// third path: the App's page once it installs for anyone, the TRI CLAW post until then.
+//
 // Writes the file nobody edits by hand:
-//   src/lib/courseLadder.generated.ts   the words, the render address, the browser keys
+//   src/lib/courseLadder.generated.ts   the words, the TRI CLAW links, the render address, the browser keys
 //
 // Run:      node scripts/course-ladder-from-spec.mjs            (write)
 //           node scripts/course-ladder-from-spec.mjs --check    (fail if stale)
@@ -34,7 +38,10 @@ export const TS_OUT = 'src/lib/courseLadder.generated.ts'
 
 const WORDS_REQUIRED = {
   KIND: 'str', SCHEMA_VERSION: 'u8', GENERATED: 'arr', RULES_SPEC: 'str', RENDER_BASE: 'str', OPEN_KEY: 'str', KEYS_KEY: 'str',
+  APP_START_PREFIX: 'str', CLAW_KEYS_ROUTE: 'str', CLAW_CLUB_ROUTE: 'str', CLAW_APP_URL: 'str', CLAW_POST_PATH: 'str', CLAW_APP_PUBLIC: 'bool', CLAW_PATHS: 'u8',
 }
+const ORIGIN = 'https://t27.ai/'
+const ROUTE_RE = /^[a-z][a-z0-9_-]*$/
 const sha256 = (text) => createHash('sha256').update(text, 'utf8').digest('hex')
 const holes = (s) => [...String(s).matchAll(/\{\d+\}|\d+/g)].map((m) => m[0]).sort().join(',')
 
@@ -45,7 +52,10 @@ export function genValues(genText) {
   return out
 }
 
-export function ladderProblems({ rulesText, wordsText, ruText, logicText, genText, analyze }) {
+/** The words a page can show: of the third path's two sets, only the one CLAW_APP_PUBLIC picks. */
+const shown = (says, claw) => Object.keys(says).filter((k) => !k.startsWith(claw.githubIsApp ? 'SAY_CLAW_POST_' : 'SAY_CLAW_APP_'))
+
+export function ladderProblems({ rulesText, wordsText, ruText, logicText, genText, analyze, postExists = (slug) => existsSync(join(SITE, 'src/data/blog/bodies', `${slug}.ts`)) }) {
   const p = []
   // The rules: compile clean, the logic built from exactly these bytes, gen.ts says what they say.
   const rules = analyze(rulesText)
@@ -81,6 +91,27 @@ export function ladderProblems({ rulesText, wordsText, ruText, logicText, genTex
   if (w.RULES_SPEC !== RULES_SPEC) p.push(`${WORDS_SPEC}: RULES_SPEC must be ${RULES_SPEC}`)
   if (JSON.stringify(w.GENERATED) !== JSON.stringify([TS_OUT])) p.push(`${WORDS_SPEC}: GENERATED must be ${JSON.stringify([TS_OUT])}`)
   if (!/^https:\/\/[a-z0-9.-]+$/.test(String(w.RENDER_BASE ?? ''))) p.push(`${WORDS_SPEC}: RENDER_BASE must be a bare https origin`)
+  // TRI CLAW: three paths, each a real place. The payload fits Telegram's start ceiling (the rules'
+  // START_MAX_CHARS), the App address is a GitHub App page, the post is a post of this site.
+  const bot = rc.BOT?.value
+  const claw = { keys: '', club: '', github: '', githubIsApp: false }
+  if (typeof bot !== 'string' || !/^[A-Za-z0-9_]{5,32}$/.test(bot)) p.push(`${RULES_SPEC}: BOT is not a Telegram bot handle`)
+  else {
+    for (const k of ['CLAW_KEYS_ROUTE', 'CLAW_CLUB_ROUTE']) {
+      const payload = `${w.APP_START_PREFIX ?? ''}${w[k] ?? ''}`
+      if (!ROUTE_RE.test(String(w[k] ?? ''))) p.push(`${WORDS_SPEC}: ${k} is not an app route`)
+      else if (payload.length > (rc.START_MAX_CHARS?.value ?? 0)) p.push(`${WORDS_SPEC}: start=${payload} is over ${rc.START_MAX_CHARS?.value} characters`)
+    }
+    claw.keys = `https://t.me/${bot}?start=${w.APP_START_PREFIX}${w.CLAW_KEYS_ROUTE}`
+    claw.club = `https://t.me/${bot}?start=${w.APP_START_PREFIX}${w.CLAW_CLUB_ROUTE}`
+  }
+  if (!/^https:\/\/github\.com\/apps\/[a-z0-9-]+$/.test(String(w.CLAW_APP_URL ?? ''))) p.push(`${WORDS_SPEC}: CLAW_APP_URL must be a GitHub App page`)
+  const slug = String(w.CLAW_POST_PATH ?? '').match(/^blog\/([a-z0-9-]+)\/$/)?.[1]
+  if (!slug) p.push(`${WORDS_SPEC}: CLAW_POST_PATH must be blog/<slug>/`)
+  else if (!postExists(slug)) p.push(`${WORDS_SPEC}: CLAW_POST_PATH names ${slug}, which is not a post of src/data/blog/bodies`)
+  claw.githubIsApp = w.CLAW_APP_PUBLIC === true
+  claw.github = claw.githubIsApp ? w.CLAW_APP_URL : `${ORIGIN}${w.CLAW_POST_PATH}`
+  if (w.CLAW_PATHS !== 3) p.push(`${WORDS_SPEC}: CLAW_PATHS must be 3 (own key, the club, GitHub)`)
   const tests = runSpecTests(words, w)
   if (tests.tests < 1) p.push(`${WORDS_SPEC}: needs at least one test block`)
   p.push(...tests.failures.map((f) => `${WORDS_SPEC}: ${f}`))
@@ -102,9 +133,10 @@ export function ladderProblems({ rulesText, wordsText, ruText, logicText, genTex
         openKey: w.OPEN_KEY,
         keysKey: w.KEYS_KEY,
         rulesSha: sha256(rulesText),
+        claw,
         say: {
-          en: Object.fromEntries(Object.keys(says).map((k) => [k.slice(4), w[k]])),
-          ru: Object.fromEntries(Object.keys(says).map((k) => [k.slice(4), ru[k]])),
+          en: Object.fromEntries(shown(says, claw).map((k) => [k.slice(4), w[k]])),
+          ru: Object.fromEntries(shown(says, claw).map((k) => [k.slice(4), ru[k]])),
         },
       }
   return { problems: p, out }
@@ -115,7 +147,7 @@ export const renderTs = (o) => `// GENERATED by scripts/course-ladder-from-spec.
 // Do not edit: change the .t27 source (or the Russian bundle) and regenerate. The rules
 // themselves run from ${LOGIC_TS}; their numbers are in ${GEN_TS}.
 
-export const LADDER = ${JSON.stringify({ renderBase: o.renderBase, openKey: o.openKey, keysKey: o.keysKey, say: o.say }, null, 2)} as const
+export const LADDER = ${JSON.stringify({ renderBase: o.renderBase, openKey: o.openKey, keysKey: o.keysKey, claw: o.claw, say: o.say }, null, 2)} as const
 
 export type LadderSay = (typeof LADDER.say)['en']
 `

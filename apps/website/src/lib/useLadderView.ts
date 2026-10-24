@@ -19,8 +19,8 @@ function readDone(): string[] {
 
 /**
  * What this reader holds: the courses opened, the lessons done, and whether the keys still hold.
- * With takeKey, a key in the address (?unlock=<key>, the bot's sign-in button) is checked, kept
- * and taken out of the address, so a club member who joined in Telegram is signed in here.
+ * With takeKey, a key in the address (?unlock=<key>, the bot's button) is checked, kept and taken
+ * out of the address, so the lessons a reader finishes here reach the course author (may_report).
  */
 export function useLadderView(takeKey = false) {
   const done = useMemo(() => (typeof window === 'undefined' ? [] : readDone()), [])
@@ -28,7 +28,6 @@ export function useLadderView(takeKey = false) {
   const withProgress = useMemo(() => COURSES.filter((c) => c.lessons.some((l) => done.includes(l.id))).map((c) => c.id as string), [done])
   const opened: Opened = useMemo(() => (typeof window === 'undefined' ? [] : readOpened(known, withProgress)), [known, withProgress])
   const [valid, setValid] = useState({ bot: false, paid: false })
-  const [signedIn, setSignedIn] = useState(false)
   const { search, pathname } = useLocation()
   const navigate = useNavigate()
 
@@ -43,7 +42,6 @@ export function useLadderView(takeKey = false) {
           if (r.step === STEP.bot) held.bot = fresh
           else held.paid = fresh
           saveKeys(held)
-          if (live) setSignedIn(r.step === STEP.paid)
         }
       }
       const [b, p] = await Promise.all([held.bot ? checkKey(held.bot) : { ok: false }, held.paid ? checkKey(held.paid) : { ok: false }])
@@ -58,7 +56,7 @@ export function useLadderView(takeKey = false) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [search])
 
-  return { done, opened, valid, signedIn }
+  return { done, opened, valid }
 }
 
 /**
