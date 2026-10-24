@@ -37,15 +37,21 @@ export async function replay(el, log) {
   const pb=mkB('\u25B6',()=>reset())
   const fe=document.createElement('span'); fe.style.cssText='color:#8b949e;font:11px monospace;margin-left:auto'
   tl.append(pb,fe)
-  el.replaceChildren(wrap,tl)
+  const fleet=document.createElement('div')
+  el.replaceChildren(wrap,tl,fleet)
+  mountFleet(fleet)
 
   const agents=new Map(),edges=[]
-  const aid=(i)=>`a${(i%4)+1}`
+    const SPEC_SPECS={}
+    const assignSpec=(aid0,si)=>{SPEC_SPECS[aid0]=SPECS[si%8]}
+  const SPECS=['frontend','idea_factory','lesson_reel','spec_graph','particle_engine','hud','display_list','scene']
+    const aid=(i)=>'a'+((i%4)+1)
+    const specOf=(i)=>SPECS[i%8]
   function addA(id){ if(agents.has(id))return
     const a={id,st:'spawning',x:W/2+(Math.random()-.5)*100,y:H/2+(Math.random()-.5)*100,vx:0,vy:0}
     const g=document.createElementNS(NS,'g')
     const c=document.createElementNS(NS,'circle'); c.setAttribute('r','2'); c.setAttribute('fill',C.spawn); c.setAttribute('stroke','#c9d1d9'); c.setAttribute('stroke-width','1'); c.style.transition='r .3s,fill .3s'
-    const t=document.createElementNS(NS,'text'); t.setAttribute('y','-18'); t.setAttribute('text-anchor','middle'); t.setAttribute('fill',C.text); t.setAttribute('font-size','9'); t.setAttribute('font-family','monospace'); t.textContent=id
+    const t=document.createElementNS(NS,'text'); t.setAttribute('y','-18'); t.setAttribute('text-anchor','middle'); t.setAttribute('fill',C.text); t.setAttribute('font-size','9'); t.setAttribute('font-family','monospace'); t.textContent=SPEC_SPECS[id]||id
     g.append(c,t); nG.append(g); a.el=g; a.c=c; agents.set(id,a)
     requestAnimationFrame(()=>c.setAttribute('r','13'))
     const p=document.createElementNS(NS,'circle'); p.setAttribute('r','13'); p.setAttribute('fill','none'); p.setAttribute('stroke',C.spawn); p.setAttribute('stroke-width','2'); p.style.cssText='animation:live-pulse .8s ease-out forwards'; g.append(p); setTimeout(()=>p.remove(),900)
@@ -69,8 +75,9 @@ export async function replay(el, log) {
   function tick(){ if(cur>=evts.length){stop();return}
     const e=evts[cur],k=e.kind??'?',tk=e.tick??cur,frame=R.arrival_frame(tk*16),who=aid(cur)
     const ln=document.createElement('div'); ln.style.cssText=`padding:1px 0;border-bottom:1px solid #21262d;color:${k==='spawn'?C.spawn:k==='down'?C.down:k==='restart'?C.restart:k==='exit'?C.exit:C.text}`
-    ln.textContent=`[${String(frame).padStart(2,'0')}] ${k} t=${tk}`; stream.append(ln); stream.scrollTop=stream.scrollHeight
-    if(k==='spawn')addA(who)
+    const sp=SPEC_SPECS[who]?` (${SPEC_SPECS[who]})`:''
+    ln.textContent=`[${String(frame).padStart(2,'0')}] ${k}${sp} t=${tk}`; stream.append(ln); stream.scrollTop=stream.scrollHeight
+    if(k==='spawn'){addA(who);assignSpec(who,cur)}
     else if(k==='down')setSt(who,'down')
     else if(k==='restart')setSt(who,'restarting')
     else if(k==='exit')setSt(who,'exit')
@@ -85,5 +92,62 @@ export async function replay(el, log) {
   for(let i=0;i<evts.length;i++){ cur=i; tick() }
   let s0=0; const settle=()=>{ layout(); if(s0++<50)requestAnimationFrame(settle) }; requestAnimationFrame(settle)
 
-  return { refused:false, message:`${evts.length} events, ${agents.size} agents. Press play to watch the replay.` }
+  return { refused:false, message:`${evts.length} events, ${agents.size} named agents on the graph; the fleet panel below is live from the GitHub API. Press play to watch the replay.` }
+}
+
+// The fleet monitor: real pull requests and real repository activity from the
+// GitHub API, refreshed on a slow cycle that respects the anonymous rate limit
+// (60/h). No keys, no server: the visitor's browser reads the public API.
+const REPO='Trinity-S-AI-DNA/t27', API=`https://api.github.com/repos/${REPO}`
+const FC={ok:'#3fb950',info:'#58a6ff',dim:'#8b949e',text:'#c9d1d9',bg:'#0d1117',border:'#30363d'}
+function mountFleet(root){
+  root.style.cssText='margin-top:12px'
+  const hd=document.createElement('div'); hd.style.cssText=`display:flex;align-items:center;gap:10px;font:12px monospace;color:${FC.text};padding:8px 12px;border:1px solid ${FC.border};border-radius:8px;background:${FC.bg}`
+  const t=document.createElement('strong'); t.textContent='THE FLEET, LIVE'; t.style.color=FC.text
+  const n=document.createElement('span'); n.style.color=FC.dim; n.textContent='loading...'
+  const tm=document.createElement('span'); tm.style.cssText=`color:${FC.dim};margin-left:auto;font-size:11px`
+  hd.append(t,n,tm); root.append(hd)
+  const cols=document.createElement('div'); cols.style.cssText='display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:8px'
+  const prP=document.createElement('div'); prP.style.cssText=`border:1px solid ${FC.border};border-radius:8px;background:${FC.bg};padding:10px;overflow-y:auto;max-height:420px`
+  const acP=document.createElement('div'); acP.style.cssText=`border:1px solid ${FC.border};border-radius:8px;background:${FC.bg};padding:10px;overflow-y:auto;max-height:420px`
+  const h1=document.createElement('div'); h1.textContent='pull requests'; h1.style.cssText=`color:${FC.text};font:bold 12px monospace;margin:0 0 8px`
+  const h2=document.createElement('div'); h2.textContent='activity'; h2.style.cssText=`color:${FC.text};font:bold 12px monospace;margin:0 0 8px`
+  prP.append(h1); acP.append(h2); cols.append(prP,acP); root.append(cols)
+  const gh=async(p)=>{ const r=await fetch(API+p,{headers:{Accept:'application/vnd.github+json'}})
+    if(r.status===403||r.status===429) throw Object.assign(new Error('rate-limited'),{rl:true})
+    if(!r.ok) throw new Error('http '+r.status); return r.json() }
+  const ago=(iso)=>{ const s=Math.floor((Date.now()-new Date(iso))/1e3)
+    return s<60?s+'s':s<3600?Math.floor(s/60)+'m':s<86400?Math.floor(s/3600)+'h':Math.floor(s/86400)+'d' }
+  async function prs(){ const L=await gh('/pulls?state=all&sort=updated&direction=desc&per_page=12')
+    n.textContent=L.filter(p=>p.state==='open').length+' open'
+    prP.querySelectorAll('.pr').forEach(e=>e.remove())
+    for(const p of L){ const m=p.merged_at!==null, st=m?'MERGED':p.state==='open'?'OPEN':'CLOSED', c=m?FC.ok:p.state==='open'?FC.info:FC.dim
+      const d=document.createElement('div'); d.className='pr'; d.style.cssText=`padding:7px;border:1px solid ${FC.border};border-radius:6px;margin-bottom:6px;font:11px monospace;display:flex;gap:8px;align-items:baseline`
+      const b=document.createElement('span'); b.style.cssText=`color:${c};flex-shrink:0`; b.textContent=m?'\u2713':p.state==='open'?'\u25CF':'\u2717'
+      const w=document.createElement('div'); w.style.cssText='flex:1;min-width:0'
+      const tt=document.createElement('div'); tt.style.cssText=`color:${FC.text};white-space:nowrap;overflow:hidden;text-overflow:ellipsis`; tt.textContent='#'+p.number+' '+(p.title||'').split('(')[0].trim()
+      const mt=document.createElement('div'); mt.style.cssText=`color:${FC.dim};font-size:10px`; mt.textContent=st+' \u00B7 '+p.head.ref.replace(/^.*\//,'')+' \u00B7 '+ago(p.updated_at)
+      w.append(tt,mt); d.append(b,w); prP.append(d) } }
+  async function acts(){ const L=await gh('/events?per_page=20')
+    acP.querySelectorAll('.ac').forEach(e=>e.remove())
+    for(const ev of L.slice(0,12)){ const d=document.createElement('div'); d.className='ac'
+      d.style.cssText=`padding:4px 0;border-bottom:1px solid #21262d;font:11px monospace;color:${FC.dim};display:flex;gap:6px`
+      const ts=document.createElement('span'); ts.style.cssText='flex-shrink:0;min-width:30px'; ts.textContent=ago(ev.created_at)
+      const tx=document.createElement('span'); tx.style.cssText='color:'+FC.text+';white-space:nowrap;overflow:hidden;text-overflow:ellipsis'
+      let s=''
+      if(ev.type==='PushEvent') s=ev.actor.login+' pushed '+(ev.payload.size||1)+' to '+String(ev.payload.ref||'').replace('refs/heads/','')
+      else if(ev.type==='PullRequestEvent') s='PR #'+ev.payload.number+' '+ev.payload.action+((ev.payload.pull_request||{}).merged?' -- MERGED':'')
+      else if(ev.type==='IssueCommentEvent') s=ev.actor.login+' commented on #'+ev.payload.issue.number
+      else if(ev.type==='CreateEvent') s=ev.actor.login+' created '+ev.payload.ref_type+(ev.payload.ref?' '+ev.payload.ref:'')
+      else s=String(ev.type||'').replace('Event','')
+      tx.textContent=s; d.append(ts,tx); acP.append(d) } }
+  let wait=150, nextAt=0
+  async function refresh(){ tm.textContent='\u21BB refreshing...'
+    const R=await Promise.allSettled([prs(),acts()])
+    const bad=R.find(r=>r.status==='rejected'&&r.reason&&r.reason.rl)
+    wait=bad?Math.min(wait*2,900):150; nextAt=Date.now()+wait*1000
+    tm.textContent=bad?('rate-limited, backing off '+Math.round(wait/60)+'m'):('live \u00B7 cycle '+Math.round(wait/60)+'m') }
+  setInterval(()=>{ if(!nextAt)return; const s=Math.max(0,Math.ceil((nextAt-Date.now())/1000))
+    tm.textContent=s>0?('next refresh '+s+'s'):'\u21BB refreshing...' },1000)
+  refresh()
 }
