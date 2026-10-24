@@ -40,12 +40,16 @@ export async function replay(el, log) {
   el.replaceChildren(wrap,tl)
 
   const agents=new Map(),edges=[]
-  const aid=(i)=>`a${(i%4)+1}`
+    const SPEC_SPECS={}
+    const assignSpec=(aid0,si)=>{SPEC_SPECS[aid0]=SPECS[si%8]}
+  const SPECS=['frontend','idea_factory','lesson_reel','spec_graph','particle_engine','hud','display_list','scene']
+    const aid=(i)=>'a'+((i%4)+1)
+    const specOf=(i)=>SPECS[i%8]
   function addA(id){ if(agents.has(id))return
     const a={id,st:'spawning',x:W/2+(Math.random()-.5)*100,y:H/2+(Math.random()-.5)*100,vx:0,vy:0}
     const g=document.createElementNS(NS,'g')
     const c=document.createElementNS(NS,'circle'); c.setAttribute('r','2'); c.setAttribute('fill',C.spawn); c.setAttribute('stroke','#c9d1d9'); c.setAttribute('stroke-width','1'); c.style.transition='r .3s,fill .3s'
-    const t=document.createElementNS(NS,'text'); t.setAttribute('y','-18'); t.setAttribute('text-anchor','middle'); t.setAttribute('fill',C.text); t.setAttribute('font-size','9'); t.setAttribute('font-family','monospace'); t.textContent=id
+    const t=document.createElementNS(NS,'text'); t.setAttribute('y','-18'); t.setAttribute('text-anchor','middle'); t.setAttribute('fill',C.text); t.setAttribute('font-size','9'); t.setAttribute('font-family','monospace'); t.textContent=SPEC_SPECS[id]||id
     g.append(c,t); nG.append(g); a.el=g; a.c=c; agents.set(id,a)
     requestAnimationFrame(()=>c.setAttribute('r','13'))
     const p=document.createElementNS(NS,'circle'); p.setAttribute('r','13'); p.setAttribute('fill','none'); p.setAttribute('stroke',C.spawn); p.setAttribute('stroke-width','2'); p.style.cssText='animation:live-pulse .8s ease-out forwards'; g.append(p); setTimeout(()=>p.remove(),900)
@@ -69,8 +73,9 @@ export async function replay(el, log) {
   function tick(){ if(cur>=evts.length){stop();return}
     const e=evts[cur],k=e.kind??'?',tk=e.tick??cur,frame=R.arrival_frame(tk*16),who=aid(cur)
     const ln=document.createElement('div'); ln.style.cssText=`padding:1px 0;border-bottom:1px solid #21262d;color:${k==='spawn'?C.spawn:k==='down'?C.down:k==='restart'?C.restart:k==='exit'?C.exit:C.text}`
-    ln.textContent=`[${String(frame).padStart(2,'0')}] ${k} t=${tk}`; stream.append(ln); stream.scrollTop=stream.scrollHeight
-    if(k==='spawn')addA(who)
+    const sp=SPEC_SPECS[who]?` (${SPEC_SPECS[who]})`:''
+    ln.textContent=`[${String(frame).padStart(2,'0')}] ${k}${sp} t=${tk}`; stream.append(ln); stream.scrollTop=stream.scrollHeight
+    if(k==='spawn'){addA(who);assignSpec(who,cur)}
     else if(k==='down')setSt(who,'down')
     else if(k==='restart')setSt(who,'restarting')
     else if(k==='exit')setSt(who,'exit')
