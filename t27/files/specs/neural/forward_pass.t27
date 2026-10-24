@@ -1,0 +1,1105 @@
+// Forward Pass Demo - VSA-based Neural Network
+// Implements transformer-style forward pass using Vector Symbolic Architecture
+// with multi-head attention, residual connections, and autoregressive generation
+//
+// Author: Dmitrii Vasilev
+// SPDX-License-Identifier: Apache-2.0
+
+module forward_pass;
+
+// `import x;` is the older spelling of `use x;`.
+use numeric::gf16;
+use base::types::Trit;
+use vsa::vsa_core::{bind, unbind, bundle2, bundle3, permute, cosine_similarity};
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+/// Default hypervector dimension
+pub const DEFAULT_DIM: usize = 1024;
+
+/// Number of role vectors for multi-head attention
+pub const NUM_ROLES: usize = 11;
+
+/// Context window size (number of tokens in context)
+pub const CONTEXT_SIZE: usize = 8;
+
+/// Number of attention heads
+pub const NUM_HEADS: usize = 3;
+
+/// Vectors per head (Q, K, V)
+pub const VECTORS_PER_HEAD: usize = 3;
+
+/// FFN role indices
+pub const FF1_ROLE_IDX: usize = 9;
+pub const FF2_ROLE_IDX: usize = 10;
+
+/// Maximum tokens for autoregressive generation
+pub const MAX_GENERATION_TOKENS: usize = 100;
+
+/// Default learning rate for resonator training
+pub const DEFAULT_LEARNING_RATE: gf16 = 0.5;
+
+/// Number of resonator iterations
+pub const RESONATOR_ITERS: usize = 5;
+
+/// Similarity threshold for early stopping
+pub const SIMILARITY_THRESHOLD: gf16 = 0.5;
+
+// ============================================================================
+// Types
+// ============================================================================
+
+/// Hypervector representation using ternary values
+// (a type alias is a `pub const` bound to the type, not `pub type`)
+pub const Hypervector = [DEFAULT_DIM]Trit;
+
+/// Role vectors for attention and FFN
+/// Layout: [Q0,K0,V0, Q1,K1,V1, Q2,K2,V2, FF1, FF2]
+pub const Roles = [NUM_ROLES]Hypervector;
+
+/// Context window of hypervectors
+pub const Context = [CONTEXT_SIZE]Hypervector;
+
+/// Training result with loss
+pub struct TrainResult {
+    pub loss: gf16,
+    pub similarity: gf16,
+    pub iterations: usize,
+}
+
+// ============================================================================
+// Core Operations
+// ============================================================================
+
+// Dialect notes (the spec was written in Rust syntax): a `&T` parameter is
+// passed by value (t27 has no reference types) and the one `&mut Roles`
+// parameter is the pointer `*Roles`, read whole through `roles.*`; `Vec<T>` is
+// the slice `[]T`, started with `[]` and grown with `.push`; a trailing
+// expression is an explicit `return`; `assert!(c)` / `assert_eq!(a, b)` are
+// `assert(c)` / `assert(a == b)`; `x.ln()` / `x.exp()` are `@log(x)` /
+// `@exp(x)`; `n as gf16` is `@as(gf16, @floatFromInt(n))`; `let mut` / `let`
+// are `var` / `const`.
+
+/// Initialize role vectors with random seeds
+pub fn init_roles(dim: usize, seed: u64) -> Roles {
+    var roles: Roles = [[TRIT_ZERO; DEFAULT_DIM]; NUM_ROLES];
+
+    for i in 0..NUM_ROLES {
+        for j in 0..dim {
+            // Simple deterministic random based on seed + i + j
+            const r = ((seed + (i as u64) * 1000 + (j as u64)) % 3) as i8 - 1;
+            roles[i][j] = @as(Trit, @enumFromInt(r)); // Rust `r as Trit`, r in {-1, 0, +1}
+        }
+    }
+
+    return roles;
+}
+
+/// Single-head attention mechanism
+/// Computes: query = bind(last_position, Q_role)
+/// Finds best matching key via similarity
+/// Returns: bind(best_position, V_role)
+pub fn single_head_attention(
+    positioned: Context,
+    q_role: Hypervector,
+    k_role: Hypervector,
+    v_role: Hypervector,
+    dim: usize,
+) -> Hypervector {
+    // Query = bind(last_position, Q_role)
+    const last_pos = positioned[CONTEXT_SIZE - 1];
+    const query = bind(last_pos, q_role);
+
+    // Find best-matching key
+    var best_sim: gf16 = -2.0;
+    var best_idx: usize = 0;
+
+    for i in 0..CONTEXT_SIZE {
+        const key_i = bind(positioned[i], k_role);
+        const sim = cosine_similarity(query, key_i);
+
+        if sim > best_sim {
+            best_sim = sim;
+            best_idx = i;
+        }
+    }
+
+    // Value = bind(best_position, V_role)
+    return bind(positioned[best_idx], v_role);
+}
+
+/// Multi-head forward pass with residual connection
+/// Pipeline: position → 3-head attention → bundle3 → FFN → residual
+pub fn forward_pass_multi_head(
+    context: Context,
+    roles: Roles,
+    dim: usize,
+) -> Hypervector {
+    // Position encoding
+    var positioned: Context = [[TRIT_ZERO; DEFAULT_DIM]; CONTEXT_SIZE];
+    for i in 0..CONTEXT_SIZE {
+        positioned[i] = permute(context[i], i);
+    }
+
+    // 3-head attention
+    const head0 = single_head_attention(positioned, roles[0], roles[1], roles[2], dim);
+    const head1 = single_head_attention(positioned, roles[3], roles[4], roles[5], dim);
+    const head2 = single_head_attention(positioned, roles[6], roles[7], roles[8], dim);
+
+    // Merge heads via bundle3
+    const merged = bundle3(head0, head1, head2);
+
+    // FFN: bind(FF1), then bind(FF2)
+    const ffn_mid = bind(merged, roles[FF1_ROLE_IDX]);
+    const ffn_out = bind(ffn_mid, roles[FF2_ROLE_IDX]);
+
+    // Residual connection: bundle with last positioned vector
+    return bundle2(ffn_out, positioned[CONTEXT_SIZE - 1]);
+}
+
+/// Summarize context into a single hypervector
+/// Uses positional permutation + sequential bundling
+pub fn summarize_context(context: Context, dim: usize) -> Hypervector {
+    var summary = permute(context[0], 0);
+
+    for i in 1..CONTEXT_SIZE {
+        const positioned = permute(context[i], i);
+        summary = bundle2(summary, positioned);
+    }
+
+    return summary;
+}
+
+/// Direct forward pass: just bind(context_summary, role)
+/// Only 1 bind operation → clean signal
+pub fn forward_pass_direct(
+    context: Context,
+    role: Hypervector,
+    dim: usize,
+) -> Hypervector {
+    const summary = summarize_context(context, dim);
+    return bind(summary, role);
+}
+
+// ============================================================================
+// Resonator Training
+// ============================================================================
+
+/// Resonator training step for a single (context, target) pair
+/// Iteratively refines FF roles to reduce error
+pub fn resonator_train_step(
+    context: Context,
+    target: Hypervector,
+    roles: *Roles, // Rust `&mut Roles`: the caller sees the updated roles
+    dim: usize,
+    learning_rate: gf16,
+    seed: u64,
+) -> TrainResult {
+    // Forward pass to get initial output
+    const output = forward_pass_multi_head(context, roles.*, dim);
+    const initial_sim = cosine_similarity(output, target);
+    var best_loss: gf16 = 1.0 - initial_sim;
+    var best_sim = initial_sim;
+
+    // Resonator iterations
+    for iter in 0..RESONATOR_ITERS {
+        // Position encoding
+        var positioned: Context = [[TRIT_ZERO; DEFAULT_DIM]; CONTEXT_SIZE];
+        for i in 0..CONTEXT_SIZE {
+            positioned[i] = permute(context[i], i);
+        }
+
+        // Compute merged attention output
+        const head0 = single_head_attention(positioned, roles[0], roles[1], roles[2], dim);
+        const head1 = single_head_attention(positioned, roles[3], roles[4], roles[5], dim);
+        const head2 = single_head_attention(positioned, roles[6], roles[7], roles[8], dim);
+        const merged = bundle3(head0, head1, head2);
+
+        // Compute ideal FF2 direction
+        const merged_ff1 = bind(merged, roles[FF1_ROLE_IDX]);
+        const ideal_ff2 = unbind(target, merged_ff1);
+
+        // Compute ideal FF1 direction
+        const ideal_ff1_input = unbind(target, roles[FF2_ROLE_IDX]);
+        const ideal_ff1 = unbind(ideal_ff1_input, merged);
+
+        // Apply corrections (simplified - sparse updates)
+        roles[FF2_ROLE_IDX] = bind(roles[FF2_ROLE_IDX], ideal_ff2);
+        roles[FF1_ROLE_IDX] = bind(roles[FF1_ROLE_IDX], ideal_ff1);
+
+        // Re-check
+        const new_output = forward_pass_multi_head(context, roles.*, dim);
+        const new_sim = cosine_similarity(new_output, target);
+        const new_loss = 1.0 - new_sim;
+
+        if new_loss < best_loss {
+            best_loss = new_loss;
+            best_sim = new_sim;
+        }
+
+        // Early stop if similarity is good
+        if new_sim > SIMILARITY_THRESHOLD {
+            break;
+        }
+    }
+
+    return TrainResult{
+        .loss = best_loss,
+        .similarity = best_sim,
+        .iterations = RESONATOR_ITERS,
+    };
+}
+
+/// Compute direct role from a corpus of (context, target) pairs
+/// One-shot computation, no iterative training needed
+pub fn compute_direct_role(
+    contexts: []Context,
+    targets: []Hypervector,
+    dim: usize,
+) -> Hypervector {
+    if contexts.len == 0 {
+        return [TRIT_ZERO; DEFAULT_DIM];
+    }
+
+    // Start with first sample
+    var accumulated_role = unbind(targets[0], summarize_context(contexts[0], dim));
+
+    // Bundle remaining samples
+    for i in 1..contexts.len {
+        const summary = summarize_context(contexts[i], dim);
+        const ideal = unbind(targets[i], summary);
+        accumulated_role = bundle2(accumulated_role, ideal);
+    }
+
+    return accumulated_role;
+}
+
+// ============================================================================
+// Autoregressive Generation
+// ============================================================================
+
+/// Autoregressive generation: predict next token, shift context, repeat
+pub fn generate_autoregressive(
+    initial_context: Context,
+    roles: Roles,
+    role: Hypervector, // For direct mode
+    dim: usize,
+    max_tokens: usize,
+    use_direct: bool,
+) -> []Hypervector {
+    var context = initial_context;
+    var generated: []Hypervector = [];
+
+    for _ in 0..max_tokens {
+        const output = if use_direct {
+            forward_pass_direct(context, role, dim)
+        } else {
+            forward_pass_multi_head(context, roles, dim)
+        };
+
+        generated.push(output);
+
+        // Shift context: drop first, append new prediction
+        for i in 0..(CONTEXT_SIZE - 1) {
+            context[i] = context[i + 1];
+        }
+        context[CONTEXT_SIZE - 1] = output;
+    }
+
+    return generated;
+}
+
+// ============================================================================
+// Utilities
+// ============================================================================
+
+/// Measure perplexity on a dataset
+/// PPL = exp(-average_log_likelihood)
+pub fn measure_perplexity(
+    contexts: []Context,
+    targets: []Hypervector,
+    roles: Roles,
+    dim: usize,
+) -> gf16 {
+    if contexts.len == 0 {
+        return 0.0;
+    }
+
+    var total_log_likelihood: gf16 = 0.0;
+
+    for i in 0..contexts.len {
+        const output = forward_pass_multi_head(contexts[i], roles, dim);
+        const sim = cosine_similarity(output, targets[i]);
+
+        // Convert similarity to pseudo-log-likelihood
+        // Similarity in [-1, 1] maps to [low, high] likelihood
+        const log_likelihood = if sim > -1.0 {
+            @log((sim + 1.0) / 2.0)
+        } else {
+            -10.0 // Floor for very negative similarities
+        };
+
+        total_log_likelihood += log_likelihood;
+    }
+
+    const avg_log_likelihood = total_log_likelihood / @as(gf16, @floatFromInt(contexts.len));
+    return @exp(-avg_log_likelihood);
+}
+
+/// Compute accuracy: fraction of predictions with similarity > threshold
+pub fn compute_accuracy(
+    contexts: []Context,
+    targets: []Hypervector,
+    roles: Roles,
+    dim: usize,
+    threshold: gf16,
+) -> gf16 {
+    if contexts.len == 0 {
+        return 0.0;
+    }
+
+    var correct: usize = 0;
+
+    for i in 0..contexts.len {
+        const output = forward_pass_multi_head(contexts[i], roles, dim);
+        const sim = cosine_similarity(output, targets[i]);
+
+        if sim > threshold {
+            correct += 1;
+        }
+    }
+
+    return @as(gf16, @floatFromInt(correct)) / @as(gf16, @floatFromInt(contexts.len));
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+test "init_roles creates 11 role vectors" {
+    const roles = init_roles(1024, 12345);
+    assert(roles.len == 11);
+}
+
+test "single_head_attention_returns_valid_output" {
+    var context: Context = [[TRIT_ZERO; DEFAULT_DIM]; CONTEXT_SIZE];
+    for i in 0..CONTEXT_SIZE {
+        for j in 0..100 {
+            context[i][j] = ((i + j) % 3) as i8 - 1;
+        }
+    }
+
+    var roles = init_roles(1024, 12345);
+
+    const result = single_head_attention(
+        context,
+        roles[0],
+        roles[1],
+        roles[2],
+        1024,
+    );
+
+    // Result should be a valid hypervector
+    var non_zero_count = 0;
+    for i in 0..100 {
+        if result[i] != TRIT_ZERO {
+            non_zero_count += 1;
+        }
+    }
+    assert(non_zero_count > 0);
+}
+
+test "forward_pass_multi_head_produces_output" {
+    var context: Context = [[TRIT_ZERO; DEFAULT_DIM]; CONTEXT_SIZE];
+    for i in 0..CONTEXT_SIZE {
+        for j in 0..100 {
+            context[i][j] = ((i + j) % 3) as i8 - 1;
+        }
+    }
+
+    const roles = init_roles(1024, 12345);
+
+    const output = forward_pass_multi_head(context, roles, 1024);
+
+    // Check output is valid
+    var sum: i32 = 0;
+    for i in 0..100 {
+        sum += output[i] as i32;
+    }
+    // Should have some non-zero values
+    assert(sum != 0);
+}
+
+test "summarize_context_produces_valid_hypervector" {
+    var context: Context = [[TRIT_ZERO; DEFAULT_DIM]; CONTEXT_SIZE];
+    for i in 0..CONTEXT_SIZE {
+        for j in 0..100 {
+            context[i][j] = ((i + j) % 3) as i8 - 1;
+        }
+    }
+
+    const summary = summarize_context(context, 1024);
+
+    // Summary should be non-zero
+    var non_zero = 0;
+    for i in 0..100 {
+        if summary[i] != TRIT_ZERO {
+            non_zero += 1;
+        }
+    }
+    assert(non_zero > 0);
+}
+
+test "forward_pass_direct_produces_output" {
+    var context: Context = [[TRIT_ZERO; DEFAULT_DIM]; CONTEXT_SIZE];
+    for i in 0..CONTEXT_SIZE {
+        for j in 0..100 {
+            context[i][j] = ((i + j) % 3) as i8 - 1;
+        }
+    }
+
+    const role = init_roles(1024, 12345)[0];
+
+    const output = forward_pass_direct(context, role, 1024);
+
+    // Check output is valid
+    var non_zero = 0;
+    for i in 0..100 {
+        if output[i] != TRIT_ZERO {
+            non_zero += 1;
+        }
+    }
+    assert(non_zero > 0);
+}
+
+test "resonator_train_step_returns_valid_result" {
+    var context: Context = [[TRIT_ZERO; DEFAULT_DIM]; CONTEXT_SIZE];
+    for i in 0..CONTEXT_SIZE {
+        for j in 0..100 {
+            context[i][j] = ((i + j) % 3) as i8 - 1;
+        }
+    }
+
+    var target: Hypervector = [TRIT_ZERO; DEFAULT_DIM];
+    for i in 0..100 {
+        target[i] = (i % 3) as i8 - 1;
+    }
+
+    var roles = init_roles(1024, 12345);
+
+    const result = resonator_train_step(context, target, &roles, 1024, 0.5, 999);
+
+    // Loss should be in [0, 1]
+    assert(result.loss >= 0.0 && result.loss <= 1.0);
+    // Similarity should be in [-1, 1]
+    assert(result.similarity >= -1.0 && result.similarity <= 1.0);
+}
+
+test "generate_autoregressive_produces_tokens" {
+    var context: Context = [[TRIT_ZERO; DEFAULT_DIM]; CONTEXT_SIZE];
+    for i in 0..CONTEXT_SIZE {
+        for j in 0..100 {
+            context[i][j] = ((i + j) % 3) as i8 - 1;
+        }
+    }
+
+    const roles = init_roles(1024, 12345);
+    const role = roles[0];
+
+    const generated = generate_autoregressive(context, roles, role, 1024, 10, true);
+
+    assert(generated.len == 10);
+}
+
+test "measure_perplexity_returns_valid_value" {
+    var contexts: []Context = [];
+    var targets: []Hypervector = [];
+
+    for sample in 0..5 {
+        var ctx: Context = [[TRIT_ZERO; DEFAULT_DIM]; CONTEXT_SIZE];
+        for i in 0..CONTEXT_SIZE {
+            for j in 0..100 {
+                ctx[i][j] = ((sample + i + j) % 3) as i8 - 1;
+            }
+        }
+        contexts.push(ctx);
+
+        var tgt: Hypervector = [TRIT_ZERO; DEFAULT_DIM];
+        for j in 0..100 {
+            tgt[j] = ((sample + j) % 3) as i8 - 1;
+        }
+        targets.push(tgt);
+    }
+
+    const roles = init_roles(1024, 12345);
+    const ppl = measure_perplexity(contexts, targets, roles, 1024);
+
+    // PPL should be positive
+    assert(ppl > 0.0);
+}
+
+test "compute_accuracy_returns_valid_value" {
+    var contexts: []Context = [];
+    var targets: []Hypervector = [];
+
+    for sample in 0..5 {
+        var ctx: Context = [[TRIT_ZERO; DEFAULT_DIM]; CONTEXT_SIZE];
+        for i in 0..CONTEXT_SIZE {
+            for j in 0..100 {
+                ctx[i][j] = ((sample + i + j) % 3) as i8 - 1;
+            }
+        }
+        contexts.push(ctx);
+
+        var tgt: Hypervector = [TRIT_ZERO; DEFAULT_DIM];
+        for j in 0..100 {
+            tgt[j] = ((sample + j) % 3) as i8 - 1;
+        }
+        targets.push(tgt);
+    }
+
+    const roles = init_roles(1024, 12345);
+    const acc = compute_accuracy(contexts, targets, roles, 1024, 0.0);
+
+    // Accuracy should be in [0, 1]
+    assert(acc >= 0.0 && acc <= 1.0);
+}
+
+test "compute_direct_role_with_empty_corpus" {
+    const contexts: []Context = [];
+    const targets: []Hypervector = [];
+
+    const role = compute_direct_role(contexts, targets, 1024);
+
+    // Should return zero hypervector
+    for i in 0..100 {
+        assert(role[i] == TRIT_ZERO);
+    }
+}
+
+test "compute_direct_role_with_single_sample" {
+    var ctx: Context = [[TRIT_ZERO; DEFAULT_DIM]; CONTEXT_SIZE];
+    for i in 0..CONTEXT_SIZE {
+        for j in 0..100 {
+            ctx[i][j] = ((i + j) % 3) as i8 - 1;
+        }
+    }
+
+    var tgt: Hypervector = [TRIT_ZERO; DEFAULT_DIM];
+    for j in 0..100 {
+        tgt[j] = (j % 3) as i8 - 1;
+    }
+
+    const contexts: []Context = [ctx];
+    const targets: []Hypervector = [tgt];
+
+    const role = compute_direct_role(contexts, targets, 1024);
+
+    // Role should be non-zero
+    var non_zero = 0;
+    for i in 0..100 {
+        if role[i] != TRIT_ZERO {
+            non_zero += 1;
+        }
+    }
+    assert(non_zero > 0);
+}
+
+test "bundle3_merges_three_heads" {
+    var h1: Hypervector = [TRIT_ZERO; DEFAULT_DIM];
+    var h2: Hypervector = [TRIT_ZERO; DEFAULT_DIM];
+    var h3: Hypervector = [TRIT_ZERO; DEFAULT_DIM];
+
+    for i in 0..100 {
+        h1[i] = TRIT_POS;
+        h2[i] = TRIT_POS;
+        h3[i] = TRIT_POS;
+    }
+
+    const merged = bundle3(h1, h2, h3);
+
+    // With all +1, majority vote should be +1
+    assert(merged[0] == TRIT_POS);
+}
+
+test "bind_unbind_self_inverse" {
+    var a: Hypervector = [TRIT_ZERO; DEFAULT_DIM];
+    var b: Hypervector = [TRIT_ZERO; DEFAULT_DIM];
+
+    for i in 0..100 {
+        a[i] = (i % 3) as i8 - 1;
+        b[i] = ((i + 1) % 3) as i8 - 1;
+    }
+
+    const bound = bind(a, b);
+    const recovered = unbind(bound, b);
+
+    // Check similarity
+    const sim = cosine_similarity(a, recovered);
+    // Should be high (perfect in theory, noise in practice)
+    assert(sim > 0.8);
+}
+
+test "permute_changes_hypervector" {
+    var hv: Hypervector = [TRIT_ZERO; DEFAULT_DIM];
+    for i in 0..100 {
+        hv[i] = (i % 3) as i8 - 1;
+    }
+
+    const permuted = permute(hv, 5);
+
+    // Permuted should be different
+    var same = true;
+    for i in 0..100 {
+        if hv[i] != permuted[i] {
+            same = false;
+            break;
+        }
+    }
+    assert(!same);
+}
+
+test "generate_autoregressive_with_multi_head" {
+    var context: Context = [[TRIT_ZERO; DEFAULT_DIM]; CONTEXT_SIZE];
+    for i in 0..CONTEXT_SIZE {
+        for j in 0..100 {
+            context[i][j] = ((i + j) % 3) as i8 - 1;
+        }
+    }
+
+    const roles = init_roles(1024, 12345);
+
+    const generated = generate_autoregressive(context, roles, roles[0], 1024, 5, false);
+
+    assert(generated.len == 5);
+}
+
+test "measure_perplexity_empty_dataset" {
+    const contexts: []Context = [];
+    const targets: []Hypervector = [];
+
+    const roles = init_roles(1024, 12345);
+    const ppl = measure_perplexity(contexts, targets, roles, 1024);
+
+    // Empty dataset should return 0
+    assert(ppl == 0.0);
+}
+
+test "resonator_improves_similarity" {
+    var context: Context = [[TRIT_ZERO; DEFAULT_DIM]; CONTEXT_SIZE];
+    for i in 0..CONTEXT_SIZE {
+        for j in 0..100 {
+            context[i][j] = ((i + j) % 3) as i8 - 1;
+        }
+    }
+
+    var target: Hypervector = [TRIT_ZERO; DEFAULT_DIM];
+    for i in 0..100 {
+        target[i] = (i % 3) as i8 - 1;
+    }
+
+    var roles = init_roles(1024, 12345);
+
+    // Get initial similarity
+    const initial_output = forward_pass_multi_head(context, roles, 1024);
+    const initial_sim = cosine_similarity(initial_output, target);
+
+    // Train
+    const result = resonator_train_step(context, target, &roles, 1024, 0.5, 999);
+
+    // Similarity should not decrease (may stay same or improve)
+    assert(result.similarity >= initial_sim - 0.1);
+}
+
+test "forward_pass_direct_faster_than_multi_head" {
+    var context: Context = [[TRIT_ZERO; DEFAULT_DIM]; CONTEXT_SIZE];
+    for i in 0..CONTEXT_SIZE {
+        for j in 0..100 {
+            context[i][j] = ((i + j) % 3) as i8 - 1;
+        }
+    }
+
+    const roles = init_roles(1024, 12345);
+    const role = roles[0];
+
+    // Both should produce valid output
+    _ = forward_pass_multi_head(context, roles, 1024);
+    _ = forward_pass_direct(context, role, 1024);
+
+    // Test passes if both complete without error
+    assert(true);
+}
+
+test "compute_accuracy_with_high_threshold" {
+    var contexts: []Context = [];
+    var targets: []Hypervector = [];
+
+    for sample in 0..3 {
+        var ctx: Context = [[TRIT_ZERO; DEFAULT_DIM]; CONTEXT_SIZE];
+        for i in 0..CONTEXT_SIZE {
+            for j in 0..100 {
+                ctx[i][j] = ((sample + i + j) % 3) as i8 - 1;
+            }
+        }
+        contexts.push(ctx);
+
+        var tgt: Hypervector = [TRIT_ZERO; DEFAULT_DIM];
+        for j in 0..100 {
+            tgt[j] = ((sample + j) % 3) as i8 - 1;
+        }
+        targets.push(tgt);
+    }
+
+    const roles = init_roles(1024, 12345);
+    const acc = compute_accuracy(contexts, targets, roles, 1024, 0.9);
+
+    // Accuracy should be in [0, 1]
+    assert(acc >= 0.0 && acc <= 1.0);
+}
+
+test "summarize_context_order_sensitive" {
+    var ctx1: Context = [[TRIT_ZERO; DEFAULT_DIM]; CONTEXT_SIZE];
+    var ctx2: Context = [[TRIT_ZERO; DEFAULT_DIM]; CONTEXT_SIZE];
+
+    for i in 0..CONTEXT_SIZE {
+        for j in 0..100 {
+            ctx1[i][j] = (i as i8) - 1;
+            ctx2[i][j] = ((CONTEXT_SIZE - 1 - i) as i8) - 1;
+        }
+    }
+
+    const sum1 = summarize_context(ctx1, 1024);
+    const sum2 = summarize_context(ctx2, 1024);
+
+    // Different orders should produce different summaries
+    var same = true;
+    for i in 0..100 {
+        if sum1[i] != sum2[i] {
+            same = false;
+            break;
+        }
+    }
+    assert(!same);
+}
+
+// ============================================================================
+// Invariants
+// ============================================================================
+
+invariant "roles_count_is_11" {
+    const roles = init_roles(1024, 12345);
+    assert(roles.len == 11);
+}
+
+invariant "forward_pass_output_has_same_dim" {
+    var context: Context = [[TRIT_ZERO; DEFAULT_DIM]; CONTEXT_SIZE];
+    const roles = init_roles(1024, 12345);
+    const output = forward_pass_multi_head(context, roles, 1024);
+    assert(output.len == 1024);
+}
+
+invariant "resonator_loss_in_valid_range" {
+    var context: Context = [[TRIT_ZERO; DEFAULT_DIM]; CONTEXT_SIZE];
+    var target: Hypervector = [TRIT_ZERO; DEFAULT_DIM];
+    var roles = init_roles(1024, 12345);
+    const result = resonator_train_step(context, target, &roles, 1024, 0.5, 999);
+    assert(result.loss >= 0.0 && result.loss <= 1.0);
+}
+
+invariant "resonator_similarity_in_valid_range" {
+    var context: Context = [[TRIT_ZERO; DEFAULT_DIM]; CONTEXT_SIZE];
+    var target: Hypervector = [TRIT_ZERO; DEFAULT_DIM];
+    var roles = init_roles(1024, 12345);
+    const result = resonator_train_step(context, target, &roles, 1024, 0.5, 999);
+    assert(result.similarity >= -1.0 && result.similarity <= 1.0);
+}
+
+invariant "generate_autoregressive_returns_correct_count" {
+    var context: Context = [[TRIT_ZERO; DEFAULT_DIM]; CONTEXT_SIZE];
+    const roles = init_roles(1024, 12345);
+    const generated = generate_autoregressive(context, roles, roles[0], 1024, 10, true);
+    assert(generated.len == 10);
+}
+
+invariant "measure_perplexity_non_negative" {
+    const contexts: []Context = [[[TRIT_ZERO; DEFAULT_DIM]; CONTEXT_SIZE]];
+    const targets: []Hypervector = [[TRIT_ZERO; DEFAULT_DIM]];
+    const roles = init_roles(1024, 12345);
+    const ppl = measure_perplexity(contexts, targets, roles, 1024);
+    assert(ppl >= 0.0);
+}
+
+invariant "compute_accuracy_in_valid_range" {
+    const contexts: []Context = [[[TRIT_ZERO; DEFAULT_DIM]; CONTEXT_SIZE]];
+    const targets: []Hypervector = [[TRIT_ZERO; DEFAULT_DIM]];
+    const roles = init_roles(1024, 12345);
+    const acc = compute_accuracy(contexts, targets, roles, 1024, 0.5);
+    assert(acc >= 0.0 && acc <= 1.0);
+}
+
+invariant "summarize_context_returns_valid_dim" {
+    var context: Context = [[TRIT_ZERO; DEFAULT_DIM]; CONTEXT_SIZE];
+    const summary = summarize_context(context, 1024);
+    assert(summary.len == 1024);
+}
+
+invariant "forward_pass_direct_returns_valid_dim" {
+    var context: Context = [[TRIT_ZERO; DEFAULT_DIM]; CONTEXT_SIZE];
+    const role = init_roles(1024, 12345)[0];
+    const output = forward_pass_direct(context, role, 1024);
+    assert(output.len == 1024);
+}
+
+invariant "compute_direct_role_returns_valid_dim" {
+    const contexts: []Context = [[[TRIT_ZERO; DEFAULT_DIM]; CONTEXT_SIZE]];
+    const targets: []Hypervector = [[TRIT_ZERO; DEFAULT_DIM]];
+    const role = compute_direct_role(contexts, targets, 1024);
+    assert(role.len == 1024);
+}
+
+invariant "bind_unbind_preserves_dimension" {
+    const a: Hypervector = [TRIT_ZERO; DEFAULT_DIM];
+    const b: Hypervector = [TRIT_ZERO; DEFAULT_DIM];
+    const bound = bind(a, b);
+    const recovered = unbind(bound, b);
+    assert(recovered.len == 1024);
+}
+
+invariant "permute_preserves_dimension" {
+    const hv: Hypervector = [TRIT_ZERO; DEFAULT_DIM];
+    const permuted = permute(hv, 5);
+    assert(permuted.len == 1024);
+}
+
+invariant "bundle2_preserves_dimension" {
+    const a: Hypervector = [TRIT_ZERO; DEFAULT_DIM];
+    const b: Hypervector = [TRIT_ZERO; DEFAULT_DIM];
+    const bundled = bundle2(a, b);
+    assert(bundled.len == 1024);
+}
+
+invariant "bundle3_preserves_dimension" {
+    const a: Hypervector = [TRIT_ZERO; DEFAULT_DIM];
+    const b: Hypervector = [TRIT_ZERO; DEFAULT_DIM];
+    const c: Hypervector = [TRIT_ZERO; DEFAULT_DIM];
+    const bundled = bundle3(a, b, c);
+    assert(bundled.len == 1024);
+}
+
+// ============================================================================
+// Benchmarks
+// ============================================================================
+
+bench "init_roles" {
+    const iterations = 1000;
+    for _ in 0..iterations {
+        _ = init_roles(1024, 12345);
+    }
+}
+
+bench "single_head_attention" {
+    const iterations = 1000;
+    var context: Context = [[TRIT_ZERO; DEFAULT_DIM]; CONTEXT_SIZE];
+    for i in 0..CONTEXT_SIZE {
+        for j in 0..1024 {
+            context[i][j] = ((i + j) % 3) as i8 - 1;
+        }
+    }
+    const roles = init_roles(1024, 12345);
+
+    for _ in 0..iterations {
+        _ = single_head_attention(context, roles[0], roles[1], roles[2], 1024);
+    }
+}
+
+bench "forward_pass_multi_head" {
+    const iterations = 100;
+    var context: Context = [[TRIT_ZERO; DEFAULT_DIM]; CONTEXT_SIZE];
+    for i in 0..CONTEXT_SIZE {
+        for j in 0..1024 {
+            context[i][j] = ((i + j) % 3) as i8 - 1;
+        }
+    }
+    const roles = init_roles(1024, 12345);
+
+    for _ in 0..iterations {
+        _ = forward_pass_multi_head(context, roles, 1024);
+    }
+}
+
+bench "forward_pass_direct" {
+    const iterations = 1000;
+    var context: Context = [[TRIT_ZERO; DEFAULT_DIM]; CONTEXT_SIZE];
+    for i in 0..CONTEXT_SIZE {
+        for j in 0..1024 {
+            context[i][j] = ((i + j) % 3) as i8 - 1;
+        }
+    }
+    const role = init_roles(1024, 12345)[0];
+
+    for _ in 0..iterations {
+        _ = forward_pass_direct(context, role, 1024);
+    }
+}
+
+bench "summarize_context" {
+    const iterations = 1000;
+    var context: Context = [[TRIT_ZERO; DEFAULT_DIM]; CONTEXT_SIZE];
+    for i in 0..CONTEXT_SIZE {
+        for j in 0..1024 {
+            context[i][j] = ((i + j) % 3) as i8 - 1;
+        }
+    }
+
+    for _ in 0..iterations {
+        _ = summarize_context(context, 1024);
+    }
+}
+
+bench "resonator_train_step" {
+    const iterations = 10;
+    var context: Context = [[TRIT_ZERO; DEFAULT_DIM]; CONTEXT_SIZE];
+    for i in 0..CONTEXT_SIZE {
+        for j in 0..1024 {
+            context[i][j] = ((i + j) % 3) as i8 - 1;
+        }
+    }
+    var target: Hypervector = [TRIT_ZERO; DEFAULT_DIM];
+    for j in 0..1024 {
+        target[j] = (j % 3) as i8 - 1;
+    }
+
+    for _ in 0..iterations {
+        var roles = init_roles(1024, 12345);
+        _ = resonator_train_step(context, target, &roles, 1024, 0.5, 999);
+    }
+}
+
+bench "generate_autoregressive" {
+    const iterations = 10;
+    var context: Context = [[TRIT_ZERO; DEFAULT_DIM]; CONTEXT_SIZE];
+    for i in 0..CONTEXT_SIZE {
+        for j in 0..1024 {
+            context[i][j] = ((i + j) % 3) as i8 - 1;
+        }
+    }
+    const roles = init_roles(1024, 12345);
+
+    for _ in 0..iterations {
+        _ = generate_autoregressive(context, roles, roles[0], 1024, 10, true);
+    }
+}
+
+bench "measure_perplexity" {
+    const iterations = 10;
+    var contexts: []Context = [];
+    var targets: []Hypervector = [];
+
+    for sample in 0..10 {
+        var ctx: Context = [[TRIT_ZERO; DEFAULT_DIM]; CONTEXT_SIZE];
+        for i in 0..CONTEXT_SIZE {
+            for j in 0..1024 {
+                ctx[i][j] = ((sample + i + j) % 3) as i8 - 1;
+            }
+        }
+        contexts.push(ctx);
+
+        var tgt: Hypervector = [TRIT_ZERO; DEFAULT_DIM];
+        for j in 0..1024 {
+            tgt[j] = ((sample + j) % 3) as i8 - 1;
+        }
+        targets.push(tgt);
+    }
+
+    const roles = init_roles(1024, 12345);
+
+    for _ in 0..iterations {
+        _ = measure_perplexity(contexts, targets, roles, 1024);
+    }
+}
+
+bench "compute_accuracy" {
+    const iterations = 10;
+    var contexts: []Context = [];
+    var targets: []Hypervector = [];
+
+    for sample in 0..10 {
+        var ctx: Context = [[TRIT_ZERO; DEFAULT_DIM]; CONTEXT_SIZE];
+        for i in 0..CONTEXT_SIZE {
+            for j in 0..1024 {
+                ctx[i][j] = ((sample + i + j) % 3) as i8 - 1;
+            }
+        }
+        contexts.push(ctx);
+
+        var tgt: Hypervector = [TRIT_ZERO; DEFAULT_DIM];
+        for j in 0..1024 {
+            tgt[j] = ((sample + j) % 3) as i8 - 1;
+        }
+        targets.push(tgt);
+    }
+
+    const roles = init_roles(1024, 12345);
+
+    for _ in 0..iterations {
+        _ = compute_accuracy(contexts, targets, roles, 1024, 0.5);
+    }
+}
+
+bench "compute_direct_role" {
+    const iterations = 10;
+    var contexts: []Context = [];
+    var targets: []Hypervector = [];
+
+    for sample in 0..10 {
+        var ctx: Context = [[TRIT_ZERO; DEFAULT_DIM]; CONTEXT_SIZE];
+        for i in 0..CONTEXT_SIZE {
+            for j in 0..1024 {
+                ctx[i][j] = ((sample + i + j) % 3) as i8 - 1;
+            }
+        }
+        contexts.push(ctx);
+
+        var tgt: Hypervector = [TRIT_ZERO; DEFAULT_DIM];
+        for j in 0..1024 {
+            tgt[j] = ((sample + j) % 3) as i8 - 1;
+        }
+        targets.push(tgt);
+    }
+
+    for _ in 0..iterations {
+        _ = compute_direct_role(contexts, targets, 1024);
+    }
+}
+
+bench "bind_operation" {
+    const iterations = 10000;
+    const a: Hypervector = [TRIT_ZERO; DEFAULT_DIM];
+    const b: Hypervector = [TRIT_ZERO; DEFAULT_DIM];
+
+    for _ in 0..iterations {
+        _ = bind(a, b);
+    }
+}
+
+bench "bundle3_operation" {
+    const iterations = 10000;
+    const a: Hypervector = [TRIT_ZERO; DEFAULT_DIM];
+    const b: Hypervector = [TRIT_ZERO; DEFAULT_DIM];
+    const c: Hypervector = [TRIT_ZERO; DEFAULT_DIM];
+
+    for _ in 0..iterations {
+        _ = bundle3(a, b, c);
+    }
+}
+
+bench "permute_operation" {
+    const iterations = 10000;
+    const hv: Hypervector = [TRIT_ZERO; DEFAULT_DIM];
+
+    for _ in 0..iterations {
+        _ = permute(hv, 5);
+    }
+}

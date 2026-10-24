@@ -1,0 +1,708 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/policy/own_language.t27 -- the "Only t27" gate: which changed paths a commit or a pull request may carry.
+; Owner's hard rule, 2026-10-05: no new commit or PR adds or modifies hand-written code in any language
+; other than t27. Allowed: .t27 specs, files t27c generated (under a generated root), and deletions -- so
+; the foreign code already in the tree is debt that can only shrink.
+; --
+; This file is the single source of truth for the rule. It is lowered by `t27c gen-c` to
+; gen/c/policy/own_language.c (never hand-edited, L2); lefthook.yml (pre-commit, pre-push) and
+; .github/workflows/own-language.yml feed `git diff --name-status` into check_all() below and fail on any
+; DENY. The only override is the owner's label `owner-approved-foreign` on a pull request.
+; --
+; Decisions, stated where the rule lives:
+; - Deletions are always ALLOW: removing foreign code is the only way the debt shrinks.
+; - A rename or copy (R/C) is judged by its NEW path, like an addition: moving foo.py to bar.py writes bar.py.
+; - Prose (.md .txt .rst .adoc) is ALLOW: the rule is about code, and a human reads prose.
+;   Exception: CMakeLists.txt is a build script wearing a .txt name, so it is listed by name and denied.
+; - Data (.json .jsonl .hjson .csv .tsv .lock) is ALLOW: JSON written by tools (seals, conformance vectors,
+;   catalogs, lockfiles) is machinery, not a hand-written language.
+; - .yml/.yaml/.toml are DENY: workflow and build configuration is code that runs. Cargo.toml counts.
+; - An unknown extension (images, fonts, pdf, bitstreams) is ALLOW as not-code. The foreign list is the
+;   set of languages people write by hand; extend it here when a new one appears.
+; - An extensionless file under a script directory (scripts/, bin/, .githooks/, .husky/) is a script
+;   with a shebang -- scripts/tri is bash -- so it is DENY.
+; - Generated roots are path prefixes: gen/ (every t27c backend), bootstrap/gen/ and
+;   bootstrap/src/memory/generated/ (t27c gen-rust output carried by the bootstrap crate). Conformance
+;   vectors are JSON and already ALLOW as data, so conformance/vectors/ is NOT a prefix: a prefix would also
+;   let a hand-written .py in.
+; - The gate's own files are PROTECTED: changing or deleting them is DENY whatever their kind. Deleting
+;   foreign code shrinks the debt; deleting the gate removes the rule, and a bee could otherwise weaken it
+;   with an allowed .t27 edit plus a regenerated gen/ file. Only the owner's label lets such a change in.
+; - A line the reader cannot parse is DENY (fail closed): a gate that waves through what it cannot read
+;   is not a gate.
+; - Owner-approved exceptions are DATA, not a bypass: tools/policy/foreign-exceptions.txt lists path
+;   prefixes, one per line ('#' starts a comment; an empty line is skipped, never "match everything"). The
+;   plumbing feeds the list first, then a separator line, then the diff. A path under an entry is ALLOW
+;   (R_EXCEPTION) unless it is malformed or protected. Separator "--" is the local hooks: the list is read
+;   from the working tree, so an agent on an owner-approved branch adds its entry and can commit. Separator
+;   "--ci" is the pull-request check: the list is read from the BASE revision (a PR cannot approve itself)
+;   and any change to the list file is PROTECTED, so every new entry needs the owner's label. No separator
+;   at all means no exceptions.
+; - The foreign-line budget (owner rule 2026-10-07, #7371): an exception names a file that may change, never
+;   how much foreign code it may gain, and the label owner-approved-foreign is applied through the same
+;   account the agents use, so neither can be what stops a hand-written feature. check_budget() reads
+;   `git diff --numstat --no-renames` and denies more than FOREIGN_ADDED_MAX added lines in one foreign
+;   file or more than FOREIGN_ADDED_TOTAL_MAX in the whole diff. No exception and no label lifts it;
+;   deletions are free; specs, generated roots, prose and data are not counted, the gate's own foreign
+;   files (lefthook.yml, its workflow) are. CI compiles the budget from the BASE revision, so a pull
+;   request cannot loosen its own limit. Locally the exception list is read from origin/master in "--ci"
+;   mode, so a branch cannot list itself either.
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module PolicyOwnLanguage;
+
+/// The verdict on one changed path.
+pub const ALLOW : u8 = 0;
+pub const DENY : u8 = 1;
+
+/// Why. Every code below DENY_FROM allows; every code at or above it denies.
+pub const R_DELETED : u8 = 1;
+pub const R_SPEC : u8 = 2;
+pub const R_GENERATED : u8 = 3;
+pub const R_PROSE : u8 = 4;
+pub const R_DATA : u8 = 5;
+pub const R_NOT_CODE : u8 = 6;
+pub const R_EXCEPTION : u8 = 7;
+pub const DENY_FROM : u8 = 16;
+pub const R_FOREIGN_EXT : u8 = 16;
+pub const R_FOREIGN_NAME : u8 = 17;
+pub const R_SCRIPT_NO_EXT : u8 = 18;
+pub const R_MALFORMED : u8 = 19;
+pub const R_PROTECTED : u8 = 20;
+
+/// Lists are comma separated and end with '$', so the same walk works in C and in Zig without a length.
+/// Extensions are matched without the dot and case-insensitively.
+pub const OWN_EXTS : str = "t27,tri,$";
+pub const PROSE_EXTS : str = "md,txt,rst,adoc,$";
+pub const DATA_EXTS : str = "json,jsonl,hjson,csv,tsv,lock,$";
+pub const FOREIGN_EXTS : str = "rs,py,pyi,ts,tsx,js,jsx,mjs,cjs,sh,bash,zsh,fish,ps1,zig,go,c,h,cc,cpp,cxx,hpp,hh,java,kt,kts,swift,rb,pl,pm,lua,v,sv,svh,vh,vhd,vhdl,lean,yml,yaml,toml,html,htm,css,scss,vue,svelte,php,cs,scala,hs,ml,dart,sql,nix,cmake,mk,tcl,xdc,ex,exs,jl,r,m,mm,gradle,groovy,s,asm,ld,dockerfile,$";
+/// File names that are code whatever their extension; matched exactly.
+pub const FOREIGN_NAMES : str = "Dockerfile,Containerfile,Makefile,GNUmakefile,makefile,Justfile,justfile,Rakefile,Gemfile,Vagrantfile,Jenkinsfile,CMakeLists.txt,$";
+/// File-name prefixes that are code: Dockerfile.dev, Containerfile.ci.
+pub const FOREIGN_NAME_PREFIXES : str = "Dockerfile.,Containerfile.,$";
+/// Roots t27c writes generated code into.
+pub const GENERATED_PREFIXES : str = "gen/,bootstrap/gen/,bootstrap/src/memory/generated/,$";
+/// Directories whose extensionless files are scripts.
+pub const SCRIPT_DIRS : str = "scripts/,bin/,.githooks/,.husky/,$";
+/// The gate itself; matched as whole paths.
+pub const PROTECTED_PATHS : str = "specs/policy/own_language.t27,gen/c/policy/own_language.c,lefthook.yml,.github/workflows/own-language.yml,$";
+/// The owner's exception list; protected in "--ci" mode only.
+pub const EXCEPTIONS_FILE : str = "tools/policy/foreign-exceptions.txt,$";
+/// The status letters `git diff --name-status` prints.
+pub const KINDS : str = "ACDMRTUXB$";
+
+/// The failure line, in two pieces around the offending extension or name.
+pub const MSG_HEAD : str = ": hand-written $";
+pub const MSG_TAIL : str = " is forbidden (owner rule 2026-10-05): write a .t27 spec and generate it with t27c; see AGENTS.md 'Only t27'$";
+
+/// The failure line for a protected path: the gate is not code a bee may write, in any language.
+pub const MSG_PROTECTED : str = ": the Only-t27 gate itself is owner-only (owner rule 2026-10-05): it needs the owner's label owner-approved-foreign; see AGENTS.md 'Only t27'$";
+
+/// '$' and ',' as numbers: a char literal is not a const initializer in every backend.
+pub const LIST_END : u8 = 36;
+pub const LIST_SEP : u8 = 44;
+
+/// ASCII lowercase of one byte.
+pub fn lower(c: u8) -> u8 {
+    if (c >= 'A' and c <= 'Z') { return c + 32; }
+    return c;
+}
+
+/// Is s[from..to] exactly one entry of `list`? `fold` compares case-insensitively.
+pub fn in_list(list: []const u8, s: []const u8, from: usize, to: usize, fold: bool) -> bool {
+    var i : usize = 0;
+    while (list[i] != LIST_END) {
+        var k : usize = from;
+        var ok : bool = true;
+        while (list[i] != LIST_SEP and list[i] != LIST_END) {
+            if (k >= to) {
+                ok = false;
+            } else {
+                var a : u8 = s[k];
+                var b : u8 = list[i];
+                if (fold) {
+                    a = lower(a);
+                    b = lower(b);
+                }
+                if (a != b) { ok = false; }
+            }
+            k += 1;
+            i += 1;
+        }
+        if (ok and k == to) { return true; }
+        if (list[i] == LIST_SEP) { i += 1; }
+    }
+    return false;
+}
+
+/// Does s[from..to] start with one entry of `list`? Case-sensitive: paths are.
+pub fn has_prefix(list: []const u8, s: []const u8, from: usize, to: usize) -> bool {
+    var i : usize = 0;
+    while (list[i] != LIST_END) {
+        var k : usize = from;
+        var ok : bool = true;
+        while (list[i] != LIST_SEP and list[i] != LIST_END) {
+            if (k >= to) {
+                ok = false;
+            } else {
+                if (s[k] != list[i]) { ok = false; }
+            }
+            k += 1;
+            i += 1;
+        }
+        if (ok) { return true; }
+        if (list[i] == LIST_SEP) { i += 1; }
+    }
+    return false;
+}
+
+/// Is `c` one of the single-byte entries of a '$'-terminated letter list?
+pub fn is_letter_of(list: []const u8, c: u8) -> bool {
+    var i : usize = 0;
+    while (list[i] != LIST_END) {
+        if (list[i] == c) { return true; }
+        i += 1;
+    }
+    return false;
+}
+
+/// Start of the file name in s[from..to]: one past the last '/'.
+pub fn base_start(s: []const u8, from: usize, to: usize) -> usize {
+    var b : usize = from;
+    var i : usize = from;
+    while (i < to) {
+        if (s[i] == '/') { b = i + 1; }
+        i += 1;
+    }
+    return b;
+}
+
+/// Index of the extension's dot in the file name, or `to` when there is none. A leading dot
+/// (.gitignore) names the file; it does not start an extension.
+pub fn ext_dot(s: []const u8, from: usize, to: usize) -> usize {
+    const b : usize = base_start(s, from, to);
+    var d : usize = to;
+    var i : usize = b + 1;
+    while (i < to) {
+        if (s[i] == '.') { d = i; }
+        i += 1;
+    }
+    return d;
+}
+
+/// The reason for one changed path s[from..to] with git status letter `kind`. A path git quoted
+/// ("...") is read without its quotes.
+pub fn reason(kind: u8, s: []const u8, from: usize, to: usize) -> u8 {
+    if (is_letter_of(KINDS, kind) == false) { return R_MALFORMED; }
+    var f : usize = from;
+    var t : usize = to;
+    if (t > f and s[f] == '"') { f += 1; }
+    if (t > f and s[t - 1] == '"') { t -= 1; }
+    if (t <= f) { return R_MALFORMED; }
+    if (in_list(PROTECTED_PATHS, s, f, t, false)) { return R_PROTECTED; }
+    if (kind == 'D') { return R_DELETED; }
+    if (has_prefix(GENERATED_PREFIXES, s, f, t)) { return R_GENERATED; }
+    const b : usize = base_start(s, f, t);
+    const d : usize = ext_dot(s, f, t);
+    if (d < t and in_list(OWN_EXTS, s, d + 1, t, true)) { return R_SPEC; }
+    if (in_list(FOREIGN_NAMES, s, b, t, false)) { return R_FOREIGN_NAME; }
+    if (has_prefix(FOREIGN_NAME_PREFIXES, s, b, t)) { return R_FOREIGN_NAME; }
+    if (d < t) {
+        if (in_list(FOREIGN_EXTS, s, d + 1, t, true)) { return R_FOREIGN_EXT; }
+        if (in_list(PROSE_EXTS, s, d + 1, t, true)) { return R_PROSE; }
+        if (in_list(DATA_EXTS, s, d + 1, t, true)) { return R_DATA; }
+        return R_NOT_CODE;
+    }
+    if (has_prefix(SCRIPT_DIRS, s, f, t)) { return R_SCRIPT_NO_EXT; }
+    return R_NOT_CODE;
+}
+
+/// ALLOW or DENY for a reason code.
+pub fn verdict(r: u8) -> u8 {
+    if (r >= DENY_FROM) { return DENY; }
+    return ALLOW;
+}
+
+/// The verdict for one changed path, the classifier in one call.
+pub fn classify(kind: u8, s: []const u8, from: usize, to: usize) -> u8 {
+    return verdict(reason(kind, s, from, to));
+}
+
+/// Write one byte at w if it fits; the returned position keeps counting past the end.
+pub fn put(out: []u8, w: usize, cap: usize, c: u8) -> usize {
+    if (w < cap) { out[w] = c; }
+    return w + 1;
+}
+
+/// Write s[from..to].
+pub fn put_range(out: []u8, w: usize, cap: usize, s: []const u8, from: usize, to: usize) -> usize {
+    var p : usize = w;
+    var i : usize = from;
+    while (i < to) {
+        p = put(out, p, cap, s[i]);
+        i += 1;
+    }
+    return p;
+}
+
+/// Write a '$'-terminated message piece without its '$'.
+pub fn put_msg(out: []u8, w: usize, cap: usize, msg: []const u8) -> usize {
+    var p : usize = w;
+    var i : usize = 0;
+    while (msg[i] != LIST_END) {
+        p = put(out, p, cap, msg[i]);
+        i += 1;
+    }
+    return p;
+}
+
+/// Is buf[f..t] under one entry of the exception list buf[ef..et] (lines of path prefixes)? A '#' line is
+/// a comment and an empty line is skipped: an empty prefix would match every path.
+pub fn excepted(buf: []const u8, ef: usize, et: usize, f: usize, t: usize) -> bool {
+    var s : usize = ef;
+    while (s < et) {
+        var e : usize = s;
+        while (e < et and buf[e] != '\n') { e += 1; }
+        var x : usize = e;
+        if (x > s and buf[x - 1] == '\r') { x -= 1; }
+        if (x > s and buf[s] != '#' and x - s <= t - f) {
+            var ok : bool = true;
+            var k : usize = 0;
+            while (k < x - s) {
+                if (buf[s + k] != buf[f + k]) { ok = false; }
+                k += 1;
+            }
+            if (ok) { return true; }
+        }
+        s = e + 1;
+    }
+    return false;
+}
+
+/// Start of the first line that is exactly "--" or "--ci", or n when there is none.
+pub fn sep_at(buf: []const u8, n: usize) -> usize {
+    var s : usize = 0;
+    while (s < n) {
+        var e : usize = s;
+        while (e < n and buf[e] != '\n') { e += 1; }
+        var x : usize = e;
+        if (x > s and buf[x - 1] == '\r') { x -= 1; }
+        if (x - s >= 2 and buf[s] == '-' and buf[s + 1] == '-') {
+            if (x - s == 2) { return s; }
+            if (x - s == 4 and buf[s + 2] == 'c' and buf[s + 3] == 'i') { return s; }
+        }
+        s = e + 1;
+    }
+    return n;
+}
+
+/// The reason for one changed path buf[from..to], given the exception list buf[ef..et] and the mode
+/// (`ci` true for the pull-request check).
+pub fn judge(kind: u8, buf: []const u8, from: usize, to: usize, ef: usize, et: usize, ci: bool) -> u8 {
+    const r : u8 = reason(kind, buf, from, to);
+    if (r == R_MALFORMED or r == R_PROTECTED) { return r; }
+    var f : usize = from;
+    var t : usize = to;
+    if (buf[f] == '"') { f += 1; }
+    if (t > f and buf[t - 1] == '"') { t -= 1; }
+    if (ci and in_list(EXCEPTIONS_FILE, buf, f, t, false)) { return R_PROTECTED; }
+    if (verdict(r) == DENY and excepted(buf, ef, et, f, t)) { return R_EXCEPTION; }
+    return r;
+}
+
+/// Read the gate's input buf[0..n] -- an optional exception list, a separator line ("--" local, "--ci"
+/// pull request), then `git diff --name-status` lines ("X\tpath" or "R100\told\tnew"; the judged path is
+/// the last field) -- write one failure line per DENY into out[0..cap], and return how many paths were
+/// denied. The caller exits non-zero when this is not 0.
+pub fn check_all(buf: []const u8, n: usize, out: []u8, cap: usize) -> u32 {
+    var denied : u32 = 0;
+    var w : usize = 0;
+    var s : usize = 0;
+    var et : usize = 0;
+    var ci : bool = false;
+    const sp : usize = sep_at(buf, n);
+    if (sp < n) {
+        et = sp;
+        if (sp + 2 < n) {
+            if (buf[sp + 2] == 'c') { ci = true; }
+        }
+        s = sp;
+        while (s < n and buf[s] != '\n') { s += 1; }
+        s += 1;
+    }
+    while (s < n) {
+        var e : usize = s;
+        while (e < n and buf[e] != '\n') { e += 1; }
+        var t : usize = e;
+        if (t > s and buf[t - 1] == '\r') { t -= 1; }
+        if (t > s) {
+            var p : usize = s;
+            var i : usize = s;
+            while (i < t) {
+                if (buf[i] == '\t') { p = i + 1; }
+                i += 1;
+            }
+            var r : u8 = R_MALFORMED;
+            if (p > s) { r = judge(buf[s], buf, p, t, 0, et, ci); }
+            if (verdict(r) == DENY) {
+                denied += 1;
+                w = put_range(out, w, cap, buf, p, t);
+                if (r == R_PROTECTED) {
+                    w = put_msg(out, w, cap, MSG_PROTECTED);
+                } else {
+                    w = put_msg(out, w, cap, MSG_HEAD);
+                    if (r == R_FOREIGN_EXT) {
+                        w = put_range(out, w, cap, buf, ext_dot(buf, p, t), t);
+                    } else {
+                        if (r == R_FOREIGN_NAME) {
+                            w = put_range(out, w, cap, buf, base_start(buf, p, t), t);
+                        } else {
+                            if (r == R_SCRIPT_NO_EXT) {
+                                w = put_msg(out, w, cap, "extensionless script$");
+                            } else {
+                                w = put_msg(out, w, cap, "unreadable diff line$");
+                            }
+                        }
+                    }
+                    w = put_msg(out, w, cap, MSG_TAIL);
+                }
+                w = put(out, w, cap, '\n');
+            }
+        }
+        s = e + 1;
+    }
+    return denied;
+}
+
+/// The foreign-line budget: added lines per hand-written foreign file, and in the whole diff.
+pub const FOREIGN_ADDED_MAX : u32 = 40;
+pub const FOREIGN_ADDED_TOTAL_MAX : u32 = 80;
+/// added_lines() for a field that is not a count.
+pub const NUMSTAT_BAD : u32 = 1000000;
+
+pub const MSG_BUDGET : str = ": more than 40 hand-written foreign lines added in one file (owner rule 2026-10-07, #7371): new logic is .t27, generated by t27c; no exception and no label lifts this limit$";
+pub const MSG_BUDGET_TOTAL : str = "all files: more than 80 hand-written foreign lines added (owner rule 2026-10-07, #7371): new logic is .t27, generated by t27c; no exception and no label lifts this limit$";
+pub const MSG_NUMSTAT_BAD : str = ": unreadable numstat line$";
+
+/// Does the path s[from..to] count against the budget? Every hand-written foreign kind does, and so do the
+/// gate's own foreign files; the gate's spec and its generated C do not.
+pub fn counts_against_budget(s: []const u8, from: usize, to: usize) -> bool {
+    const r : u8 = reason('M', s, from, to);
+    if (r == R_FOREIGN_EXT or r == R_FOREIGN_NAME or r == R_SCRIPT_NO_EXT) { return true; }
+    if (r == R_PROTECTED) {
+        if (has_prefix(GENERATED_PREFIXES, s, from, to)) { return false; }
+        const d : usize = ext_dot(s, from, to);
+        if (d < to and in_list(OWN_EXTS, s, d + 1, to, true)) { return false; }
+        return true;
+    }
+    return false;
+}
+
+/// The added-lines field s[from..to] of one numstat line: decimal digits, or "-" for a binary file (0).
+/// Anything else, and any count of NUMSTAT_BAD or more, is NUMSTAT_BAD.
+pub fn added_lines(s: []const u8, from: usize, to: usize) -> u32 {
+    if (to <= from) { return NUMSTAT_BAD; }
+    if (to == from + 1 and s[from] == '-') { return 0; }
+    var v : u32 = 0;
+    var i : usize = from;
+    while (i < to) {
+        const c : u8 = s[i];
+        if (c < '0' or c > '9') { return NUMSTAT_BAD; }
+        v = v * 10 + @as(u32, c - '0');
+        if (v >= NUMSTAT_BAD) { return NUMSTAT_BAD; }
+        i += 1;
+    }
+    return v;
+}
+
+/// Read `git diff --numstat --no-renames` lines ("added\tdeleted\tpath") from buf[0..n], write one
+/// failure line per counted file over FOREIGN_ADDED_MAX, one per unreadable line, and one more when the
+/// counted files together pass FOREIGN_ADDED_TOTAL_MAX; return how many failures there were. There is no
+/// exception list here on purpose. The caller exits non-zero when this is not 0.
+pub fn check_budget(buf: []const u8, n: usize, out: []u8, cap: usize) -> u32 {
+    var failed : u32 = 0;
+    var total : u32 = 0;
+    var w : usize = 0;
+    var s : usize = 0;
+    while (s < n) {
+        var e : usize = s;
+        while (e < n and buf[e] != '\n') { e += 1; }
+        var t : usize = e;
+        if (t > s and buf[t - 1] == '\r') { t -= 1; }
+        if (t > s) {
+            var t1 : usize = s;
+            while (t1 < t and buf[t1] != '\t') { t1 += 1; }
+            var t2 : usize = t1 + 1;
+            while (t2 < t and buf[t2] != '\t') { t2 += 1; }
+            var a : u32 = NUMSTAT_BAD;
+            if (t2 + 1 < t) { a = added_lines(buf, s, t1); }
+            if (a == NUMSTAT_BAD) {
+                failed += 1;
+                w = put_range(out, w, cap, buf, s, t);
+                w = put_msg(out, w, cap, MSG_NUMSTAT_BAD);
+                w = put(out, w, cap, '\n');
+            } else {
+                if (counts_against_budget(buf, t2 + 1, t)) {
+                    if (total <= FOREIGN_ADDED_TOTAL_MAX) { total += a; }
+                    if (a > FOREIGN_ADDED_MAX) {
+                        failed += 1;
+                        w = put_range(out, w, cap, buf, t2 + 1, t);
+                        w = put_msg(out, w, cap, MSG_BUDGET);
+                        w = put(out, w, cap, '\n');
+                    }
+                }
+            }
+        }
+        s = e + 1;
+    }
+    if (total > FOREIGN_ADDED_TOTAL_MAX) {
+        failed += 1;
+        w = put_msg(out, w, cap, MSG_BUDGET_TOTAL);
+        w = put(out, w, cap, '\n');
+    }
+    return failed;
+}
+
+test negative_control_hand_written_rust_is_denied {
+    assert classify('A', "tools/new_tool.rs", 0, 17) == DENY;
+    assert reason('A', "tools/new_tool.rs", 0, 17) == R_FOREIGN_EXT;
+}
+
+test modifying_t27b_rust_is_denied {
+    assert classify('M', "cli/t27b/src/lower.rs", 0, 21) == DENY;
+    assert classify('M', "bootstrap/src/compiler.rs", 0, 25) == DENY;
+}
+
+test generated_zig_is_allowed {
+    assert reason('A', "gen/zig/x.zig", 0, 13) == R_GENERATED;
+    assert classify('M', "gen/c/queen/priority.c", 0, 22) == ALLOW;
+    assert reason('M', "bootstrap/gen/rust/memory/x.rs", 0, 30) == R_GENERATED;
+    assert reason('A', "bootstrap/src/memory/generated/x.rs", 0, 35) == R_GENERATED;
+}
+
+test a_generated_root_is_a_prefix_not_a_substring {
+    assert classify('A', "specs/gen/x.zig", 0, 15) == DENY;
+    assert classify('A', "xgen/x.zig", 0, 10) == DENY;
+}
+
+test deleting_python_is_allowed {
+    assert reason('D', "scripts/tri_loop/t27b.py", 0, 24) == R_DELETED;
+    assert classify('D', "bootstrap/src/compiler.rs", 0, 25) == ALLOW;
+}
+
+test the_gate_itself_is_protected_even_from_deletion {
+    assert reason('M', "specs/policy/own_language.t27", 0, 29) == R_PROTECTED;
+    assert reason('M', "gen/c/policy/own_language.c", 0, 27) == R_PROTECTED;
+    assert reason('D', "lefthook.yml", 0, 12) == R_PROTECTED;
+    assert reason('D', ".github/workflows/own-language.yml", 0, 34) == R_PROTECTED;
+    assert reason('A', "specs/policy/other.t27", 0, 22) == R_SPEC;
+    assert reason('D', "lefthook.yml.bak", 0, 16) == R_DELETED;
+}
+
+test specs_are_allowed {
+    assert reason('A', "specs/queen/priority.t27", 0, 24) == R_SPEC;
+    assert reason('M', "specs/01-vm-core.tri", 0, 20) == R_SPEC;
+}
+
+test prose_and_data_are_allowed {
+    assert reason('M', "AGENTS.md", 0, 9) == R_PROSE;
+    assert reason('A', "notes/a.txt", 0, 11) == R_PROSE;
+    assert reason('A', "conformance/vectors/gf16.json", 0, 29) == R_DATA;
+    assert reason('M', "Cargo.lock", 0, 10) == R_DATA;
+    assert reason('A', "docs/logo.png", 0, 13) == R_NOT_CODE;
+    assert reason('A', ".gitignore", 0, 10) == R_NOT_CODE;
+}
+
+test configuration_is_code {
+    assert reason('A', "tools/x/lefthook.yml", 0, 20) == R_FOREIGN_EXT;
+    assert reason('M', ".github/workflows/ci.yaml", 0, 25) == R_FOREIGN_EXT;
+    assert reason('M', "bootstrap/Cargo.toml", 0, 20) == R_FOREIGN_EXT;
+}
+
+test build_files_are_code_by_name {
+    assert reason('A', "Dockerfile", 0, 10) == R_FOREIGN_NAME;
+    assert reason('A', "deploy/Dockerfile.dev", 0, 21) == R_FOREIGN_NAME;
+    assert reason('M', "fpga/Makefile", 0, 13) == R_FOREIGN_NAME;
+    assert reason('A', "x/CMakeLists.txt", 0, 16) == R_FOREIGN_NAME;
+    assert reason('A', "tools/win.ps1", 0, 13) == R_FOREIGN_EXT;
+}
+
+test extensions_fold_case {
+    assert reason('A', "a/B.PY", 0, 6) == R_FOREIGN_EXT;
+    assert reason('A', "a/C.SpEc.T27", 0, 12) == R_SPEC;
+}
+
+test an_extensionless_script_is_code {
+    assert reason('M', "scripts/tri", 0, 11) == R_SCRIPT_NO_EXT;
+    assert reason('M', ".githooks/pre-commit", 0, 20) == R_SCRIPT_NO_EXT;
+    assert reason('M', "LICENSE", 0, 7) == R_NOT_CODE;
+}
+
+test renames_and_copies_are_judged_by_the_new_path {
+    assert classify('R', "x/new.py", 0, 8) == DENY;
+    assert classify('R', "x/new.t27", 0, 9) == ALLOW;
+    assert classify('C', "x/copy.sh", 0, 9) == DENY;
+}
+
+test quoted_paths_are_read_without_quotes {
+    assert reason('A', "\"a b/x.rs\"", 0, 10) == R_FOREIGN_EXT;
+}
+
+test unreadable_input_fails_closed {
+    assert reason('?', "x.t27", 0, 5) == R_MALFORMED;
+    assert reason('A', "x.t27", 0, 0) == R_MALFORMED;
+    assert reason('A', "\"\"", 0, 2) == R_MALFORMED;
+}
+
+test check_all_counts_and_names_the_denied {
+    var out : [512]u8 = undefined;
+    assert check_all("D\tgone.py\nA\tspecs/a.t27\nM\tgen/zig/x.zig\n", 40, &out, 512) == 0;
+    assert check_all("A\tfoo.rs\nR100\told.t27\tnew.py\nM\tREADME.md\n", 41, &out, 512) == 2;
+    assert out[0] == 'f';
+    assert out[6] == ':';
+    assert out[21] == '.';
+    assert out[22] == 'r';
+    assert out[23] == 's';
+    assert out[24] == ' ';
+    assert check_all("garbage-without-a-tab\n", 22, &out, 512) == 1;
+    assert check_all("", 0, &out, 512) == 0;
+}
+
+test check_all_names_a_protected_path_with_its_own_line {
+    var out : [256]u8 = undefined;
+    assert check_all("M\tlefthook.yml\n", 15, &out, 256) == 1;
+    assert out[12] == ':';
+    assert out[14] == 't';
+    assert out[18] == 'O';
+}
+
+test check_all_never_writes_past_cap {
+    var out : [8]u8 = undefined;
+    assert check_all("A\tfoo.rs\nA\tbar.rs\n", 18, &out, 4) == 2;
+}
+
+test an_owner_exception_allows_its_paths_only {
+    assert judge('M', "cli/t27b/src/\n# owner 2026-10-05\n\ncli/t27b/src/lower.rs", 34, 55, 0, 34, false) == R_EXCEPTION;
+    assert judge('M', "cli/t27b/src/\n# owner 2026-10-05\n\ncli/t27b/src/lower.rs", 34, 55, 0, 34, true) == R_EXCEPTION;
+    assert judge('M', "cli/t27b/src/\n# owner 2026-10-05\n\ncli/t27b/src/lower.rs", 34, 55, 0, 0, false) == R_FOREIGN_EXT;
+    assert excepted("cli/t27b/src/\n# owner 2026-10-05\n\ncli/t27b/src/lower.rs", 0, 34, 34, 55) == true;
+}
+
+test an_empty_exception_line_matches_nothing {
+    assert excepted("\n\ntools/x.py", 0, 2, 2, 12) == false;
+    assert judge('A', "\n\ntools/x.py", 2, 12, 0, 2, false) == R_FOREIGN_EXT;
+}
+
+test an_exception_never_opens_the_gate_itself {
+    assert judge('M', "lefthook.yml\nlefthook.yml", 13, 25, 0, 13, false) == R_PROTECTED;
+}
+
+test the_exception_list_is_data_locally_and_owner_only_in_ci {
+    assert judge('M', "tools/policy/foreign-exceptions.txt", 0, 35, 0, 0, false) == R_PROSE;
+    assert judge('M', "tools/policy/foreign-exceptions.txt", 0, 35, 0, 0, true) == R_PROTECTED;
+    assert judge('D', "tools/policy/foreign-exceptions.txt", 0, 35, 0, 0, true) == R_PROTECTED;
+}
+
+test check_all_reads_the_list_before_the_separator {
+    var out : [512]u8 = undefined;
+    assert check_all("cli/t27b/\n--\nM\tcli/t27b/src/lower.rs\nA\tx.py\n", 44, &out, 512) == 1;
+    assert out[0] == 'x';
+    assert check_all("--ci\nM\ttools/policy/foreign-exceptions.txt\n", 43, &out, 512) == 1;
+    assert check_all("--\nM\ttools/policy/foreign-exceptions.txt\n", 41, &out, 512) == 0;
+    assert check_all("cli/\n--ci\nM\tcli/a.rs\n", 21, &out, 512) == 0;
+    assert check_all("\n\n--\nA\tx.py\n", 12, &out, 512) == 1;
+    assert sep_at("cli/\n--ci\nM\tcli/a.rs\n", 21) == 5;
+    assert sep_at("A\tx.py\n", 7) == 7;
+}
+
+test the_budget_is_forty_added_lines_per_foreign_file {
+    var out : [512]u8 = undefined;
+    assert check_budget("40\t0\tbootstrap/src/service.rs\n", 30, &out, 512) == 0;
+    assert check_budget("41\t0\tbootstrap/src/service.rs\n", 30, &out, 512) == 1;
+    assert out[0] == 'b';
+    assert out[24] == ':';
+}
+
+test no_exception_and_no_label_lifts_the_budget {
+    var out : [512]u8 = undefined;
+    assert check_budget("804\t16\tbootstrap/src/service.rs\n198\t0\tbootstrap/tests/signed_receipt_reader.rs\n3\t0\tbootstrap/Cargo.toml\n", 104, &out, 512) == 3;
+}
+
+test deletions_are_free {
+    var out : [512]u8 = undefined;
+    assert check_budget("0\t5000\tbootstrap/src/compiler.rs\n0\t900\tscripts/tri\n", 51, &out, 512) == 0;
+}
+
+test specs_generated_prose_and_data_are_not_counted {
+    var out : [512]u8 = undefined;
+    assert check_budget("900\t0\tspecs/x.t27\n900\t0\tgen/c/x.c\n900\t0\tbootstrap/gen/rust/x.rs\n900\t0\tdocs/a.md\n900\t0\tCargo.lock\n", 97, &out, 512) == 0;
+    assert check_budget("900\t0\tspecs/policy/own_language.t27\n900\t0\tgen/c/policy/own_language.c\n", 70, &out, 512) == 0;
+}
+
+test the_gates_own_foreign_files_are_counted {
+    var out : [512]u8 = undefined;
+    assert check_budget("41\t0\tlefthook.yml\n", 18, &out, 512) == 1;
+    assert check_budget("41\t0\t.github/workflows/own-language.yml\n", 40, &out, 512) == 1;
+    assert counts_against_budget("lefthook.yml", 0, 12) == true;
+    assert counts_against_budget("specs/policy/own_language.t27", 0, 29) == false;
+    assert counts_against_budget("gen/c/policy/own_language.c", 0, 27) == false;
+}
+
+test every_foreign_kind_is_counted {
+    var out : [512]u8 = undefined;
+    assert check_budget("41\t0\t.github/workflows/x.yml\n", 29, &out, 512) == 1;
+    assert check_budget("41\t0\tscripts/tri\n", 17, &out, 512) == 1;
+    assert check_budget("41\t0\tDockerfile\n", 16, &out, 512) == 1;
+    assert check_budget("41\t0\ttools/x.py\n", 16, &out, 512) == 1;
+}
+
+test many_small_files_meet_the_total {
+    var out : [512]u8 = undefined;
+    assert check_budget("40\t0\ta.rs\n40\t0\tb.rs\n", 20, &out, 512) == 0;
+    assert check_budget("40\t0\ta.rs\n40\t0\tb.rs\n1\t0\tc.rs\n", 29, &out, 512) == 1;
+    assert out[0] == 'a';
+    assert check_budget("30\t0\ta.rs\n30\t0\tb.rs\n30\t0\tc.rs\n30\t0\td.rs\n", 40, &out, 512) == 1;
+}
+
+test a_binary_file_adds_nothing_and_garbage_fails_closed {
+    var out : [512]u8 = undefined;
+    assert check_budget("-\t-\tlogo.rs\n", 12, &out, 512) == 0;
+    assert check_budget("x.rs\n", 5, &out, 512) == 1;
+    assert check_budget("12\t0\t\n", 6, &out, 512) == 1;
+    assert check_budget("4x\t0\ta.rs\n", 10, &out, 512) == 1;
+    assert check_budget("\n\n", 2, &out, 512) == 0;
+    assert added_lines("-", 0, 1) == 0;
+    assert added_lines("", 0, 0) == NUMSTAT_BAD;
+    assert added_lines("41", 0, 2) == 41;
+    assert added_lines("4:", 0, 2) == NUMSTAT_BAD;
+    assert added_lines("4/", 0, 2) == NUMSTAT_BAD;
+    assert added_lines("1000000", 0, 7) == NUMSTAT_BAD;
+    assert added_lines("999999", 0, 6) == 999999;
+}
+
+test check_budget_never_writes_past_cap {
+    var out : [8]u8 = undefined;
+    assert check_budget("41\t0\tbootstrap/src/service.rs\n", 30, &out, 8) == 1;
+}
+
+invariant every_allow_reason_is_below_every_deny_reason {
+    assert verdict(R_DELETED) == ALLOW;
+    assert verdict(R_SPEC) == ALLOW;
+    assert verdict(R_GENERATED) == ALLOW;
+    assert verdict(R_PROSE) == ALLOW;
+    assert verdict(R_DATA) == ALLOW;
+    assert verdict(R_NOT_CODE) == ALLOW;
+    assert verdict(R_EXCEPTION) == ALLOW;
+    assert verdict(R_FOREIGN_EXT) == DENY;
+    assert verdict(R_FOREIGN_NAME) == DENY;
+    assert verdict(R_SCRIPT_NO_EXT) == DENY;
+    assert verdict(R_MALFORMED) == DENY;
+    assert verdict(R_PROTECTED) == DENY;
+}
+
+invariant deletion_beats_every_extension {
+    assert classify('D', "a.rs", 0, 4) == ALLOW;
+    assert classify('D', "a.yml", 0, 5) == ALLOW;
+    assert classify('D', "Dockerfile", 0, 10) == ALLOW;
+    assert classify('D', "scripts/tri", 0, 11) == ALLOW;
+}

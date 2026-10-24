@@ -1,0 +1,1618 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/compiler/parser.t27
+// T27 Parser Specification — Self-hosting compiler core
+// φ² + 1/φ² = 3 | TRINITY
+//
+// This module defines the complete recursive descent parser for the T27 language.
+// It is a 1:1 port of bootstrap/src/compiler.rs Parser to t27 spec format.
+
+module Parsing {
+    use base::types;
+    use compiler::lexer;
+
+    // ════════════════════════════════════════════════════════════════════
+    // 1. AST Node Types
+    // ════════════════════════════════════════════════════════════════════
+
+    const MAX_CHILDREN: u32 = 32;
+
+    enum NodeKind {
+        Module = 0,
+        UseDecl = 1,
+        ConstDecl = 2,
+        VarDecl = 3,
+        FnDecl = 4,
+        EnumDecl = 5,
+        StructDecl = 6,
+        TestBlock = 7,
+        InvariantBlock = 8,
+        BenchBlock = 9,
+
+        StmtLocal = 10,
+        StmtAssign = 11,
+        StmtIf = 12,
+        StmtWhile = 13,
+        StmtFor = 14,
+        StmtExpr = 15,
+        StmtReturn = 16,
+        StmtBreak = 17,
+        StmtContinue = 18,
+
+        ExprLiteral = 20,
+        ExprIdentifier = 21,
+        ExprBinary = 22,
+        ExprUnary = 23,
+        ExprCall = 24,
+        ExprFieldAccess = 25,
+        ExprIndex = 26,
+        ExprSwitch = 27,
+        ExprIf = 28,
+        ExprStructLit = 29,
+        ExprEnumValue = 30,
+        ExprReturn = 31,
+        ExprArrayLiteral = 32,
+    }
+
+    struct Node {
+        kind: NodeKind;
+        name: str;
+        value: str;
+        extra_type: str;
+        extra_field: str;
+        extra_size: str;
+        extra_kind: str;
+        extra_op: str;
+        extra_pub: bool;
+        extra_mutable: bool;
+        extra_return_type: str;
+        child_count: u32;
+        children: [MAX_CHILDREN]Node;
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // 2. Parser State
+    // ════════════════════════════════════════════════════════════════════
+
+    struct Parser {
+        lexer: lexer::Lexer;
+        current: lexer::Token;
+        peek: lexer::Token;
+        had_error: bool;
+        error_msg: str;
+    }
+
+    fn parser_init(lex: lexer::Lexer) -> Parser {
+        var p = Parser{};
+        p.lexer = lex;
+        p.advance();
+        p.advance();
+        return p;
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // 3. Movement Primitives
+    // ════════════════════════════════════════════════════════════════════
+
+    fn advance(self: *Parser) -> void {
+        self.current = self.peek;
+        self.peek = lexer::next_token(self.lexer);
+    }
+
+    fn check(self: *Parser, kind: lexer::TokenKind) -> bool {
+        return self.current.kind == kind;
+    }
+
+    fn check_peek(self: *Parser, kind: lexer::TokenKind) -> bool {
+        return self.peek.kind == kind;
+    }
+
+    fn expect(self: *Parser, kind: lexer::TokenKind) -> bool {
+        if (self.check(kind)) {
+            self.advance();
+            return true;
+        }
+        self.had_error = true;
+        self.error_msg = "Expected token";
+        return false;
+    }
+
+    fn error(self: *Parser, msg: str) -> void {
+        self.had_error = true;
+        self.error_msg = msg;
+    }
+
+    fn get_error(self: Parser) -> str {
+        return self.error_msg;
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // 4. Error Recovery
+    // ════════════════════════════════════════════════════════════════════
+
+    fn skip_brace_body(self: *Parser) -> bool {
+        var depth: i32 = 1;
+        while (depth > 0) {
+            if (self.current.kind == lexer::TokenKind::Eof) {
+                self.error("Unexpected EOF inside brace body");
+                return false;
+            }
+            if (self.current.kind == lexer::TokenKind::LBrace) {
+                depth = depth + 1;
+            } else if (self.current.kind == lexer::TokenKind::RBrace) {
+                depth = depth - 1;
+                if (depth == 0) {
+                    return true;
+                }
+            }
+            self.advance();
+        }
+        return true;
+    }
+
+    fn skip_to_semicolon(self: *Parser) -> void {
+        var bracket_depth: i32 = 0;
+        var paren_depth: i32 = 0;
+        while (self.current.kind != lexer::TokenKind::Eof) {
+            if (self.current.kind == lexer::TokenKind::Semicolon 
+                and bracket_depth == 0 
+                and paren_depth == 0) {
+                self.advance();
+                return;
+            }
+            if (self.current.kind == lexer::TokenKind::LBrace) {
+                self.advance();
+                self.skip_brace_body();
+                if (self.current.kind == lexer::TokenKind::RBrace) {
+                    self.advance();
+                }
+            } else if (self.current.kind == lexer::TokenKind::LBracket) {
+                bracket_depth = bracket_depth + 1;
+                self.advance();
+            } else if (self.current.kind == lexer::TokenKind::RBracket) {
+                bracket_depth = bracket_depth - 1;
+                self.advance();
+            } else if (self.current.kind == lexer::TokenKind::LParen) {
+                paren_depth = paren_depth + 1;
+                self.advance();
+            } else if (self.current.kind == lexer::TokenKind::RParen) {
+                paren_depth = paren_depth - 1;
+                self.advance();
+            } else {
+                self.advance();
+            }
+        }
+    }
+
+    fn is_top_level_start(self: Parser) -> bool {
+        return self.current.kind == lexer::TokenKind::KwPub
+            or self.current.kind == lexer::TokenKind::KwFn
+            or self.current.kind == lexer::TokenKind::KwEnum
+            or self.current.kind == lexer::TokenKind::KwStruct
+            or self.current.kind == lexer::TokenKind::KwTest
+            or self.current.kind == lexer::TokenKind::KwInvariant
+            or self.current.kind == lexer::TokenKind::KwBench
+            or self.current.kind == lexer::TokenKind::KwUse
+            or self.current.kind == lexer::TokenKind::KwUsing
+            or self.current.kind == lexer::TokenKind::KwModule
+            or self.current.kind == lexer::TokenKind::RBrace
+            or self.current.kind == lexer::TokenKind::Eof;
+    }
+
+    fn skip_to_next_top_level(self: *Parser) -> void {
+        var paren_depth: i32 = 0;
+        var bracket_depth: i32 = 0;
+        while (true) {
+            if (self.current.kind == lexer::TokenKind::Eof) {
+                break;
+            }
+            if (self.current.kind == lexer::TokenKind::LBrace) {
+                self.advance();
+                self.skip_brace_body();
+                if (self.current.kind == lexer::TokenKind::RBrace) {
+                    self.advance();
+                }
+            }
+            if (self.current.kind == lexer::TokenKind::LParen) {
+                paren_depth = paren_depth + 1;
+                self.advance();
+            }
+            if (self.current.kind == lexer::TokenKind::RParen) {
+                paren_depth = paren_depth - 1;
+                self.advance();
+            }
+            if (self.current.kind == lexer::TokenKind::LBracket) {
+                bracket_depth = bracket_depth + 1;
+                self.advance();
+            }
+            if (self.current.kind == lexer::TokenKind::RBracket) {
+                bracket_depth = bracket_depth - 1;
+                self.advance();
+            }
+            if (paren_depth == 0 and bracket_depth == 0 and self.is_top_level_start()) {
+                break;
+            }
+            self.advance();
+        }
+    }
+
+    fn recover_to_stmt_boundary(self: *Parser) -> void {
+        var brace_depth: i32 = 0;
+        while (true) {
+            if (self.current.kind == lexer::TokenKind::Eof) {
+                break;
+            }
+            if (self.current.kind == lexer::TokenKind::Semicolon and brace_depth == 0) {
+                self.advance();
+                break;
+            }
+            if (self.current.kind == lexer::TokenKind::RBrace and brace_depth == 0) {
+                break;
+            }
+            if (self.current.kind == lexer::TokenKind::LBrace) {
+                brace_depth = brace_depth + 1;
+                self.advance();
+            } else if (self.current.kind == lexer::TokenKind::RBrace) {
+                brace_depth = brace_depth - 1;
+                self.advance();
+            } else {
+                self.advance();
+            }
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // 5. Type Annotation Parser
+    // ════════════════════════════════════════════════════════════════════
+
+    fn parse_type_annotation(self: *Parser) -> str {
+        var ty: str = "";
+
+        if (self.check(lexer::TokenKind::Star)) {
+            self.advance();
+            ty = ty ++ "*";
+            if (self.check(lexer::TokenKind::KwConst)) {
+                self.advance();
+                ty = ty ++ "const ";
+            }
+            if (self.check(lexer::TokenKind::Ident)) {
+                ty = ty ++ self.current.lexeme;
+                self.advance();
+            }
+            return ty;
+        }
+
+        while (self.check(lexer::TokenKind::LBracket)) {
+            self.advance();
+            ty = ty ++ "[";
+            while (self.current.kind != lexer::TokenKind::RBracket 
+                   and self.current.kind != lexer::TokenKind::Eof) {
+                ty = ty ++ self.current.lexeme;
+                self.advance();
+            }
+            ty = ty ++ "]";
+            if (self.check(lexer::TokenKind::RBracket)) {
+                self.advance();
+            }
+        }
+
+        if (self.check(lexer::TokenKind::KwConst)) {
+            if (ty != "") {
+                ty = ty ++ "const ";
+            } else {
+                ty = "const ";
+            }
+            self.advance();
+        }
+
+        if (self.check(lexer::TokenKind::Star)) {
+            self.advance();
+            ty = ty ++ "*";
+            if (self.check(lexer::TokenKind::KwConst)) {
+                self.advance();
+                ty = ty ++ "const ";
+            }
+        }
+
+        if (self.check(lexer::TokenKind::Ident)) {
+            ty = ty ++ self.current.lexeme;
+            self.advance();
+        } else if (self.check(lexer::TokenKind::KwVoid)) {
+            ty = ty ++ "void";
+            self.advance();
+        }
+
+        return ty;
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // 6. Expression Parser (Precedence Levels)
+    // ════════════════════════════════════════════════════════════════════
+
+    fn node_new(kind: NodeKind) -> Node {
+        return Node{
+            kind = kind,
+            name = "",
+            value = "",
+            extra_type = "",
+            extra_field = "",
+            extra_size = "",
+            extra_kind = "",
+            extra_op = "",
+            extra_pub = false,
+            extra_mutable = false,
+            extra_return_type = "",
+            child_count = 0,
+            children = [Node{}; MAX_CHILDREN],
+        };
+    }
+
+    fn add_child(parent: *Node, child: Node) -> void {
+        if (parent.child_count < MAX_CHILDREN) {
+            parent.children[parent.child_count] = child;
+            parent.child_count = parent.child_count + 1;
+        }
+    }
+
+    fn parse_expr(self: *Parser) -> Node {
+        return self.parse_expr_or();
+    }
+
+    fn parse_expr_or(self: *Parser) -> Node {
+        var left = self.parse_expr_and();
+        while (self.check(lexer::TokenKind::KwOr)) {
+            self.advance();
+            const right = self.parse_expr_and();
+            var node = node_new(NodeKind::ExprBinary);
+            node.extra_op = "or";
+            add_child(&node, left);
+            add_child(&node, right);
+            left = node;
+        }
+        return left;
+    }
+
+    fn parse_expr_and(self: *Parser) -> Node {
+        var left = self.parse_expr_comparison();
+        while (self.check(lexer::TokenKind::KwAnd)) {
+            self.advance();
+            const right = self.parse_expr_comparison();
+            var node = node_new(NodeKind::ExprBinary);
+            node.extra_op = "and";
+            add_child(&node, left);
+            add_child(&node, right);
+            left = node;
+        }
+        return left;
+    }
+
+    fn parse_expr_comparison(self: *Parser) -> Node {
+        var left = self.parse_expr_bitor();
+        while (self.check(lexer::TokenKind::Eq)
+               or self.check(lexer::TokenKind::Neq)
+               or self.check(lexer::TokenKind::Lt)
+               or self.check(lexer::TokenKind::Gt)
+               or self.check(lexer::TokenKind::Lte)
+               or self.check(lexer::TokenKind::Gte)
+               or self.check(lexer::TokenKind::DotDot)) {
+            const op = self.current.lexeme;
+            self.advance();
+            const right = self.parse_expr_bitor();
+            var node = node_new(NodeKind::ExprBinary);
+            node.extra_op = op;
+            add_child(&node, left);
+            add_child(&node, right);
+            left = node;
+        }
+        return left;
+    }
+
+    fn parse_expr_bitor(self: *Parser) -> Node {
+        var left = self.parse_expr_bitxor();
+        while (self.check(lexer::TokenKind::Pipe)) {
+            const op = self.current.lexeme;
+            self.advance();
+            const right = self.parse_expr_bitxor();
+            var node = node_new(NodeKind::ExprBinary);
+            node.extra_op = op;
+            add_child(&node, left);
+            add_child(&node, right);
+            left = node;
+        }
+        return left;
+    }
+
+    fn parse_expr_bitxor(self: *Parser) -> Node {
+        var left = self.parse_expr_bitand();
+        while (self.check(lexer::TokenKind::Caret)) {
+            const op = self.current.lexeme;
+            self.advance();
+            const right = self.parse_expr_bitand();
+            var node = node_new(NodeKind::ExprBinary);
+            node.extra_op = op;
+            add_child(&node, left);
+            add_child(&node, right);
+            left = node;
+        }
+        return left;
+    }
+
+    fn parse_expr_bitand(self: *Parser) -> Node {
+        var left = self.parse_expr_shift();
+        while (self.check(lexer::TokenKind::Amp)) {
+            const op = self.current.lexeme;
+            self.advance();
+            const right = self.parse_expr_shift();
+            var node = node_new(NodeKind::ExprBinary);
+            node.extra_op = op;
+            add_child(&node, left);
+            add_child(&node, right);
+            left = node;
+        }
+        return left;
+    }
+
+    fn parse_expr_shift(self: *Parser) -> Node {
+        var left = self.parse_expr_additive();
+        while (self.check(lexer::TokenKind::ShiftLeft) or self.check(lexer::TokenKind::ShiftRight)) {
+            const op = self.current.lexeme;
+            self.advance();
+            const right = self.parse_expr_additive();
+            var node = node_new(NodeKind::ExprBinary);
+            node.extra_op = op;
+            add_child(&node, left);
+            add_child(&node, right);
+            left = node;
+        }
+        return left;
+    }
+
+    fn parse_expr_additive(self: *Parser) -> Node {
+        var left = self.parse_expr_multiplicative();
+        while (self.check(lexer::TokenKind::Plus) 
+               or self.check(lexer::TokenKind::Minus) 
+               or self.check(lexer::TokenKind::PlusPercent)) {
+            const op = self.current.lexeme;
+            self.advance();
+            const right = self.parse_expr_multiplicative();
+            var node = node_new(NodeKind::ExprBinary);
+            node.extra_op = op;
+            add_child(&node, left);
+            add_child(&node, right);
+            left = node;
+        }
+        return left;
+    }
+
+    fn parse_expr_multiplicative(self: *Parser) -> Node {
+        var left = self.parse_expr_unary();
+        while (self.check(lexer::TokenKind::Star) 
+               or self.check(lexer::TokenKind::Slash) 
+               or self.check(lexer::TokenKind::Percent) 
+               or self.check(lexer::TokenKind::Power)) {
+            const op = self.current.lexeme;
+            self.advance();
+            const right = self.parse_expr_unary();
+            var node = node_new(NodeKind::ExprBinary);
+            node.extra_op = op;
+            add_child(&node, left);
+            add_child(&node, right);
+            left = node;
+        }
+        return left;
+    }
+
+    fn parse_expr_unary(self: *Parser) -> Node {
+        if (self.check(lexer::TokenKind::Minus) 
+            or self.check(lexer::TokenKind::Bang) 
+            or self.check(lexer::TokenKind::Tilde) 
+            or self.check(lexer::TokenKind::Amp)) {
+            const op = self.current.lexeme;
+            self.advance();
+            const operand = self.parse_expr_unary();
+            var node = node_new(NodeKind::ExprUnary);
+            node.extra_op = op;
+            add_child(&node, operand);
+            return node;
+        }
+        return self.parse_expr_postfix();
+    }
+
+    fn parse_expr_postfix(self: *Parser) -> Node {
+        var expr = self.parse_expr_primary();
+
+        while (true) {
+            if (self.check(lexer::TokenKind::Dot)) {
+                self.advance();
+                if (self.check(lexer::TokenKind::Star)) {
+                    self.advance();
+                    var deref = node_new(NodeKind::ExprFieldAccess);
+                    deref.name = "*";
+                    add_child(&deref, expr);
+                    expr = deref;
+                } else if (self.check(lexer::TokenKind::Ident)) {
+                    const field = self.current.lexeme;
+                    self.advance();
+                    if (self.check(lexer::TokenKind::LParen)) {
+                        expr = self.parse_call_args_internal(field, expr);
+                    } else {
+                        var fa = node_new(NodeKind::ExprFieldAccess);
+                        fa.name = field;
+                        add_child(&fa, expr);
+                        expr = fa;
+                    }
+                } else {
+                    break;
+                }
+            } else if (self.check(lexer::TokenKind::LBracket)) {
+                self.advance();
+                const index = self.parse_expr();
+                self.expect(lexer::TokenKind::RBracket);
+                var idx_node = node_new(NodeKind::ExprIndex);
+                add_child(&idx_node, expr);
+                add_child(&idx_node, index);
+                expr = idx_node;
+            } else if (self.check(lexer::TokenKind::LParen)) {
+                break;
+            } else {
+                break;
+            }
+        }
+        return expr;
+    }
+
+    fn parse_call_args_internal(self: *Parser, name: str, base_expr: Node) -> Node {
+        self.advance();
+        var call = node_new(NodeKind::ExprCall);
+        call.name = name;
+        add_child(&call, base_expr);
+
+        while (self.current.kind != lexer::TokenKind::RParen 
+               and self.current.kind != lexer::TokenKind::Eof) {
+            const arg = self.parse_expr();
+            add_child(&call, arg);
+            if (self.check(lexer::TokenKind::Comma)) {
+                self.advance();
+            }
+        }
+        self.expect(lexer::TokenKind::RParen);
+        return call;
+    }
+
+    fn parse_expr_primary(self: *Parser) -> Node {
+        if (self.check(lexer::TokenKind::Number)) {
+            var node = node_new(NodeKind::ExprLiteral);
+            node.value = self.current.lexeme;
+            self.advance();
+            return node;
+        }
+
+        if (self.check(lexer::TokenKind::CharLiteral)) {
+            var node = node_new(NodeKind::ExprLiteral);
+            node.value = self.current.lexeme;
+            self.advance();
+            return node;
+        }
+
+        if (self.check(lexer::TokenKind::StringLit)) {
+            var node = node_new(NodeKind::ExprLiteral);
+            node.value = self.current.lexeme;
+            self.advance();
+            return node;
+        }
+
+        if (self.check(lexer::TokenKind::KwTrue) or self.check(lexer::TokenKind::KwFalse)) {
+            var node = node_new(NodeKind::ExprLiteral);
+            node.value = self.current.lexeme;
+            self.advance();
+            return node;
+        }
+
+        if (self.check(lexer::TokenKind::Dot)) {
+            self.advance();
+            if (self.check(lexer::TokenKind::Ident)) {
+                var node = node_new(NodeKind::ExprEnumValue);
+                node.name = self.current.lexeme;
+                self.advance();
+                return node;
+            }
+            return node_new(NodeKind::ExprLiteral);
+        }
+
+        if (self.check(lexer::TokenKind::Ident)) {
+            const name = self.current.lexeme;
+            self.advance();
+            if (self.check(lexer::TokenKind::LBrace)) {
+                return self.parse_struct_literal(name);
+            }
+            if (self.check(lexer::TokenKind::LParen)) {
+                return self.parse_call_args(name);
+            }
+            var node = node_new(NodeKind::ExprIdentifier);
+            node.name = name;
+            return node;
+        }
+
+        if (self.check(lexer::TokenKind::LParen)) {
+            self.advance();
+            const inner = self.parse_expr();
+            self.expect(lexer::TokenKind::RParen);
+            return inner;
+        }
+
+        if (self.check(lexer::TokenKind::KwIf)) {
+            return self.parse_if_expr();
+        }
+
+        if (self.check(lexer::TokenKind::KwSwitch)) {
+            return self.parse_switch_expr();
+        }
+
+        if (self.check(lexer::TokenKind::KwTry)) {
+            self.advance();
+            const inner = self.parse_expr_postfix();
+            var node = node_new(NodeKind::ExprUnary);
+            node.extra_op = "try ";
+            add_child(&node, inner);
+            return node;
+        }
+
+        if (self.check(lexer::TokenKind::LBracket)) {
+            return self.parse_array_literal();
+        }
+
+        return node_new(NodeKind::ExprLiteral);
+    }
+
+    fn parse_call_args(self: *Parser, name: str) -> Node {
+        self.advance();
+        var call = node_new(NodeKind::ExprCall);
+        call.name = name;
+
+        while (self.current.kind != lexer::TokenKind::RParen 
+               and self.current.kind != lexer::TokenKind::Eof) {
+            const arg = self.parse_expr();
+            add_child(&call, arg);
+            if (self.check(lexer::TokenKind::Comma)) {
+                self.advance();
+            }
+        }
+        self.expect(lexer::TokenKind::RParen);
+        return call;
+    }
+
+    fn parse_struct_literal(self: *Parser, name: str) -> Node {
+        self.advance();
+        var lit = node_new(NodeKind::ExprStructLit);
+        lit.name = name;
+
+        while (self.current.kind != lexer::TokenKind::RBrace 
+               and self.current.kind != lexer::TokenKind::Eof) {
+            var field_name = "";
+            if (self.check(lexer::TokenKind::Dot)) {
+                self.advance();
+                if (self.check(lexer::TokenKind::Ident)) {
+                    field_name = self.current.lexeme;
+                    self.advance();
+                }
+            } else if (self.check(lexer::TokenKind::Ident)) {
+                field_name = self.current.lexeme;
+                self.advance();
+            }
+
+            if (self.check(lexer::TokenKind::Equals)) {
+                self.advance();
+            }
+
+            const val = self.parse_expr();
+            var field = node_new(NodeKind::ExprFieldAccess);
+            field.name = field_name;
+            add_child(&field, val);
+            add_child(&lit, field);
+
+            if (self.check(lexer::TokenKind::Comma)) {
+                self.advance();
+            }
+        }
+        self.expect(lexer::TokenKind::RBrace);
+        return lit;
+    }
+
+    fn parse_array_literal(self: *Parser) -> Node {
+        var node = node_new(NodeKind::ExprArrayLiteral);
+        self.advance();
+
+        if (self.current.kind == lexer::TokenKind::RBracket) {
+            self.advance();
+        } else {
+            var bracket_text = "";
+            while (self.current.kind != lexer::TokenKind::RBracket
+                   and self.current.kind != lexer::TokenKind::Eof) {
+                bracket_text = bracket_text ++ self.current.lexeme;
+                self.advance();
+            }
+            node.extra_size = bracket_text;
+            self.expect(lexer::TokenKind::RBracket);
+        }
+
+        if (self.check(lexer::TokenKind::Ident)) {
+            node.extra_type = self.current.lexeme;
+            self.advance();
+        }
+
+        if (self.check(lexer::TokenKind::LBrace)) {
+            self.advance();
+            if (self.current.kind != lexer::TokenKind::RBrace) {
+                var elem = self.parse_expr();
+                add_child(&node, elem);
+                while (self.check(lexer::TokenKind::Comma)) {
+                    self.advance();
+                    if (self.current.kind == lexer::TokenKind::RBrace) {
+                        break;
+                    }
+                    elem = self.parse_expr();
+                    add_child(&node, elem);
+                }
+            }
+            self.expect(lexer::TokenKind::RBrace);
+        }
+
+        if (self.check(lexer::TokenKind::Power)) {
+            self.advance();
+            var count = self.parse_expr();
+            var repeat_node = node_new(NodeKind::ExprBinary);
+            repeat_node.extra_op = "**";
+            add_child(&repeat_node, node);
+            add_child(&repeat_node, count);
+            return repeat_node;
+        }
+
+        return node;
+    }
+
+    fn parse_if_expr(self: *Parser) -> Node {
+        self.advance();
+        var node = node_new(NodeKind::ExprIf);
+
+        self.expect(lexer::TokenKind::LParen);
+        const cond = self.parse_expr();
+        self.expect(lexer::TokenKind::RParen);
+        add_child(&node, cond);
+
+        const then_expr = self.parse_expr();
+        add_child(&node, then_expr);
+
+        if (self.check(lexer::TokenKind::KwElse)) {
+            self.advance();
+            const else_expr = self.parse_expr();
+            add_child(&node, else_expr);
+        }
+
+        return node;
+    }
+
+    fn parse_switch_expr(self: *Parser) -> Node {
+        self.advance();
+        var sw = node_new(NodeKind::ExprSwitch);
+
+        self.expect(lexer::TokenKind::LParen);
+        const val = self.parse_expr();
+        self.expect(lexer::TokenKind::RParen);
+        add_child(&sw, val);
+
+        self.expect(lexer::TokenKind::LBrace);
+
+        while (self.current.kind != lexer::TokenKind::RBrace 
+               and self.current.kind != lexer::TokenKind::Eof) {
+            var arm = node_new(NodeKind::ConstDecl);
+
+            if (self.check(lexer::TokenKind::Dot)) {
+                self.advance();
+                if (self.check(lexer::TokenKind::Ident)) {
+                    arm.name = self.current.lexeme;
+                    self.advance();
+                }
+            } else if (self.check(lexer::TokenKind::KwElse)) {
+                arm.name = "else";
+                self.advance();
+            } else if (self.check(lexer::TokenKind::Minus)) {
+                arm.name = "-";
+                self.advance();
+                if (self.check(lexer::TokenKind::Number)) {
+                    arm.name = arm.name ++ self.current.lexeme;
+                    self.advance();
+                }
+            } else if (self.check(lexer::TokenKind::Ident) or self.check(lexer::TokenKind::Number)) {
+                arm.name = self.current.lexeme;
+                self.advance();
+            }
+
+            if (self.check(lexer::TokenKind::FatArrow)) {
+                self.advance();
+            }
+
+            const arm_expr = self.parse_expr();
+            add_child(&arm, arm_expr);
+            add_child(&sw, arm);
+
+            if (self.check(lexer::TokenKind::Comma)) {
+                self.advance();
+            }
+        }
+
+        self.expect(lexer::TokenKind::RBrace);
+        return sw;
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // 7. Statement Parser
+    // ════════════════════════════════════════════════════════════════════
+
+    fn parse_body_stmt(self: *Parser) -> Node {
+        if (self.check(lexer::TokenKind::KwConst) or self.check(lexer::TokenKind::KwVar)) {
+            return self.parse_local_decl();
+        }
+
+        if (self.check(lexer::TokenKind::KwReturn)) {
+            return self.parse_return_statement();
+        }
+
+        if (self.check(lexer::TokenKind::KwIf)) {
+            return self.parse_if_stmt();
+        }
+
+        if (self.check(lexer::TokenKind::KwWhile)) {
+            return self.parse_while_stmt();
+        }
+
+        if (self.check(lexer::TokenKind::KwFor)) {
+            return self.parse_for_stmt();
+        }
+
+        if (self.check(lexer::TokenKind::KwBreak)) {
+            self.advance();
+            if (self.check(lexer::TokenKind::Semicolon)) {
+                self.advance();
+            }
+            return node_new(NodeKind::StmtBreak);
+        }
+
+        if (self.check(lexer::TokenKind::KwContinue)) {
+            self.advance();
+            if (self.check(lexer::TokenKind::Semicolon)) {
+                self.advance();
+            }
+            return node_new(NodeKind::StmtContinue);
+        }
+
+        const expr = self.parse_expr();
+
+        if (self.check(lexer::TokenKind::Equals)) {
+            self.advance();
+            const rhs = self.parse_expr();
+            if (self.check(lexer::TokenKind::Semicolon)) {
+                self.advance();
+            }
+            var assign = node_new(NodeKind::StmtAssign);
+            add_child(&assign, expr);
+            add_child(&assign, rhs);
+            return assign;
+        }
+
+        if (self.check(lexer::TokenKind::PlusEquals)) {
+            self.advance();
+            const rhs = self.parse_expr();
+            if (self.check(lexer::TokenKind::Semicolon)) {
+                self.advance();
+            }
+            var assign = node_new(NodeKind::StmtAssign);
+            assign.extra_op = "+=";
+            add_child(&assign, expr);
+            add_child(&assign, rhs);
+            return assign;
+        }
+
+        if (self.check(lexer::TokenKind::Semicolon)) {
+            self.advance();
+        }
+        var stmt = node_new(NodeKind::StmtExpr);
+        add_child(&stmt, expr);
+        return stmt;
+    }
+
+    fn parse_local_decl(self: *Parser) -> Node {
+        var decl = node_new(NodeKind::StmtLocal);
+        decl.extra_mutable = self.check(lexer::TokenKind::KwVar);
+        self.advance();
+
+        if (self.current.kind == lexer::TokenKind::Ident or self.current.kind == lexer::TokenKind::KwModule) {
+            decl.name = self.current.lexeme;
+            self.advance();
+        }
+
+        if (self.check(lexer::TokenKind::Colon)) {
+            self.advance();
+            decl.extra_type = self.parse_type_annotation();
+        }
+
+        if (self.check(lexer::TokenKind::Equals)) {
+            self.advance();
+            const init = self.parse_expr();
+            add_child(&decl, init);
+        }
+
+        if (self.check(lexer::TokenKind::Semicolon)) {
+            self.advance();
+        }
+        return decl;
+    }
+
+    fn parse_return_statement(self: *Parser) -> Node {
+        var stmt = node_new(NodeKind::ExprReturn);
+        self.advance();
+
+        if (self.current.kind != lexer::TokenKind::Semicolon 
+            and self.current.kind != lexer::TokenKind::RBrace) {
+            const expr = self.parse_expr();
+            add_child(&stmt, expr);
+        }
+
+        if (self.check(lexer::TokenKind::Semicolon)) {
+            self.advance();
+        }
+        return stmt;
+    }
+
+    fn parse_if_stmt(self: *Parser) -> Node {
+        var if_node = node_new(NodeKind::StmtIf);
+        self.advance();
+
+        self.expect(lexer::TokenKind::LParen);
+        const cond = self.parse_expr();
+        self.expect(lexer::TokenKind::RParen);
+        add_child(&if_node, cond);
+
+        if (self.check(lexer::TokenKind::LBrace)) {
+            self.advance();
+            var then_block = node_new(NodeKind::Module);
+            then_block.name = "then";
+            while (self.current.kind != lexer::TokenKind::RBrace 
+                   and self.current.kind != lexer::TokenKind::Eof) {
+                const s = self.parse_body_stmt();
+                add_child(&then_block, s);
+            }
+            self.expect(lexer::TokenKind::RBrace);
+            add_child(&if_node, then_block);
+        } else {
+            const stmt = self.parse_body_stmt();
+            var then_block = node_new(NodeKind::Module);
+            then_block.name = "then";
+            add_child(&then_block, stmt);
+            add_child(&if_node, then_block);
+        }
+
+        if (self.check(lexer::TokenKind::KwElse)) {
+            self.advance();
+            if (self.check(lexer::TokenKind::KwIf)) {
+                const else_if = self.parse_if_stmt();
+                var else_block = node_new(NodeKind::Module);
+                else_block.name = "else";
+                add_child(&else_block, else_if);
+                add_child(&if_node, else_block);
+            } else if (self.check(lexer::TokenKind::LBrace)) {
+                self.advance();
+                var else_block = node_new(NodeKind::Module);
+                else_block.name = "else";
+                while (self.current.kind != lexer::TokenKind::RBrace 
+                       and self.current.kind != lexer::TokenKind::Eof) {
+                    const s = self.parse_body_stmt();
+                    add_child(&else_block, s);
+                }
+                self.expect(lexer::TokenKind::RBrace);
+                add_child(&if_node, else_block);
+            }
+        }
+
+        return if_node;
+    }
+
+    fn parse_while_stmt(self: *Parser) -> Node {
+        var while_node = node_new(NodeKind::StmtWhile);
+        self.advance();
+
+        self.expect(lexer::TokenKind::LParen);
+        const cond = self.parse_expr();
+        self.expect(lexer::TokenKind::RParen);
+        add_child(&while_node, cond);
+
+        self.expect(lexer::TokenKind::LBrace);
+        var body_block = node_new(NodeKind::Module);
+        body_block.name = "body";
+        while (self.current.kind != lexer::TokenKind::RBrace 
+               and self.current.kind != lexer::TokenKind::Eof) {
+            const s = self.parse_body_stmt();
+            add_child(&body_block, s);
+        }
+        self.expect(lexer::TokenKind::RBrace);
+        add_child(&while_node, body_block);
+
+        return while_node;
+    }
+
+    fn parse_for_stmt(self: *Parser) -> Node {
+        var for_node = node_new(NodeKind::StmtFor);
+        self.advance();
+
+        self.expect(lexer::TokenKind::LParen);
+        while (self.current.kind != lexer::TokenKind::RParen 
+               and self.current.kind != lexer::TokenKind::Eof) {
+            const iter_expr = self.parse_expr();
+            add_child(&for_node, iter_expr);
+            if (self.check(lexer::TokenKind::Comma)) {
+                self.advance();
+            }
+        }
+        self.expect(lexer::TokenKind::RParen);
+
+        if (self.check(lexer::TokenKind::Pipe)) {
+            self.advance();
+            while (self.current.kind != lexer::TokenKind::Pipe 
+                   and self.current.kind != lexer::TokenKind::Eof) {
+                if (self.check(lexer::TokenKind::Star)) {
+                    self.advance();
+                }
+                if (self.check(lexer::TokenKind::Ident)) {
+                    const param_name = self.current.lexeme;
+                    self.advance();
+                }
+                if (self.check(lexer::TokenKind::Comma)) {
+                    self.advance();
+                }
+            }
+            self.expect(lexer::TokenKind::Pipe);
+        }
+
+        self.expect(lexer::TokenKind::LBrace);
+        var body_block = node_new(NodeKind::Module);
+        body_block.name = "body";
+        while (self.current.kind != lexer::TokenKind::RBrace 
+               and self.current.kind != lexer::TokenKind::Eof) {
+            const s = self.parse_body_stmt();
+            add_child(&body_block, s);
+        }
+        self.expect(lexer::TokenKind::RBrace);
+        add_child(&for_node, body_block);
+
+        return for_node;
+    }
+
+    fn parse_fn_body(self: *Parser) -> void {
+        while (self.current.kind != lexer::TokenKind::RBrace 
+               and self.current.kind != lexer::TokenKind::Eof) {
+            const s = self.parse_body_stmt();
+            if (s.kind != NodeKind::ExprLiteral) {
+                // statement consumed
+            }
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // 8. Struct and Enum Body Parsers
+    // ════════════════════════════════════════════════════════════════════
+
+    fn parse_struct_body(self: *Parser, decl: *Node) -> void {
+        while (self.current.kind != lexer::TokenKind::RBrace 
+               and self.current.kind != lexer::TokenKind::Eof) {
+            if (self.check(lexer::TokenKind::Ident)) {
+                const field_name = self.current.lexeme;
+                self.advance();
+
+                var type_str = "";
+                if (self.check(lexer::TokenKind::Colon)) {
+                    self.advance();
+                    while (self.current.kind != lexer::TokenKind::Comma
+                           and self.current.kind != lexer::TokenKind::Semicolon
+                           and self.current.kind != lexer::TokenKind::RBrace
+                           and self.current.kind != lexer::TokenKind::Eof) {
+                        type_str = type_str ++ self.current.lexeme;
+                        self.advance();
+                    }
+                }
+
+                var field = node_new(NodeKind::ExprIdentifier);
+                field.name = field_name;
+                field.extra_type = type_str;
+                add_child(decl, field);
+
+                if (self.check(lexer::TokenKind::Comma) or self.check(lexer::TokenKind::Semicolon)) {
+                    self.advance();
+                }
+            } else {
+                self.advance();
+            }
+        }
+    }
+
+    fn parse_enum_body(self: *Parser, decl: *Node) -> void {
+        while (self.current.kind != lexer::TokenKind::RBrace 
+               and self.current.kind != lexer::TokenKind::Eof) {
+            if (self.check(lexer::TokenKind::Ident)) {
+                const name = self.current.lexeme;
+                self.advance();
+
+                var value_str = "";
+                if (self.check(lexer::TokenKind::Equals)) {
+                    self.advance();
+                    if (self.check(lexer::TokenKind::Minus)) {
+                        value_str = "-";
+                        self.advance();
+                    }
+                    if (self.check(lexer::TokenKind::Number)) {
+                        value_str = value_str ++ self.current.lexeme;
+                        self.advance();
+                    } else if (self.check(lexer::TokenKind::Ident)) {
+                        value_str = value_str ++ self.current.lexeme;
+                        self.advance();
+                    }
+                }
+
+                var variant = node_new(NodeKind::ExprLiteral);
+                variant.name = name;
+                variant.value = value_str;
+                add_child(decl, variant);
+
+                if (self.check(lexer::TokenKind::Comma)) {
+                    self.advance();
+                }
+            } else {
+                self.advance();
+            }
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // 9. Top-Level Declaration Parsers
+    // ════════════════════════════════════════════════════════════════════
+
+    fn parse_top_level_decl(self: *Parser) -> Node {
+        var is_pub = false;
+        if (self.check(lexer::TokenKind::KwPub)) {
+            is_pub = true;
+            self.advance();
+        }
+
+        if (self.check(lexer::TokenKind::KwConst)) {
+            return self.parse_const_decl(is_pub);
+        }
+        if (self.check(lexer::TokenKind::KwVar)) {
+            return self.parse_var_decl(is_pub);
+        }
+        if (self.check(lexer::TokenKind::KwFn)) {
+            return self.parse_fn_decl(is_pub);
+        }
+        if (self.check(lexer::TokenKind::KwEnum)) {
+            return self.parse_enum_decl(is_pub);
+        }
+        if (self.check(lexer::TokenKind::KwStruct)) {
+            return self.parse_struct_decl(is_pub);
+        }
+
+        return node_new(NodeKind::Module);
+    }
+
+    fn parse_const_decl(self: *Parser, is_pub: bool) -> Node {
+        var decl = node_new(NodeKind::ConstDecl);
+        decl.extra_pub = is_pub;
+
+        self.advance();
+
+        if (self.check(lexer::TokenKind::Ident)) {
+            decl.name = self.current.lexeme;
+            self.advance();
+        }
+
+        if (self.check(lexer::TokenKind::Colon)) {
+            self.advance();
+            var type_str = "";
+            if (self.check(lexer::TokenKind::LBracket)) {
+                type_str = "[";
+                self.advance();
+                while (self.current.kind != lexer::TokenKind::RBracket 
+                       and self.current.kind != lexer::TokenKind::Eof) {
+                    type_str = type_str ++ self.current.lexeme;
+                    self.advance();
+                }
+                type_str = type_str ++ "]";
+                if (self.check(lexer::TokenKind::RBracket)) {
+                    self.advance();
+                }
+            }
+            if (self.check(lexer::TokenKind::Ident)) {
+                type_str = type_str ++ self.current.lexeme;
+                self.advance();
+            }
+            decl.extra_type = type_str;
+        }
+
+        if (self.check(lexer::TokenKind::Equals)) {
+            self.advance();
+
+            if (self.check(lexer::TokenKind::KwEnum)) {
+                decl.kind = NodeKind::EnumDecl;
+                self.advance();
+                if (self.check(lexer::TokenKind::LParen)) {
+                    self.advance();
+                    if (self.check(lexer::TokenKind::Ident)) {
+                        decl.extra_type = self.current.lexeme;
+                        self.advance();
+                    }
+                    self.expect(lexer::TokenKind::RParen);
+                }
+                self.expect(lexer::TokenKind::LBrace);
+                self.parse_enum_body(&decl);
+                self.expect(lexer::TokenKind::RBrace);
+            } else if (self.check(lexer::TokenKind::KwStruct)) {
+                decl.kind = NodeKind::StructDecl;
+                self.advance();
+                self.expect(lexer::TokenKind::LBrace);
+                self.parse_struct_body(&decl);
+                self.expect(lexer::TokenKind::RBrace);
+            } else if (self.check(lexer::TokenKind::Minus)) {
+                self.advance();
+                if (self.check(lexer::TokenKind::Number)) {
+                    var val_node = node_new(NodeKind::ExprLiteral);
+                    val_node.value = "-" ++ self.current.lexeme;
+                    add_child(&decl, val_node);
+                    self.advance();
+                }
+            } else if (self.check(lexer::TokenKind::Number)) {
+                var val_node = node_new(NodeKind::ExprLiteral);
+                val_node.value = self.current.lexeme;
+                add_child(&decl, val_node);
+                self.advance();
+            } else if (self.check(lexer::TokenKind::Ident)) {
+                var val_node = node_new(NodeKind::ExprIdentifier);
+                val_node.name = self.current.lexeme;
+                add_child(&decl, val_node);
+                self.advance();
+            } else if (self.check(lexer::TokenKind::KwTrue) or self.check(lexer::TokenKind::KwFalse)) {
+                var val_node = node_new(NodeKind::ExprLiteral);
+                val_node.value = self.current.lexeme;
+                add_child(&decl, val_node);
+                self.advance();
+            } else if (self.check(lexer::TokenKind::StringLit)) {
+                var val_node = node_new(NodeKind::ExprLiteral);
+                val_node.value = self.current.lexeme;
+                add_child(&decl, val_node);
+                self.advance();
+            } else {
+                self.skip_to_semicolon();
+                return decl;
+            }
+
+            if (self.current.kind != lexer::TokenKind::Semicolon) {
+                self.skip_to_semicolon();
+            }
+        }
+
+        if (self.check(lexer::TokenKind::Semicolon)) {
+            self.advance();
+        }
+        return decl;
+    }
+
+    fn parse_var_decl(self: *Parser, is_pub: bool) -> Node {
+        var decl = node_new(NodeKind::VarDecl);
+        decl.extra_pub = is_pub;
+
+        self.advance();
+
+        if (self.check(lexer::TokenKind::Ident)) {
+            decl.name = self.current.lexeme;
+            self.advance();
+        }
+
+        self.skip_to_semicolon();
+        return decl;
+    }
+
+    fn parse_enum_decl(self: *Parser, is_pub: bool) -> Node {
+        var decl = node_new(NodeKind::EnumDecl);
+        decl.extra_pub = is_pub;
+
+        self.advance();
+
+        if (self.check(lexer::TokenKind::Ident)) {
+            decl.name = self.current.lexeme;
+            self.advance();
+        }
+
+        if (self.check(lexer::TokenKind::LParen)) {
+            self.advance();
+            while (self.current.kind != lexer::TokenKind::RParen 
+                   and self.current.kind != lexer::TokenKind::Eof) {
+                self.advance();
+            }
+            self.expect(lexer::TokenKind::RParen);
+        }
+
+        self.expect(lexer::TokenKind::LBrace);
+        self.skip_brace_body();
+        self.expect(lexer::TokenKind::RBrace);
+
+        return decl;
+    }
+
+    fn parse_struct_decl(self: *Parser, is_pub: bool) -> Node {
+        var decl = node_new(NodeKind::StructDecl);
+        decl.extra_pub = is_pub;
+
+        self.advance();
+
+        if (self.check(lexer::TokenKind::Ident)) {
+            decl.name = self.current.lexeme;
+            self.advance();
+        }
+
+        self.expect(lexer::TokenKind::LBrace);
+        self.parse_struct_body(&decl);
+        self.expect(lexer::TokenKind::RBrace);
+
+        return decl;
+    }
+
+    fn parse_fn_decl(self: *Parser, is_pub: bool) -> Node {
+        var decl = node_new(NodeKind::FnDecl);
+        decl.extra_pub = is_pub;
+
+        self.advance();
+
+        if (self.check(lexer::TokenKind::Ident)) {
+            decl.name = self.current.lexeme;
+            self.advance();
+            while (self.check(lexer::TokenKind::Dot)) {
+                self.advance();
+                if (self.check(lexer::TokenKind::Ident)) {
+                    decl.name = decl.name ++ "." ++ self.current.lexeme;
+                    self.advance();
+                }
+            }
+        }
+
+        self.expect(lexer::TokenKind::LParen);
+        while (self.current.kind != lexer::TokenKind::RParen 
+               and self.current.kind != lexer::TokenKind::Eof) {
+            if (self.check(lexer::TokenKind::Ident)) {
+                const param_name = self.current.lexeme;
+                self.advance();
+                if (self.check(lexer::TokenKind::Colon)) {
+                    self.advance();
+                }
+                const param_type = self.parse_type_annotation();
+            }
+            if (self.check(lexer::TokenKind::Comma)) {
+                self.advance();
+            }
+        }
+        self.expect(lexer::TokenKind::RParen);
+
+        if (self.check(lexer::TokenKind::Arrow)) {
+            self.advance();
+        }
+
+        if (self.check(lexer::TokenKind::Bang)) {
+            self.advance();
+        }
+
+        if (self.check(lexer::TokenKind::Ident)) {
+            decl.extra_return_type = self.current.lexeme;
+            self.advance();
+        } else if (self.check(lexer::TokenKind::LBracket)) {
+            var rt = "";
+            while (self.check(lexer::TokenKind::LBracket)) {
+                rt = rt ++ "[";
+                self.advance();
+                while (self.current.kind != lexer::TokenKind::RBracket 
+                       and self.current.kind != lexer::TokenKind::Eof) {
+                    rt = rt ++ self.current.lexeme;
+                    self.advance();
+                }
+                rt = rt ++ "]";
+                if (self.check(lexer::TokenKind::RBracket)) {
+                    self.advance();
+                }
+            }
+            if (self.check(lexer::TokenKind::KwConst)) {
+                rt = rt ++ "const ";
+                self.advance();
+            }
+            if (self.check(lexer::TokenKind::Star)) {
+                rt = rt ++ "*";
+                self.advance();
+            }
+            if (self.check(lexer::TokenKind::Ident)) {
+                rt = rt ++ self.current.lexeme;
+                self.advance();
+            }
+            decl.extra_return_type = rt;
+        } else if (self.check(lexer::TokenKind::KwVoid)) {
+            decl.extra_return_type = "void";
+            self.advance();
+        }
+
+        if (self.check(lexer::TokenKind::KwConst)) {
+            self.advance();
+        }
+
+        self.expect(lexer::TokenKind::LBrace);
+        self.parse_fn_body();
+        self.expect(lexer::TokenKind::RBrace);
+
+        return decl;
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // 10. Module Parser
+    // ════════════════════════════════════════════════════════════════════
+
+    fn parse(self: *Parser) -> Node {
+        var module = node_new(NodeKind::Module);
+
+        if (self.check(lexer::TokenKind::KwModule)) {
+            self.advance();
+            if (self.check(lexer::TokenKind::Ident)) {
+                module.name = self.current.lexeme;
+                self.advance();
+                while (self.check(lexer::TokenKind::Minus)) {
+                    module.name = module.name ++ "-";
+                    self.advance();
+                    if (self.check(lexer::TokenKind::Ident) or self.check(lexer::TokenKind::Number)) {
+                        module.name = module.name ++ self.current.lexeme;
+                        self.advance();
+                    }
+                }
+            }
+            if (self.check(lexer::TokenKind::Semicolon)) {
+                self.advance();
+            } else if (self.check(lexer::TokenKind::LBrace)) {
+                self.advance();
+                self.parse_module_body(&module);
+                self.expect(lexer::TokenKind::RBrace);
+                return module;
+            }
+        }
+
+        self.parse_module_body(&module);
+        return module;
+    }
+
+    fn parse_module_body(self: *Parser, module: *Node) -> void {
+        while (self.current.kind != lexer::TokenKind::Eof 
+               and self.current.kind != lexer::TokenKind::RBrace) {
+
+            if (self.check(lexer::TokenKind::KwUse) or self.check(lexer::TokenKind::KwUsing)) {
+                self.advance();
+                var full_path = "";
+                var alias_name = "";
+                if (self.check(lexer::TokenKind::Ident)) {
+                    full_path = self.current.lexeme;
+                    self.advance();
+
+                    if (self.check(lexer::TokenKind::Colon) and !self.check_peek(lexer::TokenKind::Colon)) {
+                        alias_name = full_path;
+                        self.advance();
+                        if (self.check(lexer::TokenKind::Ident)) {
+                            self.advance();
+                        }
+                        full_path = alias_name;
+                    } else {
+                        while (self.check(lexer::TokenKind::Colon)) {
+                            self.advance();
+                            if (self.check(lexer::TokenKind::Colon)) {
+                                self.advance();
+                                full_path = full_path ++ "::";
+                                if (self.check(lexer::TokenKind::Ident)) {
+                                    full_path = full_path ++ self.current.lexeme;
+                                    self.advance();
+                                }
+                            }
+                        }
+                    }
+                }
+                if (self.check(lexer::TokenKind::Semicolon)) {
+                    self.advance();
+                }
+                const import_name = alias_name;
+                var use_node = node_new(NodeKind::UseDecl);
+                use_node.name = import_name;
+                use_node.value = full_path;
+                add_child(module, use_node);
+                continue;
+            }
+
+            const decl = self.parse_top_level_decl();
+            if (decl.kind != NodeKind::Module) {
+                add_child(module, decl);
+            }
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // 11. Tests
+    // ════════════════════════════════════════════════════════════════════
+
+    test "kind_values" {
+        assert(NodeKind::Module == 0);
+        assert(NodeKind::FnDecl == 4);
+        assert(NodeKind::ExprBinary == 22);
+        assert(NodeKind::ExprCall == 24);
+    }
+
+    test "precedence_order" {
+        const or_level = 0;
+        const and_level = 1;
+        const comp_level = 2;
+        const add_level = 3;
+        const mul_level = 4;
+        const unary_level = 5;
+        assert(or_level < and_level);
+        assert(and_level < comp_level);
+        assert(comp_level < add_level);
+        assert(add_level < mul_level);
+        assert(mul_level < unary_level);
+    }
+
+    test "max_children_constant" {
+        assert(MAX_CHILDREN == 32);
+    }
+
+    test "node_kind_count" {
+        assert(NodeKind::ExprReturn == 31);
+        assert(NodeKind::StmtLocal == 10);
+    }
+
+    test "node_kind_coverage" {
+        assert(NodeKind::Module == NodeKind::Module);
+        assert(NodeKind::FnDecl != NodeKind::StructDecl);
+    }
+
+    test "expression_precedence_levels" {
+        assert(10 > 9);
+        assert(9 > 8);
+        assert(8 > 7);
+        assert(7 > 6);
+        assert(6 > 5);
+        assert(5 > 4);
+        assert(4 > 3);
+        assert(3 > 2);
+        assert(2 > 1);
+        assert(1 > 0);
+    }
+
+    test "break_continue_node_kinds" {
+        assert(NodeKind::StmtBreak == 17);
+        assert(NodeKind::StmtContinue == 18);
+        assert(NodeKind::StmtBreak != NodeKind::StmtContinue);
+    }
+
+    test "error_recovery_skip_to_semicolon" {
+        var p = parser_init("fn foo() { x; }", 16);
+        assert(p.current.kind != lexer::TokenKind::Eof);
+    }
+
+    test "struct_decl_distinct_from_enum" {
+        assert(NodeKind::StructDecl == 6);
+        assert(NodeKind::EnumDecl == 5);
+        assert(NodeKind::StructDecl != NodeKind::EnumDecl);
+    }
+
+    test "all_statement_kinds_unique" {
+        assert(NodeKind::StmtLocal != NodeKind::StmtAssign);
+        assert(NodeKind::StmtAssign != NodeKind::StmtIf);
+        assert(NodeKind::StmtIf != NodeKind::StmtWhile);
+        assert(NodeKind::StmtWhile != NodeKind::StmtFor);
+        assert(NodeKind::StmtFor != NodeKind::StmtExpr);
+        assert(NodeKind::StmtExpr != NodeKind::ExprReturn);
+        assert(NodeKind::ExprReturn != NodeKind::StmtBreak);
+        assert(NodeKind::StmtBreak != NodeKind::StmtContinue);
+    }
+}

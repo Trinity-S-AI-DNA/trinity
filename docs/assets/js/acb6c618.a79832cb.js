@@ -1,0 +1,1 @@
+"use strict";(globalThis.webpackChunkdocsite=globalThis.webpackChunkdocsite||[]).push([[73363],{18404(o){o.exports=JSON.parse('{"metadata":{"permalink":"/docs/blog","page":1,"postsPerPage":10,"totalPages":1,"totalCount":0,"blogDescription":"Blog","blogTitle":"Trinity blog"}}')}}]);

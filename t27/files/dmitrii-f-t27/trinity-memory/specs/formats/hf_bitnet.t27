@@ -1,0 +1,228 @@
+// SPDX-License-Identifier: Apache-2.0
+// Issue: https://github.com/dmitrii-f-t27/trinity-memory/issues/125
+// Coverage: https://github.com/dmitrii-f-t27/trinity-memory/issues/29
+// Coverage: https://github.com/dmitrii-f-t27/trinity-memory/issues/30
+// Coverage: https://github.com/dmitrii-f-t27/trinity-memory/issues/34
+// specs/formats/hf_bitnet.t27 -- Hugging Face transformers BitNet packed weights
+// Restates upstream huggingface/transformers@07338b6c74a578868368e6e549dea83414e4b8cb
+// src/transformers/integrations/bitnet.py: :14 (VALUES_PER_ITEM 4), :17-53
+// (pack_weights: T + 1 shifted by 2i into row r of a [ceil(rows/4), cols]
+// uint8 tensor), :56-121 (unpack_weights: slot i of packed row r is row
+// i*rows/4 + r, minus 1), :139-142 (BitLinear buffers: weight uint8
+// [out_features // 4, in_features], weight_scale [1] in the model dtype),
+// :180-181 (BitLinear divides by weight_scale), :245-292 (AutoBitLinear, used
+// offline by microsoft/bitnet-b1.58-2B-4T at 04c3b9ad whose config.json has
+// linear_class autobitlinear, quantization_mode offline and bfloat16:
+// output * weight_scale, so a weight is its trit times weight_scale).
+// rows is out_features (dimension 0). pack_weights pads rows to a multiple of
+// 4 but unpack_weights returns 4 * (rows / 4) rows and the BitLinear buffer
+// floors, so rows % 4 != 0 has no storage here.
+// The checkpoints are safetensors files, read as upstream
+// huggingface/safetensors@e246a2560645b7525f5775669ed816eb57c5bcc8
+// safetensors/src/tensor.rs reads them: :420-422 (read_metadata: the data
+// section ends exactly at the end of the file), :627-663 (Metadata::validate:
+// :632-638 each tensor begins where the previous one ended, :648-661 end -
+// begin == numel * bitsize / 8, whole bytes), :867-891 (Dtype::bitsize).
+// This spec states the extent rule for one tensor (it must tile with its two
+// neighbours; the whole-file tiling is not checked) and the widths of the
+// dtypes that the checkpoints read here use (U8, U32, F16, BF16, F32). A
+// numel * bitsize that does not fit in 64 bits (tensor.rs:642-650,
+// ValidationOverflow) is LENGTH, the class of a GGUF weight count that
+// gguf.cpp refuses.
+// phi^2 + 1/phi^2 = 3 | TRINITY
+module TrinityFormatsHfBitnetSpec {
+    pub const TFS_HF_ERR_LENGTH: i32 = -51;
+    pub const TFS_HF_ERR_CAPACITY: i32 = -52;
+    pub const TFS_HF_ERR_CODE: i32 = -53;
+    pub const TFS_HF_ERR_CONTAINER: i32 = -56;
+    pub const TFS_HF_ERR_SCALE_NONFINITE: i32 = -58;
+    pub const TFS_HF_ERR_EXTENT: i32 = -62;
+    pub const TFS_HF_FLAG_OUTSIDE_TERNARY: u32 = 0;
+    pub const TFS_HF_FLAG_SCALE_NEGATIVE: u32 = 2;
+    pub const TFS_HF_FLAG_SCALE_ZERO: u32 = 3;
+
+    pub const TFS_HF_PACKED: i32 = 8;
+    pub const TFS_HF_VALUES_PER_ITEM: u32 = 4;
+    pub const TFS_HF_CODE_BITS: u32 = 2;
+    pub const TFS_HF_SCALE_BITS_BF16: u32 = 16;
+
+    // Weight (i, k) of a [rows, cols] tensor: packed row i % (rows/4), bits 2 * (i / (rows/4)).
+    pub fn tfs_hf_weight(data: []u8, rows: usize, cols: usize, i: usize, k: usize) -> i32 {
+        var stride: usize = rows / 4;
+        return ((((data[(i % stride) * cols + k] as u32) >> (2 * (i / stride))) & 3) as i32) - 1;
+    }
+
+    // LENGTH (empty shape, rows % 4 != 0, size != rows/4 * cols), CAPACITY,
+    // else the number of code-3 (+2) weights.
+    pub fn tfs_hf_decode(data: []u8, size: usize, rows: usize, cols: usize, values: []i32, value_capacity: usize) -> i64 {
+        if (rows == 0 || cols == 0 || rows % 4 != 0) { return TFS_HF_ERR_LENGTH as i64; }
+        if (size % cols != 0 || size / cols != rows / 4) { return TFS_HF_ERR_LENGTH as i64; }
+        if (rows > value_capacity / cols) { return TFS_HF_ERR_CAPACITY as i64; }
+        var outside: i64 = 0;
+        // unpack_weights order: slot i covers rows [i*rows/4, (i+1)*rows/4).
+        var slot: usize = 0;
+        while (slot < 4) {
+            var r: usize = 0;
+            while (r < rows / 4) {
+                var k: usize = 0;
+                while (k < cols) {
+                    var w: i32 = ((((data[r * cols + k] as u32) >> (2 * slot)) & 3) as i32) - 1;
+                    if (w > 1) { outside = outside + 1; }
+                    values[(slot * (rows / 4) + r) * cols + k] = w;
+                    k = k + 1;
+                }
+                r = r + 1;
+            }
+            slot = slot + 1;
+        }
+        return outside;
+    }
+
+    // pack_weights with T in {-1, 0, 1}; LENGTH, CAPACITY, CODE before writing.
+    pub fn tfs_hf_encode(values: []i32, rows: usize, cols: usize, out: []u8, capacity: usize) -> i64 {
+        if (rows == 0 || cols == 0 || rows % 4 != 0) { return TFS_HF_ERR_LENGTH as i64; }
+        if (rows / 4 > capacity / cols) { return TFS_HF_ERR_CAPACITY as i64; }
+        var i: usize = 0;
+        while (i < rows * cols) {
+            if (values[i] < -1 || values[i] > 1) { return TFS_HF_ERR_CODE as i64; }
+            i = i + 1;
+        }
+        i = 0;
+        while (i < (rows / 4) * cols) { out[i] = 0; i = i + 1; }
+        var slot: usize = 0;
+        while (slot < 4) {
+            var r: usize = 0;
+            while (r < rows / 4) {
+                var k: usize = 0;
+                while (k < cols) {
+                    var code: u32 = (values[(slot * (rows / 4) + r) * cols + k] + 1) as u32;
+                    out[r * cols + k] = ((out[r * cols + k] as u32) | (code << (2 * slot))) as u8;
+                    k = k + 1;
+                }
+                r = r + 1;
+            }
+            slot = slot + 1;
+        }
+        return ((rows / 4) * cols) as i64;
+    }
+
+    // weight_scale as bfloat16: 0 positive, 1 zero, 2 negative, ERR_SCALE_NONFINITE.
+    pub fn tfs_hf_bf16_class(word: u32) -> i32 {
+        if ((word & 0x7f80) == 0x7f80) { return TFS_HF_ERR_SCALE_NONFINITE; }
+        if ((word & 0x7fff) == 0) { return 1; }
+        if ((word & 0x8000) != 0) { return 2; }
+        return 0;
+    }
+
+    // Bits per element of the dtypes used by the checkpoints read here
+    // (tensor.rs Dtype::bitsize); 0 for any other name.
+    pub fn tfs_hf_dtype_bits(dtype: []u8, size: usize) -> u64 {
+        // "U8", "U32", "F16", "F32", "BF16" as ASCII codes.
+        if (size == 2 && dtype[0] == 85 && dtype[1] == 56) { return 8; }
+        if (size == 3 && dtype[0] == 85 && dtype[1] == 51 && dtype[2] == 50) { return 32; }
+        if (size == 3 && dtype[0] == 70 && dtype[1] == 49 && dtype[2] == 54) { return 16; }
+        if (size == 3 && dtype[0] == 70 && dtype[1] == 51 && dtype[2] == 50) { return 32; }
+        if (size == 4 && dtype[0] == 66 && dtype[1] == 70 && dtype[2] == 49 && dtype[3] == 54) { return 16; }
+        return 0;
+    }
+
+    // Absolute offsets are 8 + header + data_offsets for a JSON header of
+    // `header` bytes. EXTENT when that sum does not fit in 64 bits for the
+    // relative end `end` of any entry: such offsets lie past the end of every
+    // file, and tensor.rs:632-638 refuses them since the tensors must tile the
+    // data section from 0.
+    pub fn tfs_hf_safetensors_offset_status(header: u64, end: u64) -> i32 {
+        var top: u64 = 0xffffffffffffffff;
+        if (header > top - 8) { return TFS_HF_ERR_EXTENT; }
+        if (end > top - 8 - header) { return TFS_HF_ERR_EXTENT; }
+        return 0;
+    }
+
+    // Extent of one safetensors tensor with absolute [begin, end) in a file of
+    // file_size bytes: CONTAINER for an unknown dtype (bits 0), LENGTH when
+    // numel * bits does not fit in 64 bits or is not whole bytes, EXTENT when
+    // end - begin differs from it, when the bytes run past the end of the
+    // file, or when the tensor does not tile with its neighbours
+    // (tensor.rs:627-661 and :419-421 require the tensors to tile the data
+    // section from 0 to the end of the file): it must begin at prev_end (the
+    // greatest end of another nonzero-size tensor that begins below begin, or
+    // the start of the data section when has_prev is false) and end at
+    // next_begin (the least begin of another nonzero-size tensor at or above
+    // begin), or at file_size when has_next is false.
+    pub fn tfs_hf_safetensors_status(bits: u64, numel: u64, begin: u64, end: u64, has_next: bool,
+                                     next_begin: u64, has_prev: bool, prev_end: u64, file_size: u64) -> i32 {
+        if (bits == 0) { return TFS_HF_ERR_CONTAINER; }
+        var top: u64 = 0xffffffffffffffff;
+        if (numel != 0 && bits > top / numel) { return TFS_HF_ERR_LENGTH; }
+        if ((bits * numel) % 8 != 0) { return TFS_HF_ERR_LENGTH; }
+        if (end - begin != (bits * numel) / 8) { return TFS_HF_ERR_EXTENT; }
+        if (end > file_size) { return TFS_HF_ERR_EXTENT; }
+        // Overlap with the tensor before, then a gap before this one.
+        if (has_prev && prev_end > begin) { return TFS_HF_ERR_EXTENT; }
+        if (prev_end != begin) { return TFS_HF_ERR_EXTENT; }
+        if (has_next && end != next_begin) { return TFS_HF_ERR_EXTENT; }
+        if (!has_next && end != file_size) { return TFS_HF_ERR_EXTENT; }
+        return 0;
+    }
+
+    invariant hf_four_codes_per_byte { assert TFS_HF_VALUES_PER_ITEM * TFS_HF_CODE_BITS == 8; }
+    invariant hf_scale_is_one_word_per_tensor { assert TFS_HF_SCALE_BITS_BF16 == 16; }
+
+    test "hf unpack example from the transformers docstring" {
+        var packed: [4]u8 = [161, 24, 144, 10];
+        var v: [16]i32;
+        assert tfs_hf_decode(packed, 4, 8, 2, v, 16) == 0;
+        assert v[0] == 0 && v[1] == -1 && v[2] == -1 && v[3] == 1 && v[4] == -1 && v[5] == 1;
+        assert v[6] == -1 && v[7] == 1 && v[8] == 1 && v[9] == 0 && v[10] == 0 && v[11] == -1;
+        assert v[12] == 1 && v[13] == -1 && v[14] == 1 && v[15] == -1;
+        var again: [4]u8;
+        assert tfs_hf_encode(v, 8, 2, again, 4) == 4;
+        assert again[0] == 161 && again[1] == 24 && again[2] == 144 && again[3] == 10;
+        assert tfs_hf_weight(packed, 8, 2, 7, 1) == -1;
+    }
+    test "hf rejections and scale classes" {
+        var packed: [4]u8 = [255, 24, 144, 10];
+        var v: [16]i32;
+        assert tfs_hf_decode(packed, 4, 8, 2, v, 16) == 4;
+        assert tfs_hf_decode(packed, 4, 6, 2, v, 16) == TFS_HF_ERR_LENGTH;
+        assert tfs_hf_decode(packed, 3, 8, 2, v, 16) == TFS_HF_ERR_LENGTH;
+        assert tfs_hf_decode(packed, 4, 8, 2, v, 15) == TFS_HF_ERR_CAPACITY;
+        assert tfs_hf_encode(v, 8, 2, packed, 4) == TFS_HF_ERR_CODE;
+        // BitNet b1.58 2B4T layer-0 weight_scale values (bf16).
+        assert tfs_hf_bf16_class(16284) == 0 && tfs_hf_bf16_class(16394) == 0;
+        assert tfs_hf_bf16_class(32704) == TFS_HF_ERR_SCALE_NONFINITE && tfs_hf_bf16_class(65408) == TFS_HF_ERR_SCALE_NONFINITE;
+        assert tfs_hf_bf16_class(32768) == 1 && tfs_hf_bf16_class(49024) == 2;
+    }
+    test "hf safetensors extents" {
+        var u8name: [2]u8 = [85, 56];
+        var bf16name: [4]u8 = [66, 70, 49, 54];
+        var other: [3]u8 = [73, 54, 52];
+        assert tfs_hf_dtype_bits(u8name, 2) == 8 && tfs_hf_dtype_bits(bf16name, 4) == 16 && tfs_hf_dtype_bits(other, 3) == 0;
+        // BitNet b1.58 2B4T model.layers.0.self_attn.q_proj.weight: U8 [640, 2560]
+        // at file bytes 672931828..674570228 of the 1178623988-byte model.safetensors at 04c3b9ad;
+        // in a valid file the tensors before and after it touch it.
+        assert tfs_hf_safetensors_status(8, 1638400, 672931828, 674570228, true, 674570228, true, 672931828, 1178623988) == 0;
+        assert tfs_hf_safetensors_status(8, 1638400, 672931828, 674570227, true, 674570228, true, 672931828, 1178623988) == TFS_HF_ERR_EXTENT;
+        // The next tensor begins inside it, or a gap follows it.
+        assert tfs_hf_safetensors_status(8, 1638400, 672931828, 674570228, true, 674570000, true, 672931828, 1178623988) == TFS_HF_ERR_EXTENT;
+        assert tfs_hf_safetensors_status(8, 1638400, 672931828, 674570228, true, 674570300, true, 672931828, 1178623988) == TFS_HF_ERR_EXTENT;
+        // A gap before it; as the last tensor, the file must end with it.
+        assert tfs_hf_safetensors_status(8, 1638400, 672931828, 674570228, true, 674570228, true, 672931800, 1178623988) == TFS_HF_ERR_EXTENT;
+        assert tfs_hf_safetensors_status(8, 1638400, 672931828, 674570228, false, 0, true, 672931828, 1178623988) == TFS_HF_ERR_EXTENT;
+        assert tfs_hf_safetensors_status(8, 1638400, 672931828, 674570228, false, 0, true, 672931828, 674570228) == 0;
+        assert tfs_hf_safetensors_status(8, 1638400, 672931828, 674570228, false, 0, true, 672931828, 674570227) == TFS_HF_ERR_EXTENT;
+        assert tfs_hf_safetensors_status(4, 3, 100, 102, false, 0, false, 100, 200) == TFS_HF_ERR_LENGTH;
+        assert tfs_hf_safetensors_status(0, 3, 100, 103, false, 0, false, 100, 200) == TFS_HF_ERR_CONTAINER;
+        // s at [4, 6) of the data section begins inside w at [0, 6).
+        assert tfs_hf_safetensors_status(16, 1, 104, 106, false, 0, true, 106, 106) == TFS_HF_ERR_EXTENT;
+        assert tfs_hf_safetensors_status(16, 1, 106, 108, false, 0, true, 106, 108) == 0;
+        // The first tensor (no tensor below it) must begin at the data section's start.
+        assert tfs_hf_safetensors_status(16, 1, 100, 102, false, 0, false, 100, 102) == 0;
+        assert tfs_hf_safetensors_status(16, 1, 104, 106, false, 0, false, 100, 106) == TFS_HF_ERR_EXTENT;
+        // 2^61 elements of 8 bits are 2^64 bits, which do not fit in 64 bits.
+        assert tfs_hf_safetensors_status(8, 8, 100, 108, false, 0, false, 100, 108) == 0;
+        assert tfs_hf_safetensors_status(8, 2305843009213693952, 100, 108, false, 0, false, 100, 108) == TFS_HF_ERR_LENGTH;
+        assert tfs_hf_safetensors_offset_status(83, 6) == 0;
+        assert tfs_hf_safetensors_offset_status(83, 9223372036854775807) == 0;
+    }
+}

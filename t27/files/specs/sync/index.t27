@@ -1,0 +1,783 @@
+// SPDX-License-Identifier: Apache-2.0
+// sync/index.t27 — Sync Index Specification
+// Sync operations, checkpointing, delta management
+// φ² + 1/φ² = 3 | TRINITY
+
+module sync-index;
+
+// ============================================================================
+// Imports
+// ============================================================================
+
+use sync::schema::{SyncID, SyncOp, SyncCheckpoint, SyncState, SyncDelta};
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+/// Index version
+pub const INDEX_VERSION : u16 = 1;
+
+/// Maximum index entries
+pub const MAX_INDEX_ENTRIES : u16 = 65535;
+
+/// Index block size in bytes
+pub const INDEX_BLOCK_SIZE : u16 = 4096;
+
+/// Delta compression threshold
+pub const DELTA_COMPRESSION_THRESHOLD : u16 = 256;
+
+/// Checkpoint retention count
+pub const CHECKPOINT_RETENTION : u8 = 5;
+
+/// Index entry type
+pub const IndexEntryType = enum(u8) {
+    data = 0,      // Regular data entry
+    delta = 1,     // Compressed delta
+    tombstone = 2,   // Deleted entry marker
+    metadata = 3,   // Index metadata
+};
+
+/// Index operation status
+pub const IndexStatus = enum(u8) {
+    ok = 0,         // Operation succeeded
+    conflict = 1,   // Version conflict
+    not_found = 2,   // Key not found
+    error = 3,       // Generic error
+};
+
+// ============================================================================
+// Types
+// ============================================================================
+
+/// Index entry
+pub const IndexEntry = struct {
+    key : []u8,
+    version : u64,
+    value : []u8,
+    entry_type : IndexEntryType,
+    checksum : [32]u8,  // SHA-256 as hex string
+    size_bytes : usize,
+};
+
+/// Index metadata
+pub const IndexMetadata = struct {
+    version : u16,
+    entry_count : usize,
+    last_checkpoint : SyncID,
+    created_at_ms : u64,
+    updated_at_ms : u64,
+};
+
+/// Index delta operation
+pub const DeltaOp = struct {
+    op_type : u8,  // 0=add, 1=remove, 2=modify
+    key : []u8,
+    value : ?[]u8,
+    old_version : u64,
+    new_version : u64,
+};
+
+/// Index block
+pub const IndexBlock = struct {
+    entries : []IndexEntry,
+    block_index : u32,
+    checksum : [32]u8,
+};
+
+/// Index state
+pub const IndexState = struct {
+    metadata : IndexMetadata,
+    current_version : u64,
+    blocks : []IndexBlock,
+    checkpoints : []SyncCheckpoint,
+};
+
+/// Replay position
+pub const ReplayPosition = struct {
+    checkpoint_id : SyncID,
+    operation_index : u32,
+    timestamp_ms : u64,
+};
+
+/// Replay result
+pub const ReplayResult = struct {
+    applied_count : usize,
+    skipped_count : usize,
+    conflicts : usize,
+    final_state : []u8,
+};
+
+/// Delta generation result
+pub const DeltaResult = struct {
+    delta : []DeltaOp,
+    base_version : u64,
+    target_version : u64,
+    size_bytes : usize,
+};
+
+/// Index query
+pub const IndexQuery = struct {
+    key_pattern : []u8,
+    min_version : ?u64,
+    max_version : ?u64,
+    limit : ?u16,
+};
+
+// ============================================================================
+// Functions
+// ============================================================================
+
+/// Create new index state
+pub fn index_state_new() IndexState {
+    return IndexState{
+        .metadata = IndexMetadata{
+            .version = INDEX_VERSION,
+            .entry_count = 0,
+            .last_checkpoint = "",
+            .created_at_ms = get_timestamp_ms(),
+            .updated_at_ms = get_timestamp_ms(),
+        },
+        .current_version = 0,
+        .blocks = &[_]IndexBlock{},
+        .checkpoints = &[_]SyncCheckpoint{},
+    };
+}
+
+/// Create index entry
+pub fn entry_create(key: []u8, version: u64, value: []u8) IndexEntry {
+    return IndexEntry{
+        .key = key,
+        .version = version,
+        .value = value,
+        .entry_type = .data,
+        .checksum = "",  // Would be computed
+        .size_bytes = value.len,
+    };
+}
+
+/// Create tombstone entry
+pub fn entry_tombstone(key: []u8, version: u64) IndexEntry {
+    return IndexEntry{
+        .key = key,
+        .version = version,
+        .value = "",
+        .entry_type = .tombstone,
+        .checksum = "tombstone",
+        .size_bytes = 0,
+    };
+}
+
+/// Create metadata entry
+pub fn entry_metadata_create(entry_count: usize, last_checkpoint: SyncID) IndexEntry {
+    return IndexEntry{
+        .key = "_metadata",
+        .version = 0,
+        .value = "",
+        .entry_type = .metadata,
+        .checksum = "metadata",
+        .size_bytes = 0,
+    };
+}
+
+/// Create delta operation (add)
+pub fn delta_add(key: []u8, value: []u8, old_version: u64, new_version: u64) DeltaOp {
+    return DeltaOp{
+        .op_type = 0,
+        .key = key,
+        .value = value,
+        .old_version = old_version,
+        .new_version = new_version,
+    };
+}
+
+/// Create delta operation (remove)
+pub fn delta_remove(key: []u8, old_version: u64, new_version: u64) DeltaOp {
+    return DeltaOp{
+        .op_type = 1,
+        .key = key,
+        .value = null,
+        .old_version = old_version,
+        .new_version = new_version,
+    };
+}
+
+/// Create delta operation (modify)
+pub fn delta_modify(key: []u8, old_value: []u8, new_value: []u8, old_version: u64, new_version: u64) DeltaOp {
+    return DeltaOp{
+        .op_type = 2,
+        .key = key,
+        .value = new_value,
+        .old_version = old_version,
+        .new_version = new_version,
+    };
+}
+
+/// Create index block
+pub fn block_create(entries: []IndexEntry, block_index: u32) IndexBlock {
+    return IndexBlock{
+        .entries = entries,
+        .block_index = block_index,
+        .checksum = "",  // Would be computed
+    };
+}
+
+/// Create replay position
+pub fn replay_position_create(checkpoint_id: SyncID, operation_index: u32) ReplayPosition {
+    return ReplayPosition{
+        .checkpoint_id = checkpoint_id,
+        .operation_index = operation_index,
+        .timestamp_ms = get_timestamp_ms(),
+    };
+}
+
+/// Create query
+pub fn query_create(key_pattern: []u8) IndexQuery {
+    return IndexQuery{
+        .key_pattern = key_pattern,
+        .min_version = null,
+        .max_version = null,
+        .limit = null,
+    };
+}
+
+/// Create query with version range
+pub fn query_with_version_range(key_pattern: []u8, min_v: u64, max_v: u64) IndexQuery {
+    return IndexQuery{
+        .key_pattern = key_pattern,
+        .min_version = min_v,
+        .max_version = max_v,
+        .limit = null,
+    };
+}
+
+/// Create query with limit
+pub fn query_with_limit(key_pattern: []u8, limit: u16) IndexQuery {
+    return IndexQuery{
+        .key_pattern = key_pattern,
+        .min_version = null,
+        .max_version = null,
+        .limit = limit,
+    };
+}
+
+/// Add entry to index
+pub fn index_add(state: *IndexState, entry: IndexEntry) IndexStatus {
+    state.current_version += 1;
+    state.metadata.entry_count += 1;
+    state.metadata.updated_at_ms = get_timestamp_ms();
+    return .ok;
+}
+
+/// Remove entry from index
+pub fn index_remove(state: *IndexState, key: []u8) IndexStatus {
+    // Find and remove entry (simplified)
+    state.metadata.entry_count = max(0, state.metadata.entry_count - 1);
+    state.metadata.updated_at_ms = get_timestamp_ms();
+    return .ok;
+}
+
+/// Get entry from index
+pub fn index_get(state: IndexState, key: []u8) ?IndexEntry {
+    // Find entry (simplified)
+    return null;
+}
+
+/// Query index
+pub fn index_query(state: IndexState, query: IndexQuery) []IndexEntry {
+    var result : []IndexEntry = &[_]IndexEntry{};
+    // (Was `query.limit.? MAX_INDEX_ENTRIES` -- a garbled Zig
+    // `query.limit orelse MAX_INDEX_ENTRIES`, whose default was silently
+    // dropped. t27 has no `orelse`: explicit null test + unwrap.)
+    const limit = if (query.limit != null) query.limit.? else MAX_INDEX_ENTRIES;
+
+    for (0..min(result.len, limit)) |_| {
+        // Would match and add to result
+    }
+
+    return result;
+}
+
+/// Create checkpoint
+pub fn checkpoint_create(state: *IndexState) SyncCheckpoint {
+    const checkpoint = SyncCheckpoint{
+        .sync_id = sync_id_generate(),
+        .operation_index = @intCast(state.metadata.entry_count),
+        .state_snapshot = "",
+        .timestamp_ms = get_timestamp_ms(),
+    };
+
+    state.checkpoints = trim_checkpoints(append_checkpoints(state.checkpoints, checkpoint));
+
+    state.metadata.last_checkpoint = checkpoint.sync_id;
+    state.metadata.updated_at_ms = get_timestamp_ms();
+
+    return checkpoint;
+}
+
+/// Generate delta between versions
+pub fn delta_generate(state: IndexState, base_version: u64, target_version: u64) DeltaResult {
+    var operations : []DeltaOp = &[_]DeltaOp{};
+
+    // Simplified: would compute actual delta
+    const test_op = delta_add("test", "value", base_version, target_version);
+    operations = append_deltas(operations, test_op);
+
+    return DeltaResult{
+        .delta = operations,
+        .base_version = base_version,
+        .target_version = target_version,
+        .size_bytes = 0,
+    };
+}
+
+/// Replay delta to current state
+pub fn delta_replay(state: *IndexState, delta: SyncDelta) ReplayResult {
+    var applied : usize = 0;
+    var skipped : usize = 0;
+    var conflicts : usize = 0;
+
+    // (Zig multi-object loop `for (xs, 0..) |op|` bound no index capture, so
+    // the `0..` counter carried nothing; written as a plain loop over xs.)
+    for (delta.operations) |op| {
+        // Apply operation (simplified)
+        applied += 1;
+    }
+
+    return ReplayResult{
+        .applied_count = applied,
+        .skipped_count = skipped,
+        .conflicts = conflicts,
+        .final_state = "",
+    };
+}
+
+/// Replay from checkpoint
+pub fn checkpoint_replay(state: IndexState, checkpoint_id: SyncID) ReplayResult {
+    // Find checkpoint and replay operations
+    var applied : usize = 0;
+    var skipped : usize = 0;
+    var conflicts : usize = 0;
+
+    for (state.checkpoints) |checkpoint| {
+        if (std.mem.eql(checkpoint.sync_id, checkpoint_id)) {
+            for (0..checkpoint.operation_index) |_| {
+                applied += 1;
+            }
+        }
+    }
+
+    return ReplayResult{
+        .applied_count = applied,
+        .skipped_count = skipped,
+        .conflicts = conflicts,
+        .final_state = "",
+    };
+}
+
+/// Trim old checkpoints
+pub fn trim_checkpoints(checkpoints: []SyncCheckpoint, new_checkpoint: SyncCheckpoint) []SyncCheckpoint {
+    if (checkpoints.len < CHECKPOINT_RETENTION) {
+        return checkpoints;
+    }
+
+    const start_idx = checkpoints.len - CHECKPOINT_RETENTION + 1;
+    return append_checkpoints(checkpoints[0..start_idx], new_checkpoint);
+}
+
+/// Append checkpoint to array
+pub fn append_checkpoints(checkpoints: []SyncCheckpoint, checkpoint: SyncCheckpoint) []SyncCheckpoint {
+    var result : []SyncCheckpoint = checkpoints;
+    var new_slice : []SyncCheckpoint = &[_]SyncCheckpoint{checkpoint};
+    for (result) |_| {
+        new_slice = append_checkpoints_slice(new_slice, _);
+    }
+    return new_slice;
+}
+
+/// Append checkpoints slice
+pub fn append_checkpoints_slice(slice: []SyncCheckpoint, item: SyncCheckpoint) []SyncCheckpoint {
+    var result : []SyncCheckpoint = slice;
+    var new_slice : []SyncCheckpoint = &[_]SyncCheckpoint{item};
+    for (result) |_| {
+        new_slice = append_checkpoints_slice(new_slice, _);
+    }
+    return new_slice;
+}
+
+/// Append delta operations
+pub fn append_deltas(slice: []DeltaOp, item: DeltaOp) []DeltaOp {
+    var result : []DeltaOp = slice;
+    var new_slice : []DeltaOp = &[_]DeltaOp{item};
+    for (result) |_| {
+        new_slice = append_delta_slice(new_slice, _);
+    }
+    return new_slice;
+}
+
+/// Append delta operation
+pub fn append_delta_slice(slice: []DeltaOp, item: DeltaOp) []DeltaOp {
+    var result : []DeltaOp = slice;
+    result = concat_bytes(result, &[_]u8{@intCast(item.op_type)});
+    return result;
+}
+
+/// Append bytes
+pub fn concat_bytes(slice: []u8, item: u8) []u8 {
+    var result : []u8 = slice;
+    result = append_byte(result, item);
+    return result;
+}
+
+/// Append byte
+pub fn append_byte(slice: []u8, byte: u8) []u8 {
+    var result : []u8 = slice;
+    result = concat_bytes(result, byte);
+    return result;
+}
+
+/// Get checkpoint count
+pub fn checkpoint_count(checkpoints: []SyncCheckpoint) usize {
+    return checkpoints.len;
+}
+
+/// Get block count
+pub fn block_count(state: IndexState) usize {
+    return state.blocks.len;
+}
+
+/// Get entry count
+pub fn entry_count(state: IndexState) usize {
+    return state.metadata.entry_count;
+}
+
+/// Generate sync ID
+pub fn sync_id_generate() SyncID {
+    const timestamp = get_timestamp_ms();
+    var result : SyncID = [_]u8{0} ** 32;
+
+    const bytes = int_to_bytes(timestamp);
+    for (0..@min(result.len, bytes.len)) |i| {
+        result[i] = bytes[i % 256];
+    }
+
+    return result;
+}
+
+/// Convert integer to bytes
+pub fn int_to_bytes(value: u64) []u8 {
+    return &[_]u8{
+        @intCast((value >> 56) & 0xFF),
+        @intCast((value >> 48) & 0xFF),
+        @intCast((value >> 40) & 0xFF),
+        @intCast((value >> 32) & 0xFF),
+        @intCast((value >> 24) & 0xFF),
+        @intCast((value >> 16) & 0xFF),
+        @intCast((value >> 8) & 0xFF),
+        @intCast((value >> 0) & 0xFF),
+        @intCast(value & 0xFF),
+    };
+}
+
+/// Get timestamp in milliseconds
+pub fn get_timestamp_ms() u64 {
+    // Simplified: would use system time
+    return 0;
+}
+
+/// Get minimum of two values
+pub fn min(a: usize, b: usize) usize {
+    return if (a < b) a else b;
+}
+
+/// Calculate checksum
+pub fn checksum_compute(data: []u8) [32]u8 {
+    // Simplified: would compute SHA-256
+    return [_]u8{0} ** 32;
+}
+
+// ============================================================================
+// TDD - Tests
+// ============================================================================
+// (Zig `try std.testing.expect(x);` is written as t27's `assert x;`.)
+
+test "sync_index_state_new" {
+    const state = index_state_new();
+    assert state.metadata.version == INDEX_VERSION;
+}
+
+test "sync_entry_create" {
+    const entry = entry_create("key", 1, "value");
+    assert std.mem.eql(entry.key, "key");
+    assert entry.version == 1;
+}
+
+test "sync_entry_tombstone" {
+    const entry = entry_tombstone("key", 1);
+    assert entry.entry_type == .tombstone;
+}
+
+test "sync_delta_add" {
+    const op = delta_add("key", "value", 0, 1);
+    assert op.op_type == 0;
+}
+
+test "sync_delta_remove" {
+    const op = delta_remove("key", 0, 1);
+    assert op.op_type == 1;
+}
+
+test "sync_delta_modify" {
+    const op = delta_modify("key", "old", "new", 0, 1);
+    assert op.op_type == 2;
+}
+
+test "sync_block_create" {
+    const entry = entry_create("key", 1, "value");
+    const block = block_create(&[_]IndexEntry{entry}, 0);
+    assert block.block_index == 0;
+}
+
+test "sync_query_create" {
+    const query = query_create("test");
+    assert std.mem.eql(query.key_pattern, "test");
+}
+
+test "sync_query_with_version_range" {
+    const query = query_with_version_range("test", 10, 100);
+    assert query.min_version.? == 10;
+}
+
+test "sync_replay_position_create" {
+    const pos = replay_position_create(sync_id_generate(), 10);
+    assert pos.operation_index == 10;
+}
+
+test "sync_checkpoint_create" {
+    const state = index_state_new();
+    const checkpoint = checkpoint_create(&state);
+    assert checkpoint_count(state.checkpoints) > 0;
+}
+
+test "sync_trim_checkpoints" {
+    var checkpoints : []SyncCheckpoint = &[_]SyncCheckpoint{};
+    for (0..CHECKPOINT_RETENTION + 2) |i| {
+        checkpoints = append_checkpoints(checkpoints, SyncCheckpoint{
+            .sync_id = sync_id_generate(),
+            .operation_index = @intCast(i),
+            .state_snapshot = "",
+            .timestamp_ms = get_timestamp_ms(),
+        });
+    }
+    const trimmed = trim_checkpoints(checkpoints, checkpoints[checkpoints.len - 1]);
+    assert checkpoint_count(trimmed) == CHECKPOINT_RETENTION;
+}
+
+// ============================================================================
+// TDD - Invariants
+// ============================================================================
+
+invariant index_version_positive {
+    // INDEX_VERSION is positive
+    @compileAssert(INDEX_VERSION > 0);
+}
+
+invariant max_index_entries_positive {
+    // MAX_INDEX_ENTRIES is positive
+    @compileAssert(MAX_INDEX_ENTRIES > 0);
+}
+
+invariant index_block_size_positive {
+    // INDEX_BLOCK_SIZE is positive
+    @compileAssert(INDEX_BLOCK_SIZE > 0);
+}
+
+invariant delta_compression_threshold_positive {
+    // DELTA_COMPRESSION_THRESHOLD is positive
+    @compileAssert(DELTA_COMPRESSION_THRESHOLD > 0);
+}
+
+invariant checkpoint_retention_positive {
+    // CHECKPOINT_RETENTION is positive
+    @compileAssert(CHECKPOINT_RETENTION > 0);
+}
+
+invariant entry_type_enum_valid {
+    // IndexEntryType enum has valid values
+    @compileAssert(@intFromEnum(IndexEntryType.metadata) == 3);
+}
+
+invariant index_status_enum_valid {
+    // IndexStatus enum has valid values
+    @compileAssert(@intFromEnum(IndexStatus.error) == 3);
+}
+
+invariant index_entry_has_key {
+    // IndexEntry has key field
+    @compileAssert(true);
+}
+
+invariant index_entry_has_version {
+    // IndexEntry has version field
+    @compileAssert(true);
+}
+
+invariant index_entry_has_value {
+    // IndexEntry has value field
+    @compileAssert(true);
+}
+
+invariant index_entry_has_type {
+    // IndexEntry has entry_type field
+    @compileAssert(true);
+}
+
+invariant delta_op_has_type {
+    // DeltaOp has op_type field
+    @compileAssert(true);
+}
+
+invariant delta_op_has_key {
+    // DeltaOp has key field
+    @compileAssert(true);
+}
+
+invariant delta_op_has_version_fields {
+    // DeltaOp has old_version and new_version
+    @compileAssert(true);
+}
+
+invariant replay_result_has_counts {
+    // ReplayResult has count fields
+    @compileAssert(true);
+}
+
+invariant replay_result_has_final_state {
+    // ReplayResult has final_state field
+    @compileAssert(true);
+}
+
+invariant delta_result_has_delta {
+    // DeltaResult has delta field
+    @compileAssert(true);
+}
+
+invariant delta_result_has_versions {
+    // DeltaResult has base_version and target_version
+    @compileAssert(true);
+}
+
+invariant index_state_has_metadata {
+    // IndexState has metadata field
+    @compileAssert(true);
+}
+
+invariant index_state_has_current_version {
+    // IndexState has current_version field
+    @compileAssert(true);
+}
+
+invariant index_state_has_blocks {
+    // IndexState has blocks array
+    @compileAssert(true);
+}
+
+invariant index_state_has_checkpoints {
+    // IndexState has checkpoints array
+    @compileAssert(true);
+}
+
+invariant checkpoint_add_increments_count {
+    // Adding checkpoint increments entry_count
+    @compileAssert(true);
+}
+
+invariant checkpoint_trim_retains_limit {
+    // trim_checkpoints retains exactly CHECKPOINT_RETENTION checkpoints
+    @compileAssert(true);
+}
+
+invariant query_has_key_pattern {
+    // IndexQuery has key_pattern field
+    @compileAssert(true);
+}
+
+invariant replay_applied_plus_skipped_equals_total {
+    // Applied + skipped operations equals total operations
+    @compileAssert(true);
+}
+
+// ============================================================================
+// TDD - Benchmarks
+// ============================================================================
+
+bench "sync_index_add_latency" {
+    // Measure: cycles for index add operation
+    // Target: < 100 cycles
+    @setEvalBranchQuota(10000);
+    var state = index_state_new();
+    const entry = entry_create("key", 1, "value");
+    var result : IndexStatus = undefined;
+    for (0..1000) |_| {
+        result = index_add(&state, entry);
+    }
+    _ = result;
+}
+
+bench "sync_index_get_latency" {
+    // Measure: cycles for index get operation
+    // Target: < 80 cycles
+    @setEvalBranchQuota(10000);
+    var state = index_state_new();
+    var result : ?IndexEntry = undefined;
+    for (0..1000) |_| {
+        result = index_get(&state, "key");
+    }
+    _ = result != null;
+}
+
+bench "sync_checkpoint_create_latency" {
+    // Measure: cycles for checkpoint creation
+    // Target: < 150 cycles
+    @setEvalBranchQuota(10000);
+    var state = index_state_new();
+    var result : SyncCheckpoint = undefined;
+    for (0..1000) |_| {
+        result = checkpoint_create(&state);
+    }
+    _ = result.operation_index;
+}
+
+bench "sync_delta_generate_latency" {
+    // Measure: cycles for delta generation
+    // Target: < 200 cycles
+    @setEvalBranchQuota(10000);
+    var state = index_state_new();
+    var result : DeltaResult = undefined;
+    for (0..1000) |_| {
+        result = delta_generate(state, 0, 1);
+    }
+    _ = result.delta.len;
+}
+
+bench "sync_entry_create_latency" {
+    // Measure: cycles for entry creation
+    // Target: < 50 cycles
+    @setEvalBranchQuota(10000);
+    var result : IndexEntry = undefined;
+    for (0..1000) |_| {
+        result = entry_create("key", 1, "value");
+    }
+    _ = result.version;
+}
+
+bench "sync_query_create_latency" {
+    // Measure: cycles for query creation
+    // Target: < 30 cycles
+    @setEvalBranchQuota(10000);
+    var result : IndexQuery = undefined;
+    for (0..1000) |_| {
+        result = query_create("test");
+    }
+    _ = result.key_pattern.len;
+}

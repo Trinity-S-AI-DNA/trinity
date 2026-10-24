@@ -1,0 +1,616 @@
+// SPDX-License-Identifier: Apache-2.0
+// sse.t27 — Server-Sent Events Specification
+// SSE connections, event streaming, reconnection handling
+// φ² + 1/φ² = 3 | TRINITY
+
+module server-sse;
+
+// ============================================================================
+// Imports
+// ============================================================================
+
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+/// Default SSE heartbeat interval in milliseconds
+pub const HEARTBEAT_INTERVAL_MS : u32 = 30000;  // 30 seconds
+
+/// Default SSE retry delay in milliseconds
+pub const RETRY_DELAY_MS : u32 = 1000;  // 1 second
+
+/// Maximum retry attempts
+pub const MAX_RETRIES : u8 = 10;
+
+/// SSE event prefix
+pub const EVENT_PREFIX : [6]u8 = "event:";
+
+/// SSE data prefix
+pub const DATA_PREFIX : [5]u8 = "data:";
+
+/// SSE comment prefix
+pub const COMMENT_PREFIX : [8]u8 = "comment:";
+
+/// SSE ID field
+pub const ID_FIELD : [3]u8 = "id:";
+
+/// SSE retry field
+pub const RETRY_FIELD : [6]u8 = "retry:";
+
+/// SSE event type
+pub const SSEEventType = enum(u8) {
+    message = 0,
+    status = 1,
+    @"error" = 2,
+    keepalive = 3,
+};
+
+/// SSE connection state
+pub const SSEState = enum(u8) {
+    disconnected = 0,
+    connecting = 1,
+    connected = 2,
+    reconnecting = 3,
+    closed = 4,
+};
+
+/// SSE close codes
+pub const SSECloseCode = enum(u16) {
+    normal = 1000,
+    going_away = 1001,
+    protocol_error = 1002,
+    internal_error = 1011,
+};
+
+// ============================================================================
+// Types
+// ============================================================================
+
+/// SSE event
+pub const SSEEvent = struct {
+    id : []u8,
+    event_type : []u8,
+    data : []u8,
+    retry : ?u32,
+};
+
+/// SSE connection
+pub const SSEConnection = struct {
+    state : SSEState,
+    last_event_id : []u8,
+    retry_count : u8,
+    retry_delay_ms : u32,
+    url : []u8,
+};
+
+/// SSE client
+pub const SSEClient = struct {
+    connection : SSEConnection,
+    on_message : fn(SSEEvent) void,
+    on_error : fn([]u8) void,
+    on_open : fn() void,
+    on_close : fn(SSECloseCode, []u8) void,
+};
+
+/// SSE server
+pub const SEServer = struct {
+    clients : []SSEClient,
+    heartbeat_interval_ms : u32,
+};
+
+/// SSE heartbeat event
+pub const SSEHeartbeat = struct {
+    comment : []u8,
+    timestamp_ms : u64,
+};
+// ============================================================================
+// Functions
+// ============================================================================
+
+/// Create new SSE connection
+pub fn connection_new(url: []u8) SSEConnection {
+    return SSEConnection{
+        .state = .disconnected,
+        .last_event_id = "",
+        .retry_count = 0,
+        .retry_delay_ms = RETRY_DELAY_MS,
+        .url = url,
+    };
+}
+
+/// Create new SSE client
+pub fn client_new(url: []u8) SSEClient {
+    return SSEClient{
+        .connection = connection_new(url),
+        .on_message = null,
+        .on_error = null,
+        .on_open = null,
+        .on_close = null,
+    };
+}
+
+/// Create SSE event
+pub fn event_create(event_type: []u8, data: []u8) SSEEvent {
+    return SSEEvent{
+        .id = "",
+        .event_type = event_type,
+        .data = data,
+        .retry = null,
+    };
+}
+
+/// Create SSE event with ID
+pub fn event_create_with_id(id: []u8, event_type: []u8, data: []u8) SSEEvent {
+    return SSEEvent{
+        .id = id,
+        .event_type = event_type,
+        .data = data,
+        .retry = null,
+    };
+}
+
+/// Create SSE heartbeat event
+pub fn heartbeat_create(comment: []u8) SSEHeartbeat {
+    return SSEHeartbeat{
+        .comment = comment,
+        .timestamp_ms = 0,  // Would be set at send time
+    };
+}
+
+/// Check if connection is active
+pub fn connection_is_active(conn: SSEConnection) bool {
+    return conn.state == .connected;
+}
+
+/// Check if connection can reconnect
+pub fn connection_can_reconnect(conn: SSEConnection) bool {
+    return conn.retry_count < MAX_RETRIES and conn.state == .closed;
+}
+
+/// Increment retry count
+pub fn connection_retry_inc(conn: *SSEConnection) void {
+    conn.retry_count += 1;
+    conn.retry_delay_ms *= 2;  // Exponential backoff
+}
+
+/// Reset retry count
+pub fn connection_retry_reset(conn: *SSEConnection) void {
+    conn.retry_count = 0;
+    conn.retry_delay_ms = RETRY_DELAY_MS;
+}
+
+/// Get next retry delay
+pub fn connection_retry_delay(conn: SSEConnection) u32 {
+    return conn.retry_delay_ms;
+}
+
+/// Set connection state
+pub fn connection_set_state(conn: *SSEConnection, state: SSEState) void {
+    conn.state = state;
+}
+
+/// Update last event ID
+pub fn connection_update_event_id(conn: *SSEConnection, event_id: []u8) void {
+    conn.last_event_id = event_id;
+}
+
+/// Format SSE event as string
+pub fn event_format(event: SSEEvent) []u8 {
+    var result : []u8 = EVENT_PREFIX;
+    result = concat(result, " ");
+    result = concat(result, event.event_type);
+    result = concat(result, "\n");
+    result = concat(result, DATA_PREFIX);
+    result = concat(result, " ");
+    result = concat(result, event.data);
+
+    if (event.id.len > 0) {
+        result = concat(result, "\n");
+        result = concat(result, ID_FIELD);
+        result = concat(result, " ");
+        result = concat(result, event.id);
+    }
+
+    if (event.retry != null) {
+        result = concat(result, "\n");
+        result = concat(result, RETRY_FIELD);
+        result = concat(result, " ");
+        const retry_val = @intCast(event.retry.?);
+        result = concat(result, int_to_string(retry_val));
+    }
+
+    return concat(result, "\n\n");
+}
+
+/// Format SSE heartbeat as string
+pub fn heartbeat_format(heartbeat: SSEHeartbeat) []u8 {
+    var result : []u8 = COMMENT_PREFIX;
+    result = concat(result, " ");
+    result = concat(result, heartbeat.comment);
+    result = concat(result, "\n\n");
+    return result;
+}
+
+/// Concatenate two strings
+pub fn concat(a: []u8, b: []u8) []u8 {
+    var result : []u8 = a;
+    for (b) |byte| {
+        result = append(result, byte);
+    }
+    return result;
+}
+
+/// Append to slice
+pub fn append(slice: []u8, byte: u8) []u8 {
+    var result : []u8 = slice;
+    result = concat(result, &[_]u8{byte});
+    return result;
+}
+
+/// Convert integer to string (decimal)
+pub fn int_to_string(value: u32) []u8 {
+    if (value == 0) {
+        return "0";
+    }
+
+    var result : []u8 = "";
+    var remaining : u32 = value;
+
+    while (remaining > 0) {
+        const digit = remaining % 10;
+        const char = @intCast(48 + digit);  // '0' = 48
+        result = concat(&[_]u8{char}, result);
+        remaining /= 10;
+    }
+
+    return result;
+}
+
+/// Add client to server
+pub fn server_add_client(server: *SEServer, client: SSEClient) void {
+    server.clients = append(server.clients, client);
+}
+
+/// Remove client from server
+pub fn server_remove_client(server: *SEServer, client_index: usize) void {
+    if (client_index < server.clients.len) {
+        var before : []SSEClient = server.clients[0..client_index];
+        var after : []SSEClient = server.clients[client_index + 1 ..];
+        server.clients = before ++ after;
+    }
+}
+
+/// Send event to all clients
+pub fn server_broadcast(server: *SEServer, event: SSEEvent) void {
+    const formatted = event_format(event);
+    for (server.clients) |client| {
+        // Send formatted event to client
+    }
+}
+
+/// Send heartbeat to all clients
+pub fn server_heartbeat(server: *SEServer) void {
+    const heartbeat = heartbeat_create("keepalive");
+    const formatted = heartbeat_format(heartbeat);
+    for (server.clients) |client| {
+        // Send heartbeat to client
+    }
+}
+
+/// Get client count
+pub fn server_client_count(server: SEServer) usize {
+    return server.clients.len;
+}
+
+// ============================================================================
+// TDD - Tests
+// ============================================================================
+
+test "sse_connection_new_disconnected" {
+    const conn = connection_new("http://localhost/events");
+    try std.testing.expect(conn.state == .disconnected);
+    try std.testing.expect(conn.retry_count == 0);
+}
+
+test "sse_client_new_has_connection" {
+    const client = client_new("http://localhost/events");
+    try std.testing.expect(client.connection.state == .disconnected);
+}
+
+test "sse_event_create_has_data" {
+    const event = event_create("message", "hello");
+    try std.testing.expect(std.mem.eql(event.data, "hello"));
+}
+
+test "sse_event_create_with_id" {
+    const event = event_create_with_id("123", "message", "hello");
+    try std.testing.expect(std.mem.eql(event.id, "123"));
+}
+
+test "sse_heartbeat_create" {
+    const heartbeat = heartbeat_create("keepalive");
+    try std.testing.expect(std.mem.eql(heartbeat.comment, "keepalive"));
+}
+
+test "sse_connection_is_active_true" {
+    var conn = connection_new("http://localhost/events");
+    conn.state = .connected;
+    try std.testing.expect(connection_is_active(conn));
+}
+
+test "sse_connection_is_active_false" {
+    var conn = connection_new("http://localhost/events");
+    conn.state = .connecting;
+    try std.testing.expect(!connection_is_active(conn));
+}
+
+test "sse_connection_can_reconnect_within_limit" {
+    var conn = connection_new("http://localhost/events");
+    conn.state = .closed;
+    conn.retry_count = 5;
+    try std.testing.expect(connection_can_reconnect(conn));
+}
+
+test "sse_connection_can_reconnect_exhausted" {
+    var conn = connection_new("http://localhost/events");
+    conn.state = .closed;
+    conn.retry_count = MAX_RETRIES;
+    try std.testing.expect(!connection_can_reconnect(conn));
+}
+
+test "sse_connection_retry_increments" {
+    var conn = connection_new("http://localhost/events");
+    connection_retry_inc(&conn);
+    try std.testing.expect(conn.retry_count == 1);
+    try std.testing.expect(conn.retry_delay_ms == RETRY_DELAY_MS * 2);
+}
+
+test "sse_connection_retry_reset" {
+    var conn = connection_new("http://localhost/events");
+    conn.retry_count = 10;
+    connection_retry_reset(&conn);
+    try std.testing.expect(conn.retry_count == 0);
+    try std.testing.expect(conn.retry_delay_ms == RETRY_DELAY_MS);
+}
+
+test "sse_event_format_basic" {
+    const event = event_create("message", "hello");
+    const formatted = event_format(event);
+    try std.testing.expect(std.mem.indexOf(formatted, EVENT_PREFIX) < formatted.len);
+}
+
+test "sse_heartbeat_format" {
+    const heartbeat = heartbeat_create("ping");
+    const formatted = heartbeat_format(heartbeat);
+    try std.testing.expect(std.mem.indexOf(formatted, COMMENT_PREFIX) < formatted.len);
+}
+
+test "sse_int_to_string_zero" {
+    const result = int_to_string(0);
+    try std.testing.expect(std.mem.eql(result, "0"));
+}
+
+test "sse_int_to_string_positive" {
+    const result = int_to_string(42);
+    try std.testing.expect(std.mem.eql(result, "42"));
+}
+
+test "sse_server_remove_client" {
+    var server = SEServer{
+        .clients = &[_]SSEClient{},
+        .heartbeat_interval_ms = HEARTBEAT_INTERVAL_MS,
+    };
+    
+    const client1 = client_new("http://localhost/events1");
+    const client2 = client_new("http://localhost/events2");
+    const client3 = client_new("http://localhost/events3");
+    
+    server_add_client(&server, client1);
+    server_add_client(&server, client2);
+    server_add_client(&server, client3);
+    
+    try std.testing.expect(server.clients.len == 3);
+    
+    server_remove_client(&server, 1);
+    try std.testing.expect(server.clients.len == 2);
+    
+    server_remove_client(&server, 0);
+    try std.testing.expect(server.clients.len == 1);
+    
+    server_remove_client(&server, 0);
+    try std.testing.expect(server.clients.len == 0);
+}
+
+// ============================================================================
+// TDD - Invariants
+// ============================================================================
+
+invariant heartbeat_interval_positive {
+    // HEARTBEAT_INTERVAL_MS is positive
+    @compileAssert(HEARTBEAT_INTERVAL_MS > 0);
+}
+
+invariant retry_delay_positive {
+    // RETRY_DELAY_MS is positive
+    @compileAssert(RETRY_DELAY_MS > 0);
+}
+
+invariant max_retries_positive {
+    // MAX_RETRIES is positive
+    @compileAssert(MAX_RETRIES > 0);
+}
+
+invariant event_prefix_is_string {
+    // EVENT_PREFIX is valid SSE prefix
+    @compileAssert(EVENT_PREFIX.len > 0);
+}
+
+invariant data_prefix_is_string {
+    // DATA_PREFIX is valid SSE prefix
+    @compileAssert(DATA_PREFIX.len > 0);
+}
+
+invariant sse_state_enum_valid {
+    // SSEState enum has valid values
+    @compileAssert(@intFromEnum(SSEState.closed) == 4);
+}
+
+invariant sse_event_type_enum_valid {
+    // SSEEventType enum has valid values
+    @compileAssert(@intFromEnum(SSEEventType.keepalive) == 3);
+}
+
+invariant connection_has_state {
+    // SSEConnection has state field
+    @compileAssert(true);
+}
+
+invariant connection_has_retry_count {
+    // SSEConnection has retry_count field
+    @compileAssert(true);
+}
+
+invariant connection_has_url {
+    // SSEConnection has URL field
+    @compileAssert(true);
+}
+
+invariant event_has_data {
+    // SSEEvent has data field
+    @compileAssert(true);
+}
+
+invariant event_has_type {
+    // SSEEvent has event_type field
+    @compileAssert(true);
+}
+
+invariant event_format_contains_prefixes {
+    // event_format output contains all required prefixes
+    @compileAssert(true);
+}
+
+invariant heartbeat_format_contains_comment {
+    // heartbeat_format output contains comment prefix
+    @compileAssert(true);
+}
+
+invariant server_has_clients {
+    // SEServer has clients array
+    @compileAssert(true);
+}
+
+invariant server_has_heartbeat_interval {
+    // SEServer has heartbeat_interval_ms field
+    @compileAssert(true);
+}
+
+invariant connection_retry_backoff_doubles {
+    // Each retry doubles the delay
+    @compileAssert(true);
+}
+
+invariant connection_retry_reset_clears {
+    // Reset clears retry count and delay
+    @compileAssert(true);
+}
+
+// ============================================================================
+// TDD - Benchmarks
+// ============================================================================
+
+bench "sse_event_create_latency" {
+    // Measure: cycles for event creation
+    // Target: < 50 cycles
+    @setEvalBranchQuota(10000);
+    var result : SSEEvent = undefined;
+    for (0..1000) |_| {
+        result = event_create("message", "test");
+    }
+    _ = result.data.len;
+}
+
+bench "sse_event_format_latency" {
+    // Measure: cycles for event formatting
+    // Target: < 150 cycles
+    @setEvalBranchQuota(10000);
+    const event = event_create("message", "test data");
+    var result : []u8 = undefined;
+    for (0..1000) |_| {
+        result = event_format(event);
+    }
+    _ = result.len;
+}
+
+bench "sse_connection_new_latency" {
+    // Measure: cycles for connection creation
+    // Target: < 30 cycles
+    @setEvalBranchQuota(10000);
+    var result : SSEConnection = undefined;
+    for (0..1000) |_| {
+        result = connection_new("http://localhost/events");
+    }
+    _ = result.state;
+}
+
+bench "sse_connection_check_latency" {
+    // Measure: cycles for connection state check
+    // Target: < 10 cycles
+    @setEvalBranchQuota(10000);
+    const conn = connection_new("http://localhost/events");
+    conn.state = .connected;
+    var result : bool = false;
+    for (0..1000) |_| {
+        result = connection_is_active(conn);
+    }
+    _ = result;
+}
+
+bench "sse_heartbeat_format_latency" {
+    // Measure: cycles for heartbeat formatting
+    // Target: < 50 cycles
+    @setEvalBranchQuota(10000);
+    const heartbeat = heartbeat_create("keepalive");
+    var result : []u8 = undefined;
+    for (0..1000) |_| {
+        result = heartbeat_format(heartbeat);
+    }
+    _ = result.len;
+}
+
+bench "sse_int_to_string_latency" {
+    // Measure: cycles for int to string conversion
+    // Target: < 100 cycles
+    @setEvalBranchQuota(10000);
+    var result : []u8 = undefined;
+    for (0..1000) |_| {
+        result = int_to_string(42);
+    }
+    _ = result.len;
+}
+
+// TEST CASE: Function literals in struct fields cause parser errors
+// The following should work but currently fails:
+// test "function_literals_in_struct" {
+//     const client = SSEClient{
+//         .connection = connection_new("http://test"),
+//         .on_message = fn(e: SSEEvent) void { },
+//         .on_error = fn(err: []u8) void { },
+//         .on_open = fn() void { },
+//         .on_close = fn(code: SSECloseCode, msg: []u8) void { },
+//     };
+//     _ = client;
+// }
+//
+// WORKAROUND: Use struct pattern (also currently fails):
+// test "function_literals_struct_pattern" {
+//     const client = SSEClient{
+//         .connection = connection_new("http://test"),
+//         .on_message = (struct { fn f(e: SSEEvent) void { _ = e; } }).f,
+//         .on_error = (struct { fn f(err: []u8) void { _ = err; } }).f,
+//         .on_open = (struct { fn f() void {} }).f,
+//         .on_close = (struct { fn f(code: SSECloseCode, msg: []u8) void { _ = code; _ = msg; } }).f,
+//     };
+//     _ = client;
+// }

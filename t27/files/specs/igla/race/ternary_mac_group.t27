@@ -1,0 +1,238 @@
+// SPDX-License-Identifier: Apache-2.0
+// t27/specs/igla/race/ternary_mac_group.t27
+// Eight ternary lanes sharing ONE wide accumulator -- the mu > 1 point.
+//
+// WHY THIS EXISTS.  W806 measured `specs/igla/race/ternary_mac.t27` at
+// **66 LUT, 20 CARRY4, 0 DSP48E1** for a single runtime-weight ternary MAC
+// (T499). Against the 2026 state of the art -- arXiv:2604.25183 at 19.27 LUT per
+// multiply, INT8 activations, runtime weights -- that is 3.4x behind, and the
+// 20 CARRY4 cells say exactly where the money goes: the 32-bit accumulator.
+//
+// THE COMPETITOR'S OWN MODEL SAYS WHY, and it says it in our favour (T499a).
+// Their axis is not activation width, it is a RATIO:
+//
+//     a_add ~ a_mux + a_inv   ->  grouping buys little   (their INT8 case)
+//     a_add >> a_mux + a_inv  ->  grouping buys a lot    (their FP16 case)
+//
+// Our adder is 32 bits wide; our per-lane work is a ternary select over an 8-bit
+// activation, which is nearly free. That is a HIGH ratio, so we sit in the
+// regime where grouping pays MOST -- and `ternary_mac.t27` sits at mu = 1, the
+// worst point of the space they mapped.
+//
+// THE MECHANISM, stated so the measurement can refute it. Eight products of an
+// i8 activation by a ternary weight each fit in i8; their sum fits easily in
+// i16, because 8 * 128 = 1024 and i16 reaches 32767. So the group can be reduced
+// in NARROW arithmetic and folded into the wide accumulator with ONE 32-bit add
+// instead of eight:
+//
+//     cost/mul  ~=  select_per_lane  +  wide_adder / mu
+//
+// REGISTERED FORECAST (T44, recorded in T499b BEFORE this file was written):
+//   (1) per-multiply LUT cost falls below 30, i.e. more than halves from 66;
+//   (2) CARRY4 per multiply falls by roughly mu;
+//   (3) it does NOT reach 19.27, because that figure is at INT8 with a narrower
+//       accumulator and this one keeps 32 bits.
+//   REFUTATION: cost/mul above 45 means the adder is not the dominant term and
+//   T499a's reading of the ratio is wrong.
+//
+// NO MULTIPLICATION APPEARS ANYWHERE, including in the lane indexing: the code
+// field of each lane is extracted by a constant shift written out per lane,
+// because `lane * 2` would put a `*` in generated assignments and this family of
+// specs does not do that.
+//
+// phi^2 + 1/phi^2 = 3 | TRINITY
+
+module IglaRaceTernaryMacGroup {
+    use base::types;
+
+    // ---- Geometry ----
+
+    const GROUP_SIZE : u32 = 8;      // mu
+    const CODE_BITS  : u32 = 2;      // bits per ternary weight
+    const CODES_WIDTH: u32 = 16;     // GROUP_SIZE * CODE_BITS, written out
+
+    // The GFTernary alphabet, pinned to specs/numeric/gfternary.t27.
+    const GAT_ZERO : u8 = 0;
+    const GAT_POS  : u8 = 1;
+    const GAT_NEG  : u8 = 2;
+
+    // Bound on the narrow sum: eight products of magnitude at most 128.
+    const MAX_ABS_PRODUCT : i32 = 128;
+    const MAX_ABS_SUM     : i32 = 1024;   // GROUP_SIZE * MAX_ABS_PRODUCT
+    const I16_MAX         : i32 = 32767;
+
+    // ---- One lane ----
+
+    /// Ternary select: +a, -a, or nothing. No multiply, no adder.
+    /// Codes outside the alphabet yield zero, exactly as `ternary_decode` does
+    /// in specs/igla/race/ternary_mac.t27 -- the two must not disagree.
+    fn lane_select(a: i8, code: u8) -> i8 {
+        if (code == GAT_POS) { return a; }
+        if (code == GAT_NEG) { return 0 -% a; }
+        return 0;
+    }
+
+    // ---- Code extraction, one constant shift per lane ----
+
+    fn code_0(c: u16) -> u8 { return ((c & 3) as u8); }
+    fn code_1(c: u16) -> u8 { return (((c >> 2) & 3) as u8); }
+    fn code_2(c: u16) -> u8 { return (((c >> 4) & 3) as u8); }
+    fn code_3(c: u16) -> u8 { return (((c >> 6) & 3) as u8); }
+    fn code_4(c: u16) -> u8 { return (((c >> 8) & 3) as u8); }
+    fn code_5(c: u16) -> u8 { return (((c >> 10) & 3) as u8); }
+    fn code_6(c: u16) -> u8 { return (((c >> 12) & 3) as u8); }
+    fn code_7(c: u16) -> u8 { return (((c >> 14) & 3) as u8); }
+
+    // ---- The narrow reduction: this is the whole point ----
+
+    /// Sum eight ternary products in i16. Cannot overflow -- see MAX_ABS_SUM.
+    /// The wide accumulator is NOT touched here; that is what makes the wide
+    /// adder shareable across the group.
+    fn group_sum(a0: i8, a1: i8, a2: i8, a3: i8,
+                 a4: i8, a5: i8, a6: i8, a7: i8, codes: u16) -> i16 {
+        let p0 = (lane_select(a0, code_0(codes)) as i16);
+        let p1 = (lane_select(a1, code_1(codes)) as i16);
+        let p2 = (lane_select(a2, code_2(codes)) as i16);
+        let p3 = (lane_select(a3, code_3(codes)) as i16);
+        let p4 = (lane_select(a4, code_4(codes)) as i16);
+        let p5 = (lane_select(a5, code_5(codes)) as i16);
+        let p6 = (lane_select(a6, code_6(codes)) as i16);
+        let p7 = (lane_select(a7, code_7(codes)) as i16);
+        let s01 = p0 +% p1;
+        let s23 = p2 +% p3;
+        let s45 = p4 +% p5;
+        let s67 = p6 +% p7;
+        let s0123 = s01 +% s23;
+        let s4567 = s45 +% s67;
+        return (s0123 +% s4567);
+    }
+
+    /// The ONE wide add. Eight multiplies, one 32-bit carry chain.
+    fn group_mac(acc: i32, a0: i8, a1: i8, a2: i8, a3: i8,
+                 a4: i8, a5: i8, a6: i8, a7: i8, codes: u16) -> i32 {
+        let narrow = group_sum(a0, a1, a2, a3, a4, a5, a6, a7, codes);
+        return (acc +% (narrow as i32));
+    }
+
+    // ---- Combinational port surface (T81) ----
+    //
+    // Ten wires in, one out. The activations stay separate rather than packed
+    // because packing would add a decode this design does not have; the point of
+    // the measurement is the adder, and nothing may be added that inflates it.
+    fn on_comb(acc: i32, a0: i8, a1: i8, a2: i8, a3: i8,
+               a4: i8, a5: i8, a6: i8, a7: i8, codes: u16) -> i32 {
+        return group_mac(acc, a0, a1, a2, a3, a4, a5, a6, a7, codes);
+    }
+
+    // ---- Tests ----
+
+    test all_zero_codes_leave_the_accumulator
+        given r = on_comb(100, 7, 7, 7, 7, 7, 7, 7, 7, 0)
+        then r == 100
+
+    // codes 0x5555 = 01 01 01 01 01 01 01 01 -> every lane +1
+    test all_plus_adds_every_activation
+        given r = on_comb(0, 1, 2, 3, 4, 5, 6, 7, 8, 21845)
+        then r == 36
+
+    // codes 0xAAAA = 10 10 ... -> every lane -1
+    test all_minus_subtracts_every_activation
+        given r = on_comb(0, 1, 2, 3, 4, 5, 6, 7, 8, 43690)
+        then r == -36
+
+    // Alternating +1 / -1: lanes 0,2,4,6 positive; 1,3,5,7 negative.
+    // codes = 0b10011001100110011 truncated to 16 bits = 0x9999
+    test alternating_signs_cancel_equal_activations
+        given r = on_comb(0, 5, 5, 5, 5, 5, 5, 5, 5, 39321)
+        then r == 0
+
+    // Code 3 is outside the alphabet and must contribute nothing, exactly as
+    // `ternary_decode` returns 0 for it in ternary_mac.t27.
+    test out_of_alphabet_codes_contribute_nothing
+        given r = on_comb(50, 9, 9, 9, 9, 9, 9, 9, 9, 65535)
+        then r == 50
+
+    test only_lane_zero_active
+        given r = on_comb(0, 11, 99, 99, 99, 99, 99, 99, 99, 1)
+        then r == 11
+
+    test only_lane_seven_active
+        given r = on_comb(0, 99, 99, 99, 99, 99, 99, 99, 11, 16384)
+        then r == 11
+
+    test negative_activation_with_minus_weight_adds
+        given r = on_comb(0, -7, 0, 0, 0, 0, 0, 0, 0, 2)
+        then r == 7
+
+    test accumulator_seed_is_carried
+        given r = on_comb(-1000, 1, 1, 1, 1, 1, 1, 1, 1, 21845)
+        then r == -992
+
+    // The narrow reduction on its own, so a failure localises.
+    test narrow_sum_of_all_plus
+        given s = group_sum(1, 2, 3, 4, 5, 6, 7, 8, 21845)
+        then s == 36
+
+    test narrow_sum_of_empty_group
+        given s = group_sum(9, 9, 9, 9, 9, 9, 9, 9, 0)
+        then s == 0
+
+    test lane_select_zero_code
+        given v = lane_select(42, 0)
+        then v == 0
+
+    test lane_select_plus
+        given v = lane_select(42, 1)
+        then v == 42
+
+    test lane_select_minus
+        given v = lane_select(42, 2)
+        then v == -42
+
+    test code_extraction_top_lane
+        given c = code_7(49152)
+        then c == 3
+
+    test code_extraction_bottom_lane
+        given c = code_0(2)
+        then c == 2
+
+    // ---- Invariants ----
+
+    invariant group_is_eight_lanes
+        assert GROUP_SIZE == 8
+
+    invariant codes_width_covers_the_group
+        assert CODES_WIDTH == 16
+
+    // THE SAFETY ARGUMENT for reducing in i16 rather than i32: the worst case
+    // is every lane at full magnitude with the same sign, and it does not come
+    // close to the narrow type's range. Asserted at compile time because the
+    // whole density claim rests on this add being narrow.
+    invariant narrow_sum_cannot_overflow
+        assert MAX_ABS_SUM < I16_MAX
+
+    invariant worst_case_sum_is_group_times_product
+        assert MAX_ABS_SUM == 1024
+
+    // A group of one is exactly `ternary_mac.t27`, so mu > 1 is the claim.
+    invariant this_is_not_the_mu_one_point
+        assert GROUP_SIZE > 1
+
+    // The alphabet must agree with ternary_mac.t27 or the two units compute
+    // different things and the density comparison is meaningless.
+    invariant alphabet_matches_the_scalar_unit
+        assert GAT_POS == 1
+
+    invariant negative_code_matches_the_scalar_unit
+        assert GAT_NEG == 2
+
+    // ---- Bench ----
+
+    bench group_mac_arithmetic
+        assert on_comb(0, 1, 2, 3, 4, 5, 6, 7, 8, 21845) == 36
+        assert on_comb(0, 1, 2, 3, 4, 5, 6, 7, 8, 43690) == -36
+        assert group_sum(9, 9, 9, 9, 9, 9, 9, 9, 0) == 0
+}
+
+// phi^2 + 1/phi^2 = 3 | TRINITY

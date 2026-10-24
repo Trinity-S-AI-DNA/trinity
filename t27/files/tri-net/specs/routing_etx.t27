@@ -1,0 +1,171 @@
+// SPDX-License-Identifier: Apache-2.0
+// tri-net/specs/routing_etx.t27
+// Fixed-point formalization of the ETX link metric in src/routing.rs (T27-first).
+// Delivery ratios and the RTI penalty are expressed in MILLI units (1000 = 1.0),
+// ETX likewise in milli (1000 = 1.0 transmissions). f32::INFINITY has no integer
+// analogue, so a DEAD link is the sentinel 0 (a real ETX is always >= 1000, so 0
+// is unambiguous). The live routing.rs path still runs the f32 version; a Rust
+// equivalence test pins this spec to it point-by-point before any rewiring.
+// phi^2 + phi^-2 = 3 | TRINITY
+
+module RoutingEtx {
+    use base::types;
+
+    const MILLI : u32 = 1000;
+    // A direction whose delivery estimate decays below 0.15 is dead (DEAD_EPS).
+    const DEAD_EPS_MILLI : u32 = 150;
+    // WMEWMA optimistic prior for a fresh link (0.9).
+    const OPTIMISTIC_MILLI : u32 = 900;
+    // ETX of a dead link — sentinel (no finite ETX can be 0; minimum real ETX is 1000).
+    const ETX_DEAD : u32 = 0;
+    // Upper clamp on the RTI penalty (32x). A link 32x worse than clear is already
+    // "avoid entirely", so clamping changes no realistic decision. It ALSO keeps
+    // `base * penalty_milli` inside u32: the worst base is 1e9/(150*150)=44444, and
+    // 44444 * 32000 = 1.42e9 < 2^32. Without it, a penalty above ~96000 milli wraps
+    // the u32 multiply and a heavily-obstructed link reads as a great route (a
+    // differential audit over the full domain caught this; the live f32 path in
+    // src/routing.rs does not wrap, but the fixed-point form must clamp before wiring).
+    const PENALTY_MAX_MILLI : u32 = 32000;
+
+    // Single-link ETX in milli: 1e9 / (df_milli * dr_milli), then the RTI penalty
+    // multiplier (milli). Dead when either direction is below DEAD_EPS_MILLI.
+    fn etx_milli(df_milli: u32, dr_milli: u32, penalty_milli: u32) -> u32 {
+        if (df_milli < DEAD_EPS_MILLI) {
+            return ETX_DEAD;
+        }
+        if (dr_milli < DEAD_EPS_MILLI) {
+            return ETX_DEAD;
+        }
+        let base : u32 = 1000000000 / (df_milli * dr_milli);
+        if (penalty_milli > PENALTY_MAX_MILLI) {
+            return (base * PENALTY_MAX_MILLI) / MILLI;
+        }
+        return (base * penalty_milli) / MILLI;
+    }
+
+    // Route preference: a candidate replaces the incumbent only if STRICTLY better
+    // (lower finite ETX). Dead candidates never win; anything beats a dead incumbent.
+    fn better_route(candidate_etx: u32, incumbent_etx: u32) -> bool {
+        if (candidate_etx == ETX_DEAD) {
+            return false;
+        }
+        if (incumbent_etx == ETX_DEAD) {
+            return true;
+        }
+        return candidate_etx < incumbent_etx;
+    }
+
+    // Path ETX is additive over hops; adding a hop through a dead link kills the path.
+    fn path_etx(upstream_etx: u32, link_etx: u32) -> u32 {
+        if (upstream_etx == ETX_DEAD) {
+            return ETX_DEAD;
+        }
+        if (link_etx == ETX_DEAD) {
+            return ETX_DEAD;
+        }
+        return upstream_etx + link_etx;
+    }
+
+    // RFC 8966 section 3.7 feasibility: a candidate route to a destination is accepted
+    // only if there is no incumbent, or it is STRICTLY better than the incumbent (which
+    // also forces it to be finite). This is the loop-prevention rule: a node never
+    // accepts a route worse-or-equal to the one it already advertises.
+    // has_existing is a 0/1 flag (the t27c emitter miscompiles bool-literal compares).
+    fn is_feasible(new_etx: u32, existing_etx: u32, has_existing: u32) -> bool {
+        if (has_existing == 0) {
+            return true;
+        }
+        return better_route(new_etx, existing_etx);
+    }
+
+    // A route may be LEARNED only if it is not a self-route (dst == next_hop is
+    // meaningless) and it passes feasibility. is_self_route is a 0/1 flag.
+    fn learn_ok(is_self_route: u32, feasible: bool) -> bool {
+        if (is_self_route == 1) {
+            return false;
+        }
+        return feasible;
+    }
+
+    // ---- TDD (L4): pinned to the f32 semantics of src/routing.rs ----
+    test perfect_link_is_exactly_one_transmission
+        given e = etx_milli(1000, 1000, 1000)
+        then e == 1000
+
+    test optimistic_prior_link
+        given e = etx_milli(900, 900, 1000)
+        then e == 1234
+
+    test dead_forward_direction_is_dead
+        given e = etx_milli(149, 1000, 1000)
+        then e == 0
+
+    test dead_reverse_direction_is_dead
+        given e = etx_milli(1000, 100, 1000)
+        then e == 0
+
+    test rti_penalty_scales_cost
+        given clear = etx_milli(1000, 1000, 1000)
+        and   blocked = etx_milli(1000, 1000, 10000)
+        then clear == 1000
+        and  blocked == 10000
+
+    // A runaway penalty is clamped to 32x, not wrapped: 1000 * 32000 / 1000 = 32000.
+    // (Without the clamp the worst-case u32 multiply overflows above ~96x.)
+    test runaway_penalty_is_clamped_not_wrapped
+        given huge = etx_milli(1000, 1000, 500000)
+        and   at_cap = etx_milli(1000, 1000, 32000)
+        then huge == 32000
+        and  at_cap == 32000
+
+    test strictly_better_wins_ties_do_not
+        given win = better_route(1200, 1300)
+        and   tie = better_route(1300, 1300)
+        then win == true
+        and  tie == false
+
+    test dead_candidate_never_wins
+        given w = better_route(0, 5000)
+        then w == false
+
+    test anything_beats_dead_incumbent
+        given w = better_route(9000, 0)
+        then w == true
+
+    test path_adds_and_dead_propagates
+        given p = path_etx(2000, 1500)
+        and   d = path_etx(2000, 0)
+        then p == 3500
+        and  d == 0
+
+    test no_incumbent_is_always_feasible
+        given f = is_feasible(9999, 0, 0)
+        then f == true
+
+    test strictly_better_is_feasible_ties_are_not
+        given better = is_feasible(1200, 1500, 1)
+        and   tie    = is_feasible(1500, 1500, 1)
+        and   worse  = is_feasible(1800, 1500, 1)
+        then better == true
+        and  tie == false
+        and  worse == false
+
+    test dead_candidate_not_feasible
+        given f = is_feasible(0, 1500, 1)
+        then f == false
+
+    test self_route_never_learned
+        given selfroute = learn_ok(1, true)
+        and   normal    = learn_ok(0, true)
+        and   infeasible = learn_ok(0, false)
+        then selfroute == false
+        and  normal == true
+        and  infeasible == false
+
+    // ---- invariants ----
+    invariant dead_epsilon_is_150_milli
+        assert DEAD_EPS_MILLI == 150
+
+    invariant optimistic_prior_is_900_milli
+        assert OPTIMISTIC_MILLI == 900
+}

@@ -1,0 +1,314 @@
+// SPDX-License-Identifier: Apache-2.0
+// t27/specs/fpga/simulator.t27
+// HIR Cycle-Accurate Simulation Engine Specification
+// Provides simulation primitives for verifying HIR modules pre-synthesis
+// Uses flat arrays + count fields (parser-compatible)
+// phi^2 + 1/phi^2 = 3 | TRINITY
+
+module Simulator {
+
+    // === Simulator state ===
+
+    pub const SimState = enum(i8) {
+        idle = 0,
+        running = 1,
+        paused = 2,
+        done = 3,
+        error = 4,
+    }
+
+    // === Simulator configuration ===
+
+    pub struct SimConfig {
+        name : &str,
+        max_cycles : u32,
+        clock_freq_hz : u32,
+        trace_enabled : bool,
+        vcd_output : bool,
+        break_on_error : bool,
+        vcd_path : &str,
+    }
+
+    // === Simulation result ===
+
+    pub struct SimResult {
+        cycles : u32,
+        state : i8,
+        errors : u32,
+        assertions_fired : u32,
+        coverage_points : u32,
+    }
+
+    // === Signal probe point ===
+
+    pub struct ProbePoint {
+        name : &str,
+        signal : &str,
+        width : u32,
+        is_signed : bool,
+    }
+
+    // === Trace entry ===
+
+    pub struct TraceEntry {
+        cycle : u32,
+        signal : &str,
+        value : u32,
+    }
+
+    // === Constructor helpers ===
+
+    fn sim_config(name: &str, max_cycles: u32) -> SimConfig {
+        return SimConfig{
+            .name = name,
+            .max_cycles = max_cycles,
+            .clock_freq_hz = 100000000,
+            .trace_enabled = false,
+            .vcd_output = false,
+            .break_on_error = true,
+            .vcd_path = "",
+        };
+    }
+
+    fn sim_config_with_trace(name: &str, max_cycles: u32, vcd_path: &str) -> SimConfig {
+        return SimConfig{
+            .name = name,
+            .max_cycles = max_cycles,
+            .clock_freq_hz = 100000000,
+            .trace_enabled = true,
+            .vcd_output = true,
+            .break_on_error = true,
+            .vcd_path = vcd_path,
+        };
+    }
+
+    fn sim_ok(cycles: u32, coverage: u32) -> SimResult {
+        return SimResult{
+            .cycles = cycles,
+            .state = 3,
+            .errors = 0,
+            .assertions_fired = 0,
+            .coverage_points = coverage,
+        };
+    }
+
+    fn sim_error(cycles: u32, errors: u32) -> SimResult {
+        return SimResult{
+            .cycles = cycles,
+            .state = 4,
+            .errors = errors,
+            .assertions_fired = 0,
+            .coverage_points = 0,
+        };
+    }
+
+    fn probe(name: &str, signal: &str, width: u32) -> ProbePoint {
+        return ProbePoint{
+            .name = name,
+            .signal = signal,
+            .width = width,
+            .is_signed = false,
+        };
+    }
+
+    fn trace_entry(cycle: u32, signal: &str, value: u32) -> TraceEntry {
+        return TraceEntry{
+            .cycle = cycle,
+            .signal = signal,
+            .value = value,
+        };
+    }
+
+    // === Query functions ===
+
+    fn is_idle(r: SimResult) -> bool {
+        return r.state == 0;
+    }
+
+    fn is_done(r: SimResult) -> bool {
+        return r.state == 3;
+    }
+
+    fn is_error(r: SimResult) -> bool {
+        return r.state == 4;
+    }
+
+    fn sim_time_ns(cfg: SimConfig, cycles: u32) -> u32 {
+        if (cfg.clock_freq_hz == 0) {
+            return 0;
+        }
+        // `cycles * 1000000000` overflows u32 for cycles >= 5: at cycles=100
+        // the product is 100_000_000_000 against a u32 max of 4_294_967_295.
+        // Widen the intermediate to u64 -- and then SATURATE, because the
+        // result is not always small: at 2_000_000_000 cycles on a 100 MHz
+        // clock it is 20_000_000_000, and a bare `as u32` wraps it to
+        // 2_820_130_816. The hand-written model in rings/ring-090-rust, which
+        // this spec is supposed to define, has always had that guard; the spec
+        // did not, and the two disagreed on 126 of 1190 differential cases.
+        var ns : u64 = (cycles as u64) * 1000000000 / (cfg.clock_freq_hz as u64);
+        if (ns > 4294967295) {
+            return 4294967295;
+        }
+        return ns as u32;
+    }
+
+    // The case that made the spec and rings/ring-090-rust disagree: at
+    // 2_000_000_000 cycles on the default 100 MHz clock the nanosecond count is
+    // 20_000_000_000, and a bare `as u32` wraps it to 2_820_130_816.
+    test "sim_time_ns_saturates_instead_of_wrapping"
+        const cfg = sim_config("sat", 0);
+        assert(sim_time_ns(cfg, 2000000000) == 4294967295);
+
+    test "sim_time_ns_is_exact_below_the_ceiling"
+        const cfg2 = sim_config("exact", 0);
+        assert(sim_time_ns(cfg2, 100) == 1000);
+
+    fn sim_time_us(cfg: SimConfig, cycles: u32) -> u32 {
+        return sim_time_ns(cfg, cycles) / 1000;
+    }
+
+    fn sim_time_ms(cfg: SimConfig, cycles: u32) -> u32 {
+        return sim_time_ns(cfg, cycles) / 1000000;
+    }
+
+    fn cycles_for_time_ns(cfg: SimConfig, ns: u32) -> u32 {
+        if (cfg.clock_freq_hz == 0) {
+            return 0;
+        }
+        // Same overflow as sim_time_ns, inverted: at ns=1000 and a 100 MHz
+        // clock the product is 100_000_000_000, far past the u32 max.
+        return ((ns as u64) * (cfg.clock_freq_hz as u64) / 1000000000) as u32;
+    }
+
+    fn has_errors(r: SimResult) -> bool {
+        return r.errors > 0;
+    }
+
+    fn passed(r: SimResult) -> bool {
+        return r.state == 3 and r.errors == 0;
+    }
+
+    // === Validation ===
+
+    fn validate_sim_config(cfg: SimConfig) -> u32 {
+        var errors : u32 = 0;
+        if (cfg.name == "") {
+            errors = errors + 1;
+        }
+        if (cfg.max_cycles == 0) {
+            errors = errors + 1;
+        }
+        if (cfg.clock_freq_hz == 0) {
+            errors = errors + 1;
+        }
+        return errors;
+    }
+
+    // === Tests ===
+
+    test sim_config_creation
+        given cfg = sim_config("uart_sim", 10000)
+        then cfg.max_cycles == 10000
+        and cfg.trace_enabled == false
+
+    test sim_config_with_trace
+        given cfg = sim_config_with_trace("uart_sim", 10000, "uart.vcd")
+        then cfg.trace_enabled == true
+        and cfg.vcd_output == true
+        and cfg.vcd_path == "uart.vcd"
+
+    test sim_ok_result
+        given r = sim_ok(5000, 10)
+        then is_done(r) == true
+        and is_error(r) == false
+        and passed(r) == true
+        and has_errors(r) == false
+        and r.cycles == 5000
+        and r.coverage_points == 10
+
+    test sim_error_result
+        given r = sim_error(3000, 2)
+        then is_done(r) == false
+        and is_error(r) == true
+        and passed(r) == false
+        and has_errors(r) == true
+        and r.errors == 2
+
+    test is_idle_true
+        given r = SimResult{.cycles = 0, .state = 0, .errors = 0, .assertions_fired = 0, .coverage_points = 0}
+        then is_idle(r) == true
+
+    test is_idle_false_when_done
+        given r = sim_ok(100, 5)
+        then is_idle(r) == false
+
+    test is_idle_false_when_error
+        given r = sim_error(50, 1)
+        then is_idle(r) == false
+
+    test probe_creation
+        given p = probe("clk_probe", "clk", 1)
+        then p.name == "clk_probe"
+        and p.signal == "clk"
+        and p.width == 1
+
+    test trace_entry_creation
+        given t = trace_entry(42, "counter", 27)
+        then t.cycle == 42
+        and t.signal == "counter"
+        and t.value == 27
+
+    test sim_time_ns
+        given cfg = sim_config("sim", 10000)
+        then sim_time_ns(cfg, 100) == 1000
+
+    test sim_time_us
+        given cfg = sim_config("sim", 10000)
+        then sim_time_us(cfg, 100000) == 1000
+
+    test sim_time_ms
+        given cfg = sim_config("sim", 10000)
+        then sim_time_ms(cfg, 100000000) == 1000
+
+    test cycles_for_time_ns
+        given cfg = sim_config("sim", 10000)
+        then cycles_for_time_ns(cfg, 1000) == 100
+
+    test validate_config_ok
+        given cfg = sim_config("sim", 10000)
+        then validate_sim_config(cfg) == 0
+
+    test validate_config_empty_name
+        given cfg = sim_config("", 10000)
+        then validate_sim_config(cfg) > 0
+
+    test validate_config_zero_cycles
+        given cfg = sim_config("sim", 0)
+        then validate_sim_config(cfg) > 0
+
+    // === Invariants ===
+
+    invariant max_cycles_positive
+        given cfg = sim_config("inv", 100)
+        assert cfg.max_cycles > 0
+
+    invariant sim_time_positive
+        given cfg = sim_config("inv", 100)
+        assert sim_time_ns(cfg, 1) > 0
+
+    invariant cycles_for_time_positive
+        given cfg = sim_config("inv", 100)
+        assert cycles_for_time_ns(cfg, 10) > 0
+
+    invariant validate_non_negative
+        given cfg = sim_config("inv", 100)
+        assert validate_sim_config(cfg) >= 0
+
+    // === Benchmarks ===
+
+    bench sim_time_calc_latency
+        measure: nanoseconds for sim_time_ns(sim_config("b", 1000), 1000)
+        target: < 100ns
+}
+
+// phi^2 + 1/phi^2 = 3 | TRINITY

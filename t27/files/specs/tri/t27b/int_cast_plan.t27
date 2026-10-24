@@ -1,0 +1,265 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/tri/t27b/int_cast_plan.t27 -- how t27b lowers `@intCast(x)` when the context gives it an integer result
+; type (issue #7412, t27b lane 4 of epic #6063; written in t27 under the port epic #6198).
+; gen-zig prints `@intCast(x)` as written. Zig takes the result type from the result location -- `@as(T, ..)`,
+; a typed binding, a parameter, a `return` -- and keeps the value exactly, so t27b must give the call the
+; meaning Zig 0.16 gives it in a Debug build. Everything t27b decides about it is in this file and reaches
+; cli/t27b through `t27c gen-rust` (gen/rust/tri/t27b/int_cast_plan.rs): which shapes are refused and the
+; names a refusal reports, which conversions widen, which fold to a constant, which become a checked Cast
+; that traps outside the result type, and what wrap mode does instead. The Rust glue in
+; cli/t27b/src/lower.rs only classifies the operand it lowered, reads the width and signedness of the two
+; types, asks `plan`, and builds the IR node the answer names.
+; --
+; The semantics (Zig 0.16 Debug, run under `t27c test-report` for #7412):
+;   A lossless conversion -- same signedness and not narrower, or unsigned into a strictly wider signed
+;   type -- widens, with no check. Any other conversion is checked and traps when the value is outside the
+;   result type (a safety panic in Zig's Debug build, so a failed test). That includes unsigned to unsigned,
+;   where t27b's `as` truncates instead.
+;   A constant operand folds when its value is kept: always when the conversion widens, else when it fits.
+;   A comptime_int literal folds when it fits and is refused when it does not: Zig refuses it at compile
+;   time, in either overflow mode.
+;   In wrap mode (`--overflow wrap`) a conversion that does not widen truncates, as `as` does there, and a
+;   constant folds to its truncated value.
+;   Refused: any number of operands but one, a result type that is not an integer, and an operand that is
+;   not an integer (a float, a bool, a comptime_float, an aggregate). `@intCast` with no result type never
+;   reaches this plan: Zig refuses it, and t27b keeps refusing it as an `ExprCall(@intCast)`.
+; --
+; The oracle is the hand-written Rust of draft PR #7417 (branch claude/t27b-lane4-intcast, b8d6cc24d): its
+; `int_cast` passed specs/tri/t27b/conformance/int_cast.t27 and the t27b lab corpus. Its branches are the
+; decisions of `shape` and `plan` here. Its trap cases are cli/t27b/tests/int_cast_traps.t27, a t27 file
+; whose test names carry their verdicts.
+; ASCII only (L3)
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module T27bIntCastPlan;
+
+// What the lowered operand is, as the glue sees it: a typed integer (a constant one included), a
+// comptime_int literal, or anything else.
+pub const K_INT : u8 = 0;
+pub const K_CT : u8 = 1;
+pub const K_OTHER : u8 = 2;
+
+// What the call lowers to. GO: the shape is right; lower the operand and ask `plan`.
+// FOLD: a constant of the result type with the operand's value. FOLD_WRAP: the same, truncated to the
+// result type. KEEP: the operand itself, which has the result type already. WIDEN: a Widen node.
+// CHECK: a Cast node with a trap site. TRUNCATE: a Cast node with no trap site.
+pub const GO : u8 = 0;
+pub const REFUSE_ARITY : u8 = 1;
+pub const REFUSE_RESULT : u8 = 2;
+pub const REFUSE_OPERAND : u8 = 3;
+pub const REFUSE_LITERAL : u8 = 4;
+pub const FOLD : u8 = 5;
+pub const FOLD_WRAP : u8 = 6;
+pub const KEEP : u8 = 7;
+pub const WIDEN : u8 = 8;
+pub const CHECK : u8 = 9;
+pub const TRUNCATE : u8 = 10;
+
+/// The construct every refusal names, and the word a checked Cast's trap site starts with.
+pub const WHAT : str = "ExprCall(@intCast)";
+pub const SITE : str = "@intCast";
+
+/// Can the call be lowered at all: one operand, an integer result type? The operand count is asked first.
+pub fn shape(operands: usize, result_is_int: bool) -> u8 {
+    if (operands != 1) { return REFUSE_ARITY; }
+    if (!result_is_int) { return REFUSE_RESULT; }
+    return GO;
+}
+
+/// Does every value of the integer type (from_bits, from_signed) fit the integer type (to_bits, to_signed)?
+/// Zig's lossless rule: same signedness and not narrower, or unsigned into a strictly wider signed type.
+pub fn widens(from_bits: u32, from_signed: bool, to_bits: u32, to_signed: bool) -> bool {
+    if (from_signed == to_signed) { return to_bits >= from_bits; }
+    return to_signed and to_bits > from_bits;
+}
+
+/// The decision, once `shape` said GO. k: the operand's kind. The widths and signedness of the operand's
+/// type and of the result type (a literal has no type of its own: the glue passes the result type twice).
+/// is_const: the operand is a constant, a literal or a typed one. fits: that constant is inside the result
+/// type. wrap: `--overflow wrap`.
+pub fn plan(k: u8, from_bits: u32, from_signed: bool, to_bits: u32, to_signed: bool, is_const: bool, fits: bool, wrap: bool) -> u8 {
+    if (k == K_OTHER) { return REFUSE_OPERAND; }
+    if (k == K_CT) {
+        if (fits) { return FOLD; }
+        return REFUSE_LITERAL;
+    }
+    if (widens(from_bits, from_signed, to_bits, to_signed)) {
+        if (is_const) { return FOLD; }
+        if (from_bits == to_bits and from_signed == to_signed) { return KEEP; }
+        return WIDEN;
+    }
+    if (is_const and wrap) { return FOLD_WRAP; }
+    if (is_const and fits) { return FOLD; }
+    if (wrap) { return TRUNCATE; }
+    return CHECK;
+}
+
+/// Does the answer build a Cast node, and does that node trap?
+pub fn is_cast(act: u8) -> bool {
+    return act == CHECK or act == TRUNCATE;
+}
+
+pub fn traps(act: u8) -> bool {
+    return act == CHECK;
+}
+
+/// Is the answer a refusal? Its words, after the operand and the result type, are `why`.
+pub fn refuses(act: u8) -> bool {
+    return act >= REFUSE_ARITY and act <= REFUSE_LITERAL;
+}
+
+pub fn why(act: u8) -> str {
+    if (act == REFUSE_ARITY) { return "it takes one operand"; }
+    if (act == REFUSE_RESULT) { return "the result type is not an integer"; }
+    if (act == REFUSE_OPERAND) { return "the operand is not an integer"; }
+    if (act == REFUSE_LITERAL) { return "the literal does not fit the result type"; }
+    return "";
+}
+
+// The eight integer types t27b names (u8 .. i64), as (bits, signed) by index, for the tests.
+fn icp_bits(i: u32) -> u32 {
+    if (i % 4 == 0) { return 8; }
+    if (i % 4 == 1) { return 16; }
+    if (i % 4 == 2) { return 32; }
+    return 64;
+}
+
+fn icp_signed(i: u32) -> bool {
+    return i >= 4;
+}
+
+test the_shape_is_one_operand_and_an_integer_result_type {
+    assert shape(1, true) == GO;
+    assert shape(0, true) == REFUSE_ARITY;
+    assert shape(2, true) == REFUSE_ARITY;
+    assert shape(2, false) == REFUSE_ARITY;
+    assert shape(1, false) == REFUSE_RESULT;
+}
+
+test lossless_conversions_widen {
+    assert widens(8, false, 16, false);
+    assert widens(16, false, 64, false);
+    assert widens(8, true, 64, true);
+    assert widens(32, true, 32, true);
+    assert widens(64, false, 64, false);
+    assert widens(4, false, 8, false);
+    assert widens(21, true, 32, true);
+    assert widens(8, false, 16, true);
+    assert widens(32, false, 64, true);
+    assert widens(31, false, 32, true);
+}
+
+test every_other_conversion_does_not_widen {
+    assert !widens(16, false, 8, false);
+    assert !widens(64, true, 32, true);
+    assert !widens(32, false, 31, false);
+    assert !widens(8, false, 8, true);
+    assert !widens(32, false, 32, true);
+    assert !widens(64, false, 64, true);
+    assert !widens(8, true, 16, false);
+    assert !widens(8, true, 64, false);
+    assert !widens(64, true, 64, false);
+}
+
+// Over u8, u16, u32, u64, i8, i16, i32, i64: the relation is a partial order (each type widens to itself,
+// two distinct types never widen both ways, and widening composes), and it holds for 26 of the 64 pairs:
+// 10 unsigned to unsigned, 10 signed to signed, 6 unsigned to a strictly wider signed type.
+test widening_is_a_partial_order_with_26_pairs {
+    var pairs : u32 = 0;
+    var a : u32 = 0;
+    while (a < 8) {
+        assert widens(icp_bits(a), icp_signed(a), icp_bits(a), icp_signed(a));
+        var b : u32 = 0;
+        while (b < 8) {
+            const ab : bool = widens(icp_bits(a), icp_signed(a), icp_bits(b), icp_signed(b));
+            const ba : bool = widens(icp_bits(b), icp_signed(b), icp_bits(a), icp_signed(a));
+            if (ab) { pairs = pairs + 1; }
+            if (ab and ba) { assert a == b; }
+            var c : u32 = 0;
+            while (c < 8) {
+                if (ab and widens(icp_bits(b), icp_signed(b), icp_bits(c), icp_signed(c))) {
+                    assert widens(icp_bits(a), icp_signed(a), icp_bits(c), icp_signed(c));
+                }
+                c = c + 1;
+            }
+            b = b + 1;
+        }
+        a = a + 1;
+    }
+    assert pairs == 26;
+}
+
+test a_typed_operand_widens_is_kept_or_is_checked {
+    assert plan(K_INT, 32, false, 64, false, false, false, false) == WIDEN;
+    assert plan(K_INT, 32, true, 64, true, false, false, false) == WIDEN;
+    assert plan(K_INT, 32, false, 64, true, false, false, false) == WIDEN;
+    assert plan(K_INT, 64, false, 64, false, false, false, false) == KEEP;
+    assert plan(K_INT, 8, true, 8, true, false, false, false) == KEEP;
+    assert plan(K_INT, 32, false, 16, false, false, false, false) == CHECK;
+    assert plan(K_INT, 64, true, 32, true, false, false, false) == CHECK;
+    assert plan(K_INT, 64, true, 64, false, false, false, false) == CHECK;
+    assert plan(K_INT, 64, false, 64, true, false, false, false) == CHECK;
+    assert plan(K_INT, 32, true, 32, false, false, false, false) == CHECK;
+    assert plan(K_INT, 32, false, 32, true, false, false, false) == CHECK;
+}
+
+test a_constant_operand_folds_when_its_value_is_kept {
+    assert plan(K_INT, 16, false, 64, false, true, true, false) == FOLD;
+    assert plan(K_INT, 16, false, 64, false, true, true, true) == FOLD;
+    assert plan(K_INT, 64, false, 64, false, true, true, false) == FOLD;
+    assert plan(K_INT, 64, false, 8, false, true, true, false) == FOLD;
+    assert plan(K_INT, 64, true, 32, false, true, true, false) == FOLD;
+    assert plan(K_INT, 64, false, 8, false, true, false, false) == CHECK;
+    assert plan(K_INT, 64, true, 32, false, true, false, false) == CHECK;
+}
+
+test a_literal_folds_when_it_fits_and_is_refused_when_not {
+    assert plan(K_CT, 8, false, 8, false, true, true, false) == FOLD;
+    assert plan(K_CT, 64, true, 64, true, true, true, true) == FOLD;
+    assert plan(K_CT, 8, false, 8, false, true, false, false) == REFUSE_LITERAL;
+    assert plan(K_CT, 8, false, 8, false, true, false, true) == REFUSE_LITERAL;
+}
+
+test wrap_mode_truncates_what_does_not_widen {
+    assert plan(K_INT, 32, false, 16, false, false, false, true) == TRUNCATE;
+    assert plan(K_INT, 64, true, 64, false, false, false, true) == TRUNCATE;
+    assert plan(K_INT, 64, false, 8, false, true, false, true) == FOLD_WRAP;
+    assert plan(K_INT, 64, false, 8, false, true, true, true) == FOLD_WRAP;
+    assert plan(K_INT, 16, false, 32, false, false, false, true) == WIDEN;
+    assert plan(K_INT, 32, false, 32, false, false, false, true) == KEEP;
+}
+
+test anything_but_an_integer_operand_is_refused {
+    assert plan(K_OTHER, 64, false, 64, false, false, false, false) == REFUSE_OPERAND;
+    assert plan(K_OTHER, 8, true, 64, false, true, true, true) == REFUSE_OPERAND;
+}
+
+test only_check_and_truncate_build_a_cast_and_only_check_traps {
+    assert is_cast(CHECK);
+    assert is_cast(TRUNCATE);
+    assert !is_cast(WIDEN);
+    assert !is_cast(FOLD);
+    assert !is_cast(FOLD_WRAP);
+    assert !is_cast(KEEP);
+    assert traps(CHECK);
+    assert !traps(TRUNCATE);
+    assert !traps(REFUSE_LITERAL);
+    assert refuses(REFUSE_ARITY);
+    assert refuses(REFUSE_RESULT);
+    assert refuses(REFUSE_OPERAND);
+    assert refuses(REFUSE_LITERAL);
+    assert !refuses(GO);
+    assert !refuses(FOLD);
+    assert !refuses(TRUNCATE);
+}
+
+test the_refusals_name_the_call_and_say_why {
+    assert std.mem.eql(u8, WHAT, "ExprCall(@intCast)");
+    assert std.mem.eql(u8, SITE, "@intCast");
+    assert std.mem.eql(u8, why(REFUSE_ARITY), "it takes one operand");
+    assert std.mem.eql(u8, why(REFUSE_RESULT), "the result type is not an integer");
+    assert std.mem.eql(u8, why(REFUSE_OPERAND), "the operand is not an integer");
+    assert std.mem.eql(u8, why(REFUSE_LITERAL), "the literal does not fit the result type");
+    assert why(FOLD).len == 0;
+    assert why(CHECK).len == 0;
+}

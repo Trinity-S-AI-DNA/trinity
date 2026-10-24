@@ -1,0 +1,329 @@
+// TRI-NET GF-T (ternary-native GoldenFloat) verifiable multiply arithmetic.
+//
+// A compute receipt binds {format, op, operands, result} and is SIGNED, but a
+// signature only attests WHO produced the result, not that the result is CORRECT.
+// This spec lets a verifier RECOMPUTE the checkable core of a GF-T multiply -- its
+// exponent -- and reject a receipt whose claimed exponent is wrong (compute fraud),
+// independent of any signature.
+//
+// GF-T's defining feature is that the exponent is a balanced-ternary number added
+// NATIVELY: phi^a * phi^b = phi^(a+b). Carried as an OFFSET (exp + bias, so it is a
+// small unsigned int, the reserved special row at offset_max = 3^Et - 1), a GF-T
+// multiply's result exponent is offset_a + offset_b - bias, saturating to 0 on
+// underflow and to the special row (inf) on overflow. For GF-T16 (Et=4): bias = 40
+// (unity exponent phi^0 sits at offset 40), offset_max = 80 (matches
+// tri_compute_gfvalid.GFT16_OFFSET_MAX and tri_gft_ladder.gft_offset_max(4)).
+
+module TriGftArith {
+    use base::types;
+
+    const GFT16_BIAS: u32 = 40;        // GF-T16 unity exponent offset (phi^0)
+    const GFT16_OFFSET_MAX: u32 = 80;  // GF-T16 reserved special row (3^4 - 1)
+
+    // The result exponent-offset of a GF-T multiply: add the two exponents (native
+    // balanced-ternary add, here in decoded offset form) and re-bias. Saturating:
+    // underflow -> 0 (smallest), overflow -> offset_max (inf/special row).
+    fn gft_mul_offset(offset_a: u32, offset_b: u32, bias: u32, offset_max: u32) -> u32 {
+        let sum: u32 = offset_a + offset_b;
+        if (sum < bias) {
+            return 0;
+        } else {
+            let result: u32 = sum - bias;
+            if (result >= offset_max) {
+                return offset_max;
+            } else {
+                return result;
+            }
+        }
+    }
+
+    // A verifier accepts a claimed GF-T-multiply result exponent iff it equals the
+    // recomputed one: this catches a receipt that claims a wrong product exponent,
+    // with no signature needed.
+    fn verify_gft_mul_offset(offset_a: u32, offset_b: u32, claimed: u32, bias: u32, offset_max: u32) -> bool {
+        return gft_mul_offset(offset_a, offset_b, bias, offset_max) == claimed;
+    }
+
+    // Sign of a GF-T multiply: XOR of operand signs (0 = +, 1 = -).
+    fn gft_mul_sign(sign_a: u32, sign_b: u32) -> u32 {
+        return sign_a ^ sign_b;
+    }
+
+    // --- Mantissa (GF-T16 layout [sign | 4 exp trits | 9 mantissa bits]). The 9-bit
+    // mantissa M is the significand 1 + M/512. A multiply's significands multiply:
+    // (1 + Ma/512)(1 + Mb/512) lands in [1, 4). Scaled by 512^2 that is the integer
+    // (512 + Ma)(512 + Mb). If it reaches 2*512^2 the product's significand is >= 2
+    // and needs a RENORMALIZATION CARRY: the exponent gains +1 and the significand
+    // is halved. gft_mul_offset above omitted this carry -- so it was correct only
+    // when the mantissa product did not overflow. These close that gap.
+    const MANT_ONE: u32 = 512;               // 2^9: the GF-T16 implicit-1 significand scale
+
+    // --- Per-rung parametric multiply. `mant_one` = 2^MANT for the rung (GF-T4 -> 2,
+    // GF-T8 -> 16, GF-T16 -> 512; see tri_gft_ladder.gft_mant_one). u32-safe for these
+    // rungs. GF-T32 (25-bit mantissa) needs u64 and is blocked by a t27c u64-compare
+    // codegen defect, so it is NOT covered here.
+
+    // 1 if the mantissa product renormalizes (exponent +1), else 0.
+    fn gft_mul_mant_carry_p(ma: u32, mb: u32, mant_one: u32) -> u32 {
+        let prod: u32 = (mant_one + ma) * (mant_one + mb);
+        if (prod >= (2 * mant_one) * mant_one) {
+            return 1;
+        } else {
+            return 0;
+        }
+    }
+
+    // The result mantissa (round-toward-zero): halve the significand on a carry, then
+    // drop the implicit 1.
+    fn gft_mul_mant_p(ma: u32, mb: u32, mant_one: u32) -> u32 {
+        let prod: u32 = (mant_one + ma) * (mant_one + mb);
+        if (prod >= (2 * mant_one) * mant_one) {
+            return (prod / (2 * mant_one)) - mant_one;
+        } else {
+            return (prod / mant_one) - mant_one;
+        }
+    }
+
+    // The FULL result exponent offset including the mantissa renormalization carry.
+    fn gft_mul_offset_full_p(offset_a: u32, ma: u32, offset_b: u32, mb: u32, bias: u32, offset_max: u32, mant_one: u32) -> u32 {
+        let carry: u32 = gft_mul_mant_carry_p(ma, mb, mant_one);
+        let sum: u32 = offset_a + offset_b + carry;
+        if (sum < bias) {
+            return 0;
+        } else {
+            let result: u32 = sum - bias;
+            if (result >= offset_max) {
+                return offset_max;
+            } else {
+                return result;
+            }
+        }
+    }
+
+    // Verify a per-rung claimed multiply result (exponent + mantissa) against the
+    // rung's bias / offset_max / mantissa scale.
+    fn verify_gft_mul_full_p(offset_a: u32, ma: u32, offset_b: u32, mb: u32, claimed_offset: u32, claimed_mant: u32, bias: u32, offset_max: u32, mant_one: u32) -> bool {
+        if (gft_mul_offset_full_p(offset_a, ma, offset_b, mb, bias, offset_max, mant_one) == claimed_offset) {
+            return gft_mul_mant_p(ma, mb, mant_one) == claimed_mant;
+        } else {
+            return offset_a != offset_a;
+        }
+    }
+
+    // --- GF-T32 multiply (u64). GF-T32's 25-bit mantissa gives a significand product
+    // ~2^50 that overflows u32, so mantissa arithmetic runs in u64 (the offset stays
+    // u32). Same round-toward-zero renormalization as the u32 rungs. mant_one = 2^25.
+    // (Unblocked by the t27c u64-comparison codegen fix.)
+
+    fn gft_mul_mant_carry_u64(ma: u64, mb: u64, mant_one: u64) -> u32 {
+        let prod: u64 = (mant_one + ma) * (mant_one + mb);
+        if (prod >= (2 * mant_one) * mant_one) {
+            return 1;
+        } else {
+            return 0;
+        }
+    }
+
+    fn gft_mul_mant_u64(ma: u64, mb: u64, mant_one: u64) -> u32 {
+        let prod: u64 = (mant_one + ma) * (mant_one + mb);
+        if (prod >= (2 * mant_one) * mant_one) {
+            return ((prod / (2 * mant_one)) - mant_one) as u32;
+        } else {
+            return ((prod / mant_one) - mant_one) as u32;
+        }
+    }
+
+    fn gft_mul_offset_full_u64(offset_a: u32, ma: u64, offset_b: u32, mb: u64, bias: u32, offset_max: u32, mant_one: u64) -> u32 {
+        let carry: u32 = gft_mul_mant_carry_u64(ma, mb, mant_one);
+        let sum: u32 = offset_a + offset_b + carry;
+        if (sum < bias) {
+            return 0;
+        } else {
+            let result: u32 = sum - bias;
+            if (result >= offset_max) {
+                return offset_max;
+            } else {
+                return result;
+            }
+        }
+    }
+
+    fn verify_gft_mul_full_u64(offset_a: u32, ma: u64, offset_b: u32, mb: u64, claimed_offset: u32, claimed_mant: u32, bias: u32, offset_max: u32, mant_one: u64) -> bool {
+        if (gft_mul_offset_full_u64(offset_a, ma, offset_b, mb, bias, offset_max, mant_one) == claimed_offset) {
+            return gft_mul_mant_u64(ma, mb, mant_one) == claimed_mant;
+        } else {
+            return offset_a != offset_a;
+        }
+    }
+
+    // GF-T16 (mant_one = 512): the original entry points, now thin views of the
+    // parametric form (unchanged behavior; existing callers/tests unaffected).
+    fn gft_mul_mant_carry(ma: u32, mb: u32) -> u32 {
+        return gft_mul_mant_carry_p(ma, mb, MANT_ONE);
+    }
+    fn gft_mul_mant(ma: u32, mb: u32) -> u32 {
+        return gft_mul_mant_p(ma, mb, MANT_ONE);
+    }
+    fn gft_mul_offset_full(offset_a: u32, ma: u32, offset_b: u32, mb: u32, bias: u32, offset_max: u32) -> u32 {
+        return gft_mul_offset_full_p(offset_a, ma, offset_b, mb, bias, offset_max, MANT_ONE);
+    }
+
+    // Verify a FULL claimed GF-T multiply result -- both the exponent offset (with
+    // carry) AND the mantissa -- recompute. Catches a wrong product mantissa, not
+    // just a wrong exponent.
+    fn verify_gft_mul_full(offset_a: u32, ma: u32, offset_b: u32, mb: u32, claimed_offset: u32, claimed_mant: u32, bias: u32, offset_max: u32) -> bool {
+        if (gft_mul_offset_full(offset_a, ma, offset_b, mb, bias, offset_max) == claimed_offset) {
+            return gft_mul_mant(ma, mb) == claimed_mant;
+        } else {
+            return offset_a != offset_a;
+        }
+    }
+
+    // Encode a GF-T16 result (exponent offset + 9-bit mantissa) as one 16-bit value:
+    // offset in the high bits, mantissa in the low 9 -- a single comparable result
+    // for a receipt / a challenge (challenger recomputes and compares this value).
+    fn gft_result_encode(offset: u32, mant: u32) -> u32 {
+        return (offset << 9) | (mant & 0x1FF);
+    }
+
+    // The full recomputed GF-T multiply result, encoded: what a challenger computes
+    // from the operands and compares against the executor's claimed result.
+    fn gft_mul_result(offset_a: u32, ma: u32, offset_b: u32, mb: u32, bias: u32, offset_max: u32) -> u32 {
+        return gft_result_encode(gft_mul_offset_full(offset_a, ma, offset_b, mb, bias, offset_max), gft_mul_mant(ma, mb));
+    }
+
+    // ---- Tests / invariants ----
+
+    // phi^0 * phi^0 = phi^0 (unity), phi^1 * phi^1 = phi^2, etc., in GF-T16 offsets.
+    test mul_exponent_law {
+        assert(gft_mul_offset(40, 40, GFT16_BIAS, GFT16_OFFSET_MAX) == 40, "unity * unity = unity (offset 40)");
+        assert(gft_mul_offset(41, 41, GFT16_BIAS, GFT16_OFFSET_MAX) == 42, "phi^1 * phi^1 = phi^2");
+        assert(gft_mul_offset(50, 60, GFT16_BIAS, GFT16_OFFSET_MAX) == 70, "phi^10 * phi^20 = phi^30");
+        assert(gft_mul_offset(40, 55, GFT16_BIAS, GFT16_OFFSET_MAX) == 55, "unity * x = x");
+    }
+
+    // Saturation: overflow to the special (inf) row, underflow to the smallest offset.
+    test mul_saturation {
+        assert(gft_mul_offset(79, 79, GFT16_BIAS, GFT16_OFFSET_MAX) == 80, "big * big overflows to the inf row");
+        assert(gft_mul_offset(70, 60, GFT16_BIAS, GFT16_OFFSET_MAX) == 80, "90 >= offset_max -> inf");
+        assert(gft_mul_offset(10, 10, GFT16_BIAS, GFT16_OFFSET_MAX) == 0, "tiny * tiny underflows to offset 0");
+        assert(gft_mul_offset(0, 0, GFT16_BIAS, GFT16_OFFSET_MAX) == 0, "min * min = min");
+    }
+
+    // The verifier accepts an honest receipt and REJECTS a forged product exponent.
+    test verify_catches_fraud {
+        assert(verify_gft_mul_offset(41, 41, 42, GFT16_BIAS, GFT16_OFFSET_MAX) == true, "honest phi^2 accepted");
+        assert(verify_gft_mul_offset(41, 41, 43, GFT16_BIAS, GFT16_OFFSET_MAX) == false, "wrong product exponent rejected");
+        assert(verify_gft_mul_offset(50, 60, 71, GFT16_BIAS, GFT16_OFFSET_MAX) == false, "off-by-one exponent rejected");
+    }
+
+    // Sign law: like signs -> +, unlike -> -.
+    test sign_law {
+        assert(gft_mul_sign(0, 0) == 0, "(+)(+) = +");
+        assert(gft_mul_sign(1, 1) == 0, "(-)(-) = +");
+        assert(gft_mul_sign(0, 1) == 1, "(+)(-) = -");
+    }
+
+    // Mantissa multiply + renormalization carry. Significands: M=0 -> 1.0, M=256 ->
+    // 1.5, M=511 -> ~2.0. 1.5*1.5 = 2.25 -> carries (exponent +1); 1.0*1.5 = 1.5 -> no.
+    test mantissa_product {
+        assert(gft_mul_mant_carry(0, 0) == 0, "1.0 * 1.0 = 1.0, no carry");
+        assert(gft_mul_mant(0, 0) == 0, "1.0 * 1.0 mantissa 0");
+        assert(gft_mul_mant_carry(0, 256) == 0, "1.0 * 1.5 = 1.5, no carry");
+        assert(gft_mul_mant(0, 256) == 256, "1.0 * 1.5 mantissa = 256 (1.5)");
+        assert(gft_mul_mant_carry(256, 256) == 1, "1.5 * 1.5 = 2.25 carries");
+        assert(gft_mul_mant(256, 256) == 64, "1.5 * 1.5 -> 1.125 after renorm, mantissa 64");
+    }
+
+    // The FULL exponent uses the carry: gft_mul_offset omitted it, so it was wrong
+    // exactly when the mantissa product renormalized. phi-offsets 41*41 with a
+    // carrying mantissa (1.5*1.5) is 42 + 1 = 43, not 42.
+    test full_exponent_uses_carry {
+        assert(gft_mul_offset_full(41, 0, 41, 0, GFT16_BIAS, GFT16_OFFSET_MAX) == 42, "no mantissa carry -> exponent 42");
+        assert(gft_mul_offset_full(41, 256, 41, 256, GFT16_BIAS, GFT16_OFFSET_MAX) == 43, "1.5*1.5 carry -> exponent 43");
+    }
+
+    // Full verify catches a wrong mantissa even when the exponent claim is right.
+    test full_verify_catches_mantissa {
+        assert(verify_gft_mul_full(40, 0, 40, 256, 40, 256, GFT16_BIAS, GFT16_OFFSET_MAX) == true, "unity * 1.5 = 1.5 accepted");
+        assert(verify_gft_mul_full(40, 0, 40, 256, 40, 255, GFT16_BIAS, GFT16_OFFSET_MAX) == false, "wrong result mantissa rejected");
+        assert(verify_gft_mul_full(41, 256, 41, 256, 43, 64, GFT16_BIAS, GFT16_OFFSET_MAX) == true, "1.5*1.5 -> exp 43, mant 64 accepted");
+        assert(verify_gft_mul_full(41, 256, 41, 256, 42, 64, GFT16_BIAS, GFT16_OFFSET_MAX) == false, "ignoring the carry (exp 42) rejected");
+    }
+
+    // The encoded recomputed result is what a challenge compares: a challenger that
+    // recomputes gets the SAME value as an honest executor, and a different one from
+    // a fraudulent claim.
+    test result_encode {
+        assert(gft_result_encode(42, 0) == (42 << 9), "encode offset 42, mant 0");
+        assert(gft_mul_result(41, 0, 41, 0, GFT16_BIAS, GFT16_OFFSET_MAX) == gft_result_encode(42, 0), "phi^1*phi^1 recomputes to encoded (42,0)");
+        assert(gft_mul_result(41, 256, 41, 256, GFT16_BIAS, GFT16_OFFSET_MAX) == gft_result_encode(43, 64), "1.5*1.5 recomputes to encoded (43,64)");
+        assert(gft_mul_result(41, 0, 41, 0, GFT16_BIAS, GFT16_OFFSET_MAX) != gft_result_encode(43, 0), "a wrong claimed result differs");
+    }
+
+    // Per-rung multiply recompute (mant_one from tri_gft_ladder.gft_mant_one):
+    // GF-T16 (512) unchanged; GF-T8 (16) and GF-T4 (2) now verify too. (GF-T16 bias 40,
+    // offset_max 80; GF-T8 bias 13, offset_max 26; GF-T4 bias 4, offset_max 8.)
+    test per_rung_multiply {
+        // GF-T16 view equals the original: unity*unity and 1.5*1.5 with carry.
+        assert(gft_mul_offset_full_p(40, 0, 40, 0, 40, 80, 512) == 40, "GF-T16 unity*unity offset 40");
+        assert(gft_mul_offset_full_p(41, 256, 41, 256, 40, 80, 512) == 43, "GF-T16 1.5*1.5 carry -> 43");
+        assert(gft_mul_mant_p(256, 256, 512) == 64, "GF-T16 1.5*1.5 mantissa 64");
+        // GF-T8: mant_one 16, M=8 is 1.5. 1.5*1.5=2.25 carries -> mantissa 2, exponent +1.
+        assert(gft_mul_mant_carry_p(8, 8, 16) == 1, "GF-T8 1.5*1.5 carries");
+        assert(gft_mul_mant_p(8, 8, 16) == 2, "GF-T8 1.5*1.5 -> mantissa 2");
+        assert(verify_gft_mul_full_p(13, 8, 13, 8, 14, 2, 13, 26, 16) == true, "GF-T8 1.5*1.5 = exp 14, mant 2");
+        assert(verify_gft_mul_full_p(13, 0, 13, 0, 13, 0, 13, 26, 16) == true, "GF-T8 unity*unity = exp 13, mant 0");
+        // GF-T4: mant_one 2, M=1 is 1.5. 1.5*1.5=2.25 carries -> mantissa 0, exponent +1.
+        assert(verify_gft_mul_full_p(4, 1, 4, 1, 5, 0, 4, 8, 2) == true, "GF-T4 1.5*1.5 = exp 5, mant 0");
+        assert(verify_gft_mul_full_p(4, 1, 4, 1, 4, 0, 4, 8, 2) == false, "GF-T4 wrong exponent rejected");
+    }
+
+    // GF-T32 multiply (u64): mant_one 2^25 = 33554432, bias 364, offset_max 728.
+    // M = 2^24 is the significand 1.5; 2^22 is 1.125. Unity is offset 364.
+    test gft32_multiply {
+        // unity * unity = unity (no carry): offset 364, mantissa 0.
+        assert(gft_mul_mant_carry_u64(0, 0, 33554432) == 0, "GF-T32 1.0*1.0 no carry");
+        assert(gft_mul_mant_u64(0, 0, 33554432) == 0, "GF-T32 unity mantissa 0");
+        assert(verify_gft_mul_full_u64(364, 0, 364, 0, 364, 0, 364, 728, 33554432) == true, "GF-T32 unity*unity = offset 364, mant 0");
+        // 1.5 * 1.5 = 2.25 -> significand 1.125 (M 2^22), exponent +1: offset 365.
+        assert(gft_mul_mant_carry_u64(16777216, 16777216, 33554432) == 1, "GF-T32 1.5*1.5 carries");
+        assert(gft_mul_mant_u64(16777216, 16777216, 33554432) == 4194304, "GF-T32 1.5*1.5 -> mantissa 2^22");
+        assert(verify_gft_mul_full_u64(364, 16777216, 364, 16777216, 365, 4194304, 364, 728, 33554432) == true, "GF-T32 1.5*1.5 = offset 365, mant 2^22");
+        assert(verify_gft_mul_full_u64(364, 16777216, 364, 16777216, 364, 4194304, 364, 728, 33554432) == false, "GF-T32 missed carry rejected");
+    }
+
+    // Perf-profile bench (completing the ALU trio with add/sub sweeps): a GF-T16
+    // multiply sweep across the mantissa range, both carry regimes and the offset
+    // path, cycle count reported by the icarus flow.
+    bench mul_mantissa_sweep {
+        m0 = gft_mul_mant(0, 0);
+        c0 = gft_mul_mant_carry(0, 0);
+        m1 = gft_mul_mant(128, 128);
+        c1 = gft_mul_mant_carry(128, 128);
+        m2 = gft_mul_mant(256, 0);
+        m3 = gft_mul_mant(256, 256);
+        c3 = gft_mul_mant_carry(256, 256);
+        m4 = gft_mul_mant(384, 384);
+        m5 = gft_mul_mant(448, 64);
+        m6 = gft_mul_mant(64, 448);
+        m7 = gft_mul_mant(511, 511);
+        c7 = gft_mul_mant_carry(511, 511);
+        o0 = gft_mul_offset(44, 44, 40, 80);
+        of = gft_mul_offset_full(44, 256, 44, 256, 40, 80);
+        assert(m0 == 0, "1.0 * 1.0 mantissa 0");
+        assert(c0 == 0, "1.0 * 1.0 no carry");
+        assert(m1 == 288, "1.25^2 = 1.5625 -> mantissa 288");
+        assert(c1 == 0, "1.25^2 no carry");
+        assert(m2 == 256, "1.5 * 1.0 = 1.5");
+        assert(m3 == 64, "1.5^2 = 2.25 -> mantissa 64");
+        assert(c3 == 1, "1.5^2 carries");
+        assert(m4 == 272, "1.75^2 = 3.0625 -> mantissa 272");
+        assert(m5 == 28, "1.875 * 1.125 -> mantissa 28 (carry regime)");
+        assert(m6 == 28, "multiply is commutative across the carry regime");
+        assert(m7 == 510, "max mantissa product stays in range");
+        assert(c7 == 1, "max product carries");
+        assert(o0 == 48, "offset path: 44 + 44 - bias 40");
+        assert(of == 49, "full offset includes the mantissa carry");
+    }
+}

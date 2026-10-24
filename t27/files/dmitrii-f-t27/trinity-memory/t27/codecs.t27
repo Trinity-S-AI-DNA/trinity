@@ -1,0 +1,232 @@
+// Native ternary codec algorithms. Source of truth; generated C is disposable.
+// IDs and canonical byte layout match TMEM v1. Input/output buffers must not overlap.
+module TrinityMemoryCodecs {
+    const TM_ERR_CODEC: i32 = -1;
+    const TM_ERR_CAPACITY: i32 = -2;
+    const TM_ERR_TRIT: i32 = -3;
+    const TM_ERR_SPARSITY: i32 = -4;
+    const TM_ERR_LENGTH: i32 = -5;
+    const TM_ERR_CODE: i32 = -6;
+    const TM_ERR_PADDING: i32 = -7;
+    const TM_ERR_HEADER: i32 = -8;
+    const TM_ERR_CHECKSUM: i32 = -9;
+    const TM_ERR_LIMIT: i32 = -10;
+
+    fn tm_group_size(codec: i32) -> usize {
+        if (codec == 0 || codec == 4) { return 4; }
+        if (codec == 1) { return 5; }
+        if (codec == 2) { return 17; }
+        if (codec == 3) { return 22; }
+        if (codec == 5) { return 8; }
+        return 0;
+    }
+
+    fn tm_group_bits(codec: i32) -> u32 {
+        if (codec == 0 || codec == 1 || codec == 5) { return 8; }
+        if (codec == 2) { return 27; }
+        if (codec == 3) { return 35; }
+        if (codec == 4) { return 4; }
+        return 0;
+    }
+
+    fn tm_payload_size(codec: i32, count: u64) -> i64 {
+        var group: u64 = tm_group_size(codec) as u64;
+        if (group == 0) { return TM_ERR_CODEC as i64; }
+        var groups: u64 = count / group;
+        if (count % group != 0) { groups = groups + 1; }
+        // Dividing before multiplying avoids overflow even for UINT64_MAX.
+        var bits: u64 = tm_group_bits(codec) as u64;
+        var bytes: u64 = (groups / 8) * bits + ((groups % 8) * bits + 7) / 8;
+        return bytes as i64;
+    }
+
+    fn tm_pow3(exponent: usize) -> u64 {
+        var value: u64 = 1;
+        var i: usize = 0;
+        while (i < exponent) { value = value * 3; i = i + 1; }
+        return value;
+    }
+
+    fn tm_sparse_word(values: []i32, start: usize, count: usize, group: usize) -> u64 {
+        var nonzero: usize = 0;
+        var first: usize = 0;
+        var second: usize = 0;
+        var signs: u64 = 0;
+        var lane: usize = 0;
+        while (lane < group && lane < count - start) {
+            var value: i32 = values[start + lane];
+            if (value != 0) {
+                if (nonzero == 0) { first = lane; }
+                else { second = lane; }
+                if (value == 1) { signs = signs | ((1 as u64) << nonzero); }
+                nonzero = nonzero + 1;
+            }
+            lane = lane + 1;
+        }
+        if (nonzero == 0) { return 0; }
+        if (nonzero == 1) { return 1 + 2 * (first as u64) + signs; }
+        // Python combinations(range(8),2): first position, then second.
+        var pair_index: u64 = 0;
+        var p: usize = 0;
+        while (p < first) { pair_index = pair_index + ((group - p - 1) as u64); p = p + 1; }
+        pair_index = pair_index + ((second - first - 1) as u64);
+        return 17 + pair_index * 4 + signs;
+    }
+
+    fn tm_word_trit(codec: i32, word: u64, lane: usize) -> i32 {
+        if (codec == 0) {
+            var encoded: u64 = (word >> (2 * lane)) & 3;
+            if (encoded == 2) { return -1; }
+            return encoded as i32;
+        }
+        if (codec == 4 || codec == 5) {
+            if (word == 0) { return 0; }
+            var group: usize = tm_group_size(codec);
+            if (word <= (2 * group) as u64) {
+                var position: usize = ((word - 1) / 2) as usize;
+                if (lane != position) { return 0; }
+                if ((word - 1) % 2 == 1) { return 1; }
+                return -1;
+            }
+            var pair_index: u64 = (word - 17) / 4;
+            var signs: u64 = (word - 17) % 4;
+            var first: usize = 0;
+            while (first < 7) {
+                var pairs: u64 = (7 - first) as u64;
+                if (pair_index < pairs) {
+                    var second: usize = first + 1 + (pair_index as usize);
+                    if (lane == first) {
+                        if ((signs & 1) != 0) { return 1; }
+                        return -1;
+                    }
+                    if (lane == second) {
+                        if ((signs & 2) != 0) { return 1; }
+                        return -1;
+                    }
+                    return 0;
+                }
+                pair_index = pair_index - pairs;
+                first = first + 1;
+            }
+            return 0;
+        }
+        return ((word / tm_pow3(lane)) % 3) as i32 - 1;
+    }
+
+    fn tm_word_valid(codec: i32, word: u64) -> bool {
+        if (codec == 0) {
+            var lane: usize = 0;
+            while (lane < 4) {
+                if (((word >> (2 * lane)) & 3) == 3) { return false; }
+                lane = lane + 1;
+            }
+            return true;
+        }
+        if (codec == 4) { return word < 9; }
+        if (codec == 5) { return word < 129; }
+        return word < tm_pow3(tm_group_size(codec));
+    }
+
+    fn tm_encode(codec: i32, values: []i32, count: usize, out: []u8, capacity: usize) -> i64 {
+        var needed: i64 = tm_payload_size(codec, count as u64);
+        if (needed < 0) { return needed; }
+        if ((needed as u64) > (capacity as u64)) { return TM_ERR_CAPACITY as i64; }
+        var group: usize = tm_group_size(codec);
+        var nonzero: usize = 0;
+        var i: usize = 0;
+        while (i < count) {
+            if (values[i] < -1 || values[i] > 1) { return TM_ERR_TRIT as i64; }
+            if (i % group == 0) { nonzero = 0; }
+            if (values[i] != 0) { nonzero = nonzero + 1; }
+            if (codec == 4 && nonzero > 1) { return TM_ERR_SPARSITY as i64; }
+            if (codec == 5 && nonzero > 2) { return TM_ERR_SPARSITY as i64; }
+            i = i + 1;
+        }
+        // All validation precedes the first caller-buffer write.
+        var buffered: u64 = 0;
+        var buffered_bits: u32 = 0;
+        var group_bits: u32 = tm_group_bits(codec);
+        var offset: usize = 0;
+        var dest: usize = 0;
+        while (offset < count) {
+            var word: u64 = 0;
+            if (codec == 4 || codec == 5) {
+                word = tm_sparse_word(values, offset, count, group);
+            } else {
+                var lane: usize = 0;
+                var factor: u64 = 1;
+                while (lane < group) {
+                    var trit: i32 = 0;
+                    if (lane < count - offset) { trit = values[offset + lane]; }
+                    if (codec == 0) {
+                        var encoded: u64 = 0;
+                        if (trit == -1) { encoded = 2; }
+                        if (trit == 1) { encoded = 1; }
+                        word = word | (encoded << (2 * lane));
+                    } else {
+                        word = word + ((trit + 1) as u64) * factor;
+                        factor = factor * 3;
+                    }
+                    lane = lane + 1;
+                }
+            }
+            buffered = buffered | (word << buffered_bits);
+            buffered_bits = buffered_bits + group_bits;
+            while (buffered_bits >= 8) {
+                out[dest] = (buffered & 255) as u8;
+                dest = dest + 1;
+                buffered = buffered >> 8;
+                buffered_bits = buffered_bits - 8;
+            }
+            // Avoid offset+group overflow for a partial final group.
+            if (count - offset <= group) { offset = count; }
+            else { offset = offset + group; }
+        }
+        if (buffered_bits != 0) { out[dest] = buffered as u8; }
+        return needed;
+    }
+
+    fn tm_decode(codec: i32, data: []u8, size: usize, count: usize, out: []i32, capacity: usize) -> i32 {
+        var needed: i64 = tm_payload_size(codec, count as u64);
+        if (needed < 0) { return needed as i32; }
+        if ((needed as u64) != (size as u64)) { return TM_ERR_LENGTH; }
+        if (capacity < count) { return TM_ERR_CAPACITY; }
+        var group: usize = tm_group_size(codec);
+        var group_bits: u32 = tm_group_bits(codec);
+        var mask: u64 = ((1 as u64) << group_bits) - 1;
+        // First pass validates all words and padding. Second pass writes.
+        var pass: u32 = 0;
+        while (pass < 2) {
+            var buffered: u64 = 0;
+            var buffered_bits: u32 = 0;
+            var offset: usize = 0;
+            var dest: usize = 0;
+            while (dest < count) {
+                while (buffered_bits < group_bits) {
+                    buffered = buffered | ((data[offset] as u64) << buffered_bits);
+                    offset = offset + 1;
+                    buffered_bits = buffered_bits + 8;
+                }
+                var word: u64 = buffered & mask;
+                buffered = buffered >> group_bits;
+                buffered_bits = buffered_bits - group_bits;
+                if (pass == 0 && !tm_word_valid(codec, word)) { return TM_ERR_CODE; }
+                var lane: usize = 0;
+                while (lane < group) {
+                    var trit: i32 = tm_word_trit(codec, word, lane);
+                    if (lane < count - dest) {
+                        if (pass == 1) { out[dest + lane] = trit; }
+                    } else {
+                        if (pass == 0 && trit != 0) { return TM_ERR_PADDING; }
+                    }
+                    lane = lane + 1;
+                }
+                if (count - dest <= group) { dest = count; }
+                else { dest = dest + group; }
+            }
+            if (pass == 0 && buffered != 0) { return TM_ERR_PADDING; }
+            pass = pass + 1;
+        }
+        return 0;
+    }
+}

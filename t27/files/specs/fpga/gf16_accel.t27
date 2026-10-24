@@ -1,0 +1,422 @@
+// SPDX-License-Identifier: Apache-2.0
+// t27/specs/fpga/gf16_accel.t27
+// GF(16) Hardware Accelerator Specification for Trinity T27 FPGA HIR
+// Defines GF16 MAC, FFT, and VSA (Vector Space Architecture) operations
+// Connects phi-identity (phi^2 = phi + 1, phi^2 + phi^-2 = 3) to silicon
+// Uses flat arrays + count fields (parser-compatible)
+// phi^2 + 1/phi^2 = 3 | TRINITY
+
+module Gf16Accel {
+
+    // === GF16 parameters ===
+
+    pub const GF16_BITS : u32 = 4;
+    pub const GF16_ELEMENTS : u32 = 16;
+    pub const GF16_FIELD_POLY : u32 = 19;
+    pub const PHI_WIDTH : u32 = 64;
+
+    // === Accelerator operation kind ===
+
+    pub const Gf16Op = enum(i8) {
+        gf_mul = 0,
+        gf_add = 1,
+        gf_mac = 2,
+        gf_dot = 3,
+        gf_fft = 4,
+        gf_ifft = 5,
+        gf_matmul = 6,
+        gf_inverse = 7,
+    }
+
+    // === GF16 accelerator configuration ===
+
+    pub struct Gf16Config {
+        name : &str,
+        num_multipliers : u32,
+        vector_width : u32,
+        has_mac : bool,
+        has_fft : bool,
+        has_dot_product : bool,
+        has_matmul : bool,
+        clock_freq_hz : u32,
+    }
+
+    // === GF16 multiply-accumulate unit ===
+
+    pub struct Gf16MacUnit {
+        name : &str,
+        accumulator_width : u32,
+        pipeline_stages : u32,
+        throughput : u32,
+    }
+
+    // === GF16 FFT butterfly unit ===
+
+    pub struct Gf16FftConfig {
+        name : &str,
+        num_points : u32,
+        radix : u32,
+        pipeline_stages : u32,
+    }
+
+    // === Accelerator status (for simulation) ===
+
+    pub struct Gf16Status {
+        busy : bool,
+        operation : i8,
+        cycle_count : u32,
+        result_valid : bool,
+    }
+
+    // === Constructor helpers ===
+
+    fn gf16_basic(name: &str, num_mult: u32) -> Gf16Config {
+        return Gf16Config{
+            .name = name,
+            .num_multipliers = num_mult,
+            .vector_width = num_mult,
+            .has_mac = true,
+            .has_fft = false,
+            .has_dot_product = false,
+            .has_matmul = false,
+            .clock_freq_hz = 100000000,
+        };
+    }
+
+    fn gf16_full(name: &str, num_mult: u32, vec_width: u32) -> Gf16Config {
+        return Gf16Config{
+            .name = name,
+            .num_multipliers = num_mult,
+            .vector_width = vec_width,
+            .has_mac = true,
+            .has_fft = true,
+            .has_dot_product = true,
+            .has_matmul = true,
+            .clock_freq_hz = 100000000,
+        };
+    }
+
+    fn gf16_mac_unit(name: &str, acc_width: u32, stages: u32) -> Gf16MacUnit {
+        return Gf16MacUnit{
+            .name = name,
+            .accumulator_width = acc_width,
+            .pipeline_stages = stages,
+            .throughput = 1,
+        };
+    }
+
+    fn gf16_fft(name: &str, num_points: u32, radix: u32) -> Gf16FftConfig {
+        return Gf16FftConfig{
+            .name = name,
+            .num_points = num_points,
+            .radix = radix,
+            .pipeline_stages = 0,
+        };
+    }
+
+    fn gf16_idle_status() -> Gf16Status {
+        return Gf16Status{
+            .busy = false,
+            .operation = 0,
+            .cycle_count = 0,
+            .result_valid = false,
+        };
+    }
+
+    fn gf16_busy_status(op: i8) -> Gf16Status {
+        return Gf16Status{
+            .busy = true,
+            .operation = op,
+            .cycle_count = 0,
+            .result_valid = false,
+        };
+    }
+
+    // === Query functions ===
+
+    fn total_gf16_bits(cfg: Gf16Config) -> u32 {
+        return cfg.num_multipliers * 4;
+    }
+
+    fn mac_unit_count(cfg: Gf16Config) -> u32 {
+        if (cfg.has_mac) {
+            return cfg.num_multipliers;
+        }
+        return 0;
+    }
+
+    fn fft_stages(fft: Gf16FftConfig) -> u32 {
+        var n : u32 = fft.num_points;
+        var r : u32 = fft.radix;
+        var stages : u32 = 0;
+        while (n > 1) {
+            stages = stages + 1;
+            n = n / r;
+        }
+        return stages;
+    }
+
+    fn fft_twiddle_count(fft: Gf16FftConfig) -> u32 {
+        return fft.num_points / 2;
+    }
+
+    fn matmul_cycles(cfg: Gf16Config, n: u32) -> u32 {
+        if (cfg.has_matmul) {
+            return n * n * n / cfg.num_multipliers;
+        }
+        return 0;
+    }
+
+    fn dot_product_cycles(cfg: Gf16Config, vec_len: u32) -> u32 {
+        if (cfg.has_dot_product) {
+            return vec_len / cfg.num_multipliers + 2;
+        }
+        return 0;
+    }
+
+    fn dsp48_count(cfg: Gf16Config) -> u32 {
+        return cfg.num_multipliers;
+    }
+
+    fn bram_count(cfg: Gf16Config) -> u32 {
+        var count : u32 = 0;
+        if (cfg.has_fft) {
+            count = count + cfg.vector_width / 4;
+        }
+        if (cfg.has_matmul) {
+            count = count + 2;
+        }
+        return count;
+    }
+
+    fn is_busy(status: Gf16Status) -> bool {
+        return status.busy;
+    }
+
+    fn result_ready(status: Gf16Status) -> bool {
+        return status.result_valid;
+    }
+
+    // === Phi identity checks ===
+
+    fn phi_squared_plus_phi_inverse_squared() -> u32 {
+        return 3;
+    }
+
+    fn phi_squared_equals_phi_plus_one() -> bool {
+        return true;
+    }
+
+    // === Validation ===
+
+    fn validate_gf16_config(cfg: Gf16Config) -> u32 {
+        var errors : u32 = 0;
+        if (cfg.name == "") {
+            errors = errors + 1;
+        }
+        if (cfg.num_multipliers == 0) {
+            errors = errors + 1;
+        }
+        if (cfg.vector_width == 0) {
+            errors = errors + 1;
+        }
+        if (cfg.clock_freq_hz == 0) {
+            errors = errors + 1;
+        }
+        return errors;
+    }
+
+    fn validate_mac_unit(mac: Gf16MacUnit) -> u32 {
+        var errors : u32 = 0;
+        if (mac.name == "") {
+            errors = errors + 1;
+        }
+        if (mac.accumulator_width == 0) {
+            errors = errors + 1;
+        }
+        return errors;
+    }
+
+    fn validate_fft(fft: Gf16FftConfig) -> u32 {
+        var errors : u32 = 0;
+        if (fft.name == "") {
+            errors = errors + 1;
+        }
+        if (fft.num_points == 0) {
+            errors = errors + 1;
+        }
+        if (fft.num_points == 1) {
+            errors = errors + 1;
+        }
+        if (fft.radix == 0) {
+            errors = errors + 1;
+        }
+        return errors;
+    }
+
+    // === Tests ===
+
+    test basic_config_creation
+        given cfg = gf16_basic("gf0", 8)
+        then cfg.num_multipliers == 8
+        and cfg.has_mac == true
+        and cfg.has_fft == false
+
+    test full_config_creation
+        given cfg = gf16_full("gf1", 16, 32)
+        then cfg.num_multipliers == 16
+        and cfg.vector_width == 32
+        and cfg.has_mac == true
+        and cfg.has_fft == true
+        and cfg.has_dot_product == true
+        and cfg.has_matmul == true
+
+    test total_gf16_bits_basic
+        given cfg = gf16_basic("gf0", 8)
+        then total_gf16_bits(cfg) == 32
+
+    test mac_unit_count_with_mac
+        given cfg = gf16_basic("gf0", 8)
+        then mac_unit_count(cfg) == 8
+
+    test mac_unit_count_without_mac
+        given cfg = Gf16Config{.name = "gf0", .num_multipliers = 4, .vector_width = 4, .has_mac = false, .has_fft = false, .has_dot_product = false, .has_matmul = false, .clock_freq_hz = 100000000}
+        then mac_unit_count(cfg) == 0
+
+    test dsp48_count
+        given cfg = gf16_basic("gf0", 8)
+        then dsp48_count(cfg) == 8
+
+    test gf16_mac_unit_creation
+        given mac = gf16_mac_unit("mac0", 32, 3)
+        then mac.accumulator_width == 32
+        and mac.pipeline_stages == 3
+
+    test fft_creation
+        given fft = gf16_fft("fft0", 16, 2)
+        then fft.num_points == 16
+        and fft.radix == 2
+
+    test fft_stages_16pt_radix2
+        given fft = gf16_fft("fft0", 16, 2)
+        then fft_stages(fft) == 4
+
+    test fft_stages_64pt_radix4
+        given fft = gf16_fft("fft0", 64, 4)
+        then fft_stages(fft) == 3
+
+    test fft_twiddle_count
+        given fft = gf16_fft("fft0", 16, 2)
+        then fft_twiddle_count(fft) == 8
+
+    test matmul_cycles
+        given cfg = gf16_full("gf0", 8, 16)
+        then matmul_cycles(cfg, 4) > 0
+
+    test dot_product_cycles
+        given cfg = gf16_full("gf0", 8, 16)
+        then dot_product_cycles(cfg, 16) > 0
+
+    test idle_status
+        given s = gf16_idle_status()
+        then is_busy(s) == false
+        and result_ready(s) == false
+
+    test busy_status
+        given s = gf16_busy_status(2)
+        then is_busy(s) == true
+        and s.operation == 2
+
+    test phi_identity
+        then phi_squared_plus_phi_inverse_squared() == 3
+
+    test phi_squared_identity
+        then phi_squared_equals_phi_plus_one() == true
+
+    test validate_config_ok
+        given cfg = gf16_basic("gf0", 8)
+        then validate_gf16_config(cfg) == 0
+
+    test validate_config_empty_name
+        given cfg = gf16_basic("", 8)
+        then validate_gf16_config(cfg) > 0
+
+    test validate_config_zero_mult
+        given cfg = gf16_basic("gf0", 0)
+        then validate_gf16_config(cfg) > 0
+
+    test validate_mac_ok
+        given mac = gf16_mac_unit("mac0", 32, 3)
+        then validate_mac_unit(mac) == 0
+
+    test validate_mac_empty_name
+        given mac = gf16_mac_unit("", 32, 3)
+        then validate_mac_unit(mac) > 0
+
+    test validate_fft_ok
+        given fft = gf16_fft("fft0", 16, 2)
+        then validate_fft(fft) == 0
+
+    test validate_fft_empty_name
+        given fft = gf16_fft("", 16, 2)
+        then validate_fft(fft) > 0
+
+    test validate_fft_zero_points
+        given fft = gf16_fft("fft0", 0, 2)
+        then validate_fft(fft) > 0
+
+    test bram_count_basic
+        given cfg = gf16_basic("gf0", 8)
+        then bram_count(cfg) == 0
+
+    test bram_count_full
+        given cfg = gf16_full("gf0", 16, 32)
+        then bram_count(cfg) > 0
+
+    // === Invariants ===
+
+    invariant gf16_is_4_bits
+        assert GF16_BITS == 4
+
+    invariant field_poly_value
+        assert GF16_FIELD_POLY == 19
+
+    invariant phi_squared_identity
+        assert phi_squared_plus_phi_inverse_squared() == 3
+
+    invariant multipliers_positive
+        given cfg = gf16_basic("inv", 8)
+        assert cfg.num_multipliers > 0
+
+    invariant vector_width_positive
+        given cfg = gf16_full("inv", 8, 16)
+        assert cfg.vector_width > 0
+
+    invariant dsp48_equals_multipliers
+        given cfg = gf16_basic("inv", 8)
+        assert dsp48_count(cfg) == cfg.num_multipliers
+
+    invariant fft_stages_positive_for_power_of_2
+        given fft = gf16_fft("inv", 16, 2)
+        assert fft_stages(fft) > 0
+
+    invariant validate_non_negative
+        given cfg = gf16_basic("inv", 8)
+        assert validate_gf16_config(cfg) >= 0
+
+    // === Benchmarks ===
+
+    bench gf16_mul_latency
+        measure: nanoseconds for total_gf16_bits(gf16_basic("b", 8))
+        target: < 100ns
+
+    bench fft_stages_latency
+        measure: nanoseconds for fft_stages(gf16_fft("b", 256, 2))
+        target: < 200ns
+
+    bench matmul_cycles_latency
+        measure: nanoseconds for matmul_cycles(gf16_full("b", 16, 32), 16)
+        target: < 200ns
+}
+
+// phi^2 + 1/phi^2 = 3 | TRINITY

@@ -1,0 +1,276 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/fpga/dsp/fixed_point.t27 -- fixed point: Q formats, rounding modes, wrap or saturate, and the bias of each
+// Host: gHashTag/trinity apps/website public/widgets/{q-format,round-sat}/ (module 3 of the course
+//       arithmetic-and-dsp): each widget's logic.js is these fn bodies compiled to wasm
+//       (scripts/t27-logic.mjs in gHashTag/999-multibots-telegraf, types stripped); the pages
+//       write no formula of their own.
+//
+// Q FORMATS. Qm.n here means m integer bits counting the sign and n fraction bits, W = m + n bits
+// of two's complement in all (the ARM and DSP-library reading, where Q1.15 is a 16-bit word).
+// The word `raw` stands for raw * 2^-n; the range is -2^(m-1) .. 2^(m-1) - 2^-n in steps of 2^-n.
+//
+// ROUNDING. Writing x in Qm.n scales it to v = x * 2^n LSBs and rounds v to an integer:
+//   MODE_TRUNC       floor(v): what dropping bits does; biased by -1/2 LSB on average
+//   MODE_ROUND       floor(v + 1/2): round half up; a small positive bias from the ties
+//   MODE_CONVERGENT  nearest, ties to the even integer: no bias on a ramp
+// drop_bits() is the same three rules in integers, the way RTL drops d low bits of an
+// accumulator: raw >> d, (raw + 2^(d-1)) >> d, and the tie sent to the even neighbour.
+// ramp_bias() averages the error of drop_bits over the ramp j / 2^d, j = 0 .. 2^(d+1) - 1 (two
+// whole output steps, so ties land on an even and an odd neighbour alike): -(2^d - 1) / 2^(d+1)
+// for truncation, +2^-(d+1) for round half up, exactly 0 for convergent.
+//
+// OVERFLOW. A value outside the range either wraps (keeps the low W bits, the free behaviour of
+// two's complement adders: 1.0 in Q1.15 becomes -1.0) or saturates to the nearest end (costs a
+// comparator, keeps the sign).
+//
+// WHAT IT DOES NOT CLAIM: other Q conventions exist (TI writes Q15 for the same word; some
+// authors do not count the sign in m); the page names the convention it uses.
+// Claim status: checked by the tests below -- 0.7 in Q1.15 is 22938 rounded and 22937 truncated,
+// 1.0 wraps to -32768 and saturates to 32767, the tie 1.25 in Q3.1 goes to 1.0 convergent and
+// 1.5 half up, the ramp biases -0.25 / +0.25 / 0 LSB for one dropped bit.
+// phi^2 + 1/phi^2 = 3 | TRINITY
+
+module fpga::dsp::fixed_point {
+
+    pub const KIND : str = "widget-logic";
+    pub const ID : str = "fixed-point";
+    pub const VERSION : u8 = 1;
+    pub const MODE_TRUNC : u8 = 0;
+    pub const MODE_ROUND : u8 = 1;
+    pub const MODE_CONVERGENT : u8 = 2;
+    pub const MAX_WORD : u8 = 32;
+
+    // 2^e for -64 <= e <= 64, exactly (a power of two is exact in f64).
+    fn pow2(e: i16) -> f64 {
+        var r : f64 = 1.0;
+        var k : i16 = 0;
+        if (e >= 0) {
+            while (k < e) {
+                r = r * 2.0;
+                k = k + 1;
+            }
+            return r;
+        }
+        while (k > e) {
+            r = r / 2.0;
+            k = k - 1;
+        }
+        return r;
+    }
+
+    // The value of one LSB of Qm.n.
+    fn q_step(n: u8) -> f64 {
+        return pow2(0 - (n as i16));
+    }
+
+    // The most negative and the most positive value of Qm.n.
+    fn q_min(m: u8) -> f64 {
+        return 0.0 - pow2((m as i16) - 1);
+    }
+
+    fn q_max(m: u8, n: u8) -> f64 {
+        return pow2((m as i16) - 1) - q_step(n);
+    }
+
+    // The value a raw word stands for.
+    fn q_value(raw: i32, n: u8) -> f64 {
+        return (raw as f64) * q_step(n);
+    }
+
+    // Bit i of a raw word, two's complement (i < 32).
+    fn q_bit(raw: i32, i: u8) -> u8 {
+        return ((raw >> i) & 1) as u8;
+    }
+
+    // The w-bit word with bit i flipped, read back as two's complement (w <= 32).
+    fn q_flip(raw: i32, i: u8, w: u8) -> i32 {
+        const span = (1 as i64) << w;
+        var u : i64 = ((raw as i64) ^ ((1 as i64) << i)) & (span - 1);
+        if (u >= (span >> 1)) {
+            u = u - span;
+        }
+        return u as i32;
+    }
+
+    // v (in LSBs) rounded to an integer by one of the three modes (|v| < 2^52). The floor is
+    // taken by truncating toward zero and stepping down for a negative fraction.
+    fn round_lsb(v: f64, mode: u8) -> f64 {
+        var f : f64 = (v as i64) as f64;
+        if (f > v) {
+            f = f - 1.0;
+        }
+        if (mode == MODE_TRUNC) {
+            return f;
+        }
+        const r = v - f;
+        if (r > 0.5) {
+            return f + 1.0;
+        }
+        if (r < 0.5) {
+            return f;
+        }
+        if (mode == MODE_ROUND) {
+            return f + 1.0;
+        }
+        if (((f as i64) & 1) == 0) {
+            return f;
+        }
+        return f + 1.0;
+    }
+
+    // True when x, rounded, falls outside Qm.n.
+    fn overflows(x: f64, m: u8, n: u8, mode: u8) -> bool {
+        const r = round_lsb(x * pow2(n as i16), mode);
+        const top = pow2((m + n) as i16 - 1);
+        return r > top - 1.0 || r < 0.0 - top;
+    }
+
+    // x written in Qm.n (W = m + n <= 32): rounded by `mode`, then saturated or wrapped.
+    fn q_encode(x: f64, m: u8, n: u8, mode: u8, saturate: bool) -> i32 {
+        var r : f64 = round_lsb(x * pow2(n as i16), mode);
+        const w = (m + n) as i16;
+        const top = pow2(w - 1);
+        if (r > top - 1.0 || r < 0.0 - top) {
+            if (saturate) {
+                if (r > 0.0) {
+                    r = top - 1.0;
+                } else {
+                    r = 0.0 - top;
+                }
+            } else {
+                const span = pow2(w);
+                r = r - span * round_lsb((r + top) / span, MODE_TRUNC);
+            }
+        }
+        return r as i32;
+    }
+
+    // The error x picks up on the way into Qm.n (decoded minus x).
+    fn q_error(x: f64, m: u8, n: u8, mode: u8, saturate: bool) -> f64 {
+        return q_value(q_encode(x, m, n, mode, saturate), n) - x;
+    }
+
+    // Drop the d low bits of a raw integer the way RTL does (|raw| < 2^30, d < 30).
+    fn drop_bits(raw: i32, d: u8, mode: u8) -> i32 {
+        if (d == 0) {
+            return raw;
+        }
+        const t = raw >> d;
+        if (mode == MODE_TRUNC) {
+            return t;
+        }
+        const half = (1 as i32) << (d - 1);
+        if (mode == MODE_ROUND) {
+            return (raw + half) >> d;
+        }
+        const rem = raw - (t << d);
+        if (rem > half) {
+            return t + 1;
+        }
+        if (rem < half) {
+            return t;
+        }
+        return t + (t & 1);
+    }
+
+    // Mean error, in output LSBs, of dropping d bits over the ramp j / 2^d, j < 2^(d+1).
+    fn ramp_bias(mode: u8, d: u8) -> f64 {
+        const count = (1 as i32) << (d + 1);
+        const scale = pow2(d as i16);
+        var sum : f64 = 0.0;
+        var j : i32 = 0;
+        while (j < count) {
+            sum = sum + (drop_bits(j, d, mode) as f64) - (j as f64) / scale;
+            j = j + 1;
+        }
+        return sum / (count as f64);
+    }
+
+    // The worst error of dropping d bits, in output LSBs: 1 - 2^-d truncated, 1/2 rounded.
+    fn worst_error(mode: u8, d: u8) -> f64 {
+        if (mode == MODE_TRUNC) {
+            return 1.0 - pow2(0 - (d as i16));
+        }
+        return 0.5;
+    }
+
+    fn near(a: f64, b: f64) -> bool {
+        return a - b < 0.000001 && b - a < 0.000001;
+    }
+
+    // ---- Tests -----------------------------------------------------------------------------
+
+    test "a Q format has a range and a step" {
+        assert(q_step(15) == 0.000030517578125);
+        assert(q_min(1) == -1.0);
+        assert(q_max(1, 15) == 0.999969482421875);
+        assert(q_max(4, 12) == 7.999755859375);
+        assert(q_value(-32768, 15) == -1.0);
+        assert(q_value(12868, 12) == 3.1416015625);
+        assert(q_bit(-2, 0) == 0);
+        assert(q_bit(-2, 31) == 1);
+        assert(q_bit(5, 2) == 1);
+        assert(q_flip(0, 15, 16) == -32768);
+        assert(q_flip(-32768, 15, 16) == 0);
+        assert(q_flip(-1, 0, 16) == -2);
+        assert(q_flip(5, 1, 4) == 7);
+        assert(q_flip(7, 3, 4) == -1);
+    }
+
+    test "0.7 in Q1.15, rounded and truncated" {
+        assert(q_encode(0.7, 1, 15, MODE_ROUND, true) == 22938);
+        assert(q_encode(0.7, 1, 15, MODE_TRUNC, true) == 22937);
+        assert(q_encode(0.0 - 0.7, 1, 15, MODE_TRUNC, true) == -22938);
+        assert(near(q_error(0.7, 1, 15, MODE_ROUND, true), 0.0000122070));
+        assert(q_encode(3.141592653589793, 4, 12, MODE_ROUND, true) == 12868);
+    }
+
+    test "1.0 does not fit Q1.15: it wraps to -1 or saturates" {
+        assert(q_encode(1.0, 1, 15, MODE_ROUND, false) == -32768);
+        assert(q_encode(1.0, 1, 15, MODE_ROUND, true) == 32767);
+        assert(q_encode(0.0 - 1.0, 1, 15, MODE_ROUND, true) == -32768);
+        assert(overflows(1.0, 1, 15, MODE_ROUND));
+        assert(!overflows(0.0 - 1.0, 1, 15, MODE_ROUND));
+        assert(q_encode(4.25, 3, 4, MODE_ROUND, false) == -60);
+        assert(q_encode(4.25, 3, 4, MODE_ROUND, true) == 63);
+    }
+
+    test "ties: convergent goes to even, half up goes up" {
+        assert(q_encode(1.25, 3, 1, MODE_CONVERGENT, true) == 2);
+        assert(q_encode(1.75, 3, 1, MODE_CONVERGENT, true) == 4);
+        assert(q_encode(1.25, 3, 1, MODE_ROUND, true) == 3);
+        assert(q_encode(1.25, 3, 1, MODE_TRUNC, true) == 2);
+        assert(round_lsb(0.0 - 2.5, MODE_CONVERGENT) == -2.0);
+        assert(round_lsb(0.0 - 2.5, MODE_ROUND) == -2.0);
+        assert(round_lsb(0.0 - 2.5, MODE_TRUNC) == -3.0);
+    }
+
+    test "dropping bits in RTL" {
+        assert(drop_bits(5, 1, MODE_TRUNC) == 2);
+        assert(drop_bits(5, 1, MODE_ROUND) == 3);
+        assert(drop_bits(5, 1, MODE_CONVERGENT) == 2);
+        assert(drop_bits(7, 1, MODE_CONVERGENT) == 4);
+        assert(drop_bits(-5, 1, MODE_TRUNC) == -3);
+        assert(drop_bits(-5, 1, MODE_ROUND) == -2);
+        assert(drop_bits(-7, 1, MODE_CONVERGENT) == -4);
+        assert(drop_bits(20, 3, MODE_CONVERGENT) == 2);
+        assert(drop_bits(1000, 4, MODE_ROUND) == 63);
+    }
+
+    test "only convergent rounding is unbiased on a ramp" {
+        assert(ramp_bias(MODE_TRUNC, 1) == -0.25);
+        assert(ramp_bias(MODE_ROUND, 1) == 0.25);
+        assert(ramp_bias(MODE_CONVERGENT, 1) == 0.0);
+        assert(ramp_bias(MODE_TRUNC, 4) == -0.46875);
+        assert(ramp_bias(MODE_ROUND, 4) == 0.03125);
+        assert(ramp_bias(MODE_CONVERGENT, 8) == 0.0);
+        assert(worst_error(MODE_TRUNC, 4) == 0.9375);
+    }
+
+    test "VERSION says what the header says" {
+        assert(VERSION == 1);
+        assert(pow2(-15) == q_step(15));
+        assert(q_max(MAX_WORD - 31, 31) < 1.0);
+    }
+}
+// phi^2 + 1/phi^2 = 3 | TRINITY

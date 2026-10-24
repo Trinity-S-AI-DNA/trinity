@@ -1,0 +1,119 @@
+// TRI-NET end-to-end payout: compose reputation weighting (tri_compute_reputation)
+// with the pool split (tri_compute_pool) into one reward distribution, and pin the
+// property that matters when the two are combined: a REPUTATION-WEIGHTED floor-div
+// split still never over-issues (sum of shares <= pool). Higher-reputation nodes
+// earn a larger share for equal raw work; a slashed (low-reputation) node earns
+// less; an empty round pays nobody. Self-contained (mirrors the two source specs)
+// so it parses and gen-checks on its own.
+
+module TriComputePayout {
+    use base::types;
+
+    // Effective weight = raw work scaled by reputation (tri_compute_reputation).
+    // Effective weight = raw work scaled by reputation. SATURATING: raw_work * rep
+    // overflows u32 for a busy node (raw_work = summed GF widths across many
+    // receipts, an untrusted input; rep up to 1000), wrapping the weight to garbage
+    // and corrupting the proportional split before payout's u64 mulDiv ever sees
+    // it. Widen to u64 and cap at u32 max (the balance_add discipline): a weight
+    // that large already dominates the split, so saturation bounds it without wrap.
+    fn weighted(raw_work: u32, rep: u32) -> u32 {
+        let prod: u64 = (raw_work as u64) * (rep as u64);
+        if (prod > 4294967295) {
+            return 4294967295;
+        } else {
+            return prod as u32;
+        }
+    }
+
+    // Sum of three weights, saturating: three near-max weights overflow a u32 sum
+    // and would wrap total_weighted below a single share, breaking the split.
+    fn total_weighted3(w0: u32, w1: u32, w2: u32) -> u32 {
+        let sum: u64 = (w0 as u64) + (w1 as u64) + (w2 as u64);
+        if (sum > 4294967295) {
+            return 4294967295;
+        } else {
+            return sum as u32;
+        }
+    }
+
+    // Floor-div payout share of the pool by weight (tri_compute_pool discipline).
+    // Guarded against an empty round.
+    fn payout(total_pool: u32, my_weighted: u32, total_weighted: u32) -> u32 {
+        if (total_weighted == 0) {
+            return 0;
+        } else {
+            // u64 intermediate: total_pool * my_weighted overflows u32 for large
+            // pools/weights; widen the product so the floor-div stays exact.
+            let num: u64 = (total_pool as u64) * (my_weighted as u64);
+            let den: u64 = total_weighted as u64;
+            return (num / den) as u32;
+        }
+    }
+
+    // ---- Tests / invariants ----
+
+    // Three nodes, equal raw work (16), reputations 1000/500/250 -> weighted split.
+    test reputation_weighted_split {
+        w0 = weighted(16, 1000);
+        w1 = weighted(16, 500);
+        w2 = weighted(16, 250);
+        tw = total_weighted3(w0, w1, w2);
+        assert(tw == 28000, "total weighted = 16000+8000+4000");
+        s0 = payout(1000, w0, tw);
+        s1 = payout(1000, w1, tw);
+        s2 = payout(1000, w2, tw);
+        assert(s0 == 571, "rep 1000 -> 571");
+        assert(s1 == 285, "rep 500 -> 285");
+        assert(s2 == 142, "rep 250 -> 142");
+        assert(s0 > s1, "higher reputation earns more for equal work");
+        assert(s1 > s2, "a slashed (low-rep) node earns less");
+    }
+
+    // No over-issuance survives reputation weighting: shares SUM to at most the pool.
+    test weighted_no_over_issuance {
+        w0 = weighted(16, 1000);
+        w1 = weighted(16, 500);
+        w2 = weighted(16, 250);
+        tw = total_weighted3(w0, w1, w2);
+        sum = payout(1000, w0, tw) + payout(1000, w1, tw) + payout(1000, w2, tw);
+        assert(sum == 998, "sum 998 <= pool 1000 (floor loses the dust)");
+    }
+
+    // A zero-reputation node earns nothing even with raw work; empty round is safe.
+    test zero_rep_and_empty_round {
+        assert(weighted(48, 0) == 0, "no reputation => zero weight");
+        assert(payout(1000, 0, 28000) == 0, "zero weight => zero payout");
+        assert(payout(1000, 16000, 0) == 0, "empty round pays nobody, no divide-by-zero");
+    }
+
+    // Overflow guard at scale, symmetric to tri_compute_pool.pool_share: a large
+    // pool times reputation-weighted work exceeds u32 (1e6 * 16000 = 1.6e10 > 2^32);
+    // in bare u32 the product wraps to a garbage 129_795 share -- the u64 widening
+    // this spec already carries keeps it exact and no-over-issuance survives at
+    // scale, not just the toy 1000-pool rounds above.
+    test large_payout_no_overflow {
+        assert(payout(1000000, 16000, 24000) == 666666, "large pool*weighted floor-divides exactly (no u32 overflow)");
+        assert(payout(1000000, 8000, 24000) == 333333, "second node's weighted share is exact too");
+        s0 = payout(1000000, 16000, 24000);
+        s1 = payout(1000000, 8000, 24000);
+        assert((s0 + s1) == 999999, "sum 999999 <= pool 1e6 at scale; no over-issuance under weighting");
+    }
+
+    // weighted() is saturating: raw_work * rep past u32 caps at max instead of
+    // wrapping. Regression: normal weights are exact.
+    test weighted_saturates {
+        assert(weighted(16, 1000) == 16000, "normal weight is exact");
+        assert(weighted(100000, 1000) == 100000000, "1e5 * 1e3 = 1e8 fits, exact");
+        // 5_000_000 * 1000 = 5e9 > 2^32: saturates to u32 max, NOT the wrapped 705032704.
+        assert(weighted(5000000, 1000) == 4294967295, "overflowing weight saturates to u32 max, no wrap");
+        assert(weighted(4294967, 1000) == 4294967000, "just under the ceiling is still exact");
+    }
+
+    // total_weighted3() is saturating: three near-max weights cap instead of
+    // wrapping below a single share.
+    test total_weighted3_saturates {
+        assert(total_weighted3(16000, 8000, 4000) == 28000, "normal sum is exact");
+        assert(total_weighted3(4294967295, 4294967295, 4294967295) == 4294967295, "three max weights saturate, no wrap");
+        assert(total_weighted3(4000000000, 400000000, 0) == 4294967295, "sum 4.4e9 > 2^32 saturates");
+    }
+}

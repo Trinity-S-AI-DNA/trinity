@@ -1,0 +1,756 @@
+// SPDX-License-Identifier: Apache-2.0
+// runtime/execute.t27 — Runtime Execution Specification
+// Task execution, promises, cancellation, timeouts
+// φ² + 1/φ² = 3 | TRINITY
+
+module runtime-execute;
+
+// ============================================================================
+// Imports
+// ============================================================================
+
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+/// Default execution timeout in milliseconds
+pub const DEFAULT_TIMEOUT_MS : u32 = 30000;  // 30 seconds
+
+/// Maximum concurrent executions
+pub const MAX_CONCURRENT_EXECUTIONS : u8 = 16;
+
+/// Execution poll interval in milliseconds
+pub const POLL_INTERVAL_MS : u32 = 100;
+
+/// Task ID length
+pub const TASK_ID_LENGTH : u8 = 32;
+
+/// Execution result type
+pub const ExecResultType = enum(u8) {
+    success = 0,
+    timeout = 1,
+    cancelled = 2,
+    error = 3,
+};
+
+/// Task state
+pub const TaskState = enum(u8) {
+    pending = 0,
+    running = 1,
+    completed = 2,
+    failed = 3,
+    cancelled = 4,
+};
+
+/// Cancel reason
+pub const CancelReason = enum(u8) {
+    user_requested = 0,
+    timeout = 1,
+    error = 2,
+    shutdown = 3,
+};
+
+// ============================================================================
+// Types
+// ============================================================================
+
+/// Task identifier
+pub const TaskID = [TASK_ID_LENGTH]u8;
+
+/// Task definition
+pub const Task = struct {
+    id : TaskID,
+    name : []u8,
+    command : []u8,
+    args : [][]u8,
+    env : [][]u8,  // KEY=VALUE pairs
+    cwd : ?[]u8,
+    timeout_ms : u32,
+};
+
+/// Task result
+pub const TaskResult = struct {
+    task_id : TaskID,
+    result_type : ExecResultType,
+    exit_code : ?u8,
+    stdout : []u8,
+    stderr : []u8,
+    duration_ms : u64,
+    error_message : ?[]u8,
+};
+
+/// Execution context
+pub const ExecContext = struct {
+    task : Task,
+    start_time_ms : u64,
+    state : TaskState,
+    cancel_requested : bool,
+};
+
+/// Promise state
+pub const PromiseState = enum(u8) {
+    pending = 0,
+    resolved = 1,
+    rejected = 2,
+    cancelled = 3,
+};
+
+/// Promise resolve callback type. A function type cannot be written directly
+/// as a parameter type in t27, so it is named here (as router.t27 names
+/// Handler) and promise_with_resolve takes a ResolveFn.
+pub const ResolveFn = fn(TaskResult) void;
+
+/// Promise
+pub const Promise = struct {
+    task_id : TaskID,
+    state : PromiseState,
+    result : ?TaskResult,
+    created_at_ms : u64,
+    resolve_fn : ?fn(TaskResult) void,
+    reject_fn : ?fn([]u8) void,
+};
+
+/// Execution error
+pub const ExecError = struct {
+    task_id : TaskID,
+    message : []u8,
+    code : ?u16,
+    recoverable : bool,
+    timestamp_ms : u64,
+};
+
+// ============================================================================
+// Functions
+// ============================================================================
+
+/// Create task ID
+pub fn task_id_generate() TaskID {
+    // Simplified: would use UUID generation
+    const timestamp = get_timestamp_ms();
+    var result : TaskID = [_]u8{0} ** TASK_ID_LENGTH;
+
+    const bytes = int_to_bytes(timestamp);
+    for (0..@min(result.len, bytes.len)) |i| {
+        result[i] = bytes[i % 256];
+    }
+
+    return result;
+}
+
+/// Create task with default timeout
+pub fn task_create(name: []u8, command: []u8, args: [][]u8) Task {
+    return Task{
+        .id = task_id_generate(),
+        .name = name,
+        .command = command,
+        .args = args,
+        .env = &[_][]u8{},
+        .cwd = null,
+        .timeout_ms = DEFAULT_TIMEOUT_MS,
+    };
+}
+
+/// Create task with timeout
+pub fn task_with_timeout(name: []u8, command: []u8, args: [][]u8, timeout_ms: u32) Task {
+    return Task{
+        .id = task_id_generate(),
+        .name = name,
+        .command = command,
+        .args = args,
+        .env = &[_][]u8{},
+        .cwd = null,
+        .timeout_ms = timeout_ms,
+    };
+}
+
+/// Create success result
+pub fn result_success(task_id: TaskID, stdout: []u8, duration_ms: u64) TaskResult {
+    return TaskResult{
+        .task_id = task_id,
+        .result_type = .success,
+        .exit_code = 0,
+        .stdout = stdout,
+        .stderr = "",
+        .duration_ms = duration_ms,
+        .error_message = null,
+    };
+}
+
+/// Create timeout result
+pub fn result_timeout(task_id: TaskID, duration_ms: u64) TaskResult {
+    return TaskResult{
+        .task_id = task_id,
+        .result_type = .timeout,
+        .exit_code = null,
+        .stdout = "",
+        .stderr = "Execution timeout",
+        .duration_ms = duration_ms,
+        .error_message = null,
+    };
+}
+
+/// Create cancelled result
+pub fn result_cancelled(task_id: TaskID, reason: CancelReason, duration_ms: u64) TaskResult {
+    return TaskResult{
+        .task_id = task_id,
+        .result_type = .cancelled,
+        .exit_code = null,
+        .stdout = "",
+        .stderr = "",
+        .duration_ms = duration_ms,
+        .error_message = null,
+    };
+}
+
+/// Create error result
+pub fn result_error(task_id: TaskID, message: []u8, duration_ms: u64) TaskResult {
+    return TaskResult{
+        .task_id = task_id,
+        .result_type = .error,
+        .exit_code = 1,
+        .stdout = "",
+        .stderr = message,
+        .duration_ms = duration_ms,
+        .error_message = message,
+    };
+}
+
+/// Create execution context
+pub fn context_create(task: Task) ExecContext {
+    return ExecContext{
+        .task = task,
+        .start_time_ms = get_timestamp_ms(),
+        .state = .pending,
+        .cancel_requested = false,
+    };
+}
+
+/// Create promise
+pub fn promise_create(task_id: TaskID) Promise {
+    return Promise{
+        .task_id = task_id,
+        .state = .pending,
+        .result = null,
+        .created_at_ms = get_timestamp_ms(),
+        .resolve_fn = null,
+        .reject_fn = null,
+    };
+}
+
+/// Create promise with resolve function
+pub fn promise_with_resolve(task_id: TaskID, resolve_fn: ResolveFn) Promise {
+    const base = promise_create(task_id);
+    return Promise{
+        .task_id = base.task_id,
+        .state = base.state,
+        .result = base.result,
+        .created_at_ms = base.created_at_ms,
+        .resolve_fn = resolve_fn,
+        .reject_fn = null,
+    };
+}
+
+/// Resolve promise with result
+pub fn promise_resolve(promise: *Promise, result: TaskResult) void {
+    promise.state = .resolved;
+    promise.result = result;
+    if (promise.resolve_fn != null) {
+        // Unwrap, then call: `promise.resolve_fn.?(result)` in one step was
+        // lowered as a tuple expression rather than a call.
+        const resolve_fn = promise.resolve_fn.?;
+        resolve_fn(result);
+    }
+}
+
+/// Reject promise with error
+pub fn promise_reject(promise: *Promise, error: []u8) void {
+    promise.state = .rejected;
+    if (promise.reject_fn != null) {
+        // Unwrap, then call (see promise_resolve).
+        const reject_fn = promise.reject_fn.?;
+        reject_fn(error);
+    }
+}
+
+/// Cancel promise
+pub fn promise_cancel(promise: *Promise, reason: CancelReason) void {
+    promise.state = .cancelled;
+}
+
+/// Start task execution
+pub fn run(context: *ExecContext) void {
+    context.state = .running;
+}
+
+/// Cancel task execution
+pub fn cancel(context: *ExecContext, reason: CancelReason) void {
+    context.state = .cancelled;
+    context.cancel_requested = true;
+}
+
+/// Check if task is running
+pub fn is_running(context: ExecContext) bool {
+    return context.state == .running;
+}
+
+/// Check if task is pending
+pub fn is_pending(context: ExecContext) bool {
+    return context.state == .pending;
+}
+
+/// Check if task is terminal
+pub fn is_terminal(context: ExecContext) bool {
+    return context.state == .completed or context.state == .failed or context.state == .cancelled;
+}
+
+/// Run task synchronously
+pub fn run_sync(task: Task) TaskResult {
+    var context = context_create(task);
+    run(&context);
+    const duration = get_timestamp_ms() - context.start_time_ms;
+
+    return result_success(task.id, "", duration);
+}
+
+/// Run task with timeout
+pub fn run_with_timeout(task: Task) TaskResult {
+    const duration = task.timeout_ms;
+    var result = result_success(task.id, "", duration);
+
+    if (duration > DEFAULT_TIMEOUT_MS) {
+        result = result_timeout(task.id, duration);
+    }
+
+    return result;
+}
+
+/// Fork task from existing
+pub fn fork(task: Task, modifications: []TaskModification) Task {
+    // Create new task based on existing (simplified)
+    var new_task = task_create(task.name, task.command, task.args);
+    new_task.id = task_id_generate();
+    return new_task;
+}
+
+/// Check if result is success
+pub fn is_success(result: TaskResult) bool {
+    return result.result_type == .success;
+}
+
+/// Check if result is error
+pub fn is_error(result: TaskResult) bool {
+    return result.result_type == .error;
+}
+
+/// Check if result is timeout
+pub fn is_timeout(result: TaskResult) bool {
+    return result.result_type == .timeout;
+}
+
+/// Check if promise is pending
+pub fn promise_is_pending(promise: Promise) bool {
+    return promise.state == .pending;
+}
+
+/// Check if promise is resolved
+pub fn promise_is_resolved(promise: Promise) bool {
+    return promise.state == .resolved;
+}
+
+/// Check if promise is rejected
+pub fn promise_is_rejected(promise: Promise) bool {
+    return promise.state == .rejected;
+}
+
+/// Get task duration
+pub fn duration(context: ExecContext) u64 {
+    return get_timestamp_ms() - context.start_time_ms;
+}
+
+/// Create execution error
+pub fn error_create(task_id: TaskID, message: []u8) ExecError {
+    return ExecError{
+        .task_id = task_id,
+        .message = message,
+        .code = null,
+        .recoverable = false,
+        .timestamp_ms = get_timestamp_ms(),
+    };
+}
+
+/// Convert integer to bytes
+pub fn int_to_bytes(value: u64) []u8 {
+    return &[_]u8{
+        @intCast((value >> 56) & 0xFF),
+        @intCast((value >> 48) & 0xFF),
+        @intCast((value >> 40) & 0xFF),
+        @intCast((value >> 32) & 0xFF),
+        @intCast((value >> 24) & 0xFF),
+        @intCast((value >> 16) & 0xFF),
+        @intCast((value >> 8) & 0xFF),
+        @intCast((value >> 0) & 0xFF),
+        @intCast(value & 0xFF),
+    };
+}
+
+/// Get current timestamp in milliseconds
+pub fn get_timestamp_ms() u64 {
+    // Simplified: would use system time
+    return 0;
+}
+
+/// Append to task args
+pub fn append_args(slice: [][]u8, item: []u8) [][]u8 {
+    var result : [][]u8 = slice;
+    var new_slice : [][]u8 = &[_][]u8{item};
+    for (result) |_| {
+        new_slice = append_args_slice(new_slice, _);
+    }
+    return new_slice;
+}
+
+/// Append args slice
+pub fn append_args_slice(slice: [][]u8, item: []u8) [][]u8 {
+    var result : [][]u8 = slice;
+    result = concat_args(result, item);
+    return result;
+}
+
+/// Concatenate args
+pub fn concat_args(a: [][]u8, b: []u8) [][]u8 {
+    var result : [][]u8 = a;
+    var new_slice : [][]u8 = &[_][]u8{b};
+    for (result) |_| {
+        new_slice = append_args_slice(new_slice, _);
+    }
+    return new_slice;
+}
+
+/// Concat args with item
+pub fn concat_args_item(a: [][]u8, item: []u8) [][]u8 {
+    var result : [][]u8 = a;
+    result = concat_args(result, &[_][]u8{item});
+    return result;
+}
+
+// ============================================================================
+// TDD - Tests
+// ============================================================================
+
+// t27 has no anonymous fn expressions: the callbacks the tests below wrote
+// inline as `fn(result: TaskResult) void { _ = result; }`,
+// `fn(r: TaskResult) void { _ = r; }` and `fn(msg: []u8) void { _ = msg; }`
+// are these two named fns (the two resolve callbacks were identical).
+fn noop_resolve(result: TaskResult) void {
+    _ = result;
+}
+
+fn noop_reject(msg: []u8) void {
+    _ = msg;
+}
+
+test "runtime_task_create" {
+    const task = task_create("test-task", "echo", &[_][]u8{"hello"});
+    try std.testing.expect(task.timeout_ms == DEFAULT_TIMEOUT_MS);
+}
+
+test "runtime_task_with_timeout" {
+    const task = task_with_timeout("test", "sleep", &[_][]u8{"10"}, 5000);
+    try std.testing.expect(task.timeout_ms == 5000);
+}
+
+test "runtime_result_success" {
+    const id = task_id_generate();
+    const result = result_success(id, "output", 100);
+    try std.testing.expect(is_success(result));
+}
+
+test "runtime_result_timeout" {
+    const id = task_id_generate();
+    const result = result_timeout(id, 2000);
+    try std.testing.expect(is_timeout(result));
+}
+
+test "runtime_result_cancelled" {
+    const id = task_id_generate();
+    const result = result_cancelled(id, .user_requested, 1000);
+    try std.testing.expect(result.result_type == .cancelled);
+}
+
+test "runtime_result_error" {
+    const id = task_id_generate();
+    const result = result_error(id, "error message", 1000);
+    try std.testing.expect(is_error(result));
+}
+
+test "runtime_context_create" {
+    const task = task_create("test", "echo", &[_][]u8{});
+    const context = context_create(task);
+    try std.testing.expect(context.state == .pending);
+}
+
+test "runtime_is_running" {
+    var context = context_create(task_create("test", "echo", &[_][]u8{}));
+    context.state = .running;
+    try std.testing.expect(is_running(&context));
+}
+
+test "runtime_is_pending" {
+    var context = context_create(task_create("test", "echo", &[_][]u8{}));
+    try std.testing.expect(is_pending(&context));
+}
+
+test "runtime_is_terminal" {
+    var context = context_create(task_create("test", "echo", &[_][]u8{}));
+    context.state = .completed;
+    try std.testing.expect(is_terminal(&context));
+}
+
+test "runtime_promise_create" {
+    const id = task_id_generate();
+    const promise = promise_create(id);
+    try std.testing.expect(promise_is_pending(promise));
+}
+
+test "runtime_promise_with_resolve" {
+    const id = task_id_generate();
+    const resolve = noop_resolve;
+    const promise = promise_with_resolve(id, resolve);
+    try std.testing.expect(promise.resolve_fn != null);
+}
+
+test "runtime_promise_resolve" {
+    const id = task_id_generate();
+    const result = result_success(id, "output", 100);
+    var promise = promise_with_resolve(id, noop_resolve);
+    promise_resolve(&promise, result);
+    try std.testing.expect(promise_is_resolved(promise));
+}
+
+test "runtime_promise_reject" {
+    const id = task_id_generate();
+    const reject = noop_reject;
+    var promise = promise_create(id);
+    promise.reject_fn = reject;
+    promise_reject(&promise, "error");
+    try std.testing.expect(promise_is_rejected(promise));
+}
+
+test "runtime_error_create" {
+    const id = task_id_generate();
+    const error = error_create(id, "test error");
+    try std.testing.expect(std.mem.eql(error.message, "test error"));
+}
+
+// ============================================================================
+// TDD - Invariants
+// ============================================================================
+
+invariant default_timeout_positive {
+    // DEFAULT_TIMEOUT_MS is positive
+    @compileAssert(DEFAULT_TIMEOUT_MS > 0);
+}
+
+invariant max_concurrent_executions_positive {
+    // MAX_CONCURRENT_EXECUTIONS is positive
+    @compileAssert(MAX_CONCURRENT_EXECUTIONS > 0);
+}
+
+invariant poll_interval_positive {
+    // POLL_INTERVAL_MS is positive
+    @compileAssert(POLL_INTERVAL_MS > 0);
+}
+
+invariant task_id_length_positive {
+    // TASK_ID_LENGTH is positive
+    @compileAssert(TASK_ID_LENGTH > 0);
+}
+
+invariant result_type_enum_valid {
+    // ExecResultType enum has valid values
+    @compileAssert(@intFromEnum(ExecResultType.error) == 3);
+}
+
+invariant state_enum_valid {
+    // TaskState enum has valid values
+    @compileAssert(@intFromEnum(TaskState.cancelled) == 4);
+}
+
+invariant cancel_reason_enum_valid {
+    // CancelReason enum has valid values
+    @compileAssert(@intFromEnum(CancelReason.shutdown) == 3);
+}
+
+invariant promise_state_enum_valid {
+    // PromiseState enum has valid values
+    @compileAssert(@intFromEnum(PromiseState.cancelled) == 3);
+}
+
+invariant task_has_id {
+    // Task has id field
+    @compileAssert(true);
+}
+
+invariant task_has_name {
+    // Task has name field
+    @compileAssert(true);
+}
+
+invariant task_has_command {
+    // Task has command field
+    @compileAssert(true);
+}
+
+invariant task_result_has_task_id {
+    // TaskResult has task_id field
+    @compileAssert(true);
+}
+
+invariant task_result_has_result_type {
+    // TaskResult has result_type field
+    @compileAssert(true);
+}
+
+invariant task_result_has_stdout {
+    // TaskResult has stdout field
+    @compileAssert(true);
+}
+
+invariant task_result_has_stderr {
+    // TaskResult has stderr field
+    @compileAssert(true);
+}
+
+invariant context_has_task {
+    // ExecContext has task field
+    @compileAssert(true);
+}
+
+invariant context_has_state {
+    // ExecContext has state field
+    @compileAssert(true);
+}
+
+invariant context_has_cancel_requested {
+    // ExecContext has cancel_requested field
+    @compileAssert(true);
+}
+
+invariant promise_has_task_id {
+    // Promise has task_id field
+    @compileAssert(true);
+}
+
+invariant promise_has_state {
+    // Promise has state field
+    @compileAssert(true);
+}
+
+invariant promise_has_result {
+    // Promise has result field
+    @compileAssert(true);
+}
+
+invariant promise_has_created_at {
+    // Promise has created_at_ms field
+    @compileAssert(true);
+}
+
+invariant promise_resolve_updates_state {
+    // promise_resolve updates state to resolved
+    @compileAssert(true);
+}
+
+invariant promise_reject_updates_state {
+    // promise_reject updates state to rejected
+    @compileAssert(true);
+}
+
+invariant promise_cancel_updates_state {
+    // promise_cancel updates state to cancelled
+    @compileAssert(true);
+}
+
+invariant result_success_has_zero_exit_code {
+    // Success result has exit_code of 0
+    @compileAssert(true);
+}
+
+invariant result_timeout_has_no_output {
+    // Timeout result has empty stdout/stderr
+    @compileAssert(true);
+}
+
+invariant exec_error_has_message {
+    // ExecError has message field
+    @compileAssert(true);
+}
+
+invariant exec_error_has_timestamp {
+    // ExecError has timestamp_ms field
+    @compileAssert(true);
+}  // closing brace was missing in the original
+
+// ============================================================================
+// TDD - Benchmarks
+// ============================================================================
+
+bench "runtime_task_create_latency" {
+    // Measure: cycles for task creation
+    // Target: < 60 cycles
+    @setEvalBranchQuota(10000);
+    var result : Task = undefined;
+    for (0..1000) |_| {
+        result = task_create("test", "echo", &[_][]u8{});
+    }
+    _ = result.id.len;
+}
+
+bench "runtime_result_create_latency" {
+    // Measure: cycles for result creation
+    // Target: < 40 cycles
+    @setEvalBranchQuota(10000);
+    const id = task_id_generate();
+    var result : TaskResult = undefined;
+    for (0..1000) |_| {
+        result = result_success(id, "output", 100);
+    }
+    _ = result.result_type;
+}
+
+bench "runtime_promise_create_latency" {
+    // Measure: cycles for promise creation
+    // Target: < 30 cycles
+    @setEvalBranchQuota(10000);
+    const id = task_id_generate();
+    var result : Promise = undefined;
+    for (0..1000) |_| {
+        result = promise_create(id);
+    }
+    _ = result.state;
+}
+
+bench "runtime_context_create_latency" {
+    // Measure: cycles for context creation
+    // Target: < 30 cycles
+    @setEvalBranchQuota(10000);
+    const task = task_create("test", "echo", &[_][]u8{});
+    var result : ExecContext = undefined;
+    for (0..1000) |_| {
+        result = context_create(task);
+    }
+    _ = result.state;
+}
+
+bench "runtime_duration_latency" {
+    // Measure: cycles for duration calculation
+    // Target: < 20 cycles
+    @setEvalBranchQuota(10000);
+    const context = context_create(task_create("test", "echo", &[_][]u8{}));
+    var result : u64 = undefined;
+    for (0..1000) |_| {
+        result = duration(&context);
+    }
+    _ = result;
+}

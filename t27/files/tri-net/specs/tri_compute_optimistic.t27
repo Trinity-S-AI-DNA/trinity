@@ -1,0 +1,142 @@
+// TRI-NET optimistic settlement lifecycle. The node's settle path is PESSIMISTIC:
+// it recomputes every receipt before paying. That is safe but does not scale -- an
+// optimistic path credits the reward PROVISIONALLY (with the executor's bond locked),
+// opens a challenge window, and only a successful challenge (tri_compute_challenge)
+// REVERSES the credit and slashes the bond; unchallenged receipts FINALIZE when the
+// window closes. This is the compute analogue of an optimistic rollup (Keryx OPoI /
+// Truebit): honest work is cheap (no per-receipt recompute), fraud is punished.
+//
+// Composes with tri_compute_bond (post/lock/slash) and tri_compute_challenge
+// (resolve -> RESOLVE_SLASH). This spec owns only the LIFECYCLE state machine; the
+// recompute, bond math and challenge outcome live in their own specs.
+
+module TriComputeOptimistic {
+    use base::types;
+
+    const PENDING: u32 = 0;    // credited, challenge window still open
+    const FINALIZED: u32 = 1;  // window closed, no successful challenge -> confirmed
+    const REVERSED: u32 = 2;   // a challenge slashed it -> credit clawed back
+
+    // Provisional credit on an optimistic settle -- only if the executor's bond is
+    // posted (an unbonded result is not credited: nothing to slash).
+    fn provisional_balance(prev_balance: u32, reward: u32, bond_ok: u32) -> u32 {
+        if (bond_ok == 1) {
+            return prev_balance + reward;
+        } else {
+            return prev_balance;
+        }
+    }
+
+    // Is the challenge window still open? now within [settled_at, settled_at + window).
+    fn window_open(now_epoch: u32, settled_at: u32, window: u32) -> bool {
+        return now_epoch < (settled_at + window);
+    }
+
+    // Rung-aware challenge window. Higher ladder rungs are more expensive to RECOMPUTE
+    // (the datapath widens with the mantissa: GF-T16 mant 9, GF-T32 25, GF-T64 64), so a
+    // challenger needs more epochs to verify a wide-rung result before it finalizes -- and
+    // a higher-precision result is worth more, deserving longer scrutiny. The window grows
+    // with the rung's exponent-trit count Et (the geometry key, from tri_a2a.skill_et /
+    // the ladder width_to_et). Base window at/below the flagship GF-T16 (Et4); +WINDOW_PER_TRIT
+    // per exponent trit above it. Monotonic and never shrinks below the base.
+    const GFT16_ET: u32 = 4;           // flagship rung Et (ladder SSOT)
+    const BASE_WINDOW: u32 = 64;       // epochs, at/below GF-T16
+    const WINDOW_PER_TRIT: u32 = 16;   // extra epochs per exponent trit above the base
+
+    fn window_for_rung(gf_et: u32) -> u32 {
+        if (gf_et <= GFT16_ET) {
+            return BASE_WINDOW;
+        } else {
+            return BASE_WINDOW + (gf_et - GFT16_ET) * WINDOW_PER_TRIT;
+        }
+    }
+
+    // window_open with the rung-derived window: a wide-rung result stays challengeable
+    // at an epoch where a lower-rung one would already have finalized.
+    fn window_open_rung(now_epoch: u32, settled_at: u32, gf_et: u32) -> bool {
+        return window_open(now_epoch, settled_at, window_for_rung(gf_et));
+    }
+
+    // The settlement state: a successful challenge (slashed) REVERSES regardless of
+    // the window; otherwise PENDING while the window is open, FINALIZED once it closes.
+    fn settle_state(window_is_open: u32, slashed: u32) -> u32 {
+        if (slashed == 1) {
+            return REVERSED;
+        } else {
+            if (window_is_open == 1) {
+                return PENDING;
+            } else {
+                return FINALIZED;
+            }
+        }
+    }
+
+    // Balance after resolution: a REVERSED settle claws back the provisional reward;
+    // PENDING and FINALIZED keep it (saturating at 0 on the clawback).
+    fn balance_after_settle(provisional_bal: u32, reward: u32, state: u32) -> u32 {
+        if (state == REVERSED) {
+            if (provisional_bal < reward) {
+                return 0;
+            } else {
+                return provisional_bal - reward;
+            }
+        } else {
+            return provisional_bal;
+        }
+    }
+
+    // A settle is safe to FINALIZE (release the executor's bond, confirm the credit)
+    // iff the window has closed and it was not reversed.
+    fn can_finalize(state: u32) -> bool {
+        return state == FINALIZED;
+    }
+
+    // ---- Tests / invariants ----
+
+    // Provisional credit needs a posted bond; the reward is credited up front.
+    test provisional_credit {
+        assert(provisional_balance(1000, 16, 1) == 1016, "bonded result credits the reward provisionally");
+        assert(provisional_balance(1000, 16, 0) == 1000, "unbonded result is not credited");
+    }
+
+    // The window gates PENDING vs FINALIZED.
+    test window_gating {
+        assert(window_open(5, 3, 10) == true, "epoch 5 within [3, 13) -> open");
+        assert(window_open(13, 3, 10) == false, "epoch 13 == settled_at+window -> closed");
+        assert(window_open(20, 3, 10) == false, "well past the window -> closed");
+    }
+
+    // The challenge window scales with the rung: higher Et -> longer window, so a wide,
+    // expensive-to-recompute result gets more scrutiny before finalizing.
+    test window_grows_with_the_rung {
+        assert(window_for_rung(4) == 64, "GF-T16 (Et4) base window 64");
+        assert(window_for_rung(6) == 96, "GF-T32 (Et6) window 96 -- longer than GF-T16");
+        assert(window_for_rung(9) == 144, "GF-T64 (Et9) window 144");
+        assert(window_for_rung(14) == 224, "GF-T128 (Et14) window 224 -- longest");
+        assert(window_for_rung(3) == 64, "sub-flagship GF-T8 (Et3) gets the base, never shrinks");
+        // Monotonic across the ladder.
+        assert(window_for_rung(6) > window_for_rung(4), "GF-T32 window > GF-T16");
+        assert(window_for_rung(9) > window_for_rung(6), "GF-T64 window > GF-T32");
+        // A GF-T64 result is still challengeable at an epoch where a GF-T16 one has finalized.
+        assert(window_open_rung(100, 0, 4) == false, "GF-T16 finalized by epoch 100 (window 64)");
+        assert(window_open_rung(100, 0, 9) == true, "GF-T64 still challengeable at epoch 100 (window 144)");
+    }
+
+    // Lifecycle: unchallenged in-window -> PENDING; unchallenged out-of-window ->
+    // FINALIZED; challenged (slashed) -> REVERSED regardless of the window.
+    test lifecycle_states {
+        assert(settle_state(1, 0) == PENDING, "in window, no challenge -> pending");
+        assert(settle_state(0, 0) == FINALIZED, "window closed, no challenge -> finalized");
+        assert(settle_state(1, 1) == REVERSED, "slashed in window -> reversed");
+        assert(settle_state(0, 1) == REVERSED, "slashed after window -> still reversed");
+    }
+
+    // A reversal claws back exactly the provisional reward; finalize keeps it.
+    test balance_resolution {
+        assert(balance_after_settle(1016, 16, REVERSED) == 1000, "reversal claws back the reward");
+        assert(balance_after_settle(1016, 16, FINALIZED) == 1016, "finalize keeps the reward");
+        assert(balance_after_settle(1016, 16, PENDING) == 1016, "pending keeps the reward (not yet final)");
+        assert(can_finalize(FINALIZED) == true, "finalized can release the bond");
+        assert(can_finalize(PENDING) == false, "pending cannot finalize yet");
+    }
+}

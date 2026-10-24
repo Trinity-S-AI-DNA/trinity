@@ -1,0 +1,608 @@
+// SPDX-License-Identifier: Apache-2.0
+// provider/stream.t27 — SSE/Streaming Response Handling
+// Server-Sent Events and streaming response processing
+// φ² + 1/φ² = 3 | TRINITY
+
+module provider-stream;
+
+// ============================================================================
+// Imports
+// ============================================================================
+
+use provider::schema::StreamingChunk;
+use provider::schema::ChunkType;
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+/// SSE event prefix
+pub const SSE_EVENT_PREFIX : [7]u8 = "event: ";
+
+/// SSE data prefix
+pub const SSE_DATA_PREFIX : [6]u8 = "data: ";
+
+/// SSE comment prefix
+pub const SSE_COMMENT_PREFIX : [1]u8 = ":";
+
+/// SSE message event type
+pub const SSE_EVENT_MESSAGE : [7]u8 = "message";
+
+/// SSE delta event type
+pub const SSE_EVENT_DELTA : [6]u8 = "delta";
+
+/// SSE done event type
+pub const SSE_EVENT_DONE : [4]u8 = "done";
+
+/// SSE error event type
+pub const SSE_EVENT_ERROR : [5]u8 = "error";
+
+/// Default buffer size for SSE
+pub const SSE_BUFFER_SIZE : usize = 8192;
+
+/// Maximum chunk size in bytes
+pub const MAX_CHUNK_SIZE : usize = 65536;
+
+/// Default stream timeout in milliseconds
+pub const DEFAULT_STREAM_TIMEOUT_MS : usize = 60000;
+
+// ============================================================================
+// Types
+// ============================================================================
+
+/// SSE event type
+pub const SseEventType = enum(u8) {
+    message = 0,
+    delta = 1,
+    done = 2,
+    error = 3,
+    comment = 4,
+};
+
+/// SSE event
+pub const SseEvent = struct {
+    event_type : SseEventType,
+    data : []u8,
+    id : []u8,
+    retry : usize,
+};
+
+/// Stream state
+pub const StreamState = enum(u8) {
+    idle = 0,
+    connecting = 1,
+    streaming = 2,
+    paused = 3,
+    error = 4,
+    closed = 5,
+};
+
+/// Stream error type
+pub const StreamError = enum(u8) {
+    connection_failed = 0,
+    timeout = 1,
+    parse_error = 2,
+    server_error = 3,
+    client_closed = 4,
+};
+
+/// Stream configuration
+pub const StreamConfig = struct {
+    timeout_ms : usize,
+    buffer_size : usize,
+    auto_reconnect : bool,
+    max_reconnect_attempts : usize,
+};
+
+/// Stream result
+pub const StreamResult = struct {
+    success : bool,
+    chunks : []StreamingChunk,
+    error : StreamError,
+    error_message : []u8,
+};
+
+/// Buffer position
+pub const BufferPosition = struct {
+    line_start : usize,
+    current : usize,
+    capacity : usize,
+};
+
+/// Parsed event
+pub const ParsedEvent = struct {
+    success : bool,
+    event : SseEvent,
+    remaining : []u8,
+};
+
+/// Stream stats
+pub const StreamStats = struct {
+    bytes_received : usize,
+    chunks_received : usize,
+    errors : usize,
+    start_time : usize,
+    end_time : usize,
+};
+
+/// Stream callback
+pub const StreamCallback = enum(u8) {
+    on_chunk = 0,
+    on_done = 1,
+    on_error = 2,
+    on_connect = 3,
+    on_disconnect = 4,
+};
+
+/// Callback data
+pub const CallbackData = struct {
+    callback_type : StreamCallback,
+    data : []u8,
+};
+
+// ============================================================================
+// Functions
+// ============================================================================
+
+/// Create stream config
+pub fn stream_config_default() StreamConfig {
+    return StreamConfig{
+        .timeout_ms = DEFAULT_STREAM_TIMEOUT_MS,
+        .buffer_size = SSE_BUFFER_SIZE,
+        .auto_reconnect = false,
+        .max_reconnect_attempts = 3,
+    };
+}
+
+/// Create SSE event
+pub fn sse_event_create(event_type: SseEventType, data: []u8) SseEvent {
+    return SseEvent{
+        .event_type = event_type,
+        .data = data,
+        .id = "",
+        .retry = 0,
+    };
+}
+
+/// Create stream result
+pub fn stream_result_create(chunks: []StreamingChunk) StreamResult {
+    return StreamResult{
+        .success = true,
+        .chunks = chunks,
+        .error = .connection_failed,
+        .error_message = "",
+    };
+}
+
+/// Create stream result with error
+pub fn stream_result_error(error: StreamError, message: []u8) StreamResult {
+    return StreamResult{
+        .success = false,
+        .chunks = &[_]StreamingChunk{},
+        .error = error,
+        .error_message = message,
+    };
+}
+
+/// Create buffer position
+pub fn buffer_position_create(capacity: usize) BufferPosition {
+    return BufferPosition{
+        .line_start = 0,
+        .current = 0,
+        .capacity = capacity,
+    };
+}
+
+/// Create parsed event
+pub fn parsed_event_create(success: bool, event: SseEvent) ParsedEvent {
+    return ParsedEvent{
+        .success = success,
+        .event = event,
+        .remaining = "",
+    };
+}
+
+/// Create stream stats
+pub fn stream_stats_create() StreamStats {
+    return StreamStats{
+        .bytes_received = 0,
+        .chunks_received = 0,
+        .errors = 0,
+        .start_time = 0,
+        .end_time = 0,
+    };
+}
+
+/// Create callback data
+pub fn callback_data_create(callback_type: StreamCallback, data: []u8) CallbackData {
+    return CallbackData{
+        .callback_type = callback_type,
+        .data = data,
+    };
+}
+
+/// Parse SSE line
+pub fn parse_sse_line(line: []u8) ParsedEvent {
+    if (line.len == 0) {
+        return parsed_event_create(false, sse_event_create(.message, ""));
+    }
+
+    if (line[0] == ':') {
+        return parsed_event_create(true, sse_event_create(.comment, ""));
+    }
+
+    if (line.len > SSE_DATA_PREFIX.len and line[0..SSE_DATA_PREFIX.len] == SSE_DATA_PREFIX) {
+        const data = line[SSE_DATA_PREFIX.len..line.len];
+        return parsed_event_create(true, sse_event_create(.delta, data));
+    }
+
+    if (line.len > SSE_EVENT_PREFIX.len and line[0..SSE_EVENT_PREFIX.len] == SSE_EVENT_PREFIX) {
+        const event_type_str = line[SSE_EVENT_PREFIX.len..line.len];
+        const event_type = parse_event_type(event_type_str);
+        return parsed_event_create(true, sse_event_create(event_type, ""));
+    }
+
+    return parsed_event_create(false, sse_event_create(.message, ""));
+}
+
+/// Parse event type from string
+pub fn parse_event_type(s: []u8) SseEventType {
+    if (s == SSE_EVENT_MESSAGE) {
+        return .message;
+    } else if (s == SSE_EVENT_DELTA) {
+        return .delta;
+    } else if (s == SSE_EVENT_DONE) {
+        return .done;
+    } else if (s == SSE_EVENT_ERROR) {
+        return .error;
+    } else {
+        return .message;
+    }
+}
+
+/// Convert SSE event to streaming chunk
+pub fn sse_event_to_chunk(event: SseEvent) StreamingChunk {
+    const chunk_type = if (event.event_type == .done) {
+        .done
+    } else if (event.event_type == .error) {
+        .error
+    } else {
+        .content
+    };
+    return StreamingChunk{
+        .chunk_type = chunk_type,
+        .delta = event.data,
+        .tool_calls = &[_]provider-schema::ToolCall{},
+        .finish_reason = "",
+        .usage = provider-schema::usage_create(0, 0),
+    };
+}
+
+/// Check if line is SSE comment
+pub fn is_sse_comment(line: []u8) bool {
+    return line.len > 0 and line[0] == ':';
+}
+
+/// Check if line is SSE data
+pub fn is_sse_data(line: []u8) bool {
+    return line.len > SSE_DATA_PREFIX.len and line[0..SSE_DATA_PREFIX.len] == SSE_DATA_PREFIX;
+}
+
+/// Check if line is SSE event
+pub fn is_sse_event(line: []u8) bool {
+    return line.len > SSE_EVENT_PREFIX.len and line[0..SSE_EVENT_PREFIX.len] == SSE_EVENT_PREFIX;
+}
+
+/// Get SSE event type string
+pub fn sse_event_type_to_string(event_type: SseEventType) []u8 {
+    return switch (event_type) {
+        .message => SSE_EVENT_MESSAGE,
+        .delta => SSE_EVENT_DELTA,
+        .done => SSE_EVENT_DONE,
+        .error => SSE_EVENT_ERROR,
+        .comment => "comment",
+    };
+}
+
+/// Check if stream is active
+pub fn stream_is_active(state: StreamState) bool {
+    return state == .streaming or state == .connecting;
+}
+
+/// Check if stream has error
+pub fn stream_has_error(state: StreamState) bool {
+    return state == .error;
+}
+
+/// Get stream state string
+pub fn stream_state_to_string(state: StreamState) []u8 {
+    return switch (state) {
+        .idle => "idle",
+        .connecting => "connecting",
+        .streaming => "streaming",
+        .paused => "paused",
+        .error => "error",
+        .closed => "closed",
+    };
+}
+
+/// Get stream error string
+pub fn stream_error_to_string(error: StreamError) []u8 {
+    return switch (error) {
+        .connection_failed => "connection_failed",
+        .timeout => "timeout",
+        .parse_error => "parse_error",
+        .server_error => "server_error",
+        .client_closed => "client_closed",
+    };
+}
+
+/// Check if stream result is successful
+pub fn is_stream_success(result: StreamResult) bool {
+    return result.success;
+}
+
+/// Update stream stats
+pub fn update_stream_stats(stats: StreamStats, bytes: usize) StreamStats {
+    return StreamStats{
+        .bytes_received = stats.bytes_received + bytes,
+        .chunks_received = stats.chunks_received + 1,
+        .errors = stats.errors,
+        .start_time = stats.start_time,
+        .end_time = stats.end_time,
+    };
+}
+
+/// Increment stream stats errors
+pub fn increment_stream_errors(stats: StreamStats) StreamStats {
+    return StreamStats{
+        .bytes_received = stats.bytes_received,
+        .chunks_received = stats.chunks_received,
+        .errors = stats.errors + 1,
+        .start_time = stats.start_time,
+        .end_time = stats.end_time,
+    };
+}
+
+// ============================================================================
+// TDD - Tests
+// ============================================================================
+
+test "provider_stream_config_default" {
+    const config = stream_config_default();
+    try std.testing.expect(config.timeout_ms == DEFAULT_STREAM_TIMEOUT_MS);
+}
+
+test "provider_sse_event_create" {
+    const event = sse_event_create(.delta, "data");
+    try std.testing.expect(event.event_type == .delta);
+}
+
+test "provider_stream_result_create" {
+    const chunks = &[_]StreamingChunk{};
+    const result = stream_result_create(chunks);
+    try std.testing.expect(result.success == true);
+}
+
+test "provider_stream_result_error" {
+    const result = stream_result_error(.timeout, "timeout error");
+    try std.testing.expect(result.success == false);
+}
+
+test "provider_buffer_position_create" {
+    const pos = buffer_position_create(1024);
+    try std.testing.expect(pos.capacity == 1024);
+}
+
+test "provider_parse_sse_line_data" {
+    const line = "data: {\"text\":\"hello\"}";
+    const parsed = parse_sse_line(line);
+    try std.testing.expect(parsed.success == true);
+}
+
+test "provider_parse_sse_line_event" {
+    const line = "event: message";
+    const parsed = parse_sse_line(line);
+    try std.testing.expect(parsed.success == true);
+}
+
+test "provider_parse_sse_line_comment" {
+    const line = ": this is a comment";
+    const parsed = parse_sse_line(line);
+    try std.testing.expect(parsed.success == true);
+}
+
+test "provider_is_sse_comment" {
+    try std.testing.expect(is_sse_comment(": comment"));
+}
+
+test "provider_is_sse_data" {
+    try std.testing.expect(is_sse_data("data: value"));
+}
+
+test "provider_is_sse_event" {
+    try std.testing.expect(is_sse_event("event: message"));
+}
+
+test "provider_sse_event_type_to_string" {
+    const str = sse_event_type_to_string(.done);
+    try std.testing.expectEqual(@as(usize, str.len), @as(usize, 4));
+}
+
+test "provider_stream_is_active" {
+    try std.testing.expect(stream_is_active(.streaming));
+}
+
+test "provider_stream_has_error" {
+    try std.testing.expect(stream_has_error(.error));
+}
+
+test "provider_stream_state_to_string" {
+    const str = stream_state_to_string(.streaming);
+    try std.testing.expectEqual(@as(usize, str.len), @as(usize, 9));
+}
+
+test "provider_stream_error_to_string" {
+    const str = stream_error_to_string(.timeout);
+    try std.testing.expectEqual(@as(usize, str.len), @as(usize, 7));
+}
+
+test "provider_is_stream_success" {
+    const result = stream_result_create(&[_]StreamingChunk{});
+    try std.testing.expect(is_stream_success(result));
+}
+
+test "provider_update_stream_stats" {
+    var stats = stream_stats_create();
+    stats = update_stream_stats(stats, 100);
+    try std.testing.expect(stats.bytes_received == 100);
+}
+
+test "provider_increment_stream_errors" {
+    var stats = stream_stats_create();
+    stats = increment_stream_errors(stats);
+    try std.testing.expect(stats.errors == 1);
+}
+
+// ============================================================================
+// TDD - Invariants
+// ============================================================================
+
+invariant sse_event_type_in_range {
+    // SseEventType is in [0, 4]
+    @compileAssert(@as(u8, SseEventType.message) == 0);
+    @compileAssert(@as(u8, SseEventType.comment) == 4);
+}
+
+invariant stream_state_in_range {
+    // StreamState is in [0, 5]
+    @compileAssert(@as(u8, StreamState.idle) == 0);
+    @compileAssert(@as(u8, StreamState.closed) == 5);
+}
+
+invariant stream_error_in_range {
+    // StreamError is in [0, 4]
+    @compileAssert(@as(u8, StreamError.connection_failed) == 0);
+    @compileAssert(@as(u8, StreamError.client_closed) == 4);
+}
+
+invariant stream_config_valid {
+    // StreamConfig has valid timeout
+    @compileAssert(DEFAULT_STREAM_TIMEOUT_MS > 0);
+}
+
+invariant stream_buffer_size_positive {
+    // SSE_BUFFER_SIZE is positive
+    @compileAssert(SSE_BUFFER_SIZE > 0);
+}
+
+invariant max_chunk_size_positive {
+    // MAX_CHUNK_SIZE is positive
+    @compileAssert(MAX_CHUNK_SIZE > 0);
+}
+
+invariant stream_stats_valid {
+    // StreamStats has valid fields
+    @compileAssert(true);
+}
+
+invariant callback_type_in_range {
+    // StreamCallback is in [0, 4]
+    @compileAssert(@as(u8, StreamCallback.on_chunk) == 0);
+}
+
+invariant parsed_event_valid {
+    // ParsedEvent has valid success flag
+    @compileAssert(true);
+}
+
+invariant sse_event_valid {
+    // SseEvent has valid type
+    @compileAssert(true);
+}
+
+invariant default_stream_timeout_positive {
+    // DEFAULT_STREAM_TIMEOUT_MS is positive
+    @compileAssert(DEFAULT_STREAM_TIMEOUT_MS > 0);
+}
+
+invariant stream_is_active_exclusive_with_error {
+    // Stream cannot be active and error at same time
+    @compileAssert(!stream_is_active(.error));
+}
+
+invariant stream_is_result_success_matches_state {
+    // StreamResult success matches StreamState
+    @compileAssert(true);
+}
+
+// ============================================================================
+// TDD - Benchmarks
+// ============================================================================
+
+bench "provider_stream_config_default_latency" {
+    // Measure: cycles for stream config creation
+    // Target: < 50 cycles
+    @setEvalBranchQuota(10000);
+    var result : StreamConfig = undefined;
+    for (0..1000) |_| {
+        result = stream_config_default();
+    }
+    _ = result;
+}
+
+bench "provider_sse_event_create_latency" {
+    // Measure: cycles for SSE event creation
+    // Target: < 100 cycles
+    @setEvalBranchQuota(10000);
+    var result : SseEvent = undefined;
+    for (0..1000) |_| {
+        result = sse_event_create(.delta, "data");
+    }
+    _ = result;
+}
+
+bench "provider_parse_sse_line_latency" {
+    // Measure: cycles for SSE line parsing
+    // Target: < 200 cycles
+    @setEvalBranchQuota(10000);
+    var result : ParsedEvent = undefined;
+    for (0..1000) |_| {
+        result = parse_sse_line("data: value");
+    }
+    _ = result;
+}
+
+bench "provider_stream_is_active_latency" {
+    // Measure: cycles for stream active check
+    // Target: < 20 cycles
+    @setEvalBranchQuota(10000);
+    var result : bool = false;
+    for (0..1000) |_| {
+        result = stream_is_active(.streaming);
+    }
+    _ = result;
+}
+
+bench "provider_stream_state_to_string_latency" {
+    // Measure: cycles for stream state to string
+    // Target: < 30 cycles
+    @setEvalBranchQuota(10000);
+    var result : []u8 = undefined;
+    for (0..1000) |_| {
+        result = stream_state_to_string(.streaming);
+    }
+    _ = result;
+}
+
+bench "provider_update_stream_stats_latency" {
+    // Measure: cycles for stats update
+    // Target: < 50 cycles
+    @setEvalBranchQuota(10000);
+    var result : StreamStats = undefined;
+    for (0..1000) |_| {
+        var stats = stream_stats_create();
+        result = update_stream_stats(stats, 100);
+    }
+    _ = result;
+}

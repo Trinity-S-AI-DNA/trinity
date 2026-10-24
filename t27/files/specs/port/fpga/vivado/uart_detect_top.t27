@@ -1,0 +1,273 @@
+// SPDX-License-Identifier: Apache-2.0
+// t27/specs/port/fpga/vivado/uart_detect_top.t27
+// Port of fpga/vivado/uart_detect_top.v (issue #4969) for t27c gen-verilog.
+//
+// The original is a UART line-activity detector with no external clock:
+// - a 20-stage LUT1 ring clocks everything (osc = chain[19]);
+// - a 23-bit free-running counter drives the blink of led_r23 (~counter[20]);
+// - uart_rx_pin is synchronised through two flops (rx_sync, rx_prev) and every
+//   falling edge (rx_prev high, rx_sync low) bumps a 23-bit pulse_count;
+// - led_t23 stays high (off) until the first falling edge, then blinks with
+//   ~counter[19];
+// - uart_tx_pin is tied high (the UART idle level).
+//
+// What a .t27 function cannot be, and how it is carried here:
+// - The ring is combinational feedback through placed LUT1 primitives with
+//   KEEP attributes; its period is a property of the silicon. Here it is one
+//   evaluation step of the 20 nodes, ring_step. Each LUT1 has INIT = 2'b01,
+//   so O = INIT[I0] is an INVERTER (lut1 below). With the assign
+//   chain[0] = ~chain[19] the loop has 20 inversions, an even number, so in
+//   zero-delay logic an alternating pattern is a fixed point
+//   (test ring_has_a_fixed_point_in_zero_delay_logic). Whether the placed ring
+//   oscillates is decided by routing delay, which this model does not carry.
+// - The two `always @(posedge osc)` blocks become clock_edge, which applies
+//   every non-blocking assignment from the state BEFORE the edge.
+// - `reg [22:0] counter = 0` is initialised; pulse_count, rx_sync and rx_prev
+//   are not. init_state starts them at 0, the FPGA's power-up (GSR) value.
+module uart_detect_top {
+
+    pub const CHAIN_LENGTH : u32 = 20;
+    pub const COUNTER_MASK : u32 = 0x7FFFFF;   // reg [22:0]
+    pub const LUT1_INIT : u32 = 1;             // 2'b01
+    pub const LED_R23_BIT : u32 = 20;
+    pub const LED_T23_BIT : u32 = 19;
+
+    pub struct Pins {
+        uart_tx_pin : bool,
+        led_r23 : bool,
+        led_t23 : bool,
+    }
+
+    pub struct DetectState {
+        chain : [20]bool,
+        counter : u32,
+        rx_sync : bool,
+        rx_prev : bool,
+        pulse_count : u32,
+    }
+
+    pub fn init_state() -> DetectState {
+        return DetectState{
+            .chain = [false, false, false, false, false, false, false, false, false, false,
+                      false, false, false, false, false, false, false, false, false, false],
+            .counter = 0,
+            .rx_sync = false,
+            .rx_prev = false,
+            .pulse_count = 0,
+        };
+    }
+
+    // A Xilinx LUT1: O = INIT[I0].
+    pub fn lut1(init: u32, i0: bool) -> bool {
+        var idx : u32 = 0;
+        if (i0) {
+            idx = 1;
+        }
+        return ((init >> idx) & 1) == 1;
+    }
+
+    // One evaluation of the ring: chain[0] = ~chain[19]; chain[i] = LUT1(chain[i-1]).
+    pub fn ring_step(chain: [20]bool) -> [20]bool {
+        var next : [20]bool = chain;
+        next[0] = !chain[19];
+        var i : u32 = 1;
+        while (i < 20) {    // CHAIN_LENGTH, spelled as a literal so gen-verilog can unroll it
+            next[i] = lut1(LUT1_INIT, chain[i - 1]);
+            i = i + 1;
+        }
+        return next;
+    }
+
+    // assign osc = chain[19]; -- the clock is the last ring node, read as
+    // chain[19] directly. (A separate `fn osc(chain: [20]bool) -> bool` is
+    // lowered by gen-verilog without its input and with a body that names the
+    // test's argument, `c2[19]`; iverilog rejects it. Reported on #4969.)
+
+    // counter <= counter + 1, in 23 bits.
+    pub fn counter_next(counter: u32) -> u32 {
+        return (counter + 1) & COUNTER_MASK;
+    }
+
+    // if (rx_prev && !rx_sync): a falling edge of the synchronised line.
+    pub fn falling_edge(rx_prev: bool, rx_sync: bool) -> bool {
+        return rx_prev and !rx_sync;
+    }
+
+    pub fn pulse_next(pulse_count: u32, rx_prev: bool, rx_sync: bool) -> u32 {
+        if (falling_edge(rx_prev, rx_sync)) {
+            return (pulse_count + 1) & COUNTER_MASK;
+        }
+        return pulse_count;
+    }
+
+    // Both always @(posedge osc) blocks; every right-hand side reads the old state.
+    pub fn clock_edge(s: DetectState, uart_rx_pin: bool) -> DetectState {
+        var n : DetectState = s;
+        n.counter = counter_next(s.counter);
+        n.rx_sync = uart_rx_pin;
+        n.rx_prev = s.rx_sync;
+        n.pulse_count = pulse_next(s.pulse_count, s.rx_prev, s.rx_sync);
+        return n;
+    }
+
+    pub fn bit_of(value: u32, bit: u32) -> bool {
+        return ((value >> bit) & 1) == 1;
+    }
+
+    // assign led_r23 = ~counter[20];
+    pub fn led_r23(counter: u32) -> bool {
+        return !bit_of(counter, LED_R23_BIT);
+    }
+
+    // assign led_t23 = (pulse_count > 0) ? ~counter[19] : 1'b1;
+    pub fn led_t23(counter: u32, pulse_count: u32) -> bool {
+        if (pulse_count > 0) {
+            return !bit_of(counter, LED_T23_BIT);
+        }
+        return true;
+    }
+
+    // assign uart_tx_pin = 1'b1;
+    pub fn uart_tx_pin() -> bool {
+        return true;
+    }
+
+    pub fn outputs(s: DetectState) -> Pins {
+        return Pins{
+            .uart_tx_pin = uart_tx_pin(),
+            .led_r23 = led_r23(s.counter),
+            .led_t23 = led_t23(s.counter, s.pulse_count),
+        };
+    }
+
+    // Applies clock_edge once per sample of rx[0:n], from init_state.
+    pub fn run_edges(rx: []const bool, n: usize) -> DetectState {
+        var s : DetectState = init_state();
+        var i : usize = 0;
+        while (i < n) {
+            s = clock_edge(s, rx[i]);
+            i += 1;
+        }
+        return s;
+    }
+
+    // The module's combinational output surface for gen-verilog: the three
+    // output pins packed as bit 0 = uart_tx_pin, bit 1 = led_r23,
+    // bit 2 = led_t23, computed from the two registers they read.
+    pub fn on_comb(counter: u32, pulse_count: u32) -> u8 {
+        var pins : u8 = 1;                        // uart_tx_pin = 1'b1
+        if (((counter >> 20) & 1) == 0) {
+            pins = pins | 2;                      // led_r23 = ~counter[20]
+        }
+        if (pulse_count == 0) {
+            pins = pins | 4;                      // led_t23 = 1'b1 before any pulse
+        } else if (((counter >> 19) & 1) == 0) {
+            pins = pins | 4;                      // led_t23 = ~counter[19]
+        }
+        return pins;
+    }
+
+    // ---- tests ----
+
+    test on_comb_packs_the_same_pins_as_outputs {
+        assert(on_comb(0, 0) == 7);
+        assert(on_comb(0x100000, 0) == 5);        // led_r23 low
+        assert(on_comb(0x080000, 0) == 7);        // led_t23 still held high
+        assert(on_comb(0x080000, 1) == 3);        // led_t23 = ~counter[19] = 0
+        assert(on_comb(0x180000, 2) == 1);        // both LEDs low, tx high
+    }
+
+    test lut1_init_01_is_an_inverter {
+        assert(lut1(LUT1_INIT, false) == true);
+        assert(lut1(LUT1_INIT, true) == false);
+        // INIT 2'b10 would be a buffer
+        assert(lut1(2, true) == true);
+    }
+
+    test ring_step_inverts_each_stage {
+        const c0 = init_state().chain;
+        const c1 = ring_step(c0);
+        // chain[0] = ~chain[19] = ~0; every LUT inverts its 0 input
+        assert(c1[0] == true);
+        assert(c1[1] == true);
+        assert(c1[19] == true);
+        const c2 = ring_step(c1);
+        assert(c2[0] == false);
+        assert(c2[5] == false);
+        assert(c2[19] == false);   // osc
+    }
+
+    test ring_has_a_fixed_point_in_zero_delay_logic {
+        // 20 inversions around the loop: the alternating pattern ending in 1 is stable.
+        var alt : [20]bool = [false, true, false, true, false, true, false, true, false, true,
+                              false, true, false, true, false, true, false, true, false, true];
+        const next = ring_step(alt);
+        var i : u32 = 0;
+        while (i < CHAIN_LENGTH) {
+            assert(next[i] == alt[i]);
+            i = i + 1;
+        }
+    }
+
+    test counter_wraps_at_23_bits {
+        assert(counter_next(0) == 1);
+        assert(counter_next(0x7FFFFE) == 0x7FFFFF);
+        assert(counter_next(0x7FFFFF) == 0);
+    }
+
+    test only_a_falling_edge_counts {
+        assert(falling_edge(true, false));
+        assert(!falling_edge(false, true));
+        assert(!falling_edge(true, true));
+        assert(!falling_edge(false, false));
+        assert(pulse_next(4, true, false) == 5);
+        assert(pulse_next(4, false, false) == 4);
+        assert(pulse_next(0x7FFFFF, true, false) == 0);
+    }
+
+    test led_r23_is_inverted_counter_bit_20 {
+        assert(led_r23(0) == true);
+        assert(led_r23(0x100000) == false);    // bit 20 set
+        assert(led_r23(0x080000) == true);     // bit 19 only
+    }
+
+    test led_t23_waits_for_the_first_pulse {
+        // no pulse yet: held at 1 whatever the counter says
+        assert(led_t23(0, 0) == true);
+        assert(led_t23(0x080000, 0) == true);
+        // after a pulse it follows ~counter[19]
+        assert(led_t23(0, 1) == true);
+        assert(led_t23(0x080000, 1) == false);
+        assert(led_t23(0x100000, 3) == true);
+    }
+
+    test uart_tx_is_tied_high {
+        assert(uart_tx_pin() == true);
+        const p = outputs(init_state());
+        assert(p.uart_tx_pin == true);
+        assert(p.led_r23 == true);
+        assert(p.led_t23 == true);
+    }
+
+    test a_falling_edge_is_counted_two_edges_later {
+        // rx line: idle high, high, then low. The synchroniser needs one edge to
+        // load rx_sync and a second to move it to rx_prev, so the 1 -> 0 step is
+        // counted on the second edge after the line goes low.
+        var rx : [7]bool = [true, true, false, false, false, true, true];
+        assert(run_edges(&rx, 2).pulse_count == 0);
+        assert(run_edges(&rx, 3).pulse_count == 0);
+        assert(run_edges(&rx, 4).pulse_count == 1);
+        // still low, then a rising edge: neither counts
+        const s = run_edges(&rx, 7);
+        assert(s.pulse_count == 1);
+        assert(s.counter == 7);
+        assert(s.rx_sync == true);
+        assert(s.rx_prev == true);
+        assert(outputs(s).led_t23 == true);   // counter = 7, bit 19 clear
+    }
+
+    test two_dips_count_twice {
+        var rx : [8]bool = [true, false, false, true, true, false, false, true];
+        assert(run_edges(&rx, 8).pulse_count == 2);
+    }
+}

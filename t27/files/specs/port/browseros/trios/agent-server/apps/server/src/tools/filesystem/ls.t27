@@ -1,0 +1,334 @@
+// SPDX-License-Identifier: Apache-2.0
+// Port of gHashTag/BrowserOS:trios/agent-server/apps/server/src/tools/filesystem/ls.ts
+// at 928e1624a50e (issue #6107).
+//
+// The tool `filesystem_ls` lists a directory: directories first (with a
+// trailing /), then files with a human size, each group sorted with
+// localeCompare(..., { sensitivity: 'base' }), cut at `limit` lines, with a
+// footer when entries were cut.
+//
+// What is ported, and what is not:
+// - formatSize is ported in full. It writes into `buf` at `pos` and returns
+//   the end (t27 has no template strings). bytes / 1024 and
+//   bytes / 1048576 are exact binary fractions, so toFixed(1), which picks
+//   the larger candidate on a tie, is integer round-half-up:
+//   tenths = (bytes * 10 + unit / 2) / unit.
+// - createLsTool(cwd) builds an `ai` tool object whose execute resolves the
+//   path against cwd, refuses paths outside the root (assertWithinRoot), and
+//   reads the directory (readdir + stat; a failed stat counts as size 0).
+//   That is the AI SDK, zod and node:fs, so it keeps its name with an
+//   `undefined;` body that no test calls. Everything execute DECIDES after
+//   the directory has been read is ls_text: the entries (name, is-directory,
+//   size) come in as a parameter, and the text it returns is written to buf.
+// - localeCompare with sensitivity 'base' is ICU collation. For printable
+//   ASCII it is a lexicographic order on the ranks in LOCALE_ORDER, with
+//   letter case ignored. The ranks were measured with node 22 (ICU 77.1),
+//   and the rank comparison agreed with localeCompare on 200,000 random
+//   pairs. Non-ASCII names are outside this port.
+// - `params.limit || DEFAULT_LS_LIMIT` treats 0 as absent: effective_limit.
+//   limit is an integer here; zod accepts any number.
+// - A listing holds at most MAX_ENTRIES entries (fixed capacity).
+module ls {
+    pub const TOOL_NAME: str = "filesystem_ls";
+    pub const DEFAULT_LS_LIMIT: i64 = 500;     // utils.ts
+    pub const MAX_ENTRIES: usize = 256;
+
+    // localeCompare(base) order of printable ASCII, lower case standing for both cases.
+    const LOCALE_ORDER: str = " _-,;:!?.'\"()[]{}@*/\\&#%`^+<=>|~$0123456789abcdefghijklmnopqrstuvwxyz";
+
+    pub struct Entry {
+        name: str,
+        is_dir: bool,
+        size: u64,
+    }
+
+    // ---- byte-buffer helpers ----
+
+    fn put(buf: []u8, pos: usize, s: []const u8) -> usize {
+        var i: usize = 0;
+        while (i < s.len) {
+            buf[pos + i] = s[i];
+            i += 1;
+        }
+        return pos + s.len;
+    }
+
+    fn put_u64(buf: []u8, pos: usize, value: u64) -> usize {
+        var digits: [20]u8 = [_]u8{0} ** 20;
+        var n: usize = 0;
+        var v: u64 = value;
+        while (true) {
+            digits[n] = (48 + v % 10) as u8;
+            n += 1;
+            v = v / 10;
+            if (v == 0) {
+                break;
+            }
+        }
+        var p: usize = pos;
+        while (n > 0) {
+            n -= 1;
+            buf[p] = digits[n];
+            p += 1;
+        }
+        return p;
+    }
+
+
+    // ---- formatSize ----
+
+    // `${x.toFixed(1)}` for x = bytes / unit: whole part, ".", one decimal.
+    fn put_tenths(buf: []u8, pos: usize, bytes: u64, unit: u64) -> usize {
+        const tenths = (bytes * 10 + unit / 2) / unit;
+        var p: usize = put_u64(buf, pos, tenths / 10);
+        p = put(buf, p, ".");
+        return put_u64(buf, p, tenths % 10);
+    }
+
+    pub fn formatSize(bytes: u64, buf: []u8, pos: usize) -> usize {
+        if (bytes < 1024) {
+            const p = put_u64(buf, pos, bytes);
+            return put(buf, p, "B");
+        }
+        if (bytes < 1024 * 1024) {
+            const p = put_tenths(buf, pos, bytes, 1024);
+            return put(buf, p, "KB");
+        }
+        const p = put_tenths(buf, pos, bytes, 1024 * 1024);
+        return put(buf, p, "MB");
+    }
+
+    // ---- localeCompare(a, b, undefined, { sensitivity: 'base' }) ----
+
+    fn locale_rank(c: u8) -> usize {
+        var ch: u8 = c;
+        if (ch >= 'A' and ch <= 'Z') {
+            ch = ch + 32;
+        }
+        var i: usize = 0;
+        while (i < LOCALE_ORDER.len) {
+            if (LOCALE_ORDER[i] == ch) {
+                return i;
+            }
+            i += 1;
+        }
+        return LOCALE_ORDER.len;
+    }
+
+    // -1, 0 or 1, like the sign of localeCompare.
+    pub fn locale_compare(a: []const u8, b: []const u8) -> i32 {
+        var i: usize = 0;
+        while (i < a.len and i < b.len) {
+            const ra = locale_rank(a[i]);
+            const rb = locale_rank(b[i]);
+            if (ra < rb) {
+                return -1;
+            }
+            if (ra > rb) {
+                return 1;
+            }
+            i += 1;
+        }
+        if (a.len < b.len) {
+            return -1;
+        }
+        if (a.len > b.len) {
+            return 1;
+        }
+        return 0;
+    }
+
+    // Array.prototype.sort is stable: an insertion sort that moves an index
+    // only past strictly greater names keeps equal names in readdir order.
+    fn sort_by_name(entries: []const Entry, idx: []usize, n: usize) -> void {
+        var i: usize = 1;
+        while (i < n) {
+            const cur = idx[i];
+            var j: usize = i;
+            while (j > 0 and locale_compare(entries[idx[j - 1]].name, entries[cur].name) > 0) {
+                idx[j] = idx[j - 1];
+                j -= 1;
+            }
+            idx[j] = cur;
+            i += 1;
+        }
+    }
+
+    // ---- execute's decision ----
+
+    // const limit = params.limit || DEFAULT_LS_LIMIT  (0 = absent)
+    pub fn effective_limit(limit: i64) -> i64 {
+        if (limit == 0) {
+            return DEFAULT_LS_LIMIT;
+        }
+        return limit;
+    }
+
+    // The text execute returns for an already-read directory.
+    pub fn ls_text(entries: []const Entry, limit_param: i64, buf: []u8) -> usize {
+        const limit = effective_limit(limit_param);
+        var dirs: [256]usize = [_]usize{0} ** 256;
+        var files: [256]usize = [_]usize{0} ** 256;
+        var nd: usize = 0;
+        var nf: usize = 0;
+        var k: usize = 0;
+        while (k < entries.len) {
+            if (entries[k].is_dir) {
+                dirs[nd] = k;
+                nd += 1;
+            } else {
+                files[nf] = k;
+                nf += 1;
+            }
+            k += 1;
+        }
+        sort_by_name(entries, &dirs, nd);
+        sort_by_name(entries, &files, nf);
+
+        var p: usize = 0;
+        var lines: i64 = 0;
+        var i: usize = 0;
+        while (i < nd) {
+            if (lines >= limit) {
+                break;
+            }
+            if (lines > 0) {
+                p = put(buf, p, "\n");
+            }
+            p = put(buf, p, entries[dirs[i]].name);
+            p = put(buf, p, "/");
+            lines += 1;
+            i += 1;
+        }
+        i = 0;
+        while (i < nf) {
+            if (lines >= limit) {
+                break;
+            }
+            if (lines > 0) {
+                p = put(buf, p, "\n");
+            }
+            p = put(buf, p, entries[files[i]].name);
+            p = put(buf, p, " (");
+            p = formatSize(entries[files[i]].size, buf, p);
+            p = put(buf, p, ")");
+            lines += 1;
+            i += 1;
+        }
+
+        if (lines == 0) {
+            return put(buf, 0, "(empty directory)");
+        }
+        const total = (nd + nf) as i64;
+        if (total > limit) {
+            p = put(buf, p, "\n\n(Showing ");
+            p = put_u64(buf, p, limit as u64);
+            p = put(buf, p, " of ");
+            p = put_u64(buf, p, total as u64);
+            p = put(buf, p, " entries. Use limit=");
+            p = put_u64(buf, p, (limit * 2) as u64);
+            p = put(buf, p, " to see more.)");
+        }
+        return p;
+    }
+
+    // Plumbing: returns the AI SDK tool (description, zod input schema, execute,
+    // toModelOutput). execute resolves params.path against cwd, calls
+    // assertWithinRoot, reads the directory, and returns { text: ls_text(...) }.
+    // No test calls it.
+    pub fn createLsTool(cwd: str) -> void {
+        undefined;
+    }
+
+    // ---- tests: expected strings were printed by the original's code under node ----
+
+    test formatSize_bytes_kilobytes_megabytes {
+        var buf: [32]u8 = undefined;
+        const n1 = formatSize(0, &buf, 0);
+        assert(std.mem.eql(u8, buf[0:n1], "0B"));
+        const n2 = formatSize(1023, &buf, 0);
+        assert(std.mem.eql(u8, buf[0:n2], "1023B"));
+        const n3 = formatSize(1024, &buf, 0);
+        assert(std.mem.eql(u8, buf[0:n3], "1.0KB"));
+        const n4 = formatSize(1536, &buf, 0);
+        assert(std.mem.eql(u8, buf[0:n4], "1.5KB"));
+        const n5 = formatSize(1048576, &buf, 0);
+        assert(std.mem.eql(u8, buf[0:n5], "1.0MB"));
+        const n6 = formatSize(5368709120, &buf, 0);
+        assert(std.mem.eql(u8, buf[0:n6], "5120.0MB"));
+    }
+
+    test formatSize_rounds_like_toFixed {
+        var buf: [32]u8 = undefined;
+        const n7 = formatSize(1075, &buf, 0);
+        assert(std.mem.eql(u8, buf[0:n7], "1.0KB"));
+        const n8 = formatSize(1076, &buf, 0);
+        assert(std.mem.eql(u8, buf[0:n8], "1.1KB"));
+        // exact ties go up: 1.25 -> 1.3, 2.75 -> 2.8
+        const n9 = formatSize(1280, &buf, 0);
+        assert(std.mem.eql(u8, buf[0:n9], "1.3KB"));
+        const n10 = formatSize(2883584, &buf, 0);
+        assert(std.mem.eql(u8, buf[0:n10], "2.8MB"));
+        // just under 1 MiB still prints in KB
+        const n11 = formatSize(1048575, &buf, 0);
+        assert(std.mem.eql(u8, buf[0:n11], "1024.0KB"));
+    }
+
+    test locale_compare_matches_icu_base {
+        assert(locale_compare("a", "A") == 0);
+        assert(locale_compare("A.txt", "b.txt") == -1);
+        assert(locale_compare("_x", "10") == -1);     // punctuation before digits
+        assert(locale_compare("9", "a") == -1);       // digits before letters
+        assert(locale_compare("10", "9") == -1);      // no numeric collation
+        assert(locale_compare("alpha", "a") == 1);
+        assert(locale_compare(".git", "node_modules") == -1);
+    }
+
+    test effective_limit_treats_zero_as_absent {
+        assert(effective_limit(0) == 500);
+        assert(effective_limit(3) == 3);
+        assert(effective_limit(-1) == -1);
+    }
+
+    test ls_text_lists_dirs_then_files {
+        var es: [7]Entry = [
+            Entry { name: "src", is_dir: true, size: 0 },
+            Entry { name: "README.md", is_dir: false, size: 2048 },
+            Entry { name: ".git", is_dir: true, size: 0 },
+            Entry { name: "b.txt", is_dir: false, size: 12 },
+            Entry { name: "A.txt", is_dir: false, size: 1536 },
+            Entry { name: "node_modules", is_dir: true, size: 0 },
+            Entry { name: "a.txt", is_dir: false, size: 0 },
+        ];
+        var buf: [512]u8 = undefined;
+        const full = ".git/\nnode_modules/\nsrc/\nA.txt (1.5KB)\na.txt (0B)\nb.txt (12B)\nREADME.md (2.0KB)";
+        const n12 = ls_text(&es, 0, &buf);
+        assert(std.mem.eql(u8, buf[0:n12], full));
+        const n13 = ls_text(&es, 3, &buf);
+        assert(std.mem.eql(u8, buf[0:n13], ".git/\nnode_modules/\nsrc/\n\n(Showing 3 of 7 entries. Use limit=6 to see more.)"));
+        const n14 = ls_text(&es, -1, &buf);
+        assert(std.mem.eql(u8, buf[0:n14], "(empty directory)"));
+    }
+
+    test ls_text_keeps_equal_names_in_readdir_order {
+        var es: [7]Entry = [
+            Entry { name: "Zeta", is_dir: false, size: 1 },
+            Entry { name: "alpha", is_dir: false, size: 1 },
+            Entry { name: "_x", is_dir: false, size: 1 },
+            Entry { name: "10", is_dir: false, size: 1 },
+            Entry { name: "9", is_dir: false, size: 1 },
+            Entry { name: "a", is_dir: false, size: 1 },
+            Entry { name: "A", is_dir: false, size: 2 },
+        ];
+        var buf: [256]u8 = undefined;
+        const n15 = ls_text(&es, 0, &buf);
+        assert(std.mem.eql(u8, buf[0:n15], "_x (1B)\n10 (1B)\n9 (1B)\na (1B)\nA (2B)\nalpha (1B)\nZeta (1B)"));
+    }
+
+    test ls_text_empty_directory {
+        var es: [0]Entry = [];
+        var buf: [64]u8 = undefined;
+        const n16 = ls_text(&es, 5, &buf);
+        assert(std.mem.eql(u8, buf[0:n16], "(empty directory)"));
+    }
+}

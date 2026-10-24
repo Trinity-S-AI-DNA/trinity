@@ -1,0 +1,831 @@
+// SPDX-License-Identifier: Apache-2.0
+// t27/specs/queen/lotus.t27
+// Queen Lotus 6-Phase Orchestration Specification
+// Self-improving agent orchestration with episode-based learning
+//
+// STATUS (S09 of gHashTag/trinity#988, gHashTag/t27#4828, measured 2026-10-01):
+// this is the design of the LOTUS-POLICY adapter, not the Queen's task lifecycle. Its six phases
+// tune a resource policy from episodes; they do not choose, lease, review or finish a task. The
+// canonical task machine is specs/queen/dispatch.t27, taken from the trios supervisor that runs.
+// What the code does instead of these six: gHashTag/trinity src/tri/queen/lotus_cycle.zig at
+// afc9d384 runs Observe, a Record Episode stage that is only a comment, Evaluate, Plan, Act (its
+// episode-aware variant: Observe, load episodes, evaluate the window, plan, act); its 29 tests pass
+// under Zig 0.15.2, and no build step builds it. This file does not compile in C at master.
+// φ² + 1/φ² = 3 | TRINITY
+
+module QueenLotus {
+    // Import base types, HSLM, and runtime
+    use base::types;
+    use nn::hslm;
+    use compiler::runtime;
+
+    // ═════════════════════════════════════════════════════
+    // 1. Lotus Configuration
+    // ═════════════════════════════════════════════════════════════════════════
+
+    const NUM_PHASES : usize = 6;            // 6 phases in Lotus cycle
+    const EPISODE_BUFFER_SIZE : usize = 100;   // Max episodes in buffer
+    const POLICY_WINDOW_SIZE : usize = 10;     // Window for policy evaluation
+
+    // Phase definitions
+    const PHASE_OBSERVE : u8 = 0;   // Observe current state
+    const PHASE_RECALL : u8 = 1;    // Recall relevant episodes
+    const PHASE_EVALUATE : u8 = 2;  // Evaluate situation quality
+    const PHASE_PLAN : u8 = 3;      // Plan next actions
+    const PHASE_ACT : u8 = 4;       // Execute actions
+    const PHASE_RECORD : u8 = 5;    // Record episode outcome
+
+    // Outcome types
+    const OUTCOME_UNKNOWN : u8 = 0;  // Unknown/insufficient data
+    const OUTCOME_SUCCESS : u8 = 1;  // Success
+    const OUTCOME_PARTIAL : u8 = 2;  // Partial success
+    const OUTCOME_FAILURE : u8 = 3;  // Failure (expected)
+    const OUTCOME_FATAL : u8 = 4;    // Fatal/unexpected failure
+
+    // Quality levels
+    const QUALITY_UNKNOWN : u8 = 0;  // Unknown quality
+    const QUALITY_GOOD : u8 = 1;    // Good quality
+    const QUALITY_UNSTABLE : u8 = 2; // Unstable quality
+    const QUALITY_BAD : u8 = 3;     // Bad quality
+
+    // Policy delta types
+    const DELTA_SCALE_UP : u8 = 0;   // Scale up resources
+    const DELTA_SCALE_DOWN : u8 = 1; // Scale down resources
+    const DELTA_SET : u8 = 2;        // Set parameter
+    const DELTA_WAIT : u8 = 3;       // Wait/observe
+
+    // ═════════════════════════════════════════════════════
+    // 2. Lotus State
+    // ═════════════════════════════════════════════════════════════════════════
+
+    // Lotus runtime state
+    var current_phase : u8 = PHASE_OBSERVE;
+    var current_episode : usize = 0;
+
+    // Episode buffer (circular buffer)
+    struct Episode {
+        id : usize,
+        timestamp : u64,
+        context : Context,
+        evaluation : Evaluation,
+        plan : Plan,
+        result : Action,
+        outcome : u8,
+    }
+
+    var episode_buffer : [EPISODE_BUFFER_SIZE]Episode = undefined;
+
+    // Policy state
+    var policy_state : [256]u8 = [0; 256];
+
+    // Evaluation window (last N episode indices)
+    var eval_window : [POLICY_WINDOW_SIZE]usize = [0; POLICY_WINDOW_SIZE];
+
+    // Phase timeouts
+    var phase_start_time : u64 = 0;
+    const PHASE_TIMEOUT_MS : u64 = 5000;  // 5 second timeout per phase
+
+    // ═════════════════════════════════════════════════════
+    // 3. Data Structures
+    // ═════════════════════════════════════════════════════════════════════════
+
+    // Context: system state observation
+    struct Context {
+        active_issues : usize,
+        system_health : f64,
+        timestamp : u64,
+    }
+
+    // Evaluation: quality assessment
+    struct Evaluation {
+        quality : u8,
+        success_count : u8,
+        partial_count : u8,
+        failure_count : u8,
+        confidence : f64,
+    }
+
+    // Plan: action to take
+    struct Plan {
+        delta_type : u8,
+        target_resource : u8,
+        target_value : i32,
+    }
+
+    // Action: executed action
+    struct Action {
+        delta_type : u8,
+        success : bool,
+        execution_time_ms : u64,
+    }
+
+    // Cycle result
+    struct CycleResult {
+        context : Context,
+        evaluation : Evaluation,
+        plan : Plan,
+        action : Action,
+        outcome : u8,
+        total_time_ms : u64,
+    }
+
+    // ═════════════════════════════════════════════════════
+    // 4. Main Orchestration
+    // ═════════════════════════════════════════════════════════════════════════
+
+    // lotus_orchestrate() → CycleResult
+    // Run complete 6-phase Lotus cycle
+    // Returns: context, evaluation, plan, result, outcome
+    fn lotus_orchestrate() -> CycleResult {
+        var result : CycleResult = undefined;
+
+        // Phase 1: Observe
+        result.context = lotus_phase(PHASE_OBSERVE);
+
+        // Phase 2: Recall
+        var recalled_episodes = lotus_phase(PHASE_RECALL);
+
+        // Phase 3: Evaluate
+        result.evaluation = evaluate_quality(recalled_episodes);
+
+        // Phase 4: Plan
+        result.plan = generate_plan(result.evaluation);
+
+        // Phase 5: Act
+        result.action = execute_action(result.plan);
+
+        // Phase 6: Record
+        result.outcome = record_episode(result);
+
+        // Prepare result
+        result.total_time_ms = get_timestamp() - result.context.timestamp;
+
+        return result;
+    }
+
+    // lotus_phase(phase: u8) → PhaseOutput
+    // Execute a single phase of the Lotus cycle
+    fn lotus_phase(phase: u8) -> PhaseOutput {
+        current_phase = phase;
+        phase_start_time = get_timestamp();
+
+        if (phase == PHASE_OBSERVE) {
+            return observe_state();
+        } else if (phase == PHASE_RECALL) {
+            return recall_episodes();
+        } else if (phase == PHASE_EVALUATE) {
+            return evaluate_quality_();
+        } else if (phase == PHASE_PLAN) {
+            return generate_plan_();
+        } else if (phase == PHASE_ACT) {
+            return execute_action_();
+        } else if (phase == PHASE_RECORD) {
+            return record_episode_();
+        }
+
+        return PhaseOutput{ .success = false };
+    }
+
+    // ═════════════════════════════════════════════════════
+    // 5. Phase: Observe
+    // ═════════════════════════════════════════════════════════════════════════
+
+    // PhaseOutput wrapper for observe_state
+    struct PhaseOutput {
+        success : bool,
+        data : [256]u8 = [0; 256],
+    }
+
+    // observe_state() → Context
+    // Gather current state information
+    fn observe_state() -> Context {
+        const active_issues = get_active_issues_count();
+        const system_health = get_system_health();
+        const timestamp = get_timestamp();
+
+        return Context{
+            .active_issues = active_issues,
+            .system_health = system_health,
+            .timestamp = timestamp,
+        };
+    }
+
+    // get_active_issues_count() → usize
+    // Get number of active issues
+    fn get_active_issues_count() -> usize {
+        // Query issue tracker
+        return 0;  // Placeholder
+    }
+
+    // get_system_health() → f64
+    // Get system health score (0.0 to 1.0)
+    fn get_system_health() -> f64 {
+        return 1.0;  // Placeholder
+    }
+
+    // get_timestamp() → u64
+    // Get current timestamp
+    fn get_timestamp() -> u64 {
+        // Return current time (placeholder)
+        return 0;
+    }
+
+    // ═════════════════════════════════════════════════════
+    // 6. Phase: Recall
+    // ═════════════════════════════════════════════════════════════════════════
+
+    // RecallEpisode wrapper
+    struct RecallEpisode {
+        episodes : [POLICY_WINDOW_SIZE]usize,
+        count : usize,
+    }
+
+    // recall_episodes() → RecallEpisode
+    // Recall relevant episodes from episode buffer
+    // Uses HSLM for semantic similarity search
+    fn recall_episodes() -> RecallEpisode {
+        // Use HSLM to find similar episodes
+        // For now: return recent episodes
+
+        var count : usize = 0;
+        var i : usize = 0;
+
+        while (i < POLICY_WINDOW_SIZE && i < current_episode) {
+            const episode_idx = (current_episode - 1 - i) % EPISODE_BUFFER_SIZE;
+            eval_window[i] = episode_idx;
+            count = count + 1;
+            i = i + 1;
+        }
+
+        return RecallEpisode{
+            .episodes = eval_window,
+            .count = count,
+        };
+    }
+
+    // ═════════════════════════════════════════════════════
+    // 7. Phase: Evaluate
+    // ═════════════════════════════════════════════════════════════════════════
+
+    // EvaluationResult wrapper
+    struct EvaluationResult {
+        quality : u8,
+        confidence : f64,
+    }
+
+    // evaluate_quality(recalled: RecallEpisode) → Evaluation
+    // Evaluate quality based on episode outcomes
+    fn evaluate_quality(recalled: RecallEpisode) -> Evaluation {
+        var success_count : u8 = 0;
+        var partial_count : u8 = 0;
+        var failure_count : u8 = 0;
+
+        // Count outcomes from recalled episodes
+        var i : usize = 0;
+
+        while (i < recalled.count) {
+            const episode = episode_buffer[recalled.episodes[i]];
+
+            if (episode.outcome == OUTCOME_SUCCESS) {
+                success_count = success_count + 1;
+            } else if (episode.outcome == OUTCOME_PARTIAL) {
+                partial_count = partial_count + 1;
+            } else if (episode.outcome == OUTCOME_FAILURE) {
+                failure_count = failure_count + 1;
+            }
+
+            i = i + 1;
+        }
+
+        // Determine quality
+        const total = success_count + partial_count + failure_count;
+
+        if (total == 0) {
+            return Evaluation{
+                .quality = QUALITY_UNKNOWN,
+                .success_count = 0,
+                .partial_count = 0,
+                .failure_count = 0,
+                .confidence = 0.0,
+            };
+        }
+
+        const success_ratio = (success_count as f64) / (total as f64);
+        const failure_ratio = (failure_count as f64) / (total as f64);
+
+        var quality : u8 = QUALITY_UNSTABLE;
+        var confidence : f64 = 1.0 - (1.0 / (total as f64));
+
+        if (success_ratio >= 0.7) {
+            quality = QUALITY_GOOD;
+        } else if (failure_ratio >= 0.5) {
+            quality = QUALITY_BAD;
+        }
+
+        return Evaluation{
+            .quality = quality,
+            .success_count = success_count,
+            .partial_count = partial_count,
+            .failure_count = failure_count,
+            .confidence = confidence,
+        };
+    }
+
+    // evaluate_quality_() → EvaluationResult
+    // Wrapper for phase execution
+    fn evaluate_quality_() -> EvaluationResult {
+        const recalled = recall_episodes();
+        const eval = evaluate_quality(recalled);
+        return EvaluationResult{
+            .quality = eval.quality,
+            .confidence = eval.confidence,
+        };
+    }
+
+    // ═════════════════════════════════════════════════════
+    // 8. Phase: Plan
+    // ═════════════════════════════════════════════════════════════════════════
+
+    // PlanResult wrapper
+    struct PlanResult {
+        delta_type : u8,
+        target_resource : u8,
+        target_value : i32,
+    }
+
+    // generate_plan(evaluation: Evaluation) → Plan
+    // Generate action plan based on quality evaluation
+    fn generate_plan(evaluation: Evaluation) -> Plan {
+        var delta_type : u8 = DELTA_WAIT;
+
+        if (evaluation.quality == QUALITY_GOOD) {
+            delta_type = DELTA_SCALE_UP;
+        } else if (evaluation.quality == QUALITY_BAD) {
+            delta_type = DELTA_SCALE_DOWN;
+        }
+
+        return Plan{
+            .delta_type = delta_type,
+            .target_resource = 0,
+            .target_value = 0,
+        };
+    }
+
+    // generate_plan_() → PlanResult
+    // Wrapper for phase execution
+    fn generate_plan_() -> PlanResult {
+        const eval = evaluate_quality_();
+        const plan = generate_plan(Evaluation{
+            .quality = eval.quality,
+            .success_count = 0,
+            .partial_count = 0,
+            .failure_count = 0,
+            .confidence = eval.confidence,
+        });
+
+        return PlanResult{
+            .delta_type = plan.delta_type,
+            .target_resource = plan.target_resource,
+            .target_value = plan.target_value,
+        };
+    }
+
+    // ═════════════════════════════════════════════════════
+    // 9. Phase: Act
+    // ═════════════════════════════════════════════════════════════════════════
+
+    // ActionResult wrapper
+    struct ActionResult {
+        success : bool,
+        execution_time_ms : u64,
+    }
+
+    // execute_action(plan: Plan) → Action
+    // Execute the planned action
+    fn execute_action(plan: Plan) -> Action {
+        var success = false;
+        const start_time = get_timestamp();
+
+        if (plan.delta_type == DELTA_SCALE_UP) {
+            success = scale_up_resources();
+        } else if (plan.delta_type == DELTA_SCALE_DOWN) {
+            success = scale_down_resources();
+        } else if (plan.delta_type == DELTA_SET) {
+            success = set_parameter(plan);
+        } else if (plan.delta_type == DELTA_WAIT) {
+            success = true;  // Wait is always successful
+        }
+
+        const execution_time = get_timestamp() - start_time;
+
+        return Action{
+            .delta_type = plan.delta_type,
+            .success = success,
+            .execution_time_ms = execution_time,
+        };
+    }
+
+    // execute_action_() → ActionResult
+    // Wrapper for phase execution
+    fn execute_action_() -> ActionResult {
+        const plan_result = generate_plan_();
+        const action = execute_action(Plan{
+            .delta_type = plan_result.delta_type,
+            .target_resource = plan_result.target_resource,
+            .target_value = plan_result.target_value,
+        });
+
+        return ActionResult{
+            .success = action.success,
+            .execution_time_ms = action.execution_time_ms,
+        };
+    }
+
+    // scale_up_resources() → bool
+    // Increase system resources
+    fn scale_up_resources() -> bool {
+        // Increase agent count, memory allocation, etc.
+        return true;
+    }
+
+    // scale_down_resources() → bool
+    // Decrease system resources
+    fn scale_down_resources() -> bool {
+        // Decrease agent count, free memory, etc.
+        return true;
+    }
+
+    // set_parameter(plan: Plan) → bool
+    // Set a policy parameter
+    fn set_parameter(plan: Plan) -> bool {
+        // Set parameter from plan
+        policy_state[plan.target_resource] = plan.target_value as u8;
+        return true;
+    }
+
+    // ═════════════════════════════════════════════════════
+    // 10. Phase: Record
+    // ═════════════════════════════════════════════════════════════════════════
+
+    // RecordResult wrapper
+    struct RecordResult {
+        success : bool,
+        episode_id : usize,
+    }
+
+    // record_episode(cycle_result: CycleResult) → u8
+    // Record episode to buffer
+    fn record_episode(cycle_result: CycleResult) -> u8 {
+        const slot = current_episode % EPISODE_BUFFER_SIZE;
+
+        episode_buffer[slot] = Episode{
+            .id = current_episode,
+            .timestamp = cycle_result.context.timestamp,
+            .context = cycle_result.context,
+            .evaluation = cycle_result.evaluation,
+            .plan = cycle_result.plan,
+            .result = cycle_result.action,
+            .outcome = determine_outcome(cycle_result),
+        };
+
+        current_episode = current_episode + 1;
+
+        return OUTCOME_SUCCESS;  // Placeholder
+    }
+
+    // record_episode_() → RecordResult
+    // Wrapper for phase execution
+    fn record_episode_() -> RecordResult {
+        const cycle_result = CycleResult{
+            .context = observe_state(),
+            .evaluation = evaluate_quality_(),
+            .plan = generate_plan_(),      // W575: the zero-argument wrapper, like evaluate_() above
+            .action = execute_action_(),   // W575: same -- generate_plan/execute_action each take one argument
+            .outcome = OUTCOME_UNKNOWN,
+            .total_time_ms = 0,
+        };
+
+        const outcome = record_episode(cycle_result);
+
+        return RecordResult{
+            .success = true,
+            .episode_id = current_episode,
+        };
+    }
+
+    // determine_outcome(result: CycleResult) → u8
+    // Determine episode outcome based on action success
+    fn determine_outcome(result: CycleResult) -> u8 {
+        if (result.action.success) {
+            return OUTCOME_SUCCESS;
+        } else {
+            return OUTCOME_FAILURE;
+        }
+    }
+
+    // ═════════════════════════════════════════════════════
+    // 11. Agent Spawning
+    // ═════════════════════════════════════════════════════════════════════════
+
+    // lotus_spawn(agent_type: u8, count: u8) → bool
+    // Spawn new agents for orchestration
+    fn lotus_spawn(agent_type: u8, count: u8) -> bool {
+        var spawned : u8 = 0;
+
+        while (spawned < count) {
+            if (!spawn_agent(agent_type)) {
+                return false;
+            }
+            spawned = spawned + 1;
+        }
+
+        return true;
+    }
+
+    // spawn_agent(agent_type: u8) → bool
+    // Spawn a single agent
+    fn spawn_agent(agent_type: u8) -> bool {
+        // Spawn agent of specified type
+        return true;
+    }
+
+    // ═════════════════════════════════════════════════════
+    // 12. Phase Management
+    // ═════════════════════════════════════════════════════════════════════════
+
+    // lotus_phase_management() → bool
+    // Manage phase transitions and timeouts
+    fn lotus_phase_management() -> bool {
+        if (check_phase_timeout()) {
+            force_phase_transition();
+            return true;
+        }
+        return false;
+    }
+
+    // check_phase_timeout() → bool
+    // Check if current phase has timed out
+    fn check_phase_timeout() -> bool {
+        const current_time = get_timestamp();
+        const elapsed = current_time - phase_start_time;
+
+        return elapsed > PHASE_TIMEOUT_MS;
+    }
+
+    // force_phase_transition() → void
+    // Force transition to next phase
+    fn force_phase_transition() -> void {
+        current_phase = current_phase + 1;
+
+        if (current_phase >= NUM_PHASES) {
+            current_phase = 0;  // Wrap around
+        }
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+    // TDD-Inside-Spec: Tests and Invariants for QueenLotus
+    // ═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+    test lotus_num_phases_is_six
+        given phases = NUM_PHASES
+        then phases == 6
+
+    test lotus_phase_constants_unique
+        given a = PHASE_OBSERVE and b = PHASE_RECALL and c = PHASE_EVALUATE
+        and   d = PHASE_PLAN and e = PHASE_ACT and f = PHASE_RECORD
+        then a != b and b != c and c != d and d != e and e != f
+
+    test lotus_phase_constants_ordered
+        given a = PHASE_OBSERVE and b = PHASE_RECALL and c = PHASE_EVALUATE
+        and   d = PHASE_PLAN and e = PHASE_ACT and f = PHASE_RECORD
+        then a == 0 and b == 1 and c == 2 and d == 3 and e == 4 and f == 5
+
+    test lotus_episode_buffer_size_100
+        given size = EPISODE_BUFFER_SIZE
+        then size == 100
+
+    test lotus_policy_window_size_10
+        given size = POLICY_WINDOW_SIZE
+        then size == 10
+
+    test lotus_outcome_constants_unique
+        given a = OUTCOME_UNKNOWN and b = OUTCOME_SUCCESS and c = OUTCOME_PARTIAL
+        and   d = OUTCOME_FAILURE and e = OUTCOME_FATAL
+        then a != b and b != c and c != d and d != e
+
+    test lotus_quality_constants_unique
+        given a = QUALITY_UNKNOWN and b = QUALITY_GOOD and c = QUALITY_UNSTABLE and d = QUALITY_BAD
+        then a != b and b != c and c != d
+
+    test lotus_delta_constants_unique
+        given a = DELTA_SCALE_UP and b = DELTA_SCALE_DOWN and c = DELTA_SET and d = DELTA_WAIT
+        then a != b and b != c and c != d
+
+    test lotus_initial_phase_is_observe
+        given phase = current_phase
+        then phase == PHASE_OBSERVE
+
+    test lotus_phase_transitions_wrap_around
+        given initial_phase = NUM_PHASES - 1
+        and   force_phase_transition()
+        and   new_phase = current_phase
+        then new_phase == 0
+
+    test lotus_phase_transitions_increment
+        given initial_phase = 2
+        and   force_phase_transition()
+        and   new_phase = current_phase
+        then new_phase == 3
+
+    test lotus_orchestrate_returns_valid_result
+        given result = lotus_orchestrate()
+        then result.total_time_ms >= 0
+
+    test lotus_observe_returns_context
+        given context = observe_state()
+        then context.timestamp >= 0
+
+    test lotus_system_health_in_valid_range
+        given health = get_system_health()
+        then health >= 0.0 and health <= 1.0
+
+    test lotus_generate_plan_good_scales_up
+        given eval = Evaluation{.quality = QUALITY_GOOD, .success_count = 0, .partial_count = 0, .failure_count = 0, .confidence = 1.0}
+        and   plan = generate_plan(eval)
+        then plan.delta_type == DELTA_SCALE_UP
+
+    test lotus_generate_plan_bad_scales_down
+        given eval = Evaluation{.quality = QUALITY_BAD, .success_count = 0, .partial_count = 0, .failure_count = 0, .confidence = 1.0}
+        and   plan = generate_plan(eval)
+        then plan.delta_type == DELTA_SCALE_DOWN
+
+    test lotus_generate_plan_unknown_waits
+        given eval = Evaluation{.quality = QUALITY_UNKNOWN, .success_count = 0, .partial_count = 0, .failure_count = 0, .confidence = 0.0}
+        and   plan = generate_plan(eval)
+        then plan.delta_type == DELTA_WAIT
+
+    test lotus_execute_wait_succeeds
+        given plan = Plan{.delta_type = DELTA_WAIT, .target_resource = 0, .target_value = 0}
+        and   action = execute_action(plan)
+        then action.success == true
+
+    test lotus_scale_up_succeeds
+        given result = scale_up_resources()
+        then result == true
+
+    test lotus_scale_down_succeeds
+        given result = scale_down_resources()
+        then result == true
+
+    test lotus_set_parameter_updates_policy
+        given plan = Plan{.delta_type = DELTA_SET, .target_resource = 5, .target_value = 42}
+        and   result = set_parameter(plan)
+        and   then policy_state[5] == 42
+
+    test lotus_spawn_zero_agents
+        given result = lotus_spawn(0, 0)
+        then result == true
+
+    test lotus_spawn_agents
+        given result = lotus_spawn(1, 3)
+        then result == true
+
+    test lotus_episode_id_increments
+        given id_before = current_episode
+        and   record_episode(CycleResult{...})
+        and   id_after = current_episode
+        then id_after == id_before + 1
+
+    test lotus_recall_returns_window_size
+        given recalled = recall_episodes()
+        then recalled.count <= POLICY_WINDOW_SIZE
+
+    test lotus_phase_timeout_false_initially
+        given timeout = check_phase_timeout()
+        then timeout == false
+
+    invariant lotus_num_phases_constant
+        assert NUM_PHASES == 6
+
+    invariant lotus_phase_constants_sequential
+        assert PHASE_OBSERVE == 0 and PHASE_RECALL == 1 and PHASE_EVALUATE == 2
+        assert PHASE_PLAN == 3 and PHASE_ACT == 4 and PHASE_RECORD == 5
+
+    invariant lotus_episode_buffer_size_constant
+        assert EPISODE_BUFFER_SIZE == 100
+
+    invariant lotus_policy_window_size_constant
+        assert POLICY_WINDOW_SIZE == 10
+
+    invariant lotus_quality_level_in_range
+        given quality = QUALITY_BAD
+        assert quality >= 0 and quality <= 3
+
+    invariant lotus_outcome_type_in_range
+        given outcome = OUTCOME_FATAL
+        assert outcome >= 0 and outcome <= 4
+
+    invariant lotus_delta_type_in_range
+        given delta = DELTA_WAIT
+        assert delta >= 0 and delta <= 3
+
+    invariant lotus_phase_current_is_valid
+        assert current_phase >= 0 and current_phase < NUM_PHASES
+
+    invariant lotus_phase_transition_increments
+        given old = current_phase
+        and   force_phase_transition()
+        and   new = current_phase
+        then new == (old + 1) % NUM_PHASES
+
+    invariant lotus_system_health_in_bounds
+        given health = get_system_health()
+        assert health >= 0.0 and health <= 1.0
+
+    invariant lotus_timestamp_non_decreasing
+        given t1 = get_timestamp()
+        and   t2 = get_timestamp()
+        assert t2 >= t1
+
+    invariant lotus_quality_good_when_high_success_rate
+        given eval = evaluate_quality(RecallEpisode{.episodes = [0, 1, 2, 3, 4, 5, 6, 7], .count = 8})
+        assert eval.quality == QUALITY_GOOD
+
+    invariant lotus_quality_bad_when_high_failure_rate
+        given eval = evaluate_quality(RecallEpisode{.episodes = [0, 1, 2, 3, 4, 5, 6, 7], .count = 8})
+        assert eval.quality == QUALITY_BAD
+
+    invariant lotus_plan_consistency
+        given eval = Evaluation{.quality = QUALITY_GOOD, .success_count = 0, .partial_count = 0, .failure_count = 0, .confidence = 1.0}
+        and   plan = generate_plan(eval)
+        assert plan.delta_type == DELTA_SCALE_UP
+
+    invariant lotus_episode_buffer_indices_valid
+        given idx = current_episode % EPISODE_BUFFER_SIZE
+        then idx < EPISODE_BUFFER_SIZE
+
+    invariant lotus_policy_state_size_256
+        assert policy_state.len() == 256
+
+    invariant lotus_eval_window_size_matches_policy_window
+        assert eval_window.len() == POLICY_WINDOW_SIZE
+
+    invariant lotus_recall_returns_valid_indices
+        given recalled = recall_episodes()
+        and   idx = 0
+        and   valid = idx < recalled.count and recalled.episodes[idx] < EPISODE_BUFFER_SIZE
+        assert valid
+
+    bench lotus_orchestration_cycle_latency
+        measure: microseconds for lotus_orchestrate()
+        target: < 100000us  // < 100ms
+
+    bench lotus_phase_transition_latency
+        measure: nanoseconds to force_phase_transition()
+        target: < 100ns
+
+    bench lotus_observe_state_latency
+        measure: nanoseconds to observe_state()
+        target: < 5000ns
+
+    bench lotus_recall_episodes_latency
+        measure: nanoseconds to recall_episodes()
+        target: < 10000ns
+
+    bench lotus_evaluate_quality_latency
+        measure: nanoseconds to evaluate_quality(RecallEpisode{.episodes = [0; 10], .count = 10})
+        target: < 5000ns
+
+    bench lotus_generate_plan_latency
+        measure: nanoseconds to generate_plan(Evaluation{.quality = QUALITY_GOOD, .success_count = 0, .partial_count = 0, .failure_count = 0, .confidence = 1.0})
+        target: < 2000ns
+
+    bench lotus_execute_action_latency
+        measure: nanoseconds to execute_action(Plan{.delta_type = DELTA_SCALE_UP, .target_resource = 0, .target_value = 0})
+        target: < 10000ns
+
+    bench lotus_record_episode_latency
+        measure: nanoseconds to record_episode_(true)
+        target: < 5000ns
+}
+
+// W708: NO ENTRY POINT. The boundary W697 derived here was WRONG, and it is
+// removed rather than corrected.
+//
+// W697's call-graph-root rule picked `lotus_spawn(agent_type: u8, count: u8)`
+// because it is the only candidate this module has: `lotus_orchestrate()` --
+// the module's actual subject, the six-phase Observe/Recall/Evaluate/Plan/Act/
+// Record cycle -- takes NO parameters, so the rule cannot see it.
+//
+// The pick was mechanically forced and semantically wrong. `lotus_spawn` is a
+// primitive the cycle calls; exposing it as THE hardware boundary says this
+// module is a spawner, which it is not.
+//
+// T197a defended the root rule on the grounds that its two known bad picks were
+// excluded by the width filter (`f64`, `GF4`). This is a third case, and the
+// width filter does NOT help: `(u8, u8) -> bool` is entirely scalar. So the
+// filter composition narrows the failure mode without closing it.
+//
+// A stateful multi-phase cycle whose driver takes no data is not combinational
+// at all. If this module is ever given a boundary it will be `fn on_clock`, and
+// choosing it is a design decision, not a derivation.

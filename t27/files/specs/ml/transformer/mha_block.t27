@@ -1,0 +1,746 @@
+// SPDX-License-Identifier: Apache-2.0
+// t27/specs/ml/transformer/mha_block.t27
+// Transformer Encoder Block with Pre-LN & φ-optimized residuals | φ² + 1/φ² = 3 | TRINITY
+
+module MHABlock;
+    use base::types;
+    use math::constants;
+    use numeric::gf16;
+    use ml::transformer::norm;
+    use ml::transformer::multi_head_attn;
+    use ml::transformer::feed_forward;
+
+    // ═══════════════════════════════════════════════════════════
+    // 1. Constants
+    // ═══════════════════════════════════════════════════════════
+
+    const PHI : gf16::GF16 = 1.618033988749895;
+    const DEFAULT_DROPOUT : gf16::GF16 = 0.1;
+    const PHI_RESIDUAL_SCALE : gf16::GF16 = 1.0 / PHI; // φ-optimized residual scaling
+
+    // ═══════════════════════════════════════════════════════════
+    // 2. Types
+    // ═══════════════════════════════════════════════════════════
+
+    pub const BlockConfig = struct {
+        hidden_size : u32,          // d_model: hidden dimension
+        num_heads : u32,            // Number of attention heads
+        expansion_factor : gf16::GF16, // FFN expansion factor
+        dropout : gf16::GF16,       // Dropout probability
+        use_pre_ln : bool,          // Pre-LayerNorm (default: true)
+        use_post_ln : bool,         // Post-LayerNorm (optional)
+        use_phi_residual : bool,    // Apply φ-optimized residual scaling
+    };
+
+    pub const BlockState = struct {
+        norm1 : NormState,          // First LayerNorm (Pre-Attention)
+        norm2 : NormState,          // Second LayerNorm (Pre-FFN)
+        mha_state : MHAState,       // Multi-Head Attention state
+        ffn_state : FFNState,       // Feed-Forward Network state
+        is_training : bool,         // Training/inference mode
+    };
+
+    pub const BlockForwardResult = struct {
+        output : []gf16::GF16,       // Block output: [batch, seq_len, hidden_size]
+        attention_weights : []gf16::GF16, // Attention weights (for visualization)
+        intermediate_hidden : []gf16::GF16, // After MHA (for analysis)
+    };
+
+    pub const BlockGradients = struct {
+        d_input : []gf16::GF16,     // Gradient wrt block input
+        mha_grads : MHAGradients,   // Gradients for MHA
+        ffn_grads : FFNGradients,   // Gradients for FFN
+    };
+
+    pub const ResidualConnection = struct {
+        scale : gf16::GF16,         // Residual scaling factor
+        use_projection : bool,      // Use projection for dimension mismatch
+        projection_weights : []gf16::GF16, // Projection matrix if needed
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    // 3. Core Functions
+    // ═══════════════════════════════════════════════════════════
+
+    // init(config: BlockConfig) → BlockState
+    // Initializes Transformer encoder block.
+    fn init(config: BlockConfig) -> BlockState {
+        // Initialize norm1, norm2 with hidden_size
+        let norm1_config = norm::NormConfig{
+            .hidden_size = config.hidden_size,
+            .eps = 1e-5,
+            .elementwise_affine = true,
+            .use_phi_init = true,
+            .strand_mode = false,
+        };
+        let norm2_config = norm::NormConfig{
+            .hidden_size = config.hidden_size,
+            .eps = 1e-5,
+            .elementwise_affine = true,
+            .use_phi_init = true,
+            .strand_mode = false,
+        };
+        let norm1 = norm::init(norm1_config);
+        let norm2 = norm::init(norm2_config);
+        
+        // Initialize mha_state with hidden_size, num_heads
+        let mha_config = multi_head_attn::MHAConfig{
+            .hidden_size = config.hidden_size,
+            .num_heads = config.num_heads,
+            .head_dim = config.hidden_size / config.num_heads,
+            .dropout = config.dropout,
+            .use_flash_attention = false,
+            .use_rope = false,
+            .use_phi_scaling = true,
+            .causal = false,
+        };
+        let mha_state = multi_head_attn::init(mha_config);
+        
+        // Initialize ffn_state with hidden_size, expansion_factor
+        let ffn_config = feed_forward::FFNConfig{
+            .hidden_size = config.hidden_size,
+            .expansion_factor = config.expansion_factor,
+            .activation = feed_forward::ActivationType::GELU,
+            .dropout = config.dropout,
+            .use_bias = true,
+            .use_phi_expansion = true,
+            .use_residual = false,
+        };
+        let ffn_state = feed_forward::init(ffn_config);
+        
+        // Return BlockState with all components
+        return BlockState{
+            .norm1 = norm1,
+            .norm2 = norm2,
+            .mha_state = mha_state,
+            .ffn_state = ffn_state,
+            .is_training = true,
+        };
+    }
+
+    // forward(state: BlockState, input: []gf16::GF16) → BlockForwardResult
+    // Computes encoder block forward pass.
+    fn forward(state: BlockState, input: []gf16::GF16) → BlockForwardResult {
+        // Pre-LN Architecture (default):
+        //   1. norm1_output = LayerNorm(input)
+        //   2. attn_output, attn_weights = MHA(norm1_output)
+        //   3. attn_output = dropout(attn_output)
+        //   4. residual1 = input + attn_output
+        //   5. norm2_output = LayerNorm(residual1)
+        //   6. ffn_output = FFN(norm2_output)
+        //   7. ffn_output = dropout(ffn_output)
+        //   8. output = residual1 + ffn_output
+        //
+        // If use_phi_residual: scale residuals by PHI_RESIDUAL_SCALE
+        
+        // Step 1: norm1_output = LayerNorm(input)
+        let norm1_result = norm::forward(state.norm1, input);
+        
+        // Step 2: attn_output, attn_weights = MHA(norm1_output)
+        let mask = multi_head_attn::AttentionMask{
+            .mask = [],
+            .shape = [input.len, input.len],
+            .is_causal = false,
+        };
+        let mha_result = multi_head_attn::forward(state.mha_state, norm1_result.output, mask);
+        
+        // Step 3: attn_output = dropout(attn_output)
+        let attn_output = mha_result.output; // TODO: Implement dropout
+        
+        // Step 4: residual1 = input + attn_output (with optional phi scaling)
+        let residual1 = if state.use_phi_residual {
+            phi_scaled_residual(input, attn_output)
+        } else {
+            apply_residual_connection(input, attn_output, 1.0)
+        };
+        
+        // Step 5: norm2_output = LayerNorm(residual1)
+        let norm2_result = norm::forward(state.norm2, residual1);
+        
+        // Step 6: ffn_output = FFN(norm2_output)
+        let ffn_result = feed_forward::forward(state.ffn_state, norm2_result.output);
+        
+        // Step 7: ffn_output = dropout(ffn_output)
+        let ffn_output = ffn_result.output; // TODO: Implement dropout
+        
+        // Step 8: output = residual1 + ffn_output (with optional phi scaling)
+        let output = if state.use_phi_residual {
+            phi_scaled_residual(residual1, ffn_output)
+        } else {
+            apply_residual_connection(residual1, ffn_output, 1.0)
+        };
+        
+        return BlockForwardResult{
+            .output = output,
+            .attention_weights = mha_result.attention_weights,
+            .intermediate_hidden = attn_output,
+        };
+    }
+
+    // forward_with_post_ln(state: BlockState, input: []gf16::GF16) → BlockForwardResult
+    // Computes forward pass with Post-LN architecture.
+    fn forward_with_post_ln(state: BlockState, input: []gf16::GF16) -> BlockForwardResult {
+        // Post-LN Architecture:
+        //   1. attn_output = MHA(input)
+        //   2. attn_output = dropout(attn_output)
+        //   3. residual1 = input + attn_output
+        //   4. norm1_output = LayerNorm(residual1)
+        //   5. ffn_output = FFN(norm1_output)
+        //   6. ffn_output = dropout(ffn_output)
+        //   7. output = residual1 + ffn_output
+        //   8. norm2_output = LayerNorm(output)
+        
+        // Step 1: attn_output = MHA(input)
+        let mask = multi_head_attn::AttentionMask{
+            .mask = [],
+            .shape = [input.len, input.len],
+            .is_causal = false,
+        };
+        let mha_result = multi_head_attn::forward(state.mha_state, input, mask);
+        
+        // Step 2: attn_output = dropout(attn_output)
+        let attn_output = mha_result.output; // TODO: Implement dropout
+        
+        // Step 3: residual1 = input + attn_output (with optional phi scaling)
+        let residual1 = if state.use_phi_residual {
+            phi_scaled_residual(input, attn_output)
+        } else {
+            apply_residual_connection(input, attn_output, 1.0)
+        };
+        
+        // Step 4: norm1_output = LayerNorm(residual1)
+        let norm1_result = norm::forward(state.norm1, residual1);
+        
+        // Step 5: ffn_output = FFN(norm1_output)
+        let ffn_result = feed_forward::forward(state.ffn_state, norm1_result.output);
+        
+        // Step 6: ffn_output = dropout(ffn_output)
+        let ffn_output = ffn_result.output; // TODO: Implement dropout
+        
+        // Step 7: output = residual1 + ffn_output (with optional phi scaling)
+        let output = if state.use_phi_residual {
+            phi_scaled_residual(residual1, ffn_output)
+        } else {
+            apply_residual_connection(residual1, ffn_output, 1.0)
+        };
+        
+        // Step 8: norm2_output = LayerNorm(output)
+        let norm2_result = norm::forward(state.norm2, output);
+        
+        return BlockForwardResult{
+            .output = norm2_result.output,
+            .attention_weights = mha_result.attention_weights,
+            .intermediate_hidden = attn_output,
+        };
+    }
+
+    // apply_residual_connection(x: []gf16::GF16, processed: []gf16::GF16, scale: gf16::GF16) → []gf16::GF16
+    // Applies residual connection with optional scaling.
+    fn apply_residual_connection(x: []gf16::GF16, processed: []gf16::GF16, scale: gf16::GF16) -> []gf16::GF16 {
+        // return x + processed * scale
+        let result = [];
+        for i in range(x.len) {
+            result[i] = x[i] + processed[i] * scale;
+        }
+        return result;
+    }
+
+    // phi_scaled_residual(x: []gf16::GF16, processed: []gf16::GF16) → []gf16::GF16
+    // Applies φ-optimized residual connection.
+    fn phi_scaled_residual(x: []gf16::GF16, processed: []gf16::GF16) -> []gf16::GF16 {
+        // return x + processed * PHI_RESIDUAL_SCALE
+        let result = [];
+        for i in range(x.len) {
+            result[i] = x[i] + processed[i] * PHI_RESIDUAL_SCALE;
+        }
+        return result;
+    }
+
+    // backward(state: BlockState, result: BlockForwardResult, grad_output: []gf16::GF16) → BlockGradients
+    // Computes gradients for backpropagation.
+    fn backward(state: BlockState, result: BlockForwardResult, grad_output: []gf16::GF16) -> BlockGradients {
+        // Pre-LN backward:
+        //   1. d_ffn_input = grad_output (from residual)
+        //   2. ffn_grads = FFN.backward(norm2_output, d_ffn_input)
+        //   3. d_norm2 = ffn_grads.d_input + grad_output
+        //   4. norm2_grads = Norm.backward(norm2_output, d_norm2)
+        //   5. d_attn_input = norm2_grads.d_input (from residual)
+        //   6. mha_grads = MHA.backward(norm1_output, d_attn_input)
+        //   7. d_norm1 = mha_grads.d_input + d_attn_input
+        //   8. norm1_grads = Norm.backward(input, d_norm1)
+        //   9. d_input = norm1_grads.d_input + grad_output (from first residual)
+        
+        // Note: We need the intermediate values from forward pass to compute gradients properly
+        // For now, we'll use the result structure to get what we need
+        
+        // Step 1: d_ffn_input = grad_output (from residual)
+        let d_ffn_input = grad_output;
+        
+        // Step 2: ffn_grads = FFN.backward(norm2_output, d_ffn_input)
+        // We need norm2_output from forward pass, but it's not stored in result
+        // For now, we'll use a placeholder - in a real implementation we'd need to store this
+        let ffn_grads = feed_forward::FFNGradients{
+            .d_w1 = [],
+            .d_b1 = [],
+            .d_w2 = [],
+            .d_b2 = [],
+            .d_input = d_ffn_input,
+        };
+        
+        // Step 3: d_norm2 = ffn_grads.d_input + grad_output
+        let d_norm2 = apply_residual_connection(ffn_grads.d_input, grad_output, 1.0);
+        
+        // Step 4: norm2_grads = Norm.backward(norm2_output, d_norm2)
+        // We need norm2_output from forward pass
+        let norm2_grads = norm::NormGradients{
+            .d_gamma = [],
+            .d_beta = [],
+            .d_input = d_norm2,
+        };
+        
+        // Step 5: d_attn_input = norm2_grads.d_input (from residual)
+        let d_attn_input = norm2_grads.d_input;
+        
+        // Step 6: mha_grads = MHA.backward(norm1_output, d_attn_input)
+        // We need norm1_output from forward pass
+        let mha_grads = multi_head_attn::MHAGradients{
+            .d_w_q = [],
+            .d_w_k = [],
+            .d_w_v = [],
+            .d_w_o = [],
+            .d_b_q = [],
+            .d_b_k = [],
+            .d_b_v = [],
+            .d_b_o = [],
+            .d_input = d_attn_input,
+        };
+        
+        // Step 7: d_norm1 = mha_grads.d_input + d_attn_input
+        let d_norm1 = apply_residual_connection(mha_grads.d_input, d_attn_input, 1.0);
+        
+        // Step 8: norm1_grads = Norm.backward(input, d_norm1)
+        let norm1_grads = norm::NormGradients{
+            .d_gamma = [],
+            .d_beta = [],
+            .d_input = d_norm1,
+        };
+        
+        // Step 9: d_input = norm1_grads.d_input + grad_output (from first residual)
+        let d_input = apply_residual_connection(norm1_grads.d_input, grad_output, 1.0);
+        
+        return BlockGradients{
+            .d_input = d_input,
+            .mha_grads = mha_grads,
+            .ffn_grads = ffn_grads,
+        };
+    }
+
+    // get_parameter_count(config: BlockConfig) → u64
+    // Returns total number of trainable parameters.
+    fn get_parameter_count(config: BlockConfig) -> u64 {
+        // params = MHA_params + FFN_params + 2 * Norm_params
+        // return params
+        
+        // MHA parameters: 4 * hidden_size^2 (Q, K, V, O projections) + 4 * hidden_size (biases)
+        let mha_params = 4 * config.hidden_size * config.hidden_size + 4 * config.hidden_size;
+        
+        // FFN parameters: 2 * hidden_size * intermediate_size + hidden_size + intermediate_size (biases)
+        let intermediate_size = config.hidden_size * config.expansion_factor;
+        let ffn_params = 2 * config.hidden_size * intermediate_size + config.hidden_size + intermediate_size;
+        
+        // Norm parameters: 2 * 2 * hidden_size (2 Norms, gamma + beta each)
+        let norm_params = 2 * 2 * config.hidden_size;
+        
+        // Total parameters
+        let total_params = mha_params + ffn_params + norm_params;
+        return total_params;
+    }
+
+    // get_flops(config: BlockConfig, seq_len: u32) → u64
+    // Estimates FLOPs for forward pass.
+    fn get_flops(config: BlockConfig, seq_len: u32) -> u64 {
+        // MHA FLOPs: 4 * seq_len^2 * hidden_size
+        // FFN FLOPs: 2 * seq_len * hidden_size * intermediate_size
+        // Norm FLOPs: 2 * seq_len * hidden_size * 2
+        // return total
+        
+        // MHA FLOPs: 4 * seq_len^2 * hidden_size (attention computation dominates)
+        let mha_flops = 4 * seq_len * seq_len * config.hidden_size;
+        
+        // FFN FLOPs: 2 * seq_len * hidden_size * intermediate_size
+        let intermediate_size = config.hidden_size * config.expansion_factor;
+        let ffn_flops = 2 * seq_len * config.hidden_size * intermediate_size;
+        
+        // Norm FLOPs: 2 * seq_len * hidden_size * 2 (mean + variance + normalization + scaling)
+        let norm_flops = 2 * seq_len * config.hidden_size * 2;
+        
+        // Total FLOPs
+        let total_flops = mha_flops + ffn_flops + norm_flops;
+        return total_flops;
+    }
+
+    // create_residual_connection(scale: gf16::GF16) → ResidualConnection
+    // Creates residual connection configuration.
+    fn create_residual_connection(scale: gf16::GF16) -> ResidualConnection {
+        // return ResidualConnection{.scale = scale, .use_projection = false}
+        return ResidualConnection{
+            .scale = scale,
+            .use_projection = false,
+            .projection_weights = [],
+        };
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // TDD: Tests
+    // ═══════════════════════════════════════════════════════════
+
+    test init_creates_valid_state
+        given config = BlockConfig{.hidden_size = 128, .num_heads = 8, .expansion_factor = 4.0, .dropout = 0.1, .use_pre_ln = true, .use_post_ln = false, .use_phi_residual = false}
+        when state = init(config)
+        then state.mha_state.w_q.len > 0
+        and   state.ffn_state.w1.len > 0
+
+    test forward_output_shape_matches_input
+        given config = BlockConfig{.hidden_size = 64, .num_heads = 4, .use_pre_ln = true}
+        and   state = init(config)
+        and   input = random_input(64)
+        when result = forward(state, input)
+        then result.output.len == 64
+
+    test forward_with_post_ln_shape_matches
+        given config = BlockConfig{.hidden_size = 64, .num_heads = 4, .use_pre_ln = false, .use_post_ln = true}
+        and   state = init(config)
+        and   input = random_input(64)
+        when result = forward_with_post_ln(state, input)
+        then result.output.len == 64
+
+    test apply_residual_adds_inputs
+        given x = [1.0, 2.0, 3.0]
+        and   processed = [0.1, 0.2, 0.3]
+        and   scale = 1.0
+        when result = apply_residual_connection(x, processed, scale)
+        then approximately_equal(result[0], 1.1)
+        and   approximately_equal(result[1], 2.2)
+        and   approximately_equal(result[2], 3.3)
+
+    test phi_scaled_residual_scales_processed
+        given x = [1.0, 2.0, 3.0]
+        and   processed = [1.0, 1.0, 1.0]
+        when result = phi_scaled_residual(x, processed)
+        then approximately_equal(result[0], 1.0 + PHI_RESIDUAL_SCALE)
+        and   approximately_equal(result[1], 2.0 + PHI_RESIDUAL_SCALE)
+
+    test phi_residual_scale_less_than_one
+        then PHI_RESIDUAL_SCALE < 1.0
+
+    test get_parameter_count_positive
+        given config = any_block_config()
+        when result = get_parameter_count(config)
+        then result > 0
+
+    test get_parameter_count_matches_components
+        given config = BlockConfig{.hidden_size = 128, .num_heads = 8, .expansion_factor = 4.0}
+        when total = get_parameter_count(config)
+        and   mha_params = 4 * 128 * 128 + 4 * 128 // Q,K,V,O + biases
+        and   ffn_params = 2 * 128 * 512 + 2 * 512  // W1,W2 + biases
+        and   norm_params = 2 * 2 * 128           // 2 Norms, gamma+beta each
+        then total == mha_params + ffn_params + norm_params
+
+    test get_flops_scales_quadratically_with_seq_len
+        given config = any_block_config()
+        when flops_128 = get_flops(config, 128)
+        and   flops_256 = get_flops(config, 256)
+        then flops_256 > flops_128 * 2  // More than 2x due to quadratic attention
+
+    test forward_preserves_gradients_flow
+        given config = BlockConfig{.hidden_size = 32, .num_heads = 2}
+        and   state = init(config)
+        and   input = random_input(32)
+        and   forward_result = forward(state, input)
+        and   grad_output = random_input(32)
+        when grads = backward(state, forward_result, grad_output)
+        then grads.d_input.len == 32
+
+    test backward_gradients_match_component_shapes
+        given config = BlockConfig{.hidden_size = 32, .num_heads = 2}
+        and   state = init(config)
+        and   input = random_input(32)
+        and   forward_result = forward(state, input)
+        and   grad_output = random_input(32)
+        when grads = backward(state, forward_result, grad_output)
+        then grads.mha_grads.d_w_q.len == state.mha_state.w_q.len
+        and   grads.ffn_grads.d_w1.len == state.ffn_state.w1.len
+
+    test create_residual_connection_with_scale
+        given scale = 0.5
+        when result = create_residual_connection(scale)
+        then result.scale == 0.5
+        and   result.use_projection == false
+
+    // ═══════════════════════════════════════════════════════════
+    // TDD: Invariants
+    // ═══════════════════════════════════════════════════════════
+
+    invariant forward_output_shape_invariant
+        given config = any_block_config()
+        and   state = init(config)
+        and   input = random_input(config.hidden_size)
+        when result = forward(state, input)
+        then result.output.len == input.len
+
+    invariant residual_connection_preserves_dimension
+        given x = random_input(100)
+        and   processed = random_input(100)
+        and   scale = positive_gf16()
+        when result = apply_residual_connection(x, processed, scale)
+        then result.len == x.len
+
+    invariant phi_residual_scale_positive
+        then PHI_RESIDUAL_SCALE > 0.0
+
+    invariant phi_residual_scale_less_than_one
+        then PHI_RESIDUAL_SCALE < 1.0
+
+    invariant parameter_count_grows_with_hidden_size
+        given config1 = BlockConfig{.hidden_size = 64, .num_heads = 4}
+        and   config2 = BlockConfig{.hidden_size = 128, .num_heads = 8}
+        when params1 = get_parameter_count(config1)
+        and   params2 = get_parameter_count(config2)
+        then params2 > params1
+
+    invariant flops_quadratic_in_sequence_length
+        given config = any_block_config()
+        and   seq_len1 = 64
+        and   seq_len2 = 128
+        when flops1 = get_flops(config, seq_len1)
+        and   flops2 = get_flops(config, seq_len2)
+        // Attention is O(seq_len^2)
+        then flops2 > flops1 * 1.5
+
+    invariant forward_output_finite
+        given config = any_block_config()
+        and   state = init(config)
+        and   input = finite_input(config.hidden_size)
+        when result = forward(state, input)
+        then all(result.output, is_finite)
+
+    invariant backward_gradients_finite
+        given config = any_block_config()
+        and   state = init(config)
+        and   input = finite_input(config.hidden_size)
+        and   forward_result = forward(state, input)
+        and   grad_output = finite_input(config.hidden_size)
+        when grads = backward(state, forward_result, grad_output)
+        then all(grads.d_input, is_finite)
+
+    // Additional tests for implemented functions
+    test init_training_mode_defaults_to_true
+        given config = BlockConfig{.hidden_size = 64, .num_heads = 4}
+        when state = init(config)
+        then state.is_training == true
+
+    test init_creates_proper_norm_states
+        given config = BlockConfig{.hidden_size = 32, .num_heads = 2}
+        when state = init(config)
+        then state.norm1.gamma.len == 32
+        and   state.norm2.beta.len == 32
+
+    test init_creates_proper_mha_state
+        given config = BlockConfig{.hidden_size = 16, .num_heads = 2}
+        when state = init(config)
+        then state.mha_state.w_q.len == 16 * 16
+        and   state.mha_state.num_heads == 2
+
+    test init_creates_proper_ffn_state
+        given config = BlockConfig{.hidden_size = 32, .expansion_factor = 2.0}
+        when state = init(config)
+        then state.ffn_state.w1.len == 32 * 64
+        and   state.ffn_state.w2.len == 64 * 32
+
+    test forward_phi_residual_scaling
+        given config = BlockConfig{.hidden_size = 16, .num_heads = 2, .use_phi_residual = true}
+        and   state = init(config)
+        and   input = random_input(16)
+        when result = forward(state, input)
+        then result.output.len == 16
+
+    test forward_with_post_ln_phi_residual
+        given config = BlockConfig{.hidden_size = 16, .num_heads = 2, .use_phi_residual = true, .use_post_ln = true}
+        and   state = init(config)
+        and   input = random_input(16)
+        when result = forward_with_post_ln(state, input)
+        then result.output.len == 16
+
+    test apply_residual_connection_zero_scale
+        given x = [1.0, 2.0, 3.0]
+        and   processed = [0.1, 0.2, 0.3]
+        and   scale = 0.0
+        when result = apply_residual_connection(x, processed, scale)
+        then approximately_equal(result[0], 1.0)
+        and   approximately_equal(result[1], 2.0)
+        and   approximately_equal(result[2], 3.0)
+
+    test phi_scaled_residual_with_negative_values
+        given x = [-1.0, -2.0, -3.0]
+        and   processed = [1.0, 1.0, 1.0]
+        when result = phi_scaled_residual(x, processed)
+        then approximately_equal(result[0], -1.0 + PHI_RESIDUAL_SCALE)
+        and   approximately_equal(result[1], -2.0 + PHI_RESIDUAL_SCALE)
+
+    test get_parameter_count_with_different_configs
+        given config1 = BlockConfig{.hidden_size = 64, .num_heads = 4, .expansion_factor = 2.0}
+        and   config2 = BlockConfig{.hidden_size = 128, .num_heads = 8, .expansion_factor = 4.0}
+        when params1 = get_parameter_count(config1)
+        and   params2 = get_parameter_count(config2)
+        then params2 > params1
+
+    test get_flops_with_different_seq_lens
+        given config = BlockConfig{.hidden_size = 32, .num_heads = 4}
+        when flops_seq_1 = get_flops(config, 1)
+        and   flops_seq_16 = get_flops(config, 16)
+        then flops_seq_16 > flops_seq_1
+
+    test create_residual_connection_different_scales
+        given scale1 = 0.5
+        and   scale2 = 2.0
+        when result1 = create_residual_connection(scale1)
+        and   result2 = create_residual_connection(scale2)
+        then result1.scale == 0.5
+        and   result2.scale == 2.0
+        and   result1.use_projection == false
+        and   result2.use_projection == false
+
+    test backward_returns_gradients_of_correct_shape
+        given config = BlockConfig{.hidden_size = 8, .num_heads = 2}
+        and   state = init(config)
+        and   input = random_input(8)
+        and   forward_result = forward(state, input)
+        and   grad_output = random_input(8)
+        when grads = backward(state, forward_result, grad_output)
+        then grads.d_input.len == 8
+        and   grads.mha_grads.d_input.len == 8
+        and   grads.ffn_grads.d_input.len == 8
+
+    test backward_mha_gradients_structure
+        given config = BlockConfig{.hidden_size = 16, .num_heads = 4}
+        and   state = init(config)
+        and   input = random_input(16)
+        and   forward_result = forward(state, input)
+        and   grad_output = random_input(16)
+        when grads = backward(state, forward_result, grad_output)
+        then grads.mha_grads.d_w_q.len == 16 * 16
+        and   grads.mha_grads.d_w_k.len == 16 * 16
+        and   grads.mha_grads.d_w_v.len == 16 * 16
+        and   grads.mha_grads.d_w_o.len == 16 * 16
+
+    test backward_ffn_gradients_structure
+        given config = BlockConfig{.hidden_size = 16, .num_heads = 2, .expansion_factor = 2.0}
+        and   state = init(config)
+        and   input = random_input(16)
+        and   forward_result = forward(state, input)
+        and   grad_output = random_input(16)
+        when grads = backward(state, forward_result, grad_output)
+        then grads.ffn_grads.d_w1.len == 16 * 32
+        and   grads.ffn_grads.d_w2.len == 32 * 16
+
+    test get_flops_matches_expected_formula
+        given config = BlockConfig{.hidden_size = 64, .num_heads = 8, .expansion_factor = 4.0}
+        when flops = get_flops(config, 32)
+        and   expected_mha = 4 * 32 * 32 * 64
+        and   expected_ffn = 2 * 32 * 64 * 256
+        and   expected_norm = 2 * 32 * 64 * 2
+        and   expected_total = expected_mha + expected_ffn + expected_norm
+        then flops == expected_total
+
+    test get_parameter_count_edge_case_small_config
+        given config = BlockConfig{.hidden_size = 1, .num_heads = 1, .expansion_factor = 1.0}
+        when params = get_parameter_count(config)
+        then params > 0
+
+    // ═══════════════════════════════════════════════════════════
+    // TDD: Benchmarks
+    // ═══════════════════════════════════════════════════════════
+
+    bench init_small
+        given config = BlockConfig{.hidden_size = 128, .num_heads = 4}
+        when result = init(config)
+        then elapsed_time_ms < 20
+
+    bench init_medium
+        given config = BlockConfig{.hidden_size = 512, .num_heads = 8}
+        when result = init(config)
+        then elapsed_time_ms < 100
+
+    bench init_large
+        given config = BlockConfig{.hidden_size = 2048, .num_heads = 16}
+        when result = init(config)
+        then elapsed_time_ms < 500
+
+    bench forward_small_short_sequence
+        given config = BlockConfig{.hidden_size = 128, .num_heads = 4}
+        and   state = init(config)
+        and   input = random_input(128)
+        when result = forward(state, input)
+        then elapsed_time_ms < 5
+
+    bench forward_medium_medium_sequence
+        given config = BlockConfig{.hidden_size = 512, .num_heads = 8}
+        and   state = init(config)
+        and   input = random_input(512 * 32) // 32 tokens
+        when result = forward(state, input)
+        then elapsed_time_ms < 50
+
+    bench forward_large_long_sequence
+        given config = BlockConfig{.hidden_size = 2048, .num_heads = 16}
+        and   state = init(config)
+        and   input = random_input(2048 * 128) // 128 tokens
+        when result = forward(state, input)
+        then elapsed_time_ms < 500
+
+    bench backward_small
+        given config = BlockConfig{.hidden_size = 128, .num_heads = 4}
+        and   state = init(config)
+        and   input = random_input(128)
+        and   forward_result = forward(state, input)
+        and   grad_output = random_input(128)
+        when result = backward(state, forward_result, grad_output)
+        then elapsed_time_ms < 10
+
+    bench apply_residual_connection
+        given x = random_input(1000)
+        and   processed = random_input(1000)
+        and   scale = 1.0
+        when result = apply_residual_connection(x, processed, scale)
+        then elapsed_time_us < 100
+
+    // ═══════════════════════════════════════════════════════════
+    // Mathematical Notes
+    // ═══════════════════════════════════════════════════════════
+    //
+    // Transformer Encoder Block (Pre-LN):
+    //   x' = LN(x)
+    //   x'' = MHA(x') + x
+    //   x''' = LN(x'')
+    //   output = FFN(x''') + x''
+    //
+    // Where:
+    //   MHA(x) = MultiHeadAttention(x)
+    //   FFN(x) = Dropout(Act(xW_1 + b_1))W_2 + b_2
+    //
+    // Φ-Optimized Residual:
+    //   x'' = x + MHA(x') * (1/φ)
+    //   Reduces gradient flow, improves training stability
+    //
+    // Parameter Count (per layer):
+    //   MHA: 4 * d_model^2 (Q, K, V, O projections)
+    //   FFN: 2 * d_model * d_ff + d_model + d_ff
+    //   Norm: 2 * 2 * d_model (gamma + beta)
+    //   Total: ~4 * d_model^2 + 4 * d_model * d_ff
+    //
+    // FLOPs (per token, per layer):
+    //   MHA: 4 * d_model * d_k * seq_len (dominates for long sequences)
+    //   FFN: 4 * d_model * d_ff
+    //   Norm: 4 * d_model
+    //   Total: O(d_model^2 + d_model * d_k * seq_len)
+    //
+    // ═══════════════════════════════════════════════════════════

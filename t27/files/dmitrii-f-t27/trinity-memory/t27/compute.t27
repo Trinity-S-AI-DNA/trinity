@@ -1,0 +1,142 @@
+// Trinity Memory integer/scale kernels. Canonical executable source.
+// Status: 0 success, -1 invalid input, -2 short output, -3 overflow.
+// Pointers refer to valid arrays of their explicit lengths. Input and output
+// buffers must not overlap. Inputs are read-only despite the pointer ABI.
+// f64 is the host metadata bridge type; it does not replace ternary storage.
+module TrinityMemoryCompute;
+
+fn tm_compute_finite(value: f64) -> bool {
+    return value == value && value <= 1.7976931348623157e308 && value >= -1.7976931348623157e308;
+}
+
+fn tm_add_i64_checked(left: i64, right: i64, output: *i64) -> i32 {
+    if (output == 0) { return -1; }
+    if (right > 0 && left > 9223372036854775807 - right) { return -3; }
+    if (right < 0 && left < (-9223372036854775807 - 1) - right) { return -3; }
+    output[0] = left + right;
+    return 0;
+}
+
+// One activation vector contracts the last dimension of a C-order matrix.
+// rows=1 also represents a vector. Only that form permits columns=0.
+// int64 input lanes intentionally retain invalid values for range rejection.
+fn tm_dot_i64(weights: *i64, weight_count: u64,
+              activations: *i64, activation_count: u64,
+              rows: u64, columns: u64,
+              output: *i64, output_capacity: u64) -> i32 {
+    if (rows == 0 || activation_count != columns) { return -1; }
+    if (columns == 0) {
+        if (rows != 1 || weight_count != 0) { return -1; }
+    } else {
+        if (weight_count / columns != rows || weight_count % columns != 0) { return -1; }
+    }
+    if (output_capacity < rows) { return -2; }
+    if (output == 0) { return -1; }
+    if (weight_count > 0 && weights == 0) { return -1; }
+    if (columns > 0 && activations == 0) { return -1; }
+    // Every product has magnitude <=128. This bound prevents any i64 prefix
+    // overflow before accessing impossibly large host arrays.
+    if (columns > 72057594037927935) { return -3; }
+    var index: u64 = 0;
+    while (index < weight_count) {
+        if (weights[index] < -1 || weights[index] > 1) { return -1; }
+        index = index + 1;
+    }
+    index = 0;
+    while (index < columns) {
+        if (activations[index] < -128 || activations[index] > 127) { return -1; }
+        index = index + 1;
+    }
+    var row: u64 = 0;
+    while (row < rows) {
+        var sum: i64 = 0;
+        var column: u64 = 0;
+        while (column < columns) {
+            sum = sum + weights[row * columns + column] * activations[column];
+            column = column + 1;
+        }
+        output[row] = sum;
+        row = row + 1;
+    }
+    return 0;
+}
+
+// Return raw score * positive scalar or per-row f64 metadata scale.
+// Validate every scale/product before mutating any output.
+fn tm_scale_scores(raw: *i64, count: u64, scales: *f64,
+                   scale_count: u64, output: *f64, output_capacity: u64) -> i32 {
+    if (count == 0 || (scale_count != 1 && scale_count != count)) { return -1; }
+    if (output_capacity < count) { return -2; }
+    if (raw == 0 || scales == 0 || output == 0) { return -1; }
+    var index: u64 = 0;
+    while (index < count) {
+        var scale_index: u64 = 0;
+        if (scale_count != 1) { scale_index = index; }
+        var scale: f64 = scales[scale_index];
+        if (!tm_compute_finite(scale) || scale <= 0.0) { return -1; }
+        var score: f64 = (raw[index] as f64) * scale;
+        if (!tm_compute_finite(score)) { return -3; }
+        index = index + 1;
+    }
+    index = 0;
+    while (index < count) {
+        var scale_index: u64 = 0;
+        if (scale_count != 1) { scale_index = index; }
+        output[index] = (raw[index] as f64) * scales[scale_index];
+        index = index + 1;
+    }
+    return 0;
+}
+
+// Stable first argmax. tied=1 means the caller must return an ambiguous label.
+fn tm_argmax_scores(scores: *f64, count: u64, best: *i64, tied: *i64) -> i32 {
+    if (count == 0 || count > 9223372036854775807) { return -1; }
+    if (scores == 0 || best == 0 || tied == 0) { return -1; }
+    var index: u64 = 0;
+    while (index < count) {
+        if (!tm_compute_finite(scores[index])) { return -1; }
+        index = index + 1;
+    }
+    var winner: u64 = 0;
+    var ambiguous: i64 = 0;
+    index = 1;
+    while (index < count) {
+        if (scores[index] > scores[winner]) {
+            winner = index;
+            ambiguous = 0;
+        } else {
+            if (scores[index] == scores[winner]) { ambiguous = 1; }
+        }
+        index = index + 1;
+    }
+    best[0] = winner as i64;
+    tied[0] = ambiguous;
+    return 0;
+}
+
+test tm_compute_finite_contract {
+    assert(tm_compute_finite(0.0));
+    assert(tm_compute_finite(1.7976931348623157e308));
+    assert(tm_compute_finite(-1.7976931348623157e308));
+}
+
+test tm_dot_signed_extremes {
+    var weights: [6]i64 = [1, -1, 0, -1, 1, 1];
+    var activations: [3]i64 = [-128, 127, -128];
+    var output: [2]i64 = [0, 0];
+    assert(tm_dot_i64(weights, 6, activations, 3, 2, 3, output, 2) == 0);
+    assert(output[0] == -255);
+    assert(output[1] == 127);
+}
+
+test tm_scaled_argmax_contract {
+    var raw: [3]i64 = [2, 3, 1];
+    var scales: [3]f64 = [2.0, 1.0, 1.0];
+    var scores: [3]f64 = [0.0, 0.0, 0.0];
+    var best: [1]i64 = [0];
+    var tied: [1]i64 = [0];
+    assert(tm_scale_scores(raw, 3, scales, 3, scores, 3) == 0);
+    assert(tm_argmax_scores(scores, 3, best, tied) == 0);
+    assert(best[0] == 0);
+    assert(tied[0] == 0);
+}

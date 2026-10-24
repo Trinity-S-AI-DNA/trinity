@@ -1,0 +1,595 @@
+// SPDX-License-Identifier: Apache-2.0
+; gf256.t27 — GoldenFloat256 Encode/Decode
+; GF256: 256-bit floating point with 1 sign + 32 exponent + 223 mantissa
+; Bit layout: [S(1) E(32) M(223)] = [255:255][254:223][222:0]
+; Maximum precision format for scientific computing and simulation
+; φ² + 1/φ² = 3 | TRINITY
+
+module triformat-gf256;
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+pub const SIGN_SHIFT : u16 = 255;
+pub const EXP_SHIFT : u16 = 223;
+pub const MANT_SHIFT : u16 = 0;
+
+pub const SIGN_BITS : u8 = 1;
+pub const EXP_BITS : u8 = 32;
+pub const MANT_BITS : u8 = 223;
+
+pub const EXP_MAX : u32 = 0xFFFFFFFF;   // 4294967295 (all ones in 32 bits)
+pub const EXP_MIN : u32 = 0x00000000;
+
+pub const BIAS : i64 = 2147483647;      // Exponent bias for GF256: 2^(32-1) - 1
+pub const SPECIAL_EXP : u32 = 0xFFFFFFFF;  // All ones = special (Inf/NaN)
+
+pub const PHI_BIAS : u64 = 67108864;    // Phi-optimized rounding bias
+
+// ============================================================================
+// Types
+// ============================================================================
+
+// GF256 represented as u256 (simulated via struct since Zig 0.15 doesn't have native u256)
+pub struct GF256 {
+    parts: [4]u64,  // parts[0] = LSB, parts[3] = MSB
+}
+
+// ============================================================================
+// Conversion Helpers
+// ============================================================================
+
+// gf256_zero() -> GF256
+// Returns positive zero
+pub fn gf256_zero() GF256 {
+    return GF256{ .parts = [_]u64{0, 0, 0, 0} };
+}
+
+// gf256_negative_zero() -> GF256
+// Returns negative zero
+pub fn gf256_negative_zero() GF256 {
+    var result = gf256_zero();
+    result.parts[3] |= 0x8000000000000000;  // Set MSB of most significant part
+    return result;
+}
+
+// gf256_inf_positive() -> GF256
+// Returns positive infinity
+pub fn gf256_inf_positive() GF256 {
+    // Exp = all ones (0xFFFFFFFF), mant = 0
+    // Exp at bits 254-223, so in parts[3] and parts[2]
+    return GF256{
+        .parts = [_]u64{
+            0x0000000000000000,  // parts[0] LSB
+            0x0000000000000000,  // parts[1]
+            0xFFFFFFFF00000000,  // parts[2]: exp bits 0-31 | mant bits 32-63 (0)
+            0x00000000FFFFFFFF,  // parts[3]: exp bits 32-63 | sign (0)
+        },
+    };
+}
+
+// gf256_inf_negative() -> GF256
+// Returns negative infinity
+pub fn gf256_inf_negative() GF256 {
+    var result = gf256_inf_positive();
+    result.parts[3] |= 0x8000000000000000;  // Set sign bit
+    return result;
+}
+
+// gf256_nan() -> GF256
+// Returns NaN
+pub fn gf256_nan() GF256 {
+    var result = gf256_inf_positive();
+    result.parts[0] = 1;  // Set mant LSB to make it NaN
+    return result;
+}
+
+// ============================================================================
+// Extract Functions
+// ============================================================================
+
+// gf256_extract_sign(gf256: GF256) -> i8
+// Extract sign bit (bit 255)
+// Returns: 0 for positive, -1 for negative
+pub fn gf256_extract_sign(gf256: GF256) i8 {
+    const bit = (gf256.parts[3] >> 63) & 1;
+    return if (bit != 0) -1 else 0;
+}
+
+// gf256_extract_exponent(gf256: GF256) -> u32
+// Extract exponent bits (bits 254-223)
+// Returns: 0-4294967295
+pub fn gf256_extract_exponent(gf256: GF256) u32 {
+    // Exponent spans bits 31-0 across parts[3] (bits 63-32) and parts[2] (bits 31-0)
+    // parts[3] bits 0-31 = exp bits 31-0
+    // parts[2] bits 63-32 = exp bits 0-0? No, let's recalculate:
+    // Total bits: 256 = [S(255)] E(254:223) M(222:0)
+    // Exp is 32 bits at positions 254-223
+    // parts[3] covers bits 255-192
+    // parts[2] covers bits 191-128
+    // parts[1] covers bits 127-64
+    // parts[0] covers bits 63-0
+    // Exp bits 254-223 map to:
+    //   bits 254-192 = 62 bits -> parts[3] bits 62-0 (but exp is only 32 bits)
+    // Wait, exp is at 254:223 = 32 bits
+    // Bit 254 is in parts[3] at position (254 - 192) = 62
+    // Bit 223 is in parts[3] at position (223 - 192) = 31
+    // So exp is parts[3] >> 31 & 0xFFFFFFFF
+    return @as(u32, @truncate(gf256.parts[3] >> 31));
+}
+
+// gf256_extract_mantissa(gf256: GF256) -> GF256
+// Extract mantissa bits (bits 222-0)
+// Returns: GF256 struct with mantissa in parts[0-2] and parts[3] bits 30-0
+pub fn gf256_extract_mantissa(gf256: GF256) GF256 {
+    var result = gf256;
+    // Clear sign bit and exponent bits
+    result.parts[3] &= 0x7FFFFFFF;  // Clear sign
+    result.parts[3] &= 0x00000000;  // Clear exp bits 31-0 in parts[3]
+    return result;
+}
+
+// ============================================================================
+// Assembly Functions
+// ============================================================================
+
+// gf256_from_components(sign: i8, exp: u32, mant: GF256) -> GF256
+// Assemble GF256 from sign, exponent, mantissa
+pub fn gf256_from_components(sign: i8, exp: u32, mant: GF256) GF256 {
+    var result = mant;
+    // Set sign
+    const sign_bit = if (sign < 0) 1 else 0;
+    if (sign_bit != 0) {
+        result.parts[3] |= 0x8000000000000000;
+    } else {
+        result.parts[3] &= 0x7FFFFFFFFFFFFFFF;
+    }
+    // Set exponent (bits 254-223 -> parts[3] bits 62-31)
+    result.parts[3] = (result.parts[3] & 0x7FFFFFFF) | (@as(u64, exp) << 31);
+    return result;
+}
+
+// ============================================================================
+// Special Value Checks
+// ============================================================================
+
+// gf256_is_zero(gf256: GF256) -> bool
+// Check if GF256 is zero (positive or negative)
+pub fn gf256_is_zero(gf256: GF256) bool {
+    return gf256.parts[0] == 0 and gf256.parts[1] == 0 and
+           gf256.parts[2] == 0 and (gf256.parts[3] & 0x7FFFFFFFFFFFFFFF) == 0;
+}
+
+// gf256_is_special(gf256: GF256) -> bool
+// Check if GF256 is Inf or NaN (exp == 4294967295)
+pub fn gf256_is_special(gf256: GF256) bool {
+    return gf256_extract_exponent(gf256) == EXP_MAX;
+}
+
+// gf256_is_inf(gf256: GF256) -> bool
+// Check if GF256 is infinity (exp == max, mant == 0)
+pub fn gf256_is_inf(gf256: GF256) bool {
+    if (!gf256_is_special(gf256)) {
+        return false;
+    }
+    const mant = gf256_extract_mantissa(gf256);
+    return mant.parts[0] == 0 and mant.parts[1] == 0 and
+           mant.parts[2] == 0 and mant.parts[3] == 0;
+}
+
+// gf256_is_nan(gf256: GF256) -> bool
+// Check if GF256 is NaN (exp == max, mant != 0)
+pub fn gf256_is_nan(gf256: GF256) bool {
+    if (!gf256_is_special(gf256)) {
+        return false;
+    }
+    const mant = gf256_extract_mantissa(gf256);
+    return mant.parts[0] != 0 or mant.parts[1] != 0 or
+           mant.parts[2] != 0 or mant.parts[3] != 0;
+}
+
+// ============================================================================
+// Encode/Decode Functions (via f64 with reduced precision)
+// ============================================================================
+
+// gf256_encode_f64(f64: f64) -> GF256
+// Encode IEEE 754 double precision to GF256
+// Note: f64 has only 52 mantissa bits, so precision is not fully utilized
+pub fn gf256_encode_f64(value: f64) GF256 {
+    // Handle zero
+    if (value == 0.0) {
+        return if (std.math.signbit(value)) gf256_negative_zero() else gf256_zero();
+    }
+
+    // Handle NaN
+    if (std.math.isNan(value)) {
+        return gf256_nan();
+    }
+
+    // Handle Infinity
+    if (std.math.isInf(value)) {
+        return if (value < 0.0) gf256_inf_negative() else gf256_inf_positive();
+    }
+
+    // Extract sign
+    const sign = if (value < 0.0) -1 else 0;
+    const abs_value = if (value < 0.0) -value else value;
+
+    // Get f64 components
+    const f64_bits: u64 = @bitCast(abs_value);
+    var f64_exp: i64 = @as(i64, @intCast((f64_bits >> 52) & 0x7FF)) - 1023;
+    var f64_mant: u64 = f64_bits & 0x000FFFFFFFFFFFFF;
+
+    // Convert exp from f64 bias (1023) to GF256 bias (2147483647)
+    var gf256_exp = @as(u32, @intCast(f64_exp + BIAS));
+
+    // Clamp exponent
+    if (gf256_exp >= EXP_MAX) {
+        return if (sign < 0) gf256_inf_negative() else gf256_inf_positive();
+    }
+
+    // Create mantissa struct with f64 mantissa in parts[0]
+    var mant: GF256 = undefined;
+    mant.parts[0] = f64_mant;
+    mant.parts[1] = 0;
+    mant.parts[2] = 0;
+    mant.parts[3] = 0;
+
+    return gf256_from_components(sign, gf256_exp, mant);
+}
+
+// gf256_decode_f64(gf256: GF256) -> f64
+// Decode GF256 to IEEE 754 double precision
+// Note: This loses precision as f64 has only 52 mantissa bits
+pub fn gf256_decode_f64(gf256: GF256) f64 {
+    // Handle zero
+    if (gf256_is_zero(gf256)) {
+        return if (gf256_extract_sign(gf256) < 0) -0.0 else 0.0;
+    }
+
+    // Handle NaN
+    if (gf256_is_nan(gf256)) {
+        return std.math.nan(f64);
+    }
+
+    // Handle Infinity
+    if (gf256_is_inf(gf256)) {
+        return if (gf256_extract_sign(gf256) < 0) -std.math.inf(f64) else std.math.inf(f64);
+    }
+
+    // Extract components
+    const sign = gf256_extract_sign(gf256);
+    const exp = gf256_extract_exponent(gf256);
+    const mant = gf256_extract_mantissa(gf256);
+
+    // Use only first 52 bits of mantissa
+    const mant_f64 = @as(f64, @floatFromInt(mant.parts[0])) / 4503599627370496.0;
+    const bias_adjusted = @as(i64, @intCast(exp)) - BIAS;
+
+    if (bias_adjusted < -1022 or bias_adjusted > 1023) {
+        return if (sign < 0) -std.math.inf(f64) else std.math.inf(f64);
+    }
+
+    const value = mant_f64 * std.math.pow(f64, 2.0, @as(f64, @floatFromInt(bias_adjusted)));
+    return if (sign < 0) -value else value;
+}
+
+// ============================================================================
+// Arithmetic Operations
+// ============================================================================
+
+// gf256_add(a: GF256, b: GF256) -> GF256
+pub fn gf256_add(a: GF256, b: GF256) GF256 {
+    return gf256_encode_f64(gf256_decode_f64(a) + gf256_decode_f64(b));
+}
+
+// gf256_sub(a: GF256, b: GF256) -> GF256
+pub fn gf256_sub(a: GF256, b: GF256) GF256 {
+    return gf256_encode_f64(gf256_decode_f64(a) - gf256_decode_f64(b));
+}
+
+// gf256_mul(a: GF256, b: GF256) -> GF256
+pub fn gf256_mul(a: GF256, b: GF256) GF256 {
+    return gf256_encode_f64(gf256_decode_f64(a) * gf256_decode_f64(b));
+}
+
+// gf256_div(a: GF256, b: GF256) -> GF256
+pub fn gf256_div(a: GF256, b: GF256) GF256 {
+    const fb = gf256_decode_f64(b);
+    if (fb == 0.0) {
+        const fa = gf256_decode_f64(a);
+        return if (fa < 0.0) gf256_inf_negative() else gf256_inf_positive();
+    }
+    return gf256_encode_f64(gf256_decode_f64(a) / fb);
+}
+
+// ============================================================================
+// Utility Functions
+// ============================================================================
+
+// gf256_abs(gf256: GF256) -> GF256
+pub fn gf256_abs(gf256: GF256) GF256 {
+    var result = gf256;
+    result.parts[3] &= 0x7FFFFFFFFFFFFFFF;
+    return result;
+}
+
+// gf256_neg(gf256: GF256) -> GF256
+pub fn gf256_neg(gf256: GF256) GF256 {
+    var result = gf256;
+    result.parts[3] ^= 0x8000000000000000;
+    return result;
+}
+
+// gf256_is_equal(a: GF256, b: GF256) -> bool
+pub fn gf256_is_equal(a: GF256, b: GF256) bool {
+    if (gf256_is_nan(a) or gf256_is_nan(b)) {
+        return false;
+    }
+    if (gf256_is_zero(a) and gf256_is_zero(b)) {
+        return true;
+    }
+    return a.parts[0] == b.parts[0] and a.parts[1] == b.parts[1] and
+           a.parts[2] == b.parts[2] and a.parts[3] == b.parts[3];
+}
+
+// gf256_is_greater(a: GF256, b: GF256) -> bool
+pub fn gf256_is_greater(a: GF256, b: GF256) bool {
+    if (gf256_is_nan(a) or gf256_is_nan(b)) {
+        return false;
+    }
+    const sign_a = gf256_extract_sign(a);
+    const sign_b = gf256_extract_sign(b);
+    if (sign_a != sign_b) {
+        return sign_a > sign_b;
+    }
+    // For negative numbers, reverse comparison
+    if (sign_a < 0) {
+        const neg_a = gf256_neg(a);
+        const neg_b = gf256_neg(b);
+        return neg_a.parts[3] > neg_b.parts[3] or
+               (neg_a.parts[3] == neg_b.parts[3] and neg_a.parts[2] > neg_b.parts[2]) or
+               (neg_a.parts[2] == neg_b.parts[2] and neg_a.parts[1] > neg_b.parts[1]) or
+               (neg_a.parts[1] == neg_b.parts[1] and neg_a.parts[0] > neg_b.parts[0]);
+    }
+    // Positive comparison
+    return a.parts[3] > b.parts[3] or
+           (a.parts[3] == b.parts[3] and a.parts[2] > b.parts[2]) or
+           (a.parts[2] == b.parts[2] and a.parts[1] > b.parts[1]) or
+           (a.parts[1] == b.parts[1] and a.parts[0] > b.parts[0]);
+}
+
+// gf256_max(a: GF256, b: GF256) -> GF256
+pub fn gf256_max(a: GF256, b: GF256) GF256 {
+    return if (gf256_is_greater(a, b)) a else b;
+}
+
+// gf256_min(a: GF256, b: GF256) -> GF256
+pub fn gf256_min(a: GF256, b: GF256) GF256 {
+    return if (gf256_is_greater(a, b)) b else a;
+}
+
+// gf256_clamp(value: GF256, min: GF256, max: GF256) -> GF256
+pub fn gf256_clamp(value: GF256, min: GF256, max: GF256) GF256 {
+    return gf256_min(gf256_max(value, min), max);
+}
+
+// ============================================================================
+// TDD Tests
+// ============================================================================
+
+test "gf256_zero_is_zero" {
+    assert(gf256_is_zero(gf256_zero()) == true);
+}
+
+test "gf256_negative_zero_is_zero" {
+    assert(gf256_is_zero(gf256_negative_zero()) == true);
+}
+
+test "gf256_nonzero_is_not_zero" {
+    const value = gf256_encode_f64(1.0);
+    assert(gf256_is_zero(value) == false);
+}
+
+test "gf256_inf_is_special" {
+    assert(gf256_is_special(gf256_inf_positive()) == true);
+}
+
+test "gf256_nan_is_special" {
+    assert(gf256_is_special(gf256_nan()) == true);
+}
+
+test "gf256_inf_positive" {
+    assert(gf256_is_inf(gf256_inf_positive()) == true);
+}
+
+test "gf256_inf_negative" {
+    assert(gf256_is_inf(gf256_inf_negative()) == true);
+}
+
+test "gf256_nan" {
+    assert(gf256_is_nan(gf256_nan()) == true);
+}
+
+test "gf256_inf_not_nan" {
+    assert(gf256_is_nan(gf256_inf_positive()) == false);
+}
+
+test "gf256_extract_sign_positive" {
+    const value = gf256_encode_f64(1.0);
+    const sign = gf256_extract_sign(value);
+    assert(sign == 0);
+}
+
+test "gf256_extract_sign_negative" {
+    const value = gf256_encode_f64(-1.0);
+    const sign = gf256_extract_sign(value);
+    assert(sign == -1);
+}
+
+test "gf256_encode_f64_zero" {
+    const gf = gf256_encode_f64(0.0);
+    assert(gf256_is_equal(gf, gf256_zero()) == true);
+}
+
+test "gf256_encode_f64_one" {
+    const gf = gf256_encode_f64(1.0);
+    const decoded = gf256_decode_f64(gf);
+    assert(abs(decoded - 1.0) < 0.0001);
+}
+
+test "gf256_encode_f64_negative_one" {
+    const gf = gf256_encode_f64(-1.0);
+    const decoded = gf256_decode_f64(gf);
+    assert(abs(decoded + 1.0) < 0.0001);
+}
+
+test "gf256_encode_f64_roundtrip" {
+    const original = 42.5;
+    const gf = gf256_encode_f64(original);
+    const decoded = gf256_decode_f64(gf);
+    assert(abs(decoded - original) < 0.001);
+}
+
+test "gf256_add_simple" {
+    const a = gf256_encode_f64(1.0);
+    const b = gf256_encode_f64(2.0);
+    const result = gf256_add(a, b);
+    const decoded = gf256_decode_f64(result);
+    assert(abs(decoded - 3.0) < 0.01);
+}
+
+test "gf256_mul_simple" {
+    const a = gf256_encode_f64(3.0);
+    const b = gf256_encode_f64(4.0);
+    const result = gf256_mul(a, b);
+    const decoded = gf256_decode_f64(result);
+    assert(abs(decoded - 12.0) < 0.01);
+}
+
+test "gf256_abs_positive" {
+    const value = gf256_encode_f64(5.0);
+    const abs_val = gf256_abs(value);
+    assert(gf256_is_equal(abs_val, value) == true);
+}
+
+test "gf256_abs_negative" {
+    const value = gf256_encode_f64(-5.0);
+    const abs_val = gf256_abs(value);
+    assert(gf256_extract_sign(abs_val) == 0);
+}
+
+test "gf256_neg_positive" {
+    const value = gf256_encode_f64(5.0);
+    const neg_val = gf256_neg(value);
+    assert(gf256_extract_sign(neg_val) < 0);
+}
+
+test "gf256_neg_negative" {
+    const value = gf256_encode_f64(-5.0);
+    const neg_val = gf256_neg(value);
+    assert(gf256_extract_sign(neg_val) == 0);
+}
+
+test "gf256_is_equal_same" {
+    const value = gf256_encode_f64(1.0);
+    assert(gf256_is_equal(value, value) == true);
+}
+
+test "gf256_is_equal_nan" {
+    assert(gf256_is_equal(gf256_nan(), gf256_nan()) == false);
+}
+
+test "gf256_is_equal_zero" {
+    assert(gf256_is_equal(gf256_zero(), gf256_negative_zero()) == true);
+}
+
+test "gf256_is_greater_positive" {
+    const a = gf256_encode_f64(5.0);
+    const b = gf256_encode_f64(3.0);
+    assert(gf256_is_greater(a, b) == true);
+}
+
+test "gf256_is_greater_negative" {
+    const a = gf256_encode_f64(-3.0);
+    const b = gf256_encode_f64(-5.0);
+    assert(gf256_is_greater(a, b) == true);
+}
+
+test "gf256_max_returns_larger" {
+    const a = gf256_encode_f64(3.0);
+    const b = gf256_encode_f64(5.0);
+    const result = gf256_max(a, b);
+    const decoded = gf256_decode_f64(result);
+    assert(decoded >= 4.0);
+}
+
+test "gf256_min_returns_smaller" {
+    const a = gf256_encode_f64(3.0);
+    const b = gf256_encode_f64(5.0);
+    const result = gf256_min(a, b);
+    const decoded = gf256_decode_f64(result);
+    assert(decoded <= 4.0);
+}
+
+test "gf256_from_components_roundtrip" {
+    const sign = -1;
+    const exp = 2147483648;
+    var mant = gf256_zero();
+    mant.parts[0] = 0x8000000000000000;
+    const gf = gf256_from_components(sign, exp, mant);
+    const extracted_sign = gf256_extract_sign(gf);
+    const extracted_exp = gf256_extract_exponent(gf);
+    assert(extracted_sign == sign and extracted_exp == exp);
+}
+
+// ============================================================================
+// Invariants
+// ============================================================================
+
+invariant gf256_bits_total
+    assert SIGN_BITS + EXP_BITS + MANT_BITS == 256
+
+invariant gf256_bias_power_of_two_minus_one
+    assert BIAS + 1 == 2147483648  // 2^31
+
+invariant gf256_special_exp_all_ones
+    assert SPECIAL_EXP == EXP_MAX
+
+invariant gf256_zero_no_sign_mant
+    given zero = gf256_zero()
+    assert zero.parts[0] == 0 and zero.parts[1] == 0 and zero.parts[2] == 0 and (zero.parts[3] & 0x7FFFFFFFFFFFFFFF) == 0
+
+invariant gf256_neg_zero_has_sign
+    given neg_zero = gf256_negative_zero()
+    assert (neg_zero.parts[3] & 0x8000000000000000) != 0
+
+invariant gf256_abs_removes_sign
+    assert (gf256_abs(gf256_negative_zero()).parts[3] & 0x8000000000000000) == 0
+
+invariant gf256_neg_toggles_sign {
+    const pos = gf256_encode_f64(5.0);
+    const neg = gf256_neg(pos);
+    assert((pos.parts[3] & 0x8000000000000000) != (neg.parts[3] & 0x8000000000000000));
+}
+
+// ============================================================================
+// Benchmarks
+// ============================================================================
+
+bench gf256_extract_sign_latency
+    measure: nanoseconds to gf256_extract_sign(gf256_encode_f64(1.0))
+    target: < 20ns
+
+bench gf256_encode_f64_latency
+    measure: nanoseconds to gf256_encode_f64(123.456)
+    target: < 200ns
+
+bench gf256_decode_f64_latency
+    measure: nanoseconds to gf256_decode_f64(gf256_encode_f64(123.456))
+    target: < 200ns
+
+bench gf256_add_latency
+    measure: nanoseconds to gf256_add(gf256_encode_f64(1.0), gf256_encode_f64(2.0))
+    target: < 400ns

@@ -1,0 +1,238 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/automation/meta-connect.t27 -- Threads, Instagram and a Facebook Page as API
+// connectors of the blog desk: the owner connects each network once (OAuth), and an
+// approved article is posted through Meta's own Graph API instead of a press in a
+// browser that is not signed in there.
+// Host: 999-multibots-telegraf apps/vibee-editor/render/src/agent/meta-connect.ts (the
+//       routes, the token table, the refresh, the two-step publish and its receipt)
+//       beside src/agent/blog-share-wiring.ts (publishEverywhere asks this module first
+//       for every network it holds a token of) and src/agent/meta-card.ts (the image
+//       Instagram cannot post without).
+// Why an API and not the browser: on 2026-10-02 the owner's browser was signed out of
+//       Instagram, Threads and Facebook alike, so the desk skipped all three. A Graph
+//       API publish returns the post's own id -- a receipt the browser route could only
+//       guess at from the page leaving its form.
+// Two logins, not three: the Facebook Login token of a Page also publishes to the
+//       Instagram professional account linked to that Page (graph.facebook.com), and it
+//       never expires; Threads has its own app id and its own 60-day token
+//       (graph.threads.net), refreshed by th_refresh_token.
+// Measured from Meta's documentation, 2026-10-02: Threads 500 characters, 5 links and
+//       250 posts a day; Instagram 100 API posts in a moving day, JPEG only, from a
+//       public URL, aspect between 4:5 and 1.91:1; a Page post is one call to /feed.
+// Instagram linked later (v2, 2026-10-07): the Page's Instagram account used to be read
+//       only at Connect. The owner linked t27_dev to the Page afterwards, the row kept an
+//       empty ig_id, and every approved post skipped Instagram until he pressed Connect
+//       again. Now the host re-reads the Page's instagram_business_account with the Page
+//       token it already holds -- no new consent -- when the id is missing or a publish
+//       failed, at most once per IG_RELINK_EVERY_MS per owner, and retries a failed
+//       publish once only when a different account came back.
+// UI words (the owner reads Russian) stay in the host; the spec holds the rules.
+// Claim status: written before any token exists; nothing has been posted through it.
+// phi^2 + 1/phi^2 = 3 | TRINITY
+
+module automation::meta_connect {
+
+    pub const KIND : str = "automation";
+    pub const ID : str = "meta-connect";
+    pub const REPO : str = "999-multibots-telegraf";
+    pub const VERSION : u8 = 2;
+
+    // ---- Each network's own limits --------------------------------------------------
+    pub const THREADS_TEXT_MAX : u16 = 500;  // characters of one Threads post
+    pub const THREADS_LINKS_MAX : u8 = 5;  // unique links in one Threads post
+    pub const THREADS_POSTS_PER_DAY : u16 = 250;  // a profile's own 24 h ceiling
+    pub const IG_CAPTION_MAX : u16 = 2200;  // characters of an Instagram caption
+    pub const IG_POSTS_PER_DAY : u8 = 100;  // API posts in a moving 24 h
+    pub const DESK_POSTS_PER_DAY : u8 = 1;  // blog-share asks one article a day at most
+
+    // ---- The image Instagram needs --------------------------------------------------
+    pub const CARD_W : u16 = 1080;  // the card's width in pixels
+    pub const CARD_H : u16 = 1350;  // 4:5, the tallest aspect Instagram keeps uncropped
+
+    // ---- Tokens ---------------------------------------------------------------------
+    pub const LONG_TOKEN_DAYS : u8 = 60;  // a long-lived Threads token's lifetime
+    pub const REFRESH_DAYS_LEFT : u8 = 15;  // refreshed when this few days remain
+    pub const REFRESH_MIN_AGE_H : u8 = 24;  // Meta refuses to refresh a younger token
+    pub const PAGE_TOKEN_EXPIRES : bool = false;  // from a long-lived user token
+    pub const STATE_TTL_MS : u32 = 600000;  // an OAuth state is good for ten minutes
+    pub const TOKEN_LEAVES_SERVER : bool = false;  // never in a reply, a log or an error
+
+    // ---- The two-step publish -------------------------------------------------------
+    pub const POLL_EVERY_MS : u16 = 3000;  // the container's status is read again
+    pub const POLLS : u8 = 10;  // about half a minute before the desk gives up
+    pub const ASK_NEEDS_YES : bool = true;  // the desk's own yes still comes first
+
+    // ---- Instagram linked after Connect (v2) ----------------------------------------
+    pub const IG_RELINK_EVERY_MS : u32 = 600000;  // one Page re-read per owner per ten minutes
+    pub const IG_RELINK_NEEDS_CONSENT : bool = false;  // the held Page token already may read it
+    pub const IG_PUBLISH_RETRIES : u8 = 1;  // a failed publish is tried again once, no more
+
+    // ---- Not claimed ----------------------------------------------------------------
+    pub const RUN_LIVE : bool = false;  // flips when a post returns its id in production
+
+    // Which road a network takes: its own API when a token is held, the person's
+    // browser when it is signed in there, nothing otherwise.
+    fn route(has_token: bool, signed_in: bool) -> str {
+        if has_token {
+            return "api";
+        }
+        if signed_in {
+            return "browser";
+        }
+        return "skip";
+    }
+
+    // A long-lived token is refreshed when it is old enough to be refreshable and
+    // close enough to its end; an expired one cannot be refreshed at all.
+    fn should_refresh(days_left: u16, age_h: u16) -> bool {
+        return days_left > 0 && days_left <= REFRESH_DAYS_LEFT && age_h >= REFRESH_MIN_AGE_H;
+    }
+
+    // A token is usable while it has time left; a Page token has no end.
+    fn usable(expires: bool, days_left: u16) -> bool {
+        return !expires || days_left > 0;
+    }
+
+    // A Threads post fits: within its characters and its links.
+    fn fits_threads(chars: u16, links: u8) -> bool {
+        return chars <= THREADS_TEXT_MAX && links <= THREADS_LINKS_MAX;
+    }
+
+    // The container is published only once Meta says it is finished.
+    fn ready(status: str) -> bool {
+        return status == "FINISHED";
+    }
+
+    // A container that failed or expired is given up at once, not polled again.
+    fn given_up(status: str) -> bool {
+        return status == "ERROR" || status == "EXPIRED";
+    }
+
+    // Posted means Meta returned the published post's id -- a press is not a post.
+    fn posted(published_id: str) -> bool {
+        return published_id != "";
+    }
+
+    // An OAuth state is honoured once, and only while it is young.
+    fn state_ok(age_ms: u32, used: bool) -> bool {
+        return !used && age_ms < STATE_TTL_MS;
+    }
+
+    // The last moment a container is waited on, from the first look.
+    fn last_poll_ms() -> u32 {
+        return (POLLS - 1) * POLL_EVERY_MS;
+    }
+
+    // The Page's Instagram account is read again when the row does not know it or a
+    // publish just failed -- and never twice inside the window, so a Page that truly
+    // has no Instagram is not asked on every post.
+    fn should_relink(ig_known: bool, publish_failed: bool, since_last_ms: u32) -> bool {
+        return (!ig_known || publish_failed) && since_last_ms >= IG_RELINK_EVERY_MS;
+    }
+
+    // A failed publish is retried only when the re-read found an account, and a
+    // different one: the same id would fail the same way.
+    fn retry_after_relink(old_id: str, new_id: str) -> bool {
+        return new_id != "" && new_id != old_id;
+    }
+
+    test "a held token goes by the API, a signed-in browser by the browser, else nothing" {
+        assert(route(true, false) == "api");
+        assert(route(true, true) == "api");
+        assert(route(false, true) == "browser");
+        assert(route(false, false) == "skip");
+    }
+
+    test "a token is refreshed near its end, once it is a day old" {
+        assert(should_refresh(15, 24));
+        assert(should_refresh(1, 1000));
+        assert(!should_refresh(16, 1000));
+        assert(!should_refresh(10, 23));
+        assert(!should_refresh(0, 1000));
+        assert(REFRESH_DAYS_LEFT < LONG_TOKEN_DAYS);
+    }
+
+    test "a page token never ends, a long-lived one does" {
+        assert(usable(false, 0));
+        assert(usable(true, 1));
+        assert(!usable(true, 0));
+        assert(!PAGE_TOKEN_EXPIRES);
+    }
+
+    test "a Threads post fits its characters and its links" {
+        assert(fits_threads(500, 5));
+        assert(!fits_threads(501, 1));
+        assert(!fits_threads(10, 6));
+        assert(fits_threads(0, 0));
+    }
+
+    test "a container is published only when finished, and given up when it failed" {
+        assert(ready("FINISHED"));
+        assert(!ready("IN_PROGRESS"));
+        assert(!ready("ERROR"));
+        assert(given_up("ERROR"));
+        assert(given_up("EXPIRED"));
+        assert(!given_up("IN_PROGRESS"));
+        assert(!given_up("FINISHED"));
+    }
+
+    test "a container is waited on about half a minute" {
+        assert(POLL_EVERY_MS == 3000);
+        assert(POLLS == 10);
+        assert(last_poll_ms() == 27000);
+    }
+
+    test "posted means the published id came back" {
+        assert(posted("17895695668004550"));
+        assert(!posted(""));
+    }
+
+    test "an OAuth state is good once and for ten minutes" {
+        assert(state_ok(0, false));
+        assert(state_ok(599999, false));
+        assert(!state_ok(600000, false));
+        assert(!state_ok(0, true));
+    }
+
+    test "the desk stays far under every network's daily ceiling" {
+        assert(DESK_POSTS_PER_DAY < IG_POSTS_PER_DAY);
+        assert(DESK_POSTS_PER_DAY < THREADS_POSTS_PER_DAY);
+        assert(THREADS_TEXT_MAX < IG_CAPTION_MAX);
+    }
+
+    test "the card is the tallest shape Instagram keeps" {
+        assert(CARD_W == 1080);
+        assert(CARD_H == 1350);
+        assert(CARD_H * 4 == CARD_W * 5);
+    }
+
+    test "the token never leaves the server and nothing posts without a yes" {
+        assert(!TOKEN_LEAVES_SERVER);
+        assert(ASK_NEEDS_YES);
+    }
+
+    test "an Instagram linked after Connect is read again, at most once in ten minutes" {
+        assert(should_relink(false, false, 600000));
+        assert(should_relink(false, false, 4294967295));
+        assert(!should_relink(false, false, 599999));
+        assert(should_relink(true, true, 600000));
+        assert(!should_relink(true, true, 599999));
+        assert(!should_relink(true, false, 4294967295));
+        assert(IG_RELINK_EVERY_MS == STATE_TTL_MS);
+        assert(!IG_RELINK_NEEDS_CONSENT);
+    }
+
+    test "a failed Instagram publish is retried once, only for another account" {
+        assert(retry_after_relink("", "ig2"));
+        assert(retry_after_relink("ig1", "ig2"));
+        assert(!retry_after_relink("ig1", "ig1"));
+        assert(!retry_after_relink("ig1", ""));
+        assert(IG_PUBLISH_RETRIES == 1);
+    }
+
+    test "nothing has been posted through it yet" {
+        assert(!RUN_LIVE);
+        assert(VERSION == 2);
+    }
+}
+// phi^2 + 1/phi^2 = 3 | TRINITY

@@ -1,0 +1,422 @@
+// SPDX-License-Identifier: Apache-2.0
+; lut_npu_81_entry.t27 — Sacred Opcode 0xE3: LUT NPU 81-Entry Lookup
+; Hardware LUT for NPU operations with 81 entries (9×9 transform)
+; φ² + 1/φ² = 3 | TRINITY
+
+module sacred-lut_npu_81_entry;
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+pub const OP_LUT_NPU : u8 = 0xE3;
+
+pub const LUT_SIZE : u8 = 81;  // 9×9 = 81 entries
+pub const LUT_ADDR_BITS : u8 = 7;  // 7 bits for 0-80
+pub const LUT_VALUE_BITS : u8 = 16;
+
+pub const ENTRY_VALID : u8 = 1;
+pub const ENTRY_INVALID : u8 = 0;
+
+pub const PHI_CONST_BASE : u8 = 0;
+pub const CONST_LUT_END : u8 = 80;
+
+// ============================================================================
+// Types
+// ============================================================================
+
+pub const LutEntry = struct {
+    address : u8,
+    value : u16,
+    valid : bool,
+    phi_related : bool,
+}
+
+pub const LutConfig = struct {
+    read_only : bool,
+    phi_optimized : bool,
+    cache_enabled : bool,
+}
+
+pub const NpuOperation = enum(u8) {
+    lookup = 0,
+    transform = 1,
+    phi_project = 2,
+    sparse_reduce = 3,
+    quantize = 4,
+    dequantize = 5,
+    composite = 6,
+    custom = 7,
+}
+
+pub const Transform9x9 = struct {
+    grid : [9][9]i8,
+    sparsity : u8,  // 0-100%
+    phi_score : u16,  // φ-distance from ideal
+}
+
+// ============================================================================
+// LUT Entry Functions
+// ============================================================================
+
+// lut_entry_valid(entry: LutEntry) -> bool
+// Check if LUT entry is valid
+pub fn lut_entry_valid(entry: LutEntry) bool {
+    return entry.valid and entry.address < LUT_SIZE;
+}
+
+// lut_entry_address_valid(addr: u8) -> bool
+// Check if address is valid
+pub fn lut_entry_address_valid(addr: u8) bool {
+    return addr < LUT_SIZE;
+}
+
+// create_lut_entry(addr: u8, value: u16, phi_related: bool) -> LutEntry
+// Create a LUT entry
+pub fn create_lut_entry(addr: u8, value: u16, phi_related: bool) LutEntry {
+    return LutEntry {
+        .address = addr,
+        .value = value,
+        .valid = lut_entry_address_valid(addr),
+        .phi_related = phi_related,
+    };
+}
+
+// ============================================================================
+// NPU Operation Functions
+// ============================================================================
+
+// npu_transform_9x9(grid: [9][9]i8) -> Transform9x9
+// Analyze 9×9 transform
+pub fn npu_transform_9x9(grid: [9][9]i8) Transform9x9 {
+    var zero_count : u8 = 0;
+    var phi_score : u16 = 0;
+
+    // Count zeros and compute phi score
+    // Zig `for (grid, 0..) |row, i|` written as index ranges over the 9x9 grid
+    for i in 0..9 {
+        const row = grid[i];
+        for j in 0..9 {
+            const val = row[j];
+            if (val == 0) {
+                zero_count += 1;
+            }
+            // Simple phi score based on center-weight
+            const center_dist = if (i > 4) i - 4 else 4 - i;
+            const center_dist_j = if (j > 4) j - 4 else 4 - j;
+            phi_score += @as(u16, @intCast(val)) * @as(u16, @intCast(5 - center_dist - center_dist_j));
+        }
+    }
+
+    const sparsity = (zero_count * 100) / 81;
+
+    return Transform9x9 {
+        .grid = grid,
+        .sparsity = sparsity,
+        .phi_score = phi_score,
+    };
+}
+
+// transform_is_sparse(transform: Transform9x9) -> bool
+// Check if transform is sparse (>50% zeros)
+pub fn transform_is_sparse(transform: Transform9x9) bool {
+    return transform.sparsity > 50;
+}
+
+// transform_phi_optimized(transform: Transform9x9) -> bool
+// Check if transform is phi-optimized (high phi score)
+pub fn transform_phi_optimized(transform: Transform9x9) bool {
+    return transform.phi_score > 100;
+}
+
+// ============================================================================
+// LUT Lookup Functions
+// ============================================================================
+
+// lut_lookup_base(lut: [LUT_SIZE]LutEntry, addr: u8) -> LutEntry
+// Base LUT lookup
+pub fn lut_lookup_base(lut: [LUT_SIZE]LutEntry, addr: u8) LutEntry {
+    if (!lut_entry_address_valid(addr)) {
+        return LutEntry{.address = 255, .value = 0, .valid = false, .phi_related = false};
+    }
+    return lut[@as(u8, @intCast(addr))];
+}
+
+// lut_lookup_phi(lut: [LUT_SIZE]LutEntry, addr: u8) -> LutEntry
+// Phi-optimized LUT lookup
+pub fn lut_lookup_phi(lut: [LUT_SIZE]LutEntry, addr: u8) LutEntry {
+    if (!lut_entry_address_valid(addr)) {
+        return LutEntry{.address = 255, .value = 0, .valid = false, .phi_related = false};
+    }
+
+    const entry = lut[@as(u8, @intCast(addr))];
+    if (entry.valid and entry.phi_related) {
+        return entry;
+    }
+
+    // Fallback: search for nearest phi-related entry
+    for i in 0..LUT_SIZE {
+        const e = lut[i];
+        if (e.valid and e.phi_related) {
+            return e;
+        }
+    }
+
+    return entry;
+}
+
+// lut_lookup_range(lut: [LUT_SIZE]LutEntry, start_addr: u8, count: u8) -> [LUT_SIZE]LutEntry
+// Lookup range of entries
+pub fn lut_lookup_range(lut: [LUT_SIZE]LutEntry, start_addr: u8, count: u8) [LUT_SIZE]LutEntry {
+    var result : [LUT_SIZE]LutEntry = undefined;
+
+    for i in 0..LUT_SIZE {
+        if (i < count and lut_entry_address_valid(start_addr + i)) {
+            result[i] = lut[@as(u8, @intCast(start_addr + i))];
+        } else {
+            result[i] = LutEntry{.address = 255, .value = 0, .valid = false, .phi_related = false};
+        }
+    }
+
+    return result;
+}
+
+// ============================================================================
+// Opcode Encoding/Decoding
+// ============================================================================
+
+// encode_lut_npu(op: NpuOperation, addr: u8) -> u16
+// Encode LUT NPU instruction
+pub fn encode_lut_npu(op: NpuOperation, addr: u8) u16 {
+    // Format: [OP:8][OPCODE:3][ADDR:5]
+    const op_field : u16 = @as(u16, OP_LUT_NPU) << 8;
+    const opcode_field : u16 = @as(u16, @intFromEnum(op)) << 5;
+    const addr_field : u16 = @as(u16, addr & 0x1F);
+    return op_field | opcode_field | addr_field;
+}
+
+// decode_lut_npu(encoded: u16) -> struct { op: NpuOperation, addr: u8 }
+// Decode LUT NPU instruction
+pub fn decode_lut_npu(encoded: u16) struct { op: NpuOperation, addr: u8 } {
+    const opcode_val : u8 = @as(u8, @truncate((encoded >> 5) & 0x07));
+    const addr : u8 = @as(u8, @truncate(encoded & 0x1F));
+
+    var op : NpuOperation = undefined;
+    // switch arms are expressions in t27: the arm value is assigned to op
+    op = switch (opcode_val) {
+        0 => NpuOperation.lookup,
+        1 => NpuOperation.transform,
+        2 => NpuOperation.phi_project,
+        3 => NpuOperation.sparse_reduce,
+        4 => NpuOperation.quantize,
+        5 => NpuOperation.dequantize,
+        6 => NpuOperation.composite,
+        else => NpuOperation.custom,
+    };
+
+    return .{ .op = op, .addr = addr };
+}
+
+// ============================================================================
+// TDD Tests
+// ============================================================================
+
+test "lut_size_eighty_one" {
+    assert(LUT_SIZE == 81);
+}
+
+test "lut_entry_address_valid_true" {
+    assert(lut_entry_address_valid(0) == true);
+    assert(lut_entry_address_valid(80) == true);
+}
+
+test "lut_entry_address_valid_false" {
+    assert(lut_entry_address_valid(81) == false);
+    assert(lut_entry_address_valid(255) == false);
+}
+
+test "lut_entry_valid_true" {
+    const entry = LutEntry{.address = 40, .value = 0x1234, .valid = true, .phi_related = false};
+    assert(lut_entry_valid(entry) == true);
+}
+
+test "lut_entry_valid_false_invalid_addr" {
+    const entry = LutEntry{.address = 255, .value = 0x1234, .valid = true, .phi_related = false};
+    assert(lut_entry_valid(entry) == false);
+}
+
+test "lut_entry_valid_false_invalid_flag" {
+    const entry = LutEntry{.address = 40, .value = 0x1234, .valid = false, .phi_related = false};
+    assert(lut_entry_valid(entry) == false);
+}
+
+test "create_lut_entry_valid" {
+    const entry = create_lut_entry(40, 0x1234, true);
+    assert(entry.valid == true);
+    assert(entry.phi_related == true);
+    assert(entry.value == 0x1234);
+}
+
+test "create_lut_entry_invalid" {
+    const entry = create_lut_entry(81, 0x1234, true);
+    assert(entry.valid == false);
+}
+
+test "npu_transform_9x9_count" {
+    const grid = [_][9]i8{
+        [_]i8{0} ** 9,
+        [_]i8{0} ** 9,
+        [_]i8{0} ** 9,
+        [_]i8{0} ** 9,
+        [_]i8{1} ** 9,
+        [_]i8{0} ** 9,
+        [_]i8{0} ** 9,
+        [_]i8{0} ** 9,
+        [_]i8{0} ** 9,
+    };
+    const transform = npu_transform_9x9(grid);
+    assert(transform.sparsity == 88);
+}
+
+test "transform_is_sparse_true" {
+    const grid = [_][9]i8{
+        [_]i8{0} ** 9,
+        [_]i8{0} ** 9,
+        [_]i8{0} ** 9,
+        [_]i8{0} ** 9,
+        [_]i8{1} ** 9,
+        [_]i8{0} ** 9,
+        [_]i8{0} ** 9,
+        [_]i8{0} ** 9,
+        [_]i8{0} ** 9,
+    };
+    const transform = npu_transform_9x9(grid);
+    assert(transform_is_sparse(transform) == true);
+}
+
+test "transform_is_sparse_false" {
+    const grid = [_][9]i8{[_]i8{1} ** 9} ** 9;
+    const transform = npu_transform_9x9(grid);
+    assert(transform_is_sparse(transform) == false);
+}
+
+test "transform_phi_optimized_true" {
+    const grid = [_][9]i8{
+        [_]i8{1} ** 9,
+        [_]i8{1} ** 9,
+        [_]i8{1} ** 9,
+        [_]i8{1} ** 9,
+        [_]i8{5} ** 9,
+        [_]i8{1} ** 9,
+        [_]i8{1} ** 9,
+        [_]i8{1} ** 9,
+        [_]i8{1} ** 9,
+    };
+    const transform = npu_transform_9x9(grid);
+    assert(transform_phi_optimized(transform) == true);
+}
+
+test "transform_phi_optimized_false" {
+    const grid = [_][9]i8{[_]i8{1} ** 9} ** 9;
+    const transform = npu_transform_9x9(grid);
+    assert(transform_phi_optimized(transform) == false);
+}
+
+test "lut_lookup_base_valid" {
+    const lut = [_]LutEntry{.{.address = 40, .value = 0x1234, .valid = true, .phi_related = false}} ** 81;
+    const entry = lut_lookup_base(lut, 40);
+    assert(entry.value == 0x1234);
+    assert(entry.valid == true);
+}
+
+test "lut_lookup_base_invalid_addr" {
+    const lut = [_]LutEntry{.{.address = 40, .value = 0x1234, .valid = true, .phi_related = false}} ** 81;
+    const entry = lut_lookup_base(lut, 81);
+    assert(entry.valid == false);
+}
+
+test "encode_lut_npu" {
+    const encoded = encode_lut_npu(NpuOperation.phi_project, 0x10);
+    assert((encoded >> 8) == OP_LUT_NPU);
+}
+
+test "decode_lut_npu" {
+    const decoded = decode_lut_npu(0xE350);
+    assert(decoded.op == NpuOperation.phi_project);
+    assert(decoded.addr == 0x10);
+}
+
+test "opcode_constant" {
+    assert(OP_LUT_NPU == 0xE3);
+}
+
+// ============================================================================
+// Invariants
+// ============================================================================
+
+invariant lut_size_eighty_one
+    assert LUT_SIZE == 81
+
+invariant lut_addr_bits_seven
+    assert LUT_ADDR_BITS == 7
+
+invariant lut_value_bits_sixteen
+    assert LUT_VALUE_BITS == 16
+
+invariant phi_const_base_zero
+    assert PHI_CONST_BASE == 0
+
+invariant const_lut_end_eighty
+    assert CONST_LUT_END == 80
+
+invariant entry_valid_one
+    assert ENTRY_VALID == 1
+
+invariant entry_invalid_zero
+    assert ENTRY_INVALID == 0
+
+invariant lut_address_bound
+    assert lut_entry_address_valid(80) == true and lut_entry_address_valid(81) == false
+
+invariant transform_sparsity_bound
+    given grid = [_][9]i8{[_]i8{1} ** 9} ** 9
+    when transform = npu_transform_9x9(grid)
+    assert transform.sparsity <= 100;
+
+invariant transform_sparsity_dense
+    given grid = [_][9]i8{[_]i8{1} ** 9} ** 9
+    when transform = npu_transform_9x9(grid)
+    assert transform.sparsity == 0;
+
+invariant phi_score_non_negative
+    given grid = [_][9]i8{[_]i8{1} ** 9} ** 9
+    when transform = npu_transform_9x9(grid)
+    assert transform.phi_score >= 0;
+
+invariant npu_operation_enum_values
+    assert @intFromEnum(NpuOperation.lookup) == 0;
+    assert @intFromEnum(NpuOperation.custom) == 7;
+
+// ============================================================================
+// Benchmarks
+// ============================================================================
+
+bench npu_transform_9x9_latency
+    measure: nanoseconds to npu_transform_9x9([_] [9]i8{[_]i8{1, 0, 2, 0, 3, 0, 4, 0, 5} ** 9})
+    target: < 500ns
+
+bench lut_lookup_base_latency
+    measure: nanoseconds to lut_lookup_base([_]LutEntry{.{.address = 40, .value = 0x1234, .valid = true, .phi_related = false}} ** 81, 40)
+    target: < 50ns
+
+bench lut_lookup_phi_latency
+    measure: nanoseconds to lut_lookup_phi([_]LutEntry{.{.address = 40, .value = 0x1234, .valid = true, .phi_related = true}} ** 81, 40)
+    target: < 100ns
+
+bench encode_lut_npu_latency
+    measure: nanoseconds to encode_lut_npu(NpuOperation.phi_project, 0x10)
+    target: < 20ns
+
+bench decode_lut_npu_latency
+    measure: nanoseconds to decode_lut_npu(0xE350)
+    target: < 20ns

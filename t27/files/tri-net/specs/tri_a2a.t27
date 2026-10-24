@@ -1,0 +1,727 @@
+// TRI-NET A2A-over-mesh: carry Agent-to-Agent messages as SEALED mesh datagrams,
+// reusing the existing stack -- MeshWire (wire.t27, 11-byte header), RouterTtl
+// (router_ttl.t27, multi-hop + split-horizon), CryptoFrame (crypto_frame.t27,
+// AEAD + ratchet + replay). This spec adds ONLY the A2A message-class layer; it
+// creates no new transport.
+//
+// The hosted skill is a GoldenFloat op (the workload GF was built for): an agent
+// advertises GF16 (GF4..GF1024 family), a taskAssign carries GF operands, the
+// executor runs the proven GF unit, and the taskResult carries a
+// tri_compute_receipt binding {GF format+op, operands, GF result, device, chain}.
+//
+// Demux is by PORT, never by a magic byte: the payload is ciphertext, so its
+// first byte is uniform (tri-net CLAUDE.md, mesh-bridge rule).
+
+module TriA2A {
+    use base::types;
+
+    // A2A rides KIND_DATA (== 1 in wire.t27) on a dedicated port.
+    const KIND_DATA : u32 = 1;
+    const A2A_PORT  : u32 = 0xA2A;
+
+    // A2A task lifecycle message classes.
+    const MSG_TASK_ASSIGN : u32 = 1;
+    const MSG_TASK_RESULT : u32 = 2;
+    const MSG_HEARTBEAT   : u32 = 3;
+
+    // Hosted compute skill = GoldenFloat (must match tri_compute_receipt GF ids).
+    const SKILL_GF16_MUL : u32 = 0x1611;   // GF16 (16) . GF_MUL (0x11)
+    const SKILL_GF16_ADD : u32 = 0x1610;   // GF16 (16) . GF_ADD (0x10)
+
+    // GF-T (ternary-native) hosted skills -- a node advertises which FAMILY it
+    // hosts, so a requester does not send a GF-T16 task to a GF16-only node.
+    const SKILL_GFT16_MUL : u32 = 0xA611;  // GF-T16 . mul
+    const SKILL_GFT16_ADD : u32 = 0xA610;  // GF-T16 . add
+    const SKILL_GFT8_MUL  : u32 = 0xA811;  // GF-T8 . mul
+    const SKILL_GFT8_ADD  : u32 = 0xA810;  // GF-T8 . add
+    const SKILL_GFT4_MUL  : u32 = 0xA411;  // GF-T4 . mul (bottom rung, silicon gft_mul4)
+    const SKILL_GFT4_ADD  : u32 = 0xA410;  // GF-T4 . add
+    const SKILL_GFT32_MUL : u32 = 0xA511;  // GF-T32 . mul (top silicon rung: mul/dot/tile)
+    const SKILL_GFT32_ADD : u32 = 0xA510;  // GF-T32 . add
+    const SKILL_GFT64_MUL : u32 = 0xA311;  // GF-T64 . mul (silicon: mul64/add64/dot2/dot4/tile)
+    const SKILL_GFT64_ADD : u32 = 0xA310;  // GF-T64 . add
+    const SKILL_GFT128_MUL : u32 = 0xA211; // GF-T128 . mul (spec rung, Et14)
+    const SKILL_GFT128_ADD : u32 = 0xA210; // GF-T128 . add
+
+    // Demux an incoming datagram to the A2A stack by (kind, port) -- NOT by
+    // inspecting the encrypted payload bytes.
+    fn is_a2a(kind: u32, port: u32) -> bool {
+        if (kind == KIND_DATA) { return port == A2A_PORT; } else { return port != port; }
+    }
+
+    // Only a taskResult carries a compute-receipt in its body.
+    fn carries_receipt(msg_class: u32) -> bool {
+        return msg_class == MSG_TASK_RESULT;
+    }
+
+    // A skill id is a hosted GoldenFloat op iff it decodes to a known GF skill.
+    fn is_gf_skill(skill: u32) -> bool {
+        if (skill == SKILL_GF16_MUL) { return skill == skill; }
+        else { return skill == SKILL_GF16_ADD; }
+    }
+
+    // A skill is a GF-T (ternary-native) hosted op iff it decodes to a known GF-T
+    // skill. Distinct family from is_gf_skill (binary GF).
+    fn is_gft_skill(skill: u32) -> bool {
+        if (skill == SKILL_GFT16_MUL) { return skill == skill; }
+        if (skill == SKILL_GFT16_ADD) { return skill == skill; }
+        if (skill == SKILL_GFT8_MUL)  { return skill == skill; }
+        if (skill == SKILL_GFT8_ADD)  { return skill == skill; }
+        if (skill == SKILL_GFT4_MUL)  { return skill == skill; }
+        if (skill == SKILL_GFT4_ADD)  { return skill == skill; }
+        if (skill == SKILL_GFT32_MUL) { return skill == skill; }
+        if (skill == SKILL_GFT32_ADD) { return skill == skill; }
+        if (skill == SKILL_GFT64_MUL) { return skill == skill; }
+        if (skill == SKILL_GFT64_ADD) { return skill == skill; }
+        if (skill == SKILL_GFT128_MUL) { return skill == skill; }
+        if (skill == SKILL_GFT128_ADD) { return skill == skill; }
+        return skill != skill;
+    }
+
+    // Format families (match tri_compute_receipt / tri_compute_gfvalid).
+    const FMT_GF_BINARY : u32 = 0;
+    const FMT_GFT : u32 = 1;
+
+    // The format family a hosted skill implies. (Inlined rather than calling
+    // is_gft_skill in the condition: t27c mis-lowers `bool_fn() == true` to a
+    // u32-vs-bool comparison. FMT_GFT==1, FMT_GF_BINARY==0, so the flag sum IS
+    // the family.)
+    fn skill_family(skill: u32) -> u32 {
+        if (skill == SKILL_GFT16_MUL) { return FMT_GFT; }
+        if (skill == SKILL_GFT16_ADD) { return FMT_GFT; }
+        if (skill == SKILL_GFT8_MUL)  { return FMT_GFT; }
+        if (skill == SKILL_GFT8_ADD)  { return FMT_GFT; }
+        if (skill == SKILL_GFT4_MUL)  { return FMT_GFT; }
+        if (skill == SKILL_GFT4_ADD)  { return FMT_GFT; }
+        if (skill == SKILL_GFT32_MUL) { return FMT_GFT; }
+        if (skill == SKILL_GFT32_ADD) { return FMT_GFT; }
+        if (skill == SKILL_GFT64_MUL) { return FMT_GFT; }
+        if (skill == SKILL_GFT64_ADD) { return FMT_GFT; }
+        if (skill == SKILL_GFT128_MUL) { return FMT_GFT; }
+        if (skill == SKILL_GFT128_ADD) { return FMT_GFT; }
+        return FMT_GF_BINARY;
+    }
+
+    // A taskResult is only valid if its receipt's format family matches the family
+    // the assigned skill advertised -- rejects a GF16 result for a GF-T16 request
+    // (same nominal width 16, different format) and vice versa.
+    fn family_matches(assigned_skill: u32, receipt_family: u32) -> bool {
+        return skill_family(assigned_skill) == receipt_family;
+    }
+
+    // A skill is HOSTED iff it is one of the six known GF/GF-T skills. skill_family
+    // defaults ANY unknown skill to FMT_GF_BINARY, so an unenumerated GF-T rung (a
+    // wider ladder skill like GF-T4/GF-T32, id 0xA4../0xA5..) or a crafted id would
+    // be classed BINARY and family_matches would then accept a binary receipt for
+    // it -- undermining the family binding. Return 1/0 (no bool-in-condition later).
+    fn is_hosted_skill(skill: u32) -> u32 {
+        if (skill == SKILL_GF16_MUL) { return 1; }
+        if (skill == SKILL_GF16_ADD) { return 1; }
+        if (skill == SKILL_GFT16_MUL) { return 1; }
+        if (skill == SKILL_GFT16_ADD) { return 1; }
+        if (skill == SKILL_GFT8_MUL) { return 1; }
+        if (skill == SKILL_GFT8_ADD) { return 1; }
+        if (skill == SKILL_GFT4_MUL) { return 1; }
+        if (skill == SKILL_GFT4_ADD) { return 1; }
+        if (skill == SKILL_GFT32_MUL) { return 1; }
+        if (skill == SKILL_GFT32_ADD) { return 1; }
+        if (skill == SKILL_GFT64_MUL) { return 1; }
+        if (skill == SKILL_GFT64_ADD) { return 1; }
+        if (skill == SKILL_GFT128_MUL) { return 1; }
+        if (skill == SKILL_GFT128_ADD) { return 1; }
+        return 0;
+    }
+
+    // Family match that first requires the skill to be HOSTED: an unhosted skill
+    // matches NO family, so skill_family's binary default can never slip a
+    // wrong-family receipt through. Callers should use this instead of the bare
+    // family_matches when the skill is attacker-influenced.
+    fn family_matches_strict(assigned_skill: u32, receipt_family: u32) -> bool {
+        if (is_hosted_skill(assigned_skill) == 1) {
+            return skill_family(assigned_skill) == receipt_family;
+        } else {
+            return assigned_skill != assigned_skill;
+        }
+    }
+
+    // The OP a skill implies = its low byte, which equals tri_compute_receipt's
+    // GF_MUL (0x11) / GF_ADD (0x10) by construction. Exposing it lets a caller
+    // check the A2A skill and the receipt's bound gf_op AGREE (an assigned mul
+    // must not settle an add receipt), across both format families.
+    fn skill_op(skill: u32) -> u32 {
+        return skill & 0xFF;
+    }
+
+    // A taskResult is valid for a taskAssign iff it echoes the same task_id AND
+    // its receipt commits that same task. Blocks splicing a valid result+receipt
+    // from one task onto another (the receipt's `task` field is bound, see
+    // tri_compute_receipt.receipt_leaf).
+    fn result_matches_assign(assign_task_id: u32, result_task_id: u32, receipt_task: u32) -> bool {
+        if (assign_task_id == result_task_id) { return result_task_id == receipt_task; }
+        else { return result_task_id != result_task_id; }
+    }
+
+    // Freshness: accept a result only if its task_id strictly exceeds the highest
+    // already settled -- a monotonic nonce that rejects replays of old results.
+    fn is_fresh(task_id: u32, last_settled: u32) -> bool {
+        return task_id > last_settled;
+    }
+
+    // High-water mark after settling: advance on a fresh id, hold on a stale one.
+    fn next_watermark(task_id: u32, last_settled: u32) -> u32 {
+        if (task_id > last_settled) {
+            return task_id;
+        } else {
+            return last_settled;
+        }
+    }
+
+    // The watermark must advance ONLY on a SETTLED result -- a committed state
+    // transition -- not on freshness alone. next_watermark above trusts the caller
+    // to invoke it after settling; a caller that advances on a fresh-but-REJECTED
+    // result (wrong op/family/reputation, or ingress-rejected) would let a griefer
+    // submit a high task_id that fails admission yet JUMPS the watermark, stale-
+    // blocking every legitimate lower-id result -- the task-level analogue of the
+    // dispute-watermark DoS (tri_compute_challenge.resolver_epoch_after). Gate the
+    // advance on the settled flag: an unsettled result never moves the mark.
+    fn next_watermark_settled(task_id: u32, last_settled: u32, settled: u32) -> u32 {
+        if (settled == 1) {
+            if (task_id > last_settled) {
+                return task_id;
+            } else {
+                return last_settled;
+            }
+        } else {
+            return last_settled;
+        }
+    }
+
+    // The OP the assigned skill implies must equal the op the receipt actually
+    // committed. skill_op was EXPOSED for exactly this ("an assigned mul must not
+    // settle an add receipt") but nothing enforced it: an executor assigned
+    // SKILL_GF16_MUL could commit a valid, fresh, family-matching GF_ADD receipt on
+    // the same operands and be paid for a DIFFERENT operation than requested. This
+    // makes the check a named gate.
+    fn op_matches(assigned_skill: u32, receipt_op: u32) -> bool {
+        return skill_op(assigned_skill) == receipt_op;
+    }
+
+    // The single correct "is this result valid for this assignment" gate: the
+    // result echoes the assigned task_id, the receipt commits that same task, AND
+    // the receipt's family and op both match what the skill advertised. Any one
+    // failing rejects -- no wrong-task splice (result_matches_assign), no cross-
+    // family (family_matches), no wrong-operation settlement (op_matches). Callers
+    // should use THIS instead of checking the pieces and forgetting one.
+    fn result_binds_assign(assign_task_id: u32, result_task_id: u32, receipt_task: u32, assigned_skill: u32, receipt_family: u32, receipt_op: u32) -> bool {
+        if (is_hosted_skill(assigned_skill) == 1) {
+            if (assign_task_id == result_task_id) {
+                if (result_task_id == receipt_task) {
+                    if (skill_family(assigned_skill) == receipt_family) {
+                        return skill_op(assigned_skill) == receipt_op;
+                    } else {
+                        return receipt_family != receipt_family;
+                    }
+                } else {
+                    return receipt_task != receipt_task;
+                }
+            } else {
+                return assign_task_id != assign_task_id;
+            }
+        } else {
+            return assigned_skill != assigned_skill;
+        }
+    }
+
+    // The ladder WIDTH a hosted skill advertises. family + op are a LOSSY proxy for
+    // the assigned skill: GFT16_* (0xA6..) and GFT8_* (0xA8..) share family (FMT_GFT)
+    // AND op (0x11/0x10), differing only in width. So result_binds_assign accepts a
+    // GFT8 receipt for a GFT16 assignment -- a silent precision DOWNGRADE: the executor
+    // does cheaper 8-trit work and the requester gets 8-trit precision for a 16-trit
+    // task it never agreed to. Only GFT8_* are width 8; GF16/GFT16 are width 16.
+    fn skill_width(skill: u32) -> u32 {
+        if (skill == SKILL_GFT8_MUL) { return 8; }
+        if (skill == SKILL_GFT8_ADD) { return 8; }
+        if (skill == SKILL_GFT4_MUL) { return 4; }
+        if (skill == SKILL_GFT4_ADD) { return 4; }
+        if (skill == SKILL_GFT32_MUL) { return 32; }
+        if (skill == SKILL_GFT32_ADD) { return 32; }
+        if (skill == SKILL_GFT64_MUL) { return 64; }
+        if (skill == SKILL_GFT64_ADD) { return 64; }
+        if (skill == SKILL_GFT128_MUL) { return 128; }
+        if (skill == SKILL_GFT128_ADD) { return 128; }
+        return 16;
+    }
+
+    // The ratified ladder Et for a hosted GF-T skill's rung (tri_gft_ladder width_to_et:
+    // GF-T8 -> 3, GF-T16 -> 4). This is the ASSIGNMENT-side SSOT of which rung was
+    // directed -- the dispute layer reads it as settled_et (tri_compute_challenge.
+    // resolve_full_rung) and the receipt commits it (tri_compute_receipt.receipt_leaf_gf_rung).
+    // Binary GF16 has no ternary exponent (-> 0); any unenumerated / crafted skill is
+    // FAIL-CLOSED at 0, so a rung-bound gate can never be satisfied by claiming Et 0
+    // (a real GF-T receipt commits Et >= 3).
+    fn skill_et(skill: u32) -> u32 {
+        if (skill == SKILL_GFT16_MUL) { return 4; }
+        if (skill == SKILL_GFT16_ADD) { return 4; }
+        if (skill == SKILL_GFT8_MUL)  { return 3; }
+        if (skill == SKILL_GFT8_ADD)  { return 3; }
+        if (skill == SKILL_GFT4_MUL)  { return 2; }   // GF-T4 rung, Et2 (bottom)
+        if (skill == SKILL_GFT4_ADD)  { return 2; }
+        if (skill == SKILL_GFT32_MUL) { return 6; }   // GF-T32 rung, ratified Et6
+        if (skill == SKILL_GFT32_ADD) { return 6; }
+        if (skill == SKILL_GFT64_MUL) { return 9; }   // GF-T64  rung, Et9
+        if (skill == SKILL_GFT64_ADD) { return 9; }
+        if (skill == SKILL_GFT128_MUL) { return 14; } // GF-T128 rung, Et14
+        if (skill == SKILL_GFT128_ADD) { return 14; }
+        return 0;
+    }
+
+    // Width-exact binding: result_binds_assign PLUS the receipt's committed width
+    // (tri_compute_receipt gf_width) equals the assigned skill's width. Together with
+    // family + op this uniquely identifies each of the six hosted skills, closing the
+    // GFT16/GFT8 collision. Callers binding an attacker-influenced skill should use
+    // THIS instead of the bare family+op result_binds_assign.
+    fn result_binds_assign_sized(assign_task_id: u32, result_task_id: u32, receipt_task: u32, assigned_skill: u32, receipt_family: u32, receipt_op: u32, receipt_width: u32) -> bool {
+        if (skill_width(assigned_skill) == receipt_width) {
+            return result_binds_assign(assign_task_id, result_task_id, receipt_task, assigned_skill, receipt_family, receipt_op);
+        } else {
+            return receipt_width != receipt_width;
+        }
+    }
+
+    // Rung-exact assignment binding: result_binds_assign_sized PLUS the receipt's
+    // committed rung Et equals the assigned skill's ratified Et. This is the ASSIGNMENT
+    // half of the end-to-end rung chain -- the receipt commits Et (tri_compute_receipt.
+    // receipt_leaf_gf_rung) and the dispute layer enforces it (tri_compute_challenge.
+    // resolve_full_rung); here the assignment commits which rung was directed, so a
+    // wrong-rung receipt fails to bind at ingress. skill_et 0 (binary / unknown skill)
+    // never equals a real GF-T receipt Et, so this is fail-closed on both sides.
+    fn result_binds_assign_rung(assign_task_id: u32, result_task_id: u32, receipt_task: u32, assigned_skill: u32, receipt_family: u32, receipt_op: u32, receipt_width: u32, receipt_et: u32) -> bool {
+        if (skill_et(assigned_skill) == receipt_et) {
+            return result_binds_assign_sized(assign_task_id, result_task_id, receipt_task, assigned_skill, receipt_family, receipt_op, receipt_width);
+        } else {
+            return receipt_et != receipt_et;
+        }
+    }
+
+    // The single result-admission gate at ingress: accept a taskResult iff it
+    // binds to its assignment (task + family + op via result_binds_assign), is
+    // FRESH (result_task_id beyond the settled watermark, no replay), AND the
+    // executor's reputation clears the floor (the can_admit rule from
+    // tri_compute_reputation, inlined `rep >= min_rep` to keep this module self-
+    // contained). One call the node uses instead of composing four checks and
+    // forgetting one -- the fully-bound entry to the ring.
+    fn admit_result(assign_task_id: u32, result_task_id: u32, receipt_task: u32, assigned_skill: u32, receipt_family: u32, receipt_op: u32, last_settled: u32, exec_rep: u32, min_rep: u32) -> bool {
+        if (result_task_id > last_settled) {
+            if (exec_rep >= min_rep) {
+                return result_binds_assign(assign_task_id, result_task_id, receipt_task, assigned_skill, receipt_family, receipt_op);
+            } else {
+                return exec_rep != exec_rep;
+            }
+        } else {
+            return result_task_id != result_task_id;
+        }
+    }
+
+    // Collateralized ingress: admit_result PLUS the node's bond must cover a minimum
+    // fraction of its OUTSTANDING escrowed value. A node can pass binding, freshness
+    // and reputation yet be under-collateralized for the value it already holds --
+    // a fixed bond is toothless once outstanding escrow dwarfs it (the multi-task
+    // skin-in-the-game hole). required = outstanding * min_bps / 10000 (u64-widened,
+    // mirroring tri_compute_bond.required_bond); a node under that gets no new work.
+    const A2A_BOND_BPS_UNIT: u32 = 10000;
+    fn admit_result_bonded(assign_task_id: u32, result_task_id: u32, receipt_task: u32, assigned_skill: u32, receipt_family: u32, receipt_op: u32, last_settled: u32, exec_rep: u32, min_rep: u32, bond: u32, outstanding: u32, min_bps: u32) -> bool {
+        let need: u64 = (outstanding as u64) * (min_bps as u64);
+        let required: u32 = (need / (A2A_BOND_BPS_UNIT as u64)) as u32;
+        if (bond >= required) {
+            return admit_result(assign_task_id, result_task_id, receipt_task, assigned_skill, receipt_family, receipt_op, last_settled, exec_rep, min_rep);
+        } else {
+            return bond != bond;
+        }
+    }
+
+    // The missing binding DIMENSION. An assignment is DIRECTED: MSG_TASK_ASSIGN
+    // reserves the task (and its escrow) for ONE executor, and the receipt leaf
+    // COMMITS which executor produced the output (tri_compute_receipt.receipt_leaf
+    // binds `executor`). result_binds_assign checks task/family/op but never that the
+    // committed executor IS the assigned one -- so a well-formed, fresh, reputable,
+    // bonded receipt from ANY OTHER hosted node clears ingress and collects the
+    // reward reserved for the assignee: a wrong-executor splice / assignment front-
+    // run, the identity analogue of the wrong-task splice. Bind it: committed ==
+    // assigned. (Authenticity -- that the committed executor actually SIGNED -- is
+    // the separate tri_node_identity.who_ok guard; this closes the ASSIGNMENT bind.)
+    fn executor_binds_assign(assigned_executor: u32, receipt_executor: u32) -> bool {
+        return assigned_executor == receipt_executor;
+    }
+
+    // Fully-authenticated ingress: admit_result_bonded (task/family/op binding,
+    // freshness, reputation, collateral) AND the receipt's committed executor is the
+    // ASSIGNED one. THIS is the complete entry gate the node uses. A result that
+    // binds its task, family and op, is fresh, reputable and bonded but was produced
+    // by a node OTHER than the assignee is rejected here -- closing the assignment
+    // front-run that every prior gate let through. The executor check never weakens
+    // the others; it is a strictly-additional AND.
+    fn admit_result_authentic(assign_task_id: u32, result_task_id: u32, receipt_task: u32, assigned_skill: u32, receipt_family: u32, receipt_op: u32, last_settled: u32, exec_rep: u32, min_rep: u32, bond: u32, outstanding: u32, min_bps: u32, assigned_executor: u32, receipt_executor: u32) -> bool {
+        if (assigned_executor == receipt_executor) {
+            return admit_result_bonded(assign_task_id, result_task_id, receipt_task, assigned_skill, receipt_family, receipt_op, last_settled, exec_rep, min_rep, bond, outstanding, min_bps);
+        } else {
+            return assigned_executor != assigned_executor;
+        }
+    }
+
+    // executor_binds_assign / admit_result_authentic stop HONEST misrouting, but by
+    // themselves they are FORGEABLE: the assignee id is PUBLIC (it rides in the
+    // MSG_TASK_ASSIGN), so an attacker just sets receipt_executor = assigned_executor
+    // and forges the rest -- the committed executor is self-reported. The binding only
+    // bites once that executor is AUTHENTIC: a valid signature AND the committed
+    // executor equals the commitment to the SIGNING pubkey (tri_node_identity:
+    // executor_id = low32(SHA-256(pubkey)), recomputed by the verifier from the key).
+    // A forger can NAME the assignee but cannot also produce a signature whose key
+    // hashes to it. This mirrors tri_node_identity.who_ok, inlined to keep the module
+    // self-contained exactly as can_admit's rep-floor is inlined above.
+    fn executor_authentic(assigned_executor: u32, receipt_executor: u32, sig_ok: u32, hashed_pubkey_lo: u32) -> bool {
+        if (assigned_executor == receipt_executor) {
+            if (sig_ok == 1) {
+                return receipt_executor == hashed_pubkey_lo;
+            } else {
+                return sig_ok != sig_ok;
+            }
+        } else {
+            return assigned_executor != assigned_executor;
+        }
+    }
+
+    // Signature-authenticated ingress: admit_result_bonded (task/family/op, freshness,
+    // reputation, collateral) AND executor_authentic (assigned == committed == signer's
+    // key commitment, with a valid signature). THIS is the strongest entry gate -- it
+    // closes both the honest wrong-executor splice AND the forged-executor front-run
+    // that admit_result_authentic still let through. A result with no valid signature,
+    // or whose signer key does not hash to the committed executor, is rejected even
+    // when task/family/op/freshness/reputation/bond all pass. The executor_authentic
+    // logic is inlined here (nested comparisons) rather than branched-on as a bool
+    // call, keeping the generated Rust a plain comparison chain.
+    fn admit_result_signed(assign_task_id: u32, result_task_id: u32, receipt_task: u32, assigned_skill: u32, receipt_family: u32, receipt_op: u32, last_settled: u32, exec_rep: u32, min_rep: u32, bond: u32, outstanding: u32, min_bps: u32, assigned_executor: u32, receipt_executor: u32, sig_ok: u32, hashed_pubkey_lo: u32) -> bool {
+        if (assigned_executor == receipt_executor) {
+            if (sig_ok == 1) {
+                if (receipt_executor == hashed_pubkey_lo) {
+                    return admit_result_bonded(assign_task_id, result_task_id, receipt_task, assigned_skill, receipt_family, receipt_op, last_settled, exec_rep, min_rep, bond, outstanding, min_bps);
+                } else {
+                    return receipt_executor != receipt_executor;
+                }
+            } else {
+                return sig_ok != sig_ok;
+            }
+        } else {
+            return assigned_executor != assigned_executor;
+        }
+    }
+
+    // The COMPLETE ingress gate: admit_result_signed AND the receipt's committed width
+    // equals the assigned skill's. admit_result_signed binds task/family/op/freshness/
+    // reputation/collateral/executor-authenticity, but its inner result_binds_assign is
+    // width-blind, so a GFT8 receipt still clears the full gate for a GFT16 assignment
+    // (the precision downgrade result_binds_assign_sized closes at the binding layer).
+    // Wrap the width check on top so the node's single entry point rejects it too. This
+    // is the gate the ring should call; receipt_width is tri_compute_receipt gf_width.
+    fn admit_result_signed_sized(assign_task_id: u32, result_task_id: u32, receipt_task: u32, assigned_skill: u32, receipt_family: u32, receipt_op: u32, last_settled: u32, exec_rep: u32, min_rep: u32, bond: u32, outstanding: u32, min_bps: u32, assigned_executor: u32, receipt_executor: u32, sig_ok: u32, hashed_pubkey_lo: u32, receipt_width: u32) -> bool {
+        if (skill_width(assigned_skill) == receipt_width) {
+            return admit_result_signed(assign_task_id, result_task_id, receipt_task, assigned_skill, receipt_family, receipt_op, last_settled, exec_rep, min_rep, bond, outstanding, min_bps, assigned_executor, receipt_executor, sig_ok, hashed_pubkey_lo);
+        } else {
+            return receipt_width != receipt_width;
+        }
+    }
+
+    // ---- Tests / invariants ----
+
+    // A2A is demultiplexed by PORT on KIND_DATA -- not by the (ciphertext) payload.
+    test demux_by_port_not_payload {
+        assert(is_a2a(KIND_DATA, A2A_PORT) == true, "DATA on the A2A port is A2A");
+        assert(is_a2a(0, A2A_PORT) == false, "HELLO is not A2A even on the port");
+        assert(is_a2a(KIND_DATA, 0x1234) == false, "DATA on another port is not A2A");
+    }
+
+    // skill_et is the assignment-side rung SSOT: each hosted GF-T skill maps to its
+    // ratified ladder Et; binary and unknown skills fail closed at 0.
+    test skill_et_is_the_ratified_rung {
+        assert(skill_et(SKILL_GFT16_MUL) == 4, "GF-T16 skill -> Et 4");
+        assert(skill_et(SKILL_GFT16_ADD) == 4, "GF-T16 add skill -> Et 4");
+        assert(skill_et(SKILL_GFT8_MUL) == 3, "GF-T8 skill -> Et 3");
+        assert(skill_et(SKILL_GF16_MUL) == 0, "binary GF16 skill has no ternary Et");
+        assert(skill_et(0xDEADBEEF) == 0, "an unknown skill is fail-closed at Et 0");
+    }
+
+    // The assignment binds the exact RUNG: a GF-T16 assignment (Et4) accepts only a
+    // receipt committing Et4; a receipt committing a different rung's Et (e.g. GF-T32's
+    // 6 or a fail-closed 0) does not bind at ingress. Closes the rung chain on the
+    // assignment side, matching receipt_leaf_gf_rung (#216) and resolve_full_rung (#218).
+    test assignment_binds_the_exact_rung {
+        assert(result_binds_assign_rung(7, 7, 7, SKILL_GFT16_MUL, FMT_GFT, 0x11, 16, 4) == true,
+            "GF-T16 assignment + Et4/width16/GFT receipt binds");
+        assert(result_binds_assign_rung(7, 7, 7, SKILL_GFT16_MUL, FMT_GFT, 0x11, 16, 6) == false,
+            "a GF-T32-rung (Et6) receipt does NOT bind a GF-T16 assignment");
+        assert(result_binds_assign_rung(7, 7, 7, SKILL_GFT8_MUL, FMT_GFT, 0x11, 8, 3) == true,
+            "GF-T8 assignment + Et3/width8 receipt binds");
+        assert(result_binds_assign_rung(7, 7, 7, SKILL_GFT8_MUL, FMT_GFT, 0x11, 8, 4) == false,
+            "a GF-T16-rung (Et4) receipt does NOT bind a GF-T8 assignment (precision upgrade rejected)");
+    }
+
+    // GF-T32 is now a hosted rung: it has full silicon (gft_mul32/dot/tile) and ratified
+    // geometry, so the assignment layer can direct GF-T32 work with the correct
+    // width/family/op/Et and bind its receipt exactly.
+    test gft32_is_a_hosted_rung {
+        assert(is_hosted_skill(SKILL_GFT32_MUL) == 1, "GF-T32 mul is hosted");
+        assert(is_gft_skill(SKILL_GFT32_ADD) == true, "GF-T32 add is a GF-T (ternary) skill");
+        assert(is_gf_skill(SKILL_GFT32_MUL) == false, "GF-T32 is not a binary GF skill");
+        assert(skill_family(SKILL_GFT32_MUL) == FMT_GFT, "GF-T32 family is FMT_GFT");
+        assert(skill_width(SKILL_GFT32_MUL) == 32, "GF-T32 width 32");
+        assert(skill_op(SKILL_GFT32_MUL) == 0x11, "GF-T32 mul -> op 0x11");
+        assert(skill_op(SKILL_GFT32_ADD) == 0x10, "GF-T32 add -> op 0x10");
+        assert(skill_et(SKILL_GFT32_MUL) == 6, "GF-T32 rung Et 6 (ratified golden rule)");
+        // End-to-end assignment bind for a real GF-T32 task: width 32 + Et6 + GFT family + mul op.
+        assert(result_binds_assign_rung(9, 9, 9, SKILL_GFT32_MUL, FMT_GFT, 0x11, 32, 6) == true,
+            "GF-T32 assignment binds a GF-T32 receipt (width32, Et6)");
+        assert(result_binds_assign_rung(9, 9, 9, SKILL_GFT32_MUL, FMT_GFT, 0x11, 16, 4) == false,
+            "a GF-T16 receipt does NOT bind a GF-T32 assignment (precision downgrade rejected)");
+    }
+
+    // GF-T64 (full silicon: mul64/add64/dot2/dot4/tile) and GF-T128 (spec rung) are hosted
+    // too, so the whole ladder GF-T8..128 is directable end-to-end with correct geometry.
+    test gft64_gft128_are_hosted_rungs {
+        assert(is_hosted_skill(SKILL_GFT64_MUL) == 1, "GF-T64 mul is hosted");
+        assert(is_hosted_skill(SKILL_GFT128_ADD) == 1, "GF-T128 add is hosted");
+        assert(skill_family(SKILL_GFT64_MUL) == FMT_GFT, "GF-T64 family FMT_GFT");
+        assert(skill_family(SKILL_GFT128_MUL) == FMT_GFT, "GF-T128 family FMT_GFT");
+        assert(skill_width(SKILL_GFT64_MUL) == 64, "GF-T64 width 64");
+        assert(skill_width(SKILL_GFT128_MUL) == 128, "GF-T128 width 128");
+        assert(skill_et(SKILL_GFT64_MUL) == 9, "GF-T64 Et9");
+        assert(skill_et(SKILL_GFT128_MUL) == 14, "GF-T128 Et14");
+        assert(skill_op(SKILL_GFT64_ADD) == 0x10, "GF-T64 add -> op 0x10");
+        // End-to-end rung bind at the wide rungs.
+        assert(result_binds_assign_rung(11, 11, 11, SKILL_GFT64_MUL, FMT_GFT, 0x11, 64, 9) == true,
+            "GF-T64 assignment binds a GF-T64 receipt (width64, Et9)");
+        assert(result_binds_assign_rung(11, 11, 11, SKILL_GFT64_MUL, FMT_GFT, 0x11, 32, 6) == false,
+            "a GF-T32 receipt does NOT bind a GF-T64 assignment");
+        // The family/rung floor still holds: an unknown skill is not hosted and has Et 0.
+        assert(is_hosted_skill(0xBADC0DE) == 0, "unknown skill not hosted");
+        assert(skill_et(0xBADC0DE) == 0, "unknown skill fail-closed Et 0");
+    }
+
+    // GF-T4 is the BOTTOM rung: it now has silicon (gft_mul4) and is hosted, so the whole
+    // ladder GF-T4..128 is assignable. Et2 / width 4 -- the ternary-native rung.
+    test gft4_is_the_bottom_hosted_rung {
+        assert(is_hosted_skill(SKILL_GFT4_MUL) == 1, "GF-T4 mul is hosted");
+        assert(is_gft_skill(SKILL_GFT4_ADD) == true, "GF-T4 add is a GF-T (ternary) skill");
+        assert(skill_family(SKILL_GFT4_MUL) == FMT_GFT, "GF-T4 family FMT_GFT");
+        assert(skill_width(SKILL_GFT4_MUL) == 4, "GF-T4 width 4");
+        assert(skill_op(SKILL_GFT4_MUL) == 0x11, "GF-T4 mul -> op 0x11");
+        assert(skill_et(SKILL_GFT4_MUL) == 2, "GF-T4 rung Et2 (bottom of the ladder)");
+        // End-to-end assignment bind for a GF-T4 task: width 4 + Et2 + GFT + mul op.
+        assert(result_binds_assign_rung(3, 3, 3, SKILL_GFT4_MUL, FMT_GFT, 0x11, 4, 2) == true,
+            "GF-T4 assignment binds a GF-T4 receipt (width4, Et2)");
+        assert(result_binds_assign_rung(3, 3, 3, SKILL_GFT4_MUL, FMT_GFT, 0x11, 8, 3) == false,
+            "a GF-T8 receipt does NOT bind a GF-T4 assignment (precision upgrade rejected)");
+    }
+
+    // Receipt travels only with a result, never with an assignment or heartbeat.
+    test only_result_carries_receipt {
+        assert(carries_receipt(MSG_TASK_RESULT) == true, "taskResult carries a receipt");
+        assert(carries_receipt(MSG_TASK_ASSIGN) == false, "taskAssign carries no receipt");
+        assert(carries_receipt(MSG_HEARTBEAT) == false, "heartbeat carries no receipt");
+    }
+
+    // The advertised/executed skill is a GoldenFloat op (the workload GF exists for).
+    test skill_is_goldenfloat {
+        assert(is_gf_skill(SKILL_GF16_MUL) == true, "GF16 mul is a hosted skill");
+        assert(is_gf_skill(SKILL_GF16_ADD) == true, "GF16 add is a hosted skill");
+        assert(is_gft_skill(SKILL_GFT16_MUL) == true, "GF-T16 mul is a hosted skill");
+        assert(is_gft_skill(SKILL_GFT8_ADD) == true, "GF-T8 add is a hosted skill");
+        assert(is_gft_skill(SKILL_GF16_MUL) == false, "binary GF16 is NOT a GF-T skill (family distinct)");
+        assert(is_gf_skill(SKILL_GFT16_MUL) == false, "GF-T16 is NOT a binary GF skill");
+        // skill op suffix agrees with receipt GF_MUL(0x11)/GF_ADD(0x10), both families
+        assert(skill_op(SKILL_GF16_MUL) == 0x11, "GF16 mul skill -> receipt op 0x11");
+        assert(skill_op(SKILL_GF16_ADD) == 0x10, "GF16 add skill -> receipt op 0x10");
+        assert(skill_op(SKILL_GFT16_MUL) == 0x11, "GF-T16 mul skill -> same op 0x11");
+        assert(skill_op(SKILL_GFT8_ADD) == 0x10, "GF-T8 add skill -> op 0x10");
+        assert(is_gf_skill(0xDEAD) == false, "a non-GF skill is rejected");
+    }
+
+    // A result is bound to its assignment by task_id AND by the receipt's task.
+    test result_binds_to_assign {
+        assert(result_matches_assign(0x777, 0x777, 0x777) == true, "matching id + receipt binds");
+        assert(result_matches_assign(0x777, 0x888, 0x777) == false, "wrong result task_id rejected");
+        assert(result_matches_assign(0x777, 0x777, 0x999) == false, "receipt for another task rejected");
+    }
+
+    // The op gate: an assigned mul must not settle an add receipt (0x11 vs 0x10).
+    test op_must_match_the_skill {
+        assert(op_matches(SKILL_GF16_MUL, 0x11) == true, "mul skill + mul receipt op agree");
+        assert(op_matches(SKILL_GF16_MUL, 0x10) == false, "mul assignment must NOT accept an add receipt");
+        assert(op_matches(SKILL_GFT8_ADD, 0x10) == true, "GF-T8 add skill + add op agree");
+        assert(op_matches(SKILL_GFT8_ADD, 0x11) == false, "add assignment must NOT accept a mul receipt");
+    }
+
+    // The composed gate rejects if ANY of task / family / op is wrong. GF16 MUL
+    // assignment for task 0x777, binary family (0), op 0x11.
+    test composed_binding_gate {
+        assert(result_binds_assign(0x777, 0x777, 0x777, SKILL_GF16_MUL, 0, 0x11) == true, "all four bind -> valid");
+        assert(result_binds_assign(0x777, 0x888, 0x777, SKILL_GF16_MUL, 0, 0x11) == false, "wrong result id -> reject");
+        assert(result_binds_assign(0x777, 0x777, 0x999, SKILL_GF16_MUL, 0, 0x11) == false, "receipt for another task -> reject");
+        assert(result_binds_assign(0x777, 0x777, 0x777, SKILL_GF16_MUL, 1, 0x11) == false, "GF-T receipt for a binary skill -> reject");
+        assert(result_binds_assign(0x777, 0x777, 0x777, SKILL_GF16_MUL, 0, 0x10) == false, "add receipt for a mul assignment -> reject");
+    }
+
+    // The family+op proxy collides GFT16 and GFT8 (same family FMT_GFT, same op 0x11).
+    // result_binds_assign accepts a GFT8 receipt for a GFT16 assignment -- the silent
+    // precision downgrade -- while result_binds_assign_sized rejects it on width.
+    test width_binds_the_exact_skill {
+        assert(skill_width(SKILL_GFT16_MUL) == 16, "GFT16 is width 16");
+        assert(skill_width(SKILL_GFT8_MUL) == 8, "GFT8 is width 8");
+        assert(skill_width(SKILL_GF16_MUL) == 16, "GF16 is width 16");
+        // THE hole: family (1=FMT_GFT) and op (0x11) match, so the bare gate binds.
+        assert(result_binds_assign(0x777, 0x777, 0x777, SKILL_GFT16_MUL, 1, 0x11) == true, "GFT16 assignment + GFT-family mul receipt binds on family+op");
+        // The sized gate rejects a width-8 (GFT8) receipt for a GFT16 assignment.
+        assert(result_binds_assign_sized(0x777, 0x777, 0x777, SKILL_GFT16_MUL, 1, 0x11, 8) == false, "GFT8 (width 8) receipt for a GFT16 assignment -> reject (precision downgrade closed)");
+        // A width-16 receipt for the GFT16 assignment binds.
+        assert(result_binds_assign_sized(0x777, 0x777, 0x777, SKILL_GFT16_MUL, 1, 0x11, 16) == true, "matching width 16 -> binds");
+        // And a GFT8 assignment correctly takes a width-8 receipt.
+        assert(result_binds_assign_sized(0x777, 0x777, 0x777, SKILL_GFT8_MUL, 1, 0x11, 8) == true, "GFT8 assignment + width-8 receipt -> binds");
+        assert(result_binds_assign_sized(0x777, 0x777, 0x777, SKILL_GFT8_MUL, 1, 0x11, 16) == false, "a width-16 receipt for a GFT8 assignment -> reject");
+    }
+
+    // The unified ingress gate: a fully-bound, fresh result from an admissible
+    // executor is accepted; failing freshness, reputation, or ANY binding rejects.
+    // GF16 MUL, task 0x777, binary family 0, op 0x11, watermark 0x100, floor 50.
+    test admit_result_gate {
+        assert(admit_result(0x777, 0x777, 0x777, SKILL_GF16_MUL, 0, 0x11, 0x100, 100, 50) == true, "bound + fresh + admissible -> accept");
+        assert(admit_result(0x777, 0x100, 0x100, SKILL_GF16_MUL, 0, 0x11, 0x100, 100, 50) == false, "stale (id == watermark) -> reject");
+        assert(admit_result(0x777, 0x777, 0x777, SKILL_GF16_MUL, 0, 0x11, 0x100, 40, 50) == false, "executor below the reputation floor -> reject");
+        assert(admit_result(0x777, 0x777, 0x777, SKILL_GF16_MUL, 0, 0x10, 0x100, 100, 50) == false, "wrong op (add receipt) -> reject");
+        assert(admit_result(0x777, 0x777, 0x777, SKILL_GF16_MUL, 1, 0x11, 0x100, 100, 50) == false, "cross-family receipt -> reject");
+        assert(admit_result(0x777, 0x888, 0x888, SKILL_GF16_MUL, 0, 0x11, 0x100, 100, 50) == false, "wrong task id -> reject");
+    }
+
+    // Collateralized ingress: a fully-bound, fresh, reputable result is admitted
+    // ONLY if the bond also covers the outstanding escrow risk. Same base result
+    // (GF16 MUL, task 0x777, family 0, op 0x11, watermark 0x100, floor 50);
+    // outstanding 10000 at 20% needs a 2000 bond.
+    test admit_result_bonded_gate {
+        assert(admit_result_bonded(0x777, 0x777, 0x777, SKILL_GF16_MUL, 0, 0x11, 0x100, 100, 50, 2000, 10000, 2000) == true, "bond 2000 covers 20% of 10000 -> admitted");
+        assert(admit_result_bonded(0x777, 0x777, 0x777, SKILL_GF16_MUL, 0, 0x11, 0x100, 100, 50, 1999, 10000, 2000) == false, "bond 1999 is one short of the 2000 required -> rejected");
+        assert(admit_result_bonded(0x777, 0x777, 0x777, SKILL_GF16_MUL, 0, 0x11, 0x100, 100, 50, 1, 10000, 2000) == false, "a nominal bond does NOT cover 10000 outstanding -> rejected");
+        assert(admit_result_bonded(0x777, 0x777, 0x777, SKILL_GF16_MUL, 0, 0x11, 0x100, 100, 50, 5000, 0, 2000) == true, "no outstanding risk needs no bond -> admitted");
+        // A well-collateralized node still fails on ANY other ingress check.
+        assert(admit_result_bonded(0x777, 0x777, 0x777, SKILL_GF16_MUL, 0, 0x10, 0x100, 100, 50, 999999, 10000, 2000) == false, "over-collateralized but wrong op -> still rejected");
+        assert(admit_result_bonded(0x777, 0x100, 0x100, SKILL_GF16_MUL, 0, 0x11, 0x100, 100, 50, 999999, 10000, 2000) == false, "over-collateralized but stale -> still rejected");
+    }
+
+    // Monotonic freshness rejects replayed / stale results.
+    test freshness_blocks_replay {
+        assert(is_fresh(0x10, 0x0F) == true, "newer task_id is fresh");
+        assert(is_fresh(0x0F, 0x0F) == false, "replayed task_id rejected");
+        assert(is_fresh(0x0E, 0x0F) == false, "older task_id rejected");
+        assert(next_watermark(0x10, 0x0F) == 0x10, "watermark advances on fresh");
+        assert(next_watermark(0x0E, 0x0F) == 0x0F, "watermark holds on stale");
+    }
+
+    // is_hosted_skill recognizes exactly the six known skills; everything else,
+    // including a GF-T-looking unenumerated id, is NOT hosted.
+    test hosted_skill_set {
+        assert(is_hosted_skill(SKILL_GF16_MUL) == 1, "GF16 mul is hosted");
+        assert(is_hosted_skill(SKILL_GFT8_ADD) == 1, "GF-T8 add is hosted");
+        assert(is_hosted_skill(0xA412) == 0, "a GF-T4-looking id (0xA412) is NOT hosted");
+        assert(is_hosted_skill(0xA512) == 0, "a GF-T32-looking id with an unknown op is NOT hosted");
+        assert(is_hosted_skill(0xDEAD) == 0, "garbage skill is NOT hosted");
+    }
+
+    // The misclassification the strict gate closes: skill_family DEFAULTS an
+    // unenumerated GF-T skill to binary, but family_matches_strict rejects it
+    // because it is not hosted -- so it can never accept a binary receipt.
+    test strict_family_rejects_unhosted {
+        assert(skill_family(0xA412) == FMT_GF_BINARY, "skill_family WRONGLY defaults the GF-T4-looking id to binary");
+        assert(family_matches(0xA412, FMT_GF_BINARY) == true, "the bare gate would accept a binary receipt for it (the bug)");
+        assert(family_matches_strict(0xA412, FMT_GF_BINARY) == false, "strict rejects the unhosted skill -> no wrong-family receipt");
+        // hosted skills behave exactly like the bare gate.
+        assert(family_matches_strict(SKILL_GFT16_MUL, FMT_GFT) == true, "hosted GF-T skill + GF-T receipt matches");
+        assert(family_matches_strict(SKILL_GF16_MUL, FMT_GF_BINARY) == true, "hosted binary skill + binary receipt matches");
+        assert(family_matches_strict(SKILL_GFT16_MUL, FMT_GF_BINARY) == false, "hosted GF-T skill + binary receipt rejected");
+    }
+
+    // The strict hosting check is now WIRED into the ingress path: result_binds_
+    // assign (and admit_result through it) rejects an unhosted skill even when
+    // task, family (binary by default) and op would otherwise line up.
+    test ingress_rejects_unhosted_skill {
+        // A GF-T4-looking id 0xA412: op suffix 0x12, skill_family defaults binary.
+        // Everything lines up under the OLD bare check, but the skill is not hosted.
+        assert(result_binds_assign(0x777, 0x777, 0x777, 0xA412, FMT_GF_BINARY, 0x12) == false, "unhosted skill -> result does not bind");
+        // A genuine hosted skill still binds.
+        assert(result_binds_assign(0x777, 0x777, 0x777, SKILL_GF16_MUL, FMT_GF_BINARY, 0x11) == true, "hosted skill still binds");
+        // End-to-end at ingress: admit_result rejects the unhosted skill.
+        assert(admit_result(0x777, 0x777, 0x777, 0xA412, FMT_GF_BINARY, 0x12, 0x100, 100, 50) == false, "admit_result rejects an unhosted skill");
+        assert(admit_result(0x777, 0x777, 0x777, SKILL_GF16_MUL, FMT_GF_BINARY, 0x11, 0x100, 100, 50) == true, "admit_result still admits a hosted skill");
+    }
+
+    // The settled-gated watermark advances only on a committed settlement, so a
+    // fresh-but-rejected result cannot jump the mark (the task-level DoS guard).
+    test watermark_advances_only_when_settled {
+        assert(next_watermark_settled(0x20, 0x10, 1) == 0x20, "settled + fresh -> advance");
+        assert(next_watermark_settled(0x0E, 0x10, 1) == 0x10, "settled + stale -> hold");
+        // Unsettled (rejected) result does NOT advance, even a huge task_id.
+        assert(next_watermark_settled(0xFFFFFFFF, 0x10, 0) == 0x10, "unsettled high id does NOT jump the watermark");
+        // Griefing property: after a griefer's unsettled huge id, a legitimate low
+        // id is still fresh (watermark stayed at 0x10).
+        w = next_watermark_settled(0xFFFFFFFF, 0x10, 0);
+        assert(is_fresh(0x11, w) == true, "epoch 0x11 stays fresh -- the griefer could not block it");
+        // Regression: the settled path matches the bare next_watermark.
+        assert(next_watermark_settled(0x20, 0x10, 1) == next_watermark(0x20, 0x10), "settled advance == bare watermark");
+    }
+
+    // Executor-identity binding closes the assignment front-run. A result committing
+    // the ASSIGNED executor is admitted; a fully-valid result (same task/family/op,
+    // fresh, reputable, bonded) from ANY OTHER executor is rejected. Base result:
+    // GF16 MUL, task 0x777, family 0, op 0x11, watermark 0x100, rep 100/floor 50,
+    // bond 2000 covering 20% (2000 bps) of 10000 outstanding; assignee 0xE1.
+    test executor_binds_the_assignment {
+        assert(executor_binds_assign(0xE1, 0xE1) == true, "committed executor == assigned -> binds");
+        assert(executor_binds_assign(0xE1, 0xE2) == false, "a different executor does not bind");
+        assert(admit_result_authentic(0x777, 0x777, 0x777, SKILL_GF16_MUL, 0, 0x11, 0x100, 100, 50, 2000, 10000, 2000, 0xE1, 0xE1) == true, "assignee's own result -> accept");
+        assert(admit_result_authentic(0x777, 0x777, 0x777, SKILL_GF16_MUL, 0, 0x11, 0x100, 100, 50, 2000, 10000, 2000, 0xE1, 0xE2) == false, "another node's result for the assigned task -> reject (front-run closed)");
+        // The executor gate is an ADDITIONAL AND: it never rescues a result that the
+        // prior gates reject. Correct assignee but stale still rejects.
+        assert(admit_result_authentic(0x777, 0x100, 0x100, SKILL_GF16_MUL, 0, 0x11, 0x100, 100, 50, 2000, 10000, 2000, 0xE1, 0xE1) == false, "correct executor but stale -> still reject");
+        // ...and under-bonded still rejects even for the right executor.
+        assert(admit_result_authentic(0x777, 0x777, 0x777, SKILL_GF16_MUL, 0, 0x11, 0x100, 100, 50, 1999, 10000, 2000, 0xE1, 0xE1) == false, "correct executor but under-collateralized -> still reject");
+    }
+
+    // Signature authenticity closes the FORGEABLE front-run. The assignee id 0xE1 is
+    // public, so admit_result_authentic accepts any receipt that merely names it.
+    // executor_authentic additionally requires a valid signature whose key hashes to
+    // the committed executor (hashed_pubkey_lo). Base valid result as above; the honest
+    // assignee 0xE1 signs with a key that hashes to 0xE1.
+    test signature_authenticates_the_executor {
+        assert(executor_authentic(0xE1, 0xE1, 1, 0xE1) == true, "assigned + signed + key hashes to executor -> authentic");
+        assert(executor_authentic(0xE1, 0xE1, 0, 0xE1) == false, "no valid signature (forger without the key) -> not authentic");
+        assert(executor_authentic(0xE1, 0xE1, 1, 0xBB) == false, "valid sig but signer key hashes to 0xBB != committed 0xE1 -> not authentic");
+        assert(executor_authentic(0xE1, 0xE2, 1, 0xE2) == false, "a different (even authentic) executor is not the assignee");
+        // Full gate: honest assignee accepted.
+        assert(admit_result_signed(0x777, 0x777, 0x777, SKILL_GF16_MUL, 0, 0x11, 0x100, 100, 50, 2000, 10000, 2000, 0xE1, 0xE1, 1, 0xE1) == true, "authentic assignee result -> accept");
+        // The forge admit_result_authentic missed: a receipt NAMING the assignee but
+        // with no valid signature is admitted by the authentic gate, rejected here.
+        assert(admit_result_signed(0x777, 0x777, 0x777, SKILL_GF16_MUL, 0, 0x11, 0x100, 100, 50, 2000, 10000, 2000, 0xE1, 0xE1, 0, 0xE1) == false, "unsigned forge naming the assignee -> reject (the hole closed)");
+        // Valid signature but from the WRONG key (identity mismatch) -> reject.
+        assert(admit_result_signed(0x777, 0x777, 0x777, SKILL_GF16_MUL, 0, 0x11, 0x100, 100, 50, 2000, 10000, 2000, 0xE1, 0xE1, 1, 0xBB) == false, "signed by a key that is not the committed executor -> reject");
+        // Additive: authentic but stale still rejects (never rescues prior gates).
+        assert(admit_result_signed(0x777, 0x100, 0x100, SKILL_GF16_MUL, 0, 0x11, 0x100, 100, 50, 2000, 10000, 2000, 0xE1, 0xE1, 1, 0xE1) == false, "authentic but stale -> still reject");
+    }
+
+    // The COMPLETE ingress gate rejects the precision downgrade too: a fully authentic
+    // GFT16 result (bound, fresh, reputable, bonded, signed) with a GFT8-width receipt
+    // clears the width-blind admit_result_signed but is rejected by the sized gate.
+    test full_ingress_rejects_precision_downgrade {
+        assert(admit_result_signed_sized(0x777, 0x777, 0x777, SKILL_GFT16_MUL, FMT_GFT, 0x11, 0x100, 100, 50, 2000, 10000, 2000, 0xE1, 0xE1, 1, 0xE1, 16) == true, "authentic GFT16 result at width 16 -> admitted");
+        // The hole: the width-blind gate admits regardless of the receipt's width.
+        assert(admit_result_signed(0x777, 0x777, 0x777, SKILL_GFT16_MUL, FMT_GFT, 0x11, 0x100, 100, 50, 2000, 10000, 2000, 0xE1, 0xE1, 1, 0xE1) == true, "admit_result_signed admits the GFT16 assignment, width unchecked");
+        // The sized gate rejects a GFT8 (width 8) downgrade at the full ingress.
+        assert(admit_result_signed_sized(0x777, 0x777, 0x777, SKILL_GFT16_MUL, FMT_GFT, 0x11, 0x100, 100, 50, 2000, 10000, 2000, 0xE1, 0xE1, 1, 0xE1, 8) == false, "GFT8-width receipt for a GFT16 assignment -> rejected at ingress (downgrade closed)");
+        // Never rescues a prior-gate failure: right width but stale still rejects.
+        assert(admit_result_signed_sized(0x777, 0x100, 0x100, SKILL_GFT16_MUL, FMT_GFT, 0x11, 0x100, 100, 50, 2000, 10000, 2000, 0xE1, 0xE1, 1, 0xE1, 16) == false, "right width but stale -> still reject");
+    }
+}

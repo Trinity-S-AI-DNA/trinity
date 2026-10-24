@@ -1,0 +1,282 @@
+// SPDX-License-Identifier: Apache-2.0
+// Port of gHashTag/BrowserOS:trios/agent-server/apps/server/src/api/routes/queen-needs-you.ts
+// as of c25e1b0278a6 (issue #5026).
+//
+// GET / serves the Queen's escalations that need a person: the issue
+// number, attempts, hours waiting and the recorded reason. It also serves the
+// latest 20 queen_report headlines. Any failure gives the same 503 sentence.
+// outstandingEscalations counts the escalations that are still unresolved, so
+// the tick asks the same question as the route.
+//
+// What is ported, and what is not:
+// - createQueenNeedsYouRoute builds a Hono app, opens a Postgres pool, runs
+//   two queries, logs and closes the pool. That is plumbing, so it keeps its
+//   name with an `undefined;` body that no test calls. Each decision it makes
+//   is a pure helper below:
+//     resolve_database_url  deps.databaseUrl ?? (QUEEN_LEASE_DATABASE_URL ?? DATABASE_URL)
+//     url_usable            `if (!url)` -> 503 (an empty string is refused too)
+//     waiting_of            one escalation row -> { issue, attempts, hoursWaiting, reason }
+//     hours_waiting         Math.round(Number(age_hours ?? 0) * 10) / 10
+//     reason_of             a falsy note -> null, else the first REASON_MAX chars
+//     summarize             waitingCount, oldestHours (first row, or 0), needsYou
+//     headline_of           String(headline ?? '').slice(0, 200)
+//     report_needs_you      Boolean(needs_you)
+//   The SQL text is kept verbatim as constants. ESCALATIONS_SQL decides which
+//   rows count and their order (oldest finished first), so oldestHours reads row 0.
+// - outstandingEscalations runs one count query: plumbing, `undefined;`.
+//   Number(result.rows[0]?.n ?? 0) is outstanding_from.
+// - String.slice counts UTF-16 code units. Here it counts bytes, which is the
+//   same for ASCII text. Number(row.issue) and Number(row.send_backs) arrive as
+//   integers (pg returns int columns as numbers).
+module queen_needs_you {
+    pub const UNAVAILABLE: str = "Queen escalations are unavailable";
+    pub const UNAVAILABLE_STATUS: u16 = 503;
+    pub const REASON_MAX: usize = 400;
+    pub const REPORT_LIMIT: usize = 20;
+    pub const HEADLINE_MAX: usize = 200;
+
+    pub const ESCALATIONS_SQL: str = "\n  SELECT d.issue,\n         d.review_note,\n         d.send_backs,\n         EXTRACT(EPOCH FROM (now() - d.finished_at)) / 3600 AS age_hours\n    FROM queen_dispatch d\n   WHERE d.review_state = 'escalate'\n     AND d.finished_at IS NOT NULL\n   ORDER BY d.finished_at ASC\n";
+    pub const REPORTS_SQL: str = "\n  SELECT id, at, headline, needs_you\n    FROM queen_report\n   ORDER BY at DESC\n   LIMIT $1\n";
+    pub const OUTSTANDING_SQL: str = "SELECT count(*)::int AS n FROM queen_dispatch WHERE review_state = 'escalate'";
+
+    pub struct EscalationRow {
+        issue: i64,
+        review_note: ?str,
+        send_backs: ?i64,
+        age_hours: ?f64,
+    }
+
+    pub struct Waiting {
+        issue: i64,
+        attempts: i64,
+        hours_waiting: f64,
+        reason: ?str,
+    }
+
+    pub struct Summary {
+        waiting_count: usize,
+        oldest_hours: f64,
+        needs_you: bool,
+    }
+
+    // ---- the database URL ----
+
+    // The default deps.databaseUrl: process.env.QUEEN_LEASE_DATABASE_URL ?? process.env.DATABASE_URL.
+    // `??` only skips an absent value; an empty string is kept.
+    pub fn resolve_database_url(lease_url: ?str, database_url: ?str) -> ?str {
+        if (lease_url != null) {
+            return lease_url;
+        }
+        return database_url;
+    }
+
+    // `if (!url) return c.json({ error: UNAVAILABLE }, 503)`
+    pub fn url_usable(url: ?str) -> bool {
+        if (url == null) {
+            return false;
+        }
+        return url.?.len > 0;
+    }
+
+    // ---- one escalation row ----
+
+    // floor(y), for |y| < 2^63.
+    fn floor_f64(y: f64) -> f64 {
+        var t: i64 = y as i64;
+        if (t as f64 > y) {
+            t -= 1;
+        }
+        return t as f64;
+    }
+
+    // Math.round as ECMA-262 defines it: the nearest integer, a half going
+    // toward +Infinity. floor(y + 0.5) is wrong when y + 0.5 rounds up in f64.
+    fn js_round(y: f64) -> f64 {
+        const f = floor_f64(y);
+        if (y - f >= 0.5) {
+            return f + 1.0;
+        }
+        return f;
+    }
+
+    // hoursWaiting: Math.round(Number(row.age_hours ?? 0) * 10) / 10
+    pub fn hours_waiting(age_hours: ?f64) -> f64 {
+        var age: f64 = 0.0;
+        if (age_hours != null) {
+            age = age_hours.?;
+        }
+        return js_round(age * 10.0) / 10.0;
+    }
+
+    // reason: row.review_note ? String(row.review_note).slice(0, REASON_MAX) : null
+    pub fn reason_of(note: ?str) -> ?str {
+        if (note == null) {
+            return null;
+        }
+        const s = note.?;
+        if (s.len == 0) {
+            return null;
+        }
+        if (s.len > REASON_MAX) {
+            return s[0:REASON_MAX];
+        }
+        return s;
+    }
+
+    pub fn attempts_of(send_backs: ?i64) -> i64 {
+        if (send_backs == null) {
+            return 0;
+        }
+        return send_backs.?;
+    }
+
+    pub fn waiting_of(row: EscalationRow) -> Waiting {
+        return Waiting {
+            issue: row.issue,
+            attempts: attempts_of(row.send_backs),
+            hours_waiting: hours_waiting(row.age_hours),
+            reason: reason_of(row.review_note),
+        };
+    }
+
+    // ---- the response body ----
+
+    // waitingCount, oldestHours (waiting[0], since ESCALATIONS_SQL is ordered
+    // oldest first), needsYou: waiting.length > 0. Present even when empty.
+    pub fn summarize(rows: []const EscalationRow) -> Summary {
+        var oldest: f64 = 0.0;
+        if (rows.len > 0) {
+            oldest = hours_waiting(rows[0].age_hours);
+        }
+        return Summary {
+            waiting_count: rows.len,
+            oldest_hours: oldest,
+            needs_you: rows.len > 0,
+        };
+    }
+
+    // headline: String(row.headline ?? '').slice(0, 200)
+    pub fn headline_of(headline: ?str) -> str {
+        if (headline == null) {
+            return "";
+        }
+        const s = headline.?;
+        if (s.len > HEADLINE_MAX) {
+            return s[0:HEADLINE_MAX];
+        }
+        return s;
+    }
+
+    // needsYou: Boolean(row.needs_you) -- a NULL column is false.
+    pub fn report_needs_you(needs_you: ?bool) -> bool {
+        if (needs_you == null) {
+            return false;
+        }
+        return needs_you.?;
+    }
+
+    // Plumbing: the Hono app. GET / sets Cache-Control: no-store, answers 503
+    // UNAVAILABLE unless url_usable(resolve_database_url(...)), runs
+    // ESCALATIONS_SQL and REPORTS_SQL [REPORT_LIMIT] together, answers
+    // { waiting: rows.map(waiting_of), ...summarize(rows), reports }, logs
+    // any error and answers the same 503 instead, and always ends the pool.
+    pub fn createQueenNeedsYouRoute(database_url: ?str) -> void {
+        undefined;
+    }
+
+    // ---- outstandingEscalations ----
+
+    // Number(result.rows[0]?.n ?? 0): no row or a NULL n count as 0.
+    pub fn outstanding_from(n: ?i64) -> i64 {
+        if (n == null) {
+            return 0;
+        }
+        return n.?;
+    }
+
+    // Plumbing: pool.query(OUTSTANDING_SQL), then outstanding_from(rows[0].n).
+    pub fn outstandingEscalations(pool_url: str) -> i64 {
+        undefined;
+    }
+
+    // ---- tests: expected values were printed by the original's expressions under node ----
+
+    test database_url_prefers_the_lease_url_and_keeps_empty {
+        assert(std.mem.eql(u8, resolve_database_url(null, "pg://b").?, "pg://b"));
+        assert(std.mem.eql(u8, resolve_database_url("pg://a", "pg://b").?, "pg://a"));
+        // "" ?? "pg://b" is "", and !"" answers 503
+        const empty = resolve_database_url("", "pg://b");
+        assert(empty != null);
+        assert(!url_usable(empty));
+        assert(!url_usable(resolve_database_url(null, null)));
+        assert(url_usable(resolve_database_url(null, "pg://b")));
+    }
+
+    test hours_waiting_rounds_like_math_round {
+        assert(hours_waiting(3.7449) == 3.7);
+        assert(hours_waiting(3.75) == 3.8);
+        assert(hours_waiting(2.25) == 2.3);
+        assert(hours_waiting(88.85) == 88.9);
+        assert(hours_waiting(1000.05) == 1000.1);
+        assert(hours_waiting(0.04) == 0.0);
+        // y + 0.5 rounds up to 1.0 in f64; Math.round still says 0
+        assert(hours_waiting(0.049999999999999996) == 0.0);
+        // halves go toward +Infinity, also below zero
+        assert(hours_waiting(-0.15) == -0.1);
+        assert(hours_waiting(-1.25) == -1.2);
+        assert(hours_waiting(-0.05) == 0.0);
+        assert(hours_waiting(null) == 0.0);
+    }
+
+    test reason_is_absent_when_falsy_and_bounded_otherwise {
+        assert(reason_of(null) == null);
+        assert(reason_of("") == null);
+        assert(std.mem.eql(u8, reason_of("no acceptance criteria").?, "no acceptance criteria"));
+        const long: [401]u8 = [_]u8{'x'} ** 401;
+        assert(reason_of(&long).?.len == 400);
+    }
+
+    test waiting_row_maps_like_the_route {
+        const w = waiting_of(EscalationRow { issue: 4512, review_note: "no acceptance criteria", send_backs: null, age_hours: 88.85 });
+        assert(w.issue == 4512);
+        assert(w.attempts == 0);
+        assert(w.hours_waiting == 88.9);
+        assert(std.mem.eql(u8, w.reason.?, "no acceptance criteria"));
+        const v = waiting_of(EscalationRow { issue: 7, review_note: "", send_backs: 3, age_hours: null });
+        assert(v.attempts == 3);
+        assert(v.hours_waiting == 0.0);
+        assert(v.reason == null);
+    }
+
+    test summary_reads_the_oldest_row_and_is_present_when_empty {
+        var rows: [2]EscalationRow = [
+            EscalationRow { issue: 1, review_note: null, send_backs: 0, age_hours: 3.75 },
+            EscalationRow { issue: 2, review_note: null, send_backs: 0, age_hours: 0.04 },
+        ];
+        const s = summarize(&rows);
+        assert(s.waiting_count == 2);
+        assert(s.oldest_hours == 3.8);
+        assert(s.needs_you);
+        var none: [0]EscalationRow = [];
+        const e = summarize(&none);
+        assert(e.waiting_count == 0);
+        assert(e.oldest_hours == 0.0);
+        assert(!e.needs_you);
+    }
+
+    test report_fields {
+        assert(headline_of(null).len == 0);
+        assert(std.mem.eql(u8, headline_of("3 waiting on you"), "3 waiting on you"));
+        const long: [250]u8 = [_]u8{'h'} ** 250;
+        assert(headline_of(&long).len == 200);
+        assert(!report_needs_you(null));
+        assert(report_needs_you(true));
+        assert(!report_needs_you(false));
+    }
+
+    test outstanding_counts_missing_as_zero {
+        assert(outstanding_from(6) == 6);
+        assert(outstanding_from(0) == 0);
+        assert(outstanding_from(null) == 0);
+    }
+}

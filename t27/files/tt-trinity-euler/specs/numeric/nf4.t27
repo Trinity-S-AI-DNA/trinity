@@ -1,0 +1,838 @@
+// SPDX-License-Identifier: Apache-2.0
+; nf4.t27 — NormalFloat4 Quantization
+; 4-bit quantization based on normalized distribution
+; Values: {-1, -0.667, -0.333, 0, 0.333, 0.667, 1, 0} (8 levels + zero)
+; φ² + 1/φ² = 3 | TRINITY
+
+module triformat-nf4;
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+pub const BITS : u8 = 4;
+pub const LEVELS : u8 = 8;  // Non-zero levels
+pub const TOTAL_LEVELS : u8 = 16;  // Including signed variants
+
+// NF4 uses 2 bits for magnitude index (1-4) and 1 bit for sign
+// Index 0 = zero (special case)
+// Levels (normalized): [0.0, 0.333, 0.667, 1.0]
+
+pub const NUM_NEGATIVE_LEVELS : u8 = 3;
+pub const NUM_POSITIVE_LEVELS : u8 = 3;
+
+// ============================================================================
+// Types
+// ============================================================================
+
+pub const NF4 = u8;  // 4-bit value stored in lower 4 bits of u8
+
+// ============================================================================
+// LUT Tables
+// ============================================================================
+
+// Normalized float levels (de-quantization table)
+// Index 0 = 0.0 (special zero), indices 1-7 map to levels
+const LEVELS_FLOAT : [8]f32 = [8]f32{
+    0.0,     // 0: zero
+    0.333,   // 1: 1/3
+    0.667,   // 2: 2/3
+    1.0,     // 3: max
+    -0.333,  // 4: -1/3
+    -0.667,  // 5: -2/3
+    -1.0,    // 6: -max
+    0.0,     // 7: also zero (for rounding tie-breaking)
+};
+
+// More precise levels using phi-optimized values
+// φ-optimized NF4 levels based on quartiles of normal distribution
+const LEVELS_PHI : [8]f32 = [8]f32{
+    0.0,     // 0: zero
+    0.4167,  // 1: ~-1σ * 0.618
+    0.75,    // 2: -μ/2 * φ
+    1.0,     // 3: max
+    -0.4167, // 4: negative of 1
+    -0.75,   // 5: negative of 2
+    -1.0,    // 6: negative of 3
+    0.0,     // 7: zero
+};
+
+// Use phi-optimized levels by default
+pub const QUANTIZATION_LEVELS : [8]f32 = LEVELS_PHI;
+
+// ============================================================================
+// Conversion Functions
+// ============================================================================
+
+// nf4_from_f32(value: f32) -> NF4
+// Quantize f32 to NF4
+// Returns 4-bit value in lower bits of u8
+pub fn nf4_from_f32(value: f32) NF4 {
+    // Handle NaN and infinity
+    if (std.math.isNan(value) or std.math.isInf(value)) {
+        return 0;  // Return zero for special values
+    }
+
+    const abs_value = @abs(value);
+
+    // Clamp to [-1, 1]
+    if (abs_value > 1.0) {
+        if (value > 0.0) {
+            return 0b011;  // +1.0
+        } else {
+            return 0b110;  // -1.0
+        }
+    }
+
+    // Zero threshold
+    if (abs_value < 0.2) {
+        return 0b000;  // zero
+    }
+
+    // Determine level (1, 2, or 3 for magnitude)
+    var level: u3 = 0;
+    if (abs_value < 0.58) {
+        level = 1;  // ~0.4167
+    } else if (abs_value < 0.87) {
+        level = 2;  // ~0.75
+    } else {
+        level = 3;  // 1.0
+    }
+
+    // Apply sign bit (bit 2)
+    if (value < 0.0) {
+        return @as(NF4, @intCast(0b100 | level));
+    } else {
+        return @as(NF4, @intCast(level));
+    }
+}
+
+// nf4_from_f64(value: f64) -> NF4
+// Quantize f64 to NF4
+pub fn nf4_from_f64(value: f64) NF4 {
+    return nf4_from_f32(@as(f32, @floatCast(value)));
+}
+
+// nf4_from_i8(value: i8) -> NF4
+// Quantize i8 to NF4 (normalized to [-1, 1])
+pub fn nf4_from_i8(value: i8) NF4 {
+    // Normalize i8 [-128, 127] to [-1, 1]
+    const normalized = @as(f32, @floatFromInt(value)) / 127.0;
+    return nf4_from_f32(normalized);
+}
+
+// nf4_to_f32(value: NF4) -> f32
+// De-quantize NF4 to f32
+pub fn nf4_to_f32(value: NF4) f32 {
+    const index = value & 0b111;
+    return QUANTIZATION_LEVELS[@as(usize, @intCast(index))];
+}
+
+// nf4_to_f64(value: NF4) -> f64
+// De-quantize NF4 to f64
+pub fn nf4_to_f64(value: NF4) f64 {
+    return @as(f64, @floatFromInt(nf4_to_f32(value)));
+}
+
+// nf4_to_i8(value: NF4) -> i8
+// De-quantize NF4 to i8 (scale from [-1, 1] to [-128, 127])
+pub fn nf4_to_i8(value: NF4) i8 {
+    const fval = nf4_to_f32(value);
+    const scaled = fval * 127.0;
+    return @as(i8, @intFromFloat(@round(scaled)));
+}
+
+// ============================================================================
+// Arithmetic Operations (in f32 domain)
+// ============================================================================
+
+// nf4_add(a: NF4, b: NF4) -> NF4
+// Add two NF4 values (de-quantize, add, re-quantize)
+pub fn nf4_add(a: NF4, b: NF4) NF4 {
+    const fa = nf4_to_f32(a);
+    const fb = nf4_to_f32(b);
+    return nf4_from_f32(fa + fb);
+}
+
+// nf4_sub(a: NF4, b: NF4) -> NF4
+// Subtract two NF4 values
+pub fn nf4_sub(a: NF4, b: NF4) NF4 {
+    const fa = nf4_to_f32(a);
+    const fb = nf4_to_f32(b);
+    return nf4_from_f32(fa - fb);
+}
+
+// nf4_mul(a: NF4, b: NF4) -> NF4
+// Multiply two NF4 values
+pub fn nf4_mul(a: NF4, b: NF4) NF4 {
+    const fa = nf4_to_f32(a);
+    const fb = nf4_to_f32(b);
+    return nf4_from_f32(fa * fb);
+}
+
+// nf4_div(a: NF4, b: NF4) -> NF4
+// Divide two NF4 values
+pub fn nf4_div(a: NF4, b: NF4) NF4 {
+    const fb = nf4_to_f32(b);
+    if (@abs(fb) < 0.001) {
+        return 0;  // Return zero for division by near-zero
+    }
+    const fa = nf4_to_f32(a);
+    return nf4_from_f32(fa / fb);
+}
+
+// ============================================================================
+// Utility Functions
+// ============================================================================
+
+// nf4_is_zero(value: NF4) -> bool
+// Check if NF4 value is zero
+pub fn nf4_is_zero(value: NF4) bool {
+    return (value & 0b111) == 0;
+}
+
+// nf4_is_negative(value: NF4) -> bool
+// Check if NF4 value is negative
+pub fn nf4_is_negative(value: NF4) bool {
+    return (value & 0b100) != 0 and !nf4_is_zero(value);
+}
+
+// nf4_is_positive(value: NF4) -> bool
+// Check if NF4 value is positive
+pub fn nf4_is_positive(value: NF4) bool {
+    return (value & 0b111) != 0 and (value & 0b100) == 0;
+}
+
+// nf4_abs(value: NF4) -> NF4
+// Absolute value of NF4
+pub fn nf4_abs(value: NF4) NF4 {
+    return value & 0b011;
+}
+
+// nf4_neg(value: NF4) -> NF4
+// Negate NF4
+pub fn nf4_neg(value: NF4) NF4 {
+    const magnitude = value & 0b011;
+    if (magnitude == 0) {
+        return 0;  // Zero stays zero
+    }
+    return magnitude | 0b100;
+}
+
+// nf4_is_equal(a: NF4, b: NF4) -> bool
+// Check if two NF4 values are equal
+pub fn nf4_is_equal(a: NF4, b: NF4) bool {
+    return a == b;
+}
+
+// nf4_is_greater(a: NF4, b: NF4) -> bool
+// Check if a > b
+pub fn nf4_is_greater(a: NF4, b: NF4) bool {
+    const fa = nf4_to_f32(a);
+    const fb = nf4_to_f32(b);
+    return fa > fb;
+}
+
+// nf4_is_less(a: NF4, b: NF4) -> bool
+// Check if a < b
+pub fn nf4_is_less(a: NF4, b: NF4) bool {
+    const fa = nf4_to_f32(a);
+    const fb = nf4_to_f32(b);
+    return fa < fb;
+}
+
+// nf4_max(a: NF4, b: NF4) -> NF4
+// Return the larger of two NF4 values
+pub fn nf4_max(a: NF4, b: NF4) NF4 {
+    return if (nf4_is_greater(a, b)) a else b;
+}
+
+// nf4_min(a: NF4, b: NF4) -> NF4
+// Return the smaller of two NF4 values
+pub fn nf4_min(a: NF4, b: NF4) NF4 {
+    return if (nf4_is_greater(a, b)) b else a;
+}
+
+// nf4_clamp(value: NF4, min: NF4, max: NF4) -> NF4
+// Clamp value between min and max
+pub fn nf4_clamp(value: NF4, min: NF4, max: NF4) NF4 {
+    return nf4_min(nf4_max(value, min), max);
+}
+
+// nf4_lerp(a: NF4, b: NF4, t: f32) -> NF4
+// Linear interpolation between a and b
+pub fn nf4_lerp(a: NF4, b: NF4, t: f32) NF4 {
+    const fa = nf4_to_f32(a);
+    const fb = nf4_to_f32(b);
+    const result = fa + (fb - fa) * t;
+    return nf4_from_f32(result);
+}
+
+// nf4_magnitude(value: NF4) -> f32
+// Get the absolute magnitude of NF4
+pub fn nf4_magnitude(value: NF4) f32 {
+    return nf4_to_f32(nf4_abs(value));
+}
+
+// nf4_l1_distance(a: NF4, b: NF4) -> f32
+// L1 distance between two NF4 values
+pub fn nf4_l1_distance(a: NF4, b: NF4) f32 {
+    const fa = nf4_to_f32(a);
+    const fb = nf4_to_f32(b);
+    return @abs(fa - fb);
+}
+
+// nf4_l2_distance(a: NF4, b: NF4) -> f32
+// L2 distance between two NF4 values
+pub fn nf4_l2_distance(a: NF4, b: NF4) -> f32 {
+    const fa = nf4_to_f32(a);
+    const fb = nf4_to_f32(b);
+    const diff = fa - fb;
+    return diff * diff;
+}
+
+// nf4_scale(value: NF4, scale: f32) -> NF4
+// Scale NF4 value
+pub fn nf4_scale(value: NF4, scale: f32) NF4 {
+    const fa = nf4_to_f32(value);
+    return nf4_from_f32(fa * scale);
+}
+
+// ============================================================================
+// TDD Tests
+// ============================================================================
+
+test "nf4_from_f32_zero" {
+    const value = 0.0;
+    const result = nf4_from_f32(value);
+    assert(result == 0);
+}
+
+test "nf4_from_f32_small_positive" {
+    const value = 0.1;
+    const result = nf4_from_f32(value);
+    assert(nf4_is_zero(result) == true);
+}
+
+test "nf4_from_f32_medium_positive" {
+    const value = 0.5;
+    const result = nf4_from_f32(value);
+    assert(result == 0b010); // level 2
+}
+
+test "nf4_from_f32_large_positive" {
+    const value = 0.9;
+    const result = nf4_from_f32(value);
+    assert(result == 0b011); // level 3 (max)
+}
+
+test "nf4_from_f32_max_positive" {
+    const value = 1.0;
+    const result = nf4_from_f32(value);
+    assert(result == 0b011);
+}
+
+test "nf4_from_f32_above_max" {
+    const value = 1.5;
+    const result = nf4_from_f32(value);
+    assert(result == 0b011); // saturated to max
+}
+
+test "nf4_from_f32_small_negative" {
+    const value = -0.1;
+    const result = nf4_from_f32(value);
+    assert(nf4_is_zero(result) == true);
+}
+
+test "nf4_from_f32_medium_negative" {
+    const value = -0.5;
+    const result = nf4_from_f32(value);
+    assert(result == 0b110); // level 2, negative
+}
+
+test "nf4_from_f32_large_negative" {
+    const value = -0.9;
+    const result = nf4_from_f32(value);
+    assert(result == 0b111); // level 3, negative (min)
+}
+
+test "nf4_from_f32_max_negative" {
+    const value = -1.0;
+    const result = nf4_from_f32(value);
+    assert(result == 0b111);
+}
+
+test "nf4_from_f32_below_min" {
+    const value = -1.5;
+    const result = nf4_from_f32(value);
+    assert(result == 0b111); // saturated to min
+}
+
+test "nf4_from_f32_nan" {
+    const result = nf4_from_f32(std.math.nan(f32));
+    assert(result == 0);
+}
+
+test "nf4_from_f32_inf" {
+    const result = nf4_from_f32(std.math.inf(f32));
+    assert(result == 0b011);
+}
+
+test "nf4_from_f32_neg_inf" {
+    const result = nf4_from_f32(-std.math.inf(f32));
+    assert(result == 0b111);
+}
+
+test "nf4_to_f32_zero" {
+    const value: NF4 = 0;
+    const result = nf4_to_f32(value);
+    assert(result == 0.0);
+}
+
+test "nf4_to_f32_positive_max" {
+    const value: NF4 = 0b011;
+    const result = nf4_to_f32(value);
+    assert(result == 1.0);
+}
+
+test "nf4_to_f32_negative_min" {
+    const value: NF4 = 0b111;
+    const result = nf4_to_f32(value);
+    assert(result == -1.0);
+}
+
+test "nf4_to_f32_roundtrip_positive" {
+    const original = 0.7;
+    const encoded = nf4_from_f32(original);
+    const decoded = nf4_to_f32(encoded);
+    assert(abs(decoded - original) < 0.2);
+}
+
+test "nf4_to_f32_roundtrip_negative" {
+    const original = -0.7;
+    const encoded = nf4_from_f32(original);
+    const decoded = nf4_to_f32(encoded);
+    assert(abs(decoded - original) < 0.2);
+}
+
+test "nf4_from_i8_zero" {
+    const value: i8 = 0;
+    const result = nf4_from_i8(value);
+    assert(result == 0);
+}
+
+test "nf4_from_i8_max" {
+    const value: i8 = 127;
+    const result = nf4_from_i8(value);
+    assert(result == 0b011);
+}
+
+test "nf4_from_i8_min" {
+    const value: i8 = -128;
+    const result = nf4_from_i8(value);
+    assert(result == 0b111);
+}
+
+test "nf4_from_i8_medium" {
+    const value: i8 = 64;
+    const result = nf4_from_i8(value);
+    assert(result == 0b011); // 64/127 ≈ 0.5 -> level 3
+}
+
+test "nf4_to_i8_max" {
+    const value: NF4 = 0b011;
+    const result = nf4_to_i8(value);
+    assert(result >= 120); // Should be ~127
+}
+
+test "nf4_to_i8_min" {
+    const value: NF4 = 0b111;
+    const result = nf4_to_i8(value);
+    assert(result <= -120); // Should be ~-127
+}
+
+test "nf4_add_zero" {
+    const a: NF4 = 0b010;
+    const b: NF4 = 0;
+    const result = nf4_add(a, b);
+    assert(result == a);
+}
+
+test "nf4_add_positives" {
+    const a: NF4 = 0b010;
+    const b: NF4 = 0b001;
+    const result = nf4_add(a, b);
+    assert(nf4_is_positive(result) == true);
+}
+
+test "nf4_add_opposite" {
+    const a: NF4 = 0b010;
+    const b: NF4 = 0b110;
+    const result = nf4_add(a, b);
+    assert(nf4_is_zero(result) == true or nf4_magnitude(result) < 0.5);
+}
+
+test "nf4_sub_same" {
+    const a: NF4 = 0b010;
+    const result = nf4_sub(a, a);
+    assert(result == 0);
+}
+
+test "nf4_mul_zero" {
+    const a: NF4 = 0b011;
+    const b: NF4 = 0;
+    const result = nf4_mul(a, b);
+    assert(result == 0);
+}
+
+test "nf4_mul_max_max" {
+    const a: NF4 = 0b011;
+    const b: NF4 = 0b011;
+    const result = nf4_mul(a, b);
+    assert(result == 0b011); // 1.0 * 1.0 = 1.0
+}
+
+test "nf4_mul_pos_neg" {
+    const a: NF4 = 0b011;
+    const b: NF4 = 0b111;
+    const result = nf4_mul(a, b);
+    assert(nf4_is_negative(result) == true);
+}
+
+test "nf4_div_same" {
+    const a: NF4 = 0b010;
+    const result = nf4_div(a, a);
+    assert(result == 0b001); // x/x = 1
+}
+
+test "nf4_div_zero" {
+    const a: NF4 = 0b011;
+    const b: NF4 = 0;
+    const result = nf4_div(a, b);
+    assert(result == 0);
+}
+
+test "nf4_is_zero_true" {
+    assert(nf4_is_zero(0) == true);
+}
+
+test "nf4_is_zero_false" {
+    const value: NF4 = 0b001;
+    assert(nf4_is_zero(value) == false);
+}
+
+test "nf4_is_negative_true" {
+    assert(nf4_is_negative(0b111) == true);
+}
+
+test "nf4_is_negative_false_positive" {
+    assert(nf4_is_negative(0b011) == false);
+}
+
+test "nf4_is_negative_false_zero" {
+    assert(nf4_is_negative(0) == false);
+}
+
+test "nf4_is_positive_true" {
+    assert(nf4_is_positive(0b011) == true);
+}
+
+test "nf4_is_positive_false_negative" {
+    assert(nf4_is_positive(0b111) == false);
+}
+
+test "nf4_is_positive_false_zero" {
+    assert(nf4_is_positive(0) == false);
+}
+
+test "nf4_abs_positive" {
+    const value: NF4 = 0b010;
+    const result = nf4_abs(value);
+    assert(result == value);
+}
+
+test "nf4_abs_negative" {
+    const value: NF4 = 0b110;
+    const result = nf4_abs(value);
+    assert(result == 0b010);
+}
+
+test "nf4_abs_zero" {
+    const result = nf4_abs(0);
+    assert(result == 0);
+}
+
+test "nf4_neg_positive" {
+    const value: NF4 = 0b010;
+    const result = nf4_neg(value);
+    assert(result == 0b110);
+}
+
+test "nf4_neg_negative" {
+    const value: NF4 = 0b110;
+    const result = nf4_neg(value);
+    assert(result == 0b010);
+}
+
+test "nf4_neg_zero" {
+    const result = nf4_neg(0);
+    assert(result == 0);
+}
+
+test "nf4_is_equal_true" {
+    const a: NF4 = 0b010;
+    const b: NF4 = 0b010;
+    assert(nf4_is_equal(a, b) == true);
+}
+
+test "nf4_is_equal_false" {
+    const a: NF4 = 0b010;
+    const b: NF4 = 0b110;
+    assert(nf4_is_equal(a, b) == false);
+}
+
+test "nf4_is_greater_true" {
+    const a: NF4 = 0b011;
+    const b: NF4 = 0b010;
+    assert(nf4_is_greater(a, b) == true);
+}
+
+test "nf4_is_greater_false" {
+    const a: NF4 = 0b010;
+    const b: NF4 = 0b011;
+    assert(nf4_is_greater(a, b) == false);
+}
+
+test "nf4_is_less_true" {
+    const a: NF4 = 0b010;
+    const b: NF4 = 0b011;
+    assert(nf4_is_less(a, b) == true);
+}
+
+test "nf4_is_less_false" {
+    const a: NF4 = 0b011;
+    const b: NF4 = 0b010;
+    assert(nf4_is_less(a, b) == false);
+}
+
+test "nf4_max_returns_larger" {
+    const a: NF4 = 0b010;
+    const b: NF4 = 0b011;
+    const result = nf4_max(a, b);
+    assert(result == 0b011);
+}
+
+test "nf4_min_returns_smaller" {
+    const a: NF4 = 0b010;
+    const b: NF4 = 0b011;
+    const result = nf4_min(a, b);
+    assert(result == 0b010);
+}
+
+test "nf4_clamp_in_range" {
+    const value: NF4 = 0b010;
+    const min: NF4 = 0b001;
+    const max: NF4 = 0b011;
+    const result = nf4_clamp(value, min, max);
+    assert(result == value);
+}
+
+test "nf4_clamp_below_min" {
+    const value: NF4 = 0;
+    const min: NF4 = 0b001;
+    const max: NF4 = 0b011;
+    const result = nf4_clamp(value, min, max);
+    assert(result == min);
+}
+
+test "nf4_clamp_above_max" {
+    const value: NF4 = 0b111;
+    const min: NF4 = 0b001;
+    const max: NF4 = 0b011;
+    const result = nf4_clamp(value, min, max);
+    assert(result == max);
+}
+
+test "nf4_lerp_zero" {
+    const a: NF4 = 0b001;
+    const b: NF4 = 0b011;
+    const t = 0.0;
+    const result = nf4_lerp(a, b, t);
+    assert(result == a);
+}
+
+test "nf4_lerp_one" {
+    const a: NF4 = 0b001;
+    const b: NF4 = 0b011;
+    const t = 1.0;
+    const result = nf4_lerp(a, b, t);
+    assert(result == b);
+}
+
+test "nf4_lerp_half" {
+    const a: NF4 = 0;
+    const b: NF4 = 0b011;
+    const t = 0.5;
+    const result = nf4_lerp(a, b, t);
+    assert(nf4_magnitude(result) > 0.3);
+}
+
+test "nf4_magnitude_positive" {
+    const value: NF4 = 0b011;
+    const result = nf4_magnitude(value);
+    assert(result == 1.0);
+}
+
+test "nf4_magnitude_negative" {
+    const value: NF4 = 0b111;
+    const result = nf4_magnitude(value);
+    assert(result == 1.0);
+}
+
+test "nf4_l1_distance_same" {
+    const a: NF4 = 0b010;
+    const b: NF4 = 0b010;
+    const result = nf4_l1_distance(a, b);
+    assert(result == 0.0);
+}
+
+test "nf4_l1_distance_max_min" {
+    const a: NF4 = 0b011;
+    const b: NF4 = 0b111;
+    const result = nf4_l1_distance(a, b);
+    assert(result == 2.0);
+}
+
+test "nf4_l2_distance_max_min" {
+    const a: NF4 = 0b011;
+    const b: NF4 = 0b111;
+    const result = nf4_l2_distance(a, b);
+    assert(result == 4.0);
+}
+
+test "nf4_scale_up" {
+    const value: NF4 = 0b001;
+    const scale = 2.0;
+    const result = nf4_scale(value, scale);
+    assert(nf4_magnitude(result) > 0.4);
+}
+
+test "nf4_scale_down" {
+    const value: NF4 = 0b011;
+    const scale = 0.5;
+    const result = nf4_scale(value, scale);
+    assert(nf4_magnitude(result) < 1.0);
+}
+
+// ============================================================================
+// Invariants
+// ============================================================================
+
+invariant nf4_bits_constant
+    assert BITS == 4
+
+invariant nf4_levels_count
+    assert LEVELS == 8
+
+invariant nf4_total_levels
+    assert TOTAL_LEVELS == 16
+
+invariant nf4_quantization_levels_length
+    assert QUANTIZATION_LEVELS.len == 8
+
+invariant nf4_zero_is_zero
+    assert nf4_is_zero(0) == true
+
+invariant nf4_zero_not_negative
+    assert nf4_is_negative(0) == false
+
+invariant nf4_zero_not_positive
+    assert nf4_is_positive(0) == false
+
+invariant nf4_abs_zero_is_zero
+    assert nf4_abs(0) == 0
+
+invariant nf4_neg_zero_is_zero
+    assert nf4_neg(0) == 0
+
+invariant nf4_max_positive_is_max
+    given max_val: NF4 = 0b011
+    and   fmax = nf4_to_f32(max_val)
+    assert fmax == 1.0
+
+invariant nf4_min_negative_is_min
+    given min_val: NF4 = 0b111
+    and   fmin = nf4_to_f32(min_val)
+    assert fmin == -1.0
+
+invariant nf4_abs_neg_is_pos
+    given value: NF4 = 0b110
+    and   abs_val = nf4_abs(value)
+    assert nf4_is_positive(abs_val) == true
+
+invariant nf4_neg_neg_is_pos
+    given value: NF4 = 0b110
+    and   neg_val = nf4_neg(value)
+    assert nf4_is_positive(neg_val) == true
+
+invariant nf4_double_neg_original_or_zero
+    given value: NF4 = 0b010
+    and   neg_val = nf4_neg(value)
+    and   neg_neg_val = nf4_neg(neg_val)
+    assert neg_neg_val == value or value == 0
+
+invariant nf4_abs_non_negative
+    given value: NF4 = 0b111
+    and   abs_val = nf4_abs(value)
+    assert nf4_to_f32(abs_val) >= 0.0
+
+invariant nf4_l1_distance_symmetric
+    given a: NF4 = 0b010
+    and   b: NF4 = 0b111
+    assert nf4_l1_distance(a, b) == nf4_l1_distance(b, a)
+
+invariant nf4_l2_distance_symmetric
+    given a: NF4 = 0b010
+    and   b: NF4 = 0b111
+    assert nf4_l2_distance(a, b) == nf4_l2_distance(b, a)
+
+invariant nf4_l1_distance_non_negative
+    given a: NF4 = 0b010
+    and   b: NF4 = 0b111
+    assert nf4_l1_distance(a, b) >= 0.0
+
+invariant nf4_max_ge_both
+    given a: NF4 = 0b010
+    and   b: NF4 = 0b011
+    and   result = nf4_max(a, b)
+    assert nf4_is_greater(result, a) == true and nf4_is_greater(result, b) == true or nf4_is_equal(result, a) == true
+
+invariant nf4_min_le_both
+    given a: NF4 = 0b010
+    and   b: NF4 = 0b011
+    and   result = nf4_min(a, b)
+    assert nf4_is_less(result, a) == true or nf4_is_equal(result, a) == true
+
+// ============================================================================
+// Benchmarks
+// ============================================================================
+
+bench nf4_from_f32_latency
+    measure: nanoseconds to nf4_from_f32(0.7)
+    target: < 50ns
+
+bench nf4_to_f32_latency
+    measure: nanoseconds to nf4_to_f32(0b010)
+    target: < 10ns
+
+bench nf4_add_latency
+    measure: nanoseconds to nf4_add(0b010, 0b001)
+    target: < 100ns
+
+bench nf4_mul_latency
+    measure: nanoseconds to nf4_mul(0b010, 0b011)
+    target: < 100ns
+
+bench nf4_abs_latency
+    measure: nanoseconds to nf4_abs(0b111)
+    target: < 5ns
