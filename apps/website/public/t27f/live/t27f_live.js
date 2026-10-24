@@ -45,5 +45,21 @@ export async function replay(el, log) {
     table.append(tr)
   }
   el.replaceChildren(table)
-  return { refused: false, message: `The scalar layer replayed ${rows.length} events through live_mode's laws in t27f.wasm -- the full trio (arrival frames, latency windows, paints due); the graph paint lands with the struct-path exports.` }
+  // The law's answer surface, honestly labelled: latency_ms over the pairs its
+  // own transcription test pins (live_scalar_closure.t27) -- computed by the
+  // module, not measured from the log (the log carries no paint times; those
+  // are struct-path replay state).
+  const pairs = [[0, 0], [0, 15], [0, 16], [2, 7], [16, 32], [64, 100]]
+  const law = document.createElement('table')
+  for (const [e, p] of pairs) {
+    const tr = document.createElement('tr')
+    for (const v of [`latency_ms(${e}, ${p})`, `${R.latency_ms(e, p)} ms`]) {
+      const td = document.createElement('td')
+      td.textContent = v
+      tr.append(td)
+    }
+    law.append(tr)
+  }
+  el.append(law)
+  return { refused: false, message: `The scalar layer replayed ${rows.length} events through the trio in t27f.wasm, beside the latency law's answer surface (its own transcription pairs -- law output, not a measurement); the graph paint lands with the struct-path exports.` }
 }
