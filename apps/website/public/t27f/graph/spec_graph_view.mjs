@@ -129,8 +129,8 @@ export const LABEL_EXACT = 0;
 export const LABEL_KINDS = 4;
 export const LABEL_SUGGESTED = 2;
 export const LABEL_UNKNOWN = 3;
-export const MAX_EDGES = 254;
-export const MAX_NODES = 192;
+export const MAX_EDGES = 4096;
+export const MAX_NODES = 1024;
 export const NODE_BENCH = 5;
 export const NODE_CONST = 1;
 export const NODE_FN = 2;
@@ -140,9 +140,9 @@ export const NODE_MODULE = 0;
 export const NODE_OPAQUE = 7;
 export const NODE_TEST = 3;
 export const NODE_USE = 6;
-export const NO_INDEX = 255;
+export const NO_INDEX = 65535;
 export const NO_LINE = 0;
-export const SpecGraph = Object.freeze({ __struct__: "SpecGraph", fields: [["ir_version", "u32"], ["spec_path", "str"], ["line_count", "u32"], ["node_count", "u32"], ["node_kind", "[192]u8"], ["node_label", "[192]u8"], ["node_name", "[192]str"], ["line_start", "[192]u32"], ["line_end", "[192]u32"], ["edge_count", "u32"], ["edge_kind", "[254]u8"], ["edge_from", "[254]u8"], ["edge_to", "[254]u8"], ["edge_label", "[254]u8"], ["edge_line", "[254]u32"]] });
+export const SpecGraph = Object.freeze({ __struct__: "SpecGraph", fields: [["ir_version", "u32"], ["spec_path", "str"], ["line_count", "u32"], ["node_count", "u32"], ["node_kind", "[1024]u8"], ["node_label", "[1024]u8"], ["node_name", "[1024]str"], ["line_start", "[1024]u32"], ["line_end", "[1024]u32"], ["edge_count", "u32"], ["edge_kind", "[4096]u8"], ["edge_from", "[4096]u16"], ["edge_to", "[4096]u16"], ["edge_label", "[4096]u8"], ["edge_line", "[4096]u32"]] });
 export const VERDICT_KINDS = 19;
 // t27c gen-js: fn blank_graph was not emitted -- this backend lowers declarations, not bodies.
 // t27c gen-js: fn kind_bit was not emitted -- this backend lowers declarations, not bodies.
