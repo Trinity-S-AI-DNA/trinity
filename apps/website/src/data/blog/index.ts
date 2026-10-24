@@ -3,6 +3,39 @@ import type { PostMeta } from './types'
 /** Индекс блога: список и метаданные без тяжёлых тел публикаций. */
 export const postsIndex: PostMeta[] = [
   {
+    slug: "analog-emulation-v0-1",
+    title: "t27 analog emulation v0.1: 13 SAR ADC blocks checked, 9 PASS, 0 FAIL, 4 NOT MODELLED",
+    summary: "[a SAR ADC and its blocks, not a full mixed-signal chip; one corner (tt) on the board; the comparator step on the board was never loaded; the board is 170000 to 196000 times slower than real time; every number is in the v0.1 release notes with its source] A SPICE netlist with IHP SG13G2 (PSP103) models becomes .t27 specs that are at once the software reference and the FPGA design, checked against ngspice-47 and VACASK, with the AX7203 board as the bench. An external team's per-block checks on the 13 blocks of the golden SAR ADC give 9 PASS, 0 FAIL and 4 NOT MODELLED.",
+    date: "2026-10-24",
+    readingMinutes: 9,
+    tags: ["t27", "Analog", "FPGA"],
+    receipts: [
+      { label: "trinity#1732: the issue for this post", href: "https://github.com/Trinity-S-AI-DNA/trinity/issues/1732" },
+      { label: "t27#11973: the v0.1 release notes, every number with its source", href: "https://github.com/Trinity-S-AI-DNA/t27/pull/11973" },
+      { label: "t27#10486: the analog emulation epic", href: "https://github.com/Trinity-S-AI-DNA/t27/issues/10486" },
+      { label: "t27#11215: the external team's per-block checks as a .t27 evaluator", href: "https://github.com/Trinity-S-AI-DNA/t27/pull/11215" },
+      { label: "t27#11421: the dff levels row, which stays NOT MODELLED", href: "https://github.com/Trinity-S-AI-DNA/t27/pull/11421" },
+      { label: "t27#11325: the dynamic comparator with the devices' charge", href: "https://github.com/Trinity-S-AI-DNA/t27/pull/11325" },
+      { label: "t27#11220: the tt PSP103 inverter on the AX7203, 1217 of 1217 receipt lines", href: "https://github.com/Trinity-S-AI-DNA/t27/pull/11220" },
+      { label: "t27#11313: the speed measurement, stated plainly", href: "https://github.com/Trinity-S-AI-DNA/t27/pull/11313" },
+    ],
+    openQuestions: [
+      "One corner (tt) is on the board; ss, ff, fs and sf have tables and ngspice checks but no bitstream.",
+      "The comparator step on the board is one routed unit that fails 100 MHz and was never loaded.",
+      "Four blocks are NOT MODELLED, and the converter is not predicted end to end: it still takes two fitted numbers.",
+    ],
+    published: true,
+    ru: {
+      title: "Аналоговая эмуляция t27 v0.1: проверено 13 блоков SAR-АЦП, 9 PASS, 0 FAIL, 4 NOT MODELLED",
+      summary: "[SAR-АЦП и его блоки, а не полноценная смешанная микросхема; на плате один угол (tt); шаг компаратора на плате никогда не загружался; плата медленнее реального времени в 170000 .. 196000 раз; каждое число есть в заметках к релизу v0.1 с источником] Нетлист SPICE с моделями IHP SG13G2 (PSP103) превращается в спеки .t27, которые одновременно служат программным эталоном и проектом для ПЛИС; проверка по ngspice-47 и VACASK, стенд — плата AX7203. Поблочные проверки внешней команды на 13 блоках golden SAR ADC дают 9 PASS, 0 FAIL и 4 NOT MODELLED.",
+      openQuestions: [
+        "На плате один угол (tt); у ss, ff, fs и sf есть таблицы и проверки по ngspice, но нет битстрима.",
+        "Шаг компаратора на плате — один разведённый блок, который не проходит 100 МГц и никогда не загружался.",
+        "Четыре блока NOT MODELLED, а преобразователь не предсказан от начала до конца: он всё ещё берёт два подобранных числа.",
+      ],
+    },
+  },
+  {
     slug: "the-queen-and-the-hive-a-course-on-how-the-project-builds-itself",
     title: "The Queen and the hive: a course on how the project builds itself, 27 widgets on compiled specs",
     summary: "[every widget runs fn bodies of a gHashTag/t27 specs/queen or specs/automation spec compiled to wasm; no widget reads the live Queen; the game widgets are flat sketches] Course 11 opens the rules the Queen runs the hive by: shaping an issue and its boundary, priority, aging and review first, a task's state machine, the ship in the game, a deploy mid-flight, the reviewer's concurrency and back-off, the merge gate, the review jam and inherited red, refused keys and the next key, credit and token prices, agent bots in one group, the night watch, the public board and the comb.",
