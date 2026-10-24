@@ -20,9 +20,7 @@ export async function replay(el, log) {
   let R
   try { R = await instantiate() }
   catch { return refuse('t27f.wasm did not load -- the closure build has not landed yet.') }
-  // paints_due waits for the select floor (its body is a comparison); the two
-  // frame laws are the M-B exports the closure ships today.
-  for (const name of ['arrival_frame', 'latency_ms'])
+  for (const name of ['arrival_frame', 'latency_ms', 'paints_due'])
     if (typeof R[name] !== 'function')
       return refuse(`the module lacks ${name} -- the scalar exports are M-B of t27#11840.`)
   const events = Array.isArray(log.events) ? log.events : []
@@ -33,7 +31,8 @@ export async function replay(el, log) {
   for (const e of events) {
     const t = t_ms_of(e) ?? e.tick * 16 // FRAME_MS; the log's tick is a frame count by construction
     const frame = R.arrival_frame(t)
-    rows.push([String(e.kind ?? '?'), `t=${t}ms`, `frame ${frame}`])
+    const paints = R.paints_due(1)
+    rows.push([String(e.kind ?? '?'), `t=${t}ms`, `frame ${frame}`, `paints ${paints}`])
   }
   const table = document.createElement('table')
   for (const r of rows) {
@@ -46,5 +45,5 @@ export async function replay(el, log) {
     table.append(tr)
   }
   el.replaceChildren(table)
-  return { refused: false, message: `The scalar layer replayed ${rows.length} events through live_mode's laws in t27f.wasm (arrival frames); latency_ms is exported and holds the window arithmetic; paints_due lands with the select floor, the graph paint with the struct-path exports.` }
+  return { refused: false, message: `The scalar layer replayed ${rows.length} events through live_mode's laws in t27f.wasm -- the full trio (arrival frames, latency windows, paints due); the graph paint lands with the struct-path exports.` }
 }
