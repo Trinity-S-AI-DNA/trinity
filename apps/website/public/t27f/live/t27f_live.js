@@ -35,6 +35,13 @@ export async function replay(el, log) {
     rows.push([String(e.kind ?? '?'), `t=${t}ms`, `frame ${frame}`, `paints ${paints}`])
   }
   const table = document.createElement('table')
+  const head = document.createElement('tr')
+  for (const h of ['event', 'time', 'frame window (16 ms)', 'paints due']) {
+    const th = document.createElement('th')
+    th.textContent = h
+    head.append(th)
+  }
+  table.append(head)
   for (const r of rows) {
     const tr = document.createElement('tr')
     for (const v of r) {
@@ -50,10 +57,20 @@ export async function replay(el, log) {
   // module, not measured from the log (the log carries no paint times; those
   // are struct-path replay state).
   const pairs = [[0, 0], [0, 15], [0, 16], [2, 7], [16, 32], [64, 100]]
+  const cap = document.createElement('p')
+  cap.textContent = 'The latency law answers (emitted, painted) -> ms; the numbers come from the module, not a measurement.'
+  el.append(cap)
   const law = document.createElement('table')
+  const lhead = document.createElement('tr')
+  for (const h of ['latency law check', 'answer']) {
+    const th = document.createElement('th')
+    th.textContent = h
+    lhead.append(th)
+  }
+  law.append(lhead)
   for (const [e, p] of pairs) {
     const tr = document.createElement('tr')
-    for (const v of [`latency_ms(${e}, ${p})`, `${R.latency_ms(e, p)} ms`]) {
+    for (const v of [`emitted ${e} ms, painted ${p} ms`, `${R.latency_ms(e, p)} ms`] ) {
       const td = document.createElement('td')
       td.textContent = v
       tr.append(td)
@@ -61,5 +78,5 @@ export async function replay(el, log) {
     law.append(tr)
   }
   el.append(law)
-  return { refused: false, message: `The scalar layer replayed ${rows.length} events through the trio in t27f.wasm, beside the latency law's answer surface (its own transcription pairs -- law output, not a measurement); the graph paint lands with the struct-path exports.` }
+  return { refused: false, message: `Live: ${rows.length} recorded events replayed through the frame law in t27f.wasm -- each row shows when the event arrived (its 16 ms window) and the paint its window owes. The graph view lands with the struct-path layer; see PROVENANCE.txt.` }
 }
