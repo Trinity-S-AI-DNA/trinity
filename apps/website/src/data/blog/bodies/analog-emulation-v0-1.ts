@@ -110,6 +110,10 @@ export const body: Block[] = [
     "text": "The negative controls are in the evaluator's tests. The comparator with its charge removed is a FAIL: the report's limit would accept it, and the cross-check refuses it. The inverter with its charge removed (39 and 52 ps) is a FAIL too."
   },
   {
+    "kind": "p",
+    "text": "The **SAR ADC acceptance** widget at t27.ai/widgets/analog-v01-acceptance/ draws this scoreboard in the page: 9 of 13 blocks pass, 0 fail, 4 are not modelled and stay on it as open gaps, with the comparator decision time on PSP103 beside ngspice's own run. Every number comes from the release notes and is checked by the widget's spec; it makes no speed claim."
+  },
+  {
     "kind": "h",
     "text": "On the AX7203 board"
   },
@@ -323,6 +327,10 @@ export const ruBody: Block[] = [
   {
     "kind": "p",
     "text": "Отрицательные контроли лежат в тестах вычислителя. Компаратор со снятым зарядом — FAIL: предел из отчёта его бы принял, а перекрёстная проверка отвергает. Инвертор со снятым зарядом (39 и 52 пс) — тоже FAIL."
+  },
+  {
+    "kind": "p",
+    "text": "Виджет **приёмка SAR-АЦП** на t27.ai/widgets/analog-v01-acceptance/ рисует эту таблицу на странице: 9 из 13 блоков проходят, 0 не проходят, 4 не смоделированы и остаются на ней как открытые пробелы; рядом время решения компаратора на PSP103 и прогон самого ngspice. Каждое число взято из заметок к выпуску и проверяется спецификацией виджета; заявления о скорости нет."
   },
   {
     "kind": "h",
