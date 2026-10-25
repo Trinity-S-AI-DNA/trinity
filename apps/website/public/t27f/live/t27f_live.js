@@ -1,7 +1,11 @@
 // /t27f/live/: the visual replay engine. Agents appear as colored circles on
-// a force-directed graph, deliveries animate as particles along edges, and a
-// timeline replays the 24-event recording. Every frame number comes from the
-// wasm module's arrival_frame law. See PROVENANCE.txt.
+// a force-directed graph (named by the specs they work on), deliveries animate
+// as particles along edges, and a timeline replays the recorded log at the
+// law's tick grid, rendered at display frame rate. Every frame number comes
+// from the wasm module's arrival_frame law. Below the graph: the fleet panel,
+// live from the GitHub API -- pull requests, activity, and the queen lane
+// (workflow dispatches and crons). The log can grow: it is re-fetched
+// cache-busted every 5 minutes and the delta replays. See PROVENANCE.txt.
 const url = new URL('t27f.wasm', import.meta.url)
 const refuse = (m) => ({ refused: true, message: m })
 const NS = 'http://www.w3.org/2000/svg'
@@ -85,14 +89,31 @@ export async function replay(el, log) {
     cur++; fe.textContent=`${cur}/${evts.length}`
     const alive=[...agents.values()].filter(a=>a.st!=='exit').length
     stats.innerHTML=`<span style="color:${C.active}">\u25CF ${alive} agents</span><span>\u26A1 ${cur} events</span><span>\u23F1 frame ${frame}</span>` }
-  function stop(){ if(timer){clearInterval(timer);timer=null} pb.textContent='\u25B6' }
-  function reset(){ stop(); cur=0; stream.replaceChildren(); nG.replaceChildren(); eG.replaceChildren(); fG.replaceChildren(); edges.length=0; agents.clear(); fe.textContent=`0/${evts.length}`
-    pb.textContent='\u23F8'; timer=setInterval(tick,420); tick() }
+  let raf=null, playT0=0, nextIx=0
+  const SLOW=25 // 25 law-frames per second of wall clock: one law tick (16 frames) every 400 ms
+  function frame(ts){ if(!raf)return
+    const lawF=(ts-playT0)/SLOW
+    while(nextIx<evts.length && (evts[nextIx].tick??nextIx)*16<=lawF){ tick(); nextIx++ }
+    layout()
+    if(nextIx>=evts.length){ raf=null; pb.textContent='\u25B6'; return }
+    raf=requestAnimationFrame(frame) }
+  function stop(){ if(raf){cancelAnimationFrame(raf);raf=null} pb.textContent='\u25B6' }
+  function reset(){ stop(); cur=0; nextIx=0; stream.replaceChildren(); nG.replaceChildren(); eG.replaceChildren(); fG.replaceChildren(); edges.length=0; agents.clear(); fe.textContent=`0/${evts.length}`
+    pb.textContent='\u23F8'; playT0=performance.now(); raf=requestAnimationFrame(frame) }
 
   for(let i=0;i<evts.length;i++){ cur=i; tick() }
   let s0=0; const settle=()=>{ layout(); if(s0++<50)requestAnimationFrame(settle) }; requestAnimationFrame(settle)
 
-  return { refused:false, message:`${evts.length} events, ${agents.size} named agents on the graph; the fleet panel below is live from the GitHub API. Press play to watch the replay.` }
+  // the log can grow: re-fetch it cache-busted every 5 minutes and replay the delta
+  const logUrl=new URL('./logs/recorded_log.json', import.meta.url)
+  setInterval(async()=>{ try{ const r=await fetch(logUrl+'?v='+Date.now()); if(!r.ok)return
+    const d=await r.json(); if(d.format!==log.format||!Array.isArray(d.events))return
+    if(d.events.length>evts.length){ const add=d.events.slice(evts.length)
+      for(const e of add) evts.push(e)
+      for(let i=0;i<add.length;i++) tick()
+      let s1=0; const st=()=>{ layout(); if(s1++<40)requestAnimationFrame(st) }; requestAnimationFrame(st) } }catch{} },300000)
+
+  return { refused:false, message:`${evts.length} events on the law's tick grid, ${agents.size} named agents at display frame rate; below: pull requests, activity and the queen lane, live from the GitHub API. Press play to watch the replay.` }
 }
 
 // The fleet monitor: real pull requests and real repository activity from the
@@ -112,13 +133,21 @@ function mountFleet(root){
   const acP=document.createElement('div'); acP.style.cssText=`border:1px solid ${FC.border};border-radius:8px;background:${FC.bg};padding:10px;overflow-y:auto;max-height:420px`
   const h1=document.createElement('div'); h1.textContent='pull requests'; h1.style.cssText=`color:${FC.text};font:bold 12px monospace;margin:0 0 8px`
   const h2=document.createElement('div'); h2.textContent='activity'; h2.style.cssText=`color:${FC.text};font:bold 12px monospace;margin:0 0 8px`
-  prP.append(h1); acP.append(h2); cols.append(prP,acP); root.append(cols)
-  const gh=async(p)=>{ const r=await fetch(API+p,{headers:{Accept:'application/vnd.github+json'}})
+  const qP=document.createElement('div'); qP.style.cssText=`border:1px solid ${FC.border};border-radius:8px;background:${FC.bg};padding:10px;overflow-y:auto;max-height:240px;margin-top:8px`
+  const h3=document.createElement('div'); h3.textContent='the queen -- dispatches and crons (workflow runs)'; h3.style.cssText=`color:${FC.text};font:bold 12px monospace;margin:0 0 8px`
+  qP.append(h3)
+  prP.append(h1); acP.append(h2); cols.append(prP,acP); root.append(cols,qP)
+  const etags=new Map()
+  const gh=async(p)=>{ const h={Accept:'application/vnd.github+json'}; if(etags.has(p))h['If-None-Match']=etags.get(p)
+    const r=await fetch(API+p,{headers:h})
+    const et=r.headers.get('etag'); if(et)etags.set(p,et)
+    if(r.status===304) return null
     if(r.status===403||r.status===429) throw Object.assign(new Error('rate-limited'),{rl:true})
     if(!r.ok) throw new Error('http '+r.status); return r.json() }
   const ago=(iso)=>{ const s=Math.floor((Date.now()-new Date(iso))/1e3)
     return s<60?s+'s':s<3600?Math.floor(s/60)+'m':s<86400?Math.floor(s/3600)+'h':Math.floor(s/86400)+'d' }
   async function prs(){ const L=await gh('/pulls?state=all&sort=updated&direction=desc&per_page=12')
+    if(!L)return
     n.textContent=L.filter(p=>p.state==='open').length+' open'
     prP.querySelectorAll('.pr').forEach(e=>e.remove())
     for(const p of L){ const m=p.merged_at!==null, st=m?'MERGED':p.state==='open'?'OPEN':'CLOSED', c=m?FC.ok:p.state==='open'?FC.info:FC.dim
@@ -129,6 +158,7 @@ function mountFleet(root){
       const mt=document.createElement('div'); mt.style.cssText=`color:${FC.dim};font-size:10px`; mt.textContent=st+' \u00B7 '+p.head.ref.replace(/^.*\//,'')+' \u00B7 '+ago(p.updated_at)
       w.append(tt,mt); d.append(b,w); prP.append(d) } }
   async function acts(){ const L=await gh('/events?per_page=20')
+    if(!L)return
     acP.querySelectorAll('.ac').forEach(e=>e.remove())
     for(const ev of L.slice(0,12)){ const d=document.createElement('div'); d.className='ac'
       d.style.cssText=`padding:4px 0;border-bottom:1px solid #21262d;font:11px monospace;color:${FC.dim};display:flex;gap:6px`
@@ -141,9 +171,23 @@ function mountFleet(root){
       else if(ev.type==='CreateEvent') s=ev.actor.login+' created '+ev.payload.ref_type+(ev.payload.ref?' '+ev.payload.ref:'')
       else s=String(ev.type||'').replace('Event','')
       tx.textContent=s; d.append(ts,tx); acP.append(d) } }
+  async function queen(){ const L=await gh('/actions/runs?per_page=10')
+    if(!L)return
+    qP.querySelectorAll('.qw').forEach(e=>e.remove())
+    for(const r of (L.workflow_runs||[]).slice(0,8)){
+      const d=document.createElement('div'); d.className='qw'
+      d.style.cssText=`padding:4px 0;border-bottom:1px solid #21262d;font:11px monospace;color:${FC.dim};display:flex;gap:6px`
+      const ts=document.createElement('span'); ts.style.cssText='flex-shrink:0;min-width:30px'; ts.textContent=ago(r.created_at)
+      const b=document.createElement('span'); b.style.cssText='flex-shrink:0'
+      const pend=r.status!=='completed', ok=r.conclusion==='success'
+      b.textContent=pend?'\u25CB':ok?'\u2713':r.conclusion==='cancelled'?'\u2717':'!'
+      b.style.color=pend?FC.dim:ok?FC.ok:'#f85149'
+      const tx=document.createElement('span'); tx.style.cssText='color:'+FC.text+';white-space:nowrap;overflow:hidden;text-overflow:ellipsis'
+      tx.textContent=r.name+' ['+(r.event==='schedule'?'cron':r.event)+']'+(r.head_branch?' @'+r.head_branch:'')
+      d.append(ts,b,tx); qP.append(d) } }
   let wait=150, nextAt=0
   async function refresh(){ tm.textContent='\u21BB refreshing...'
-    const R=await Promise.allSettled([prs(),acts()])
+    const R=await Promise.allSettled([prs(),acts(),queen()])
     const bad=R.find(r=>r.status==='rejected'&&r.reason&&r.reason.rl)
     wait=bad?Math.min(wait*2,900):150; nextAt=Date.now()+wait*1000
     tm.textContent=bad?('rate-limited, backing off '+Math.round(wait/60)+'m'):('live \u00B7 cycle '+Math.round(wait/60)+'m') }
