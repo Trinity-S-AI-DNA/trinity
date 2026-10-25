@@ -1,0 +1,328 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/verified/seal_write.t27 -- what one seal write must guarantee before it may land in
+; .trinity/seals/. The three write-safety patterns of REA 6.6.0 (github.com/morluto/rea releases),
+; checked against `t27c seal --save` and `t27c frontier --reseal` on the Railway lab, t27c 0.5.2 at
+; master 89254d2, 2026-10-18.
+; --
+; What already exists and is NOT restated here:
+; - specs/verified/seal_identity.t27 says when a new seal is kept (remint_keeps) and names the
+;   colliding file name: two specs can derive one seal file (parent dir and module), and frontier
+;   writes the other spec's seal back. `seal --save` itself never refuses. This file is the write.
+; - specs/verified/seal_check.t27 says how a seal is checked later from recorded inputs. This file
+;   is the check the writer owes before its seal can be checked at all.
+; - specs/verified/reuse.t27 owns the PART_* codes and the fail-closed rule (MISSING is never SAME).
+; --
+; The three patterns, and where the pipeline stands (lab evidence: gHashTag/t27#10457):
+; 1. Colliding paths are refused before any write -- MISSING. `seal --save specs/a/same/m.t27` then
+;    `seal --save specs/b/same/m.t27` (both `module SameName;`) both exit 0, "Seal saved to
+;    .trinity/seals/same_SameName.json"; the file then names specs/b, and `seal --verify` of specs/a
+;    reports all five hashes MISMATCH. `module Upper;` in c/case and `module upper;` in d/case collide
+;    the same way, through the case-insensitive lookup. The corpus has 8 such names over 2198 specs.
+; 2. The hash is re-checked after the final write -- MISSING. The spec is hashed once, before its
+;    tests read it again. A failing spec swapped for a passing one 0-4 ms into `seal --save`, then
+;    swapped back, sealed "tests 1/1 pass" under the FAILING bytes' spec_hash in 14 of 18 trials;
+;    `seal --verify` said all hashes MATCH and `frontier --list` reused it (1000 permille) while
+;    `test-report` on those bytes fails. An edit during the test run left a seal whose spec_hash
+;    mismatched the moment it was written; `seal --save` still said "Seal saved" and exited 0.
+; 3. Completed seals survive a cut run -- PRESENT for completed seals. SIGINT, SIGTERM and SIGKILL
+;    6 s into a frontier reseal of six specs left 4, 2 and 3 finished seals, each verifying, and no
+;    partial file. The seal in flight is not safe: frontier writes first and restores from a copy
+;    held only in the parent's memory, so killing the parent while its child wrote specs/b's seal
+;    into specs/a's file left specs/a failing verification for good.
+; --
+; The write rule:
+; - The destination is free only when no file answers to its name (case-insensitively, as the
+;   lookup does), or the file there records exactly this spec_path. A file whose owner cannot be
+;   read is not free: fail closed, as reuse.t27 does for an unrecorded part. --force opens an
+;   unreadable owner and never another spec's file (dest_allowed, #10454).
+; - After the seal is written to a staging file, the spec is hashed again and must equal the
+;   recorded spec_hash; the tests must have run on the bytes that hash names; the staged file read
+;   back must equal what was written; the spec generated again must give the recorded gen hashes
+;   (gens_check). Any difference refuses the seal and leaves the old one.
+; - The staged, checked file then replaces the old one by one rename. A cut at any point leaves
+;   the old seal or the new checked seal, never a torn file, an unchecked seal or another spec's.
+; Tests pin literal codes where a code names itself, so renumbering the constants cannot pass.
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module VerifiedSealWrite;
+
+use verified::reuse;
+
+/// dest_check() and post_write_check() answers.
+pub const WRITE_OK : u8 = 0;
+pub const WRITE_COLLISION : u8 = 1;
+pub const WRITE_OWNER_UNKNOWN : u8 = 2;
+pub const WRITE_SPEC_MOVED : u8 = 3;
+pub const WRITE_TESTED_OTHER : u8 = 4;
+pub const WRITE_READBACK_DIFF : u8 = 5;
+/// gens_check(): the spec held still, but generating it again gave other code, so the seal would
+/// record a gen hash nobody can reproduce.
+pub const WRITE_GEN_MOVED : u8 = 6;
+
+/// The staging file is `.<seal name><SEAL_STAGE_SUFFIX>-<pid>` beside the seal. Seal readers take
+/// only `*.json`, so a staged file a cut left behind is never read as a seal.
+pub const SEAL_STAGE_SUFFIX : str = ".part";
+
+/// How a seal reaches its file.
+/// IN_PLACE: `seal --save` today, fs::write straight onto the destination.
+/// WRITE_THEN_RESTORE: `frontier --reseal` today, the child writes in place and the parent writes
+/// the old text back from memory when remint_keeps() refuses the new seal.
+/// STAGE_THEN_RENAME: the rule above.
+pub const PROTO_IN_PLACE : u8 = 1;
+pub const PROTO_WRITE_THEN_RESTORE : u8 = 2;
+pub const PROTO_STAGE_THEN_RENAME : u8 = 3;
+
+/// Where a run can be cut while it seals one spec.
+pub const CUT_BEFORE_WRITE : u8 = 1;
+pub const CUT_DURING_WRITE : u8 = 2;
+pub const CUT_AFTER_WRITE : u8 = 3;
+pub const CUT_AFTER_COMMIT : u8 = 4;
+
+/// What the destination file holds after the cut.
+pub const DISK_OLD : u8 = 1;
+pub const DISK_NEW_CHECKED : u8 = 2;
+pub const DISK_NEW_UNCHECKED : u8 = 3;
+pub const DISK_TORN : u8 = 4;
+pub const DISK_FOREIGN : u8 = 5;
+
+/// Two derived seal file names name one file when they are equal or equal up to case: `--save`
+/// matches an existing file case-insensitively, so case_Upper.json answers for `module upper;`.
+/// Why the lookup folds case (moved here from run_seal, #10457): macOS resolves
+/// ar_restraint.json and ar_Restraint.json to one file and hides the difference, while on the
+/// case-sensitive filesystem CI runs on, `--save` would create a SECOND seal for the same spec and
+/// neither would look wrong. Measured over the store: 751 file names match the derived name
+/// exactly, 4 differ only by case, 558 use the older bare-<module> scheme. An existing file wins,
+/// so the store cannot grow a case-variant twin; dest_check() then says whose file it is.
+pub fn names_collide(exact_equal: bool, casefold_equal: bool) -> bool {
+    if (exact_equal) { return true; }
+    return casefold_equal;
+}
+
+/// May this spec's seal be written to its derived file? dest_exists covers a case-variant name;
+/// owner_known says the existing file's spec_path could be read; owner_is_this_spec compares it.
+pub fn dest_check(dest_exists: bool, owner_known: bool, owner_is_this_spec: bool) -> u8 {
+    if (dest_exists == false) { return WRITE_OK; }
+    if (owner_known == false) { return WRITE_OWNER_UNKNOWN; }
+    if (owner_is_this_spec) { return WRITE_OK; }
+    return WRITE_COLLISION;
+}
+
+/// `seal --save` today: it writes whatever is at the destination. Kept as the unsafe reference the
+/// negative controls compare against.
+pub fn dest_check_today(dest_exists: bool, owner_known: bool, owner_is_this_spec: bool) -> u8 {
+    return WRITE_OK;
+}
+
+/// The check after the staged write. Hashes are stand-ins for the recorded sha256 values, compared
+/// whole: recorded is the spec_hash in the seal, after is the spec hashed again once the seal is
+/// staged, tested is the hash of the bytes the test run read. readback_equal says the staged file
+/// read back equals the text that was written.
+pub fn post_write_check(recorded: u64, after: u64, tested: u64, readback_equal: bool) -> u8 {
+    if (tested != recorded) { return WRITE_TESTED_OTHER; }
+    if (after != recorded) { return WRITE_SPEC_MOVED; }
+    if (readback_equal == false) { return WRITE_READBACK_DIFF; }
+    return WRITE_OK;
+}
+
+/// May `seal --save` write, given dest_check()'s answer? A collision is another spec's seal and
+/// nothing lifts it, --force included: forcing would only move the damage to the other spec. An
+/// unknown owner is a file that does not parse (a torn write from before staging) or a legacy seal
+/// with no spec_path; the writer cannot prove it is someone else's, so it stays closed unless the
+/// person sealing says --force.
+pub fn dest_allowed(code: u8, force: bool) -> bool {
+    if (code == WRITE_OK) { return true; }
+    if (code == WRITE_OWNER_UNKNOWN) { return force; }
+    return false;
+}
+
+/// The gen half of the check after the staged write: post_write_check()'s answer stands when it
+/// refuses; otherwise the four gen hashes computed again must equal the ones recorded.
+pub fn gens_check(code: u8, gens_same: bool) -> u8 {
+    if (code != WRITE_OK) { return code; }
+    if (gens_same) { return WRITE_OK; }
+    return WRITE_GEN_MOVED;
+}
+
+/// `seal --save` today: no check after the write. The unsafe reference.
+pub fn post_write_check_today(recorded: u64, after: u64, tested: u64, readback_equal: bool) -> u8 {
+    return WRITE_OK;
+}
+
+/// What the destination holds when a run sealing one spec is cut at `cut`. foreign says the new
+/// seal belongs to a different spec that derived the same file name (pattern 1 not yet refused).
+pub fn after_cut(proto: u8, cut: u8, foreign: bool) -> u8 {
+    if (cut == CUT_BEFORE_WRITE) { return DISK_OLD; }
+    if (proto == PROTO_STAGE_THEN_RENAME) {
+        // the rename is the commit: before it the destination was never touched
+        if (cut == CUT_AFTER_COMMIT) { return DISK_NEW_CHECKED; }
+        return DISK_OLD;
+    }
+    if (cut == CUT_DURING_WRITE) { return DISK_TORN; }
+    if (foreign) {
+        // write-then-restore restores only after the child exits; in place never restores
+        if (proto == PROTO_WRITE_THEN_RESTORE) {
+            if (cut == CUT_AFTER_COMMIT) { return DISK_OLD; }
+        }
+        return DISK_FOREIGN;
+    }
+    return DISK_NEW_UNCHECKED;
+}
+
+/// A cut is survivable when the file holds the old seal or the new checked one.
+pub fn cut_safe(disk: u8) -> bool {
+    if (disk == DISK_OLD) { return true; }
+    return disk == DISK_NEW_CHECKED;
+}
+
+/// A protocol is cut-safe when every cut point leaves a survivable file, for its own spec and for a
+/// spec that derived the same name.
+pub fn proto_cut_safe(proto: u8) -> bool {
+    if (cut_safe(after_cut(proto, CUT_DURING_WRITE, false)) == false) { return false; }
+    if (cut_safe(after_cut(proto, CUT_AFTER_WRITE, false)) == false) { return false; }
+    if (cut_safe(after_cut(proto, CUT_AFTER_WRITE, true)) == false) { return false; }
+    if (cut_safe(after_cut(proto, CUT_AFTER_COMMIT, false)) == false) { return false; }
+    return cut_safe(after_cut(proto, CUT_AFTER_COMMIT, true));
+}
+
+test a_free_or_own_destination_is_written {
+    // a spec sealed for the first time
+    assert dest_check(false, false, false) == 0;
+    // a reseal of the spec's own seal
+    assert dest_check(true, true, true) == 0;
+}
+
+test the_lab_collision_is_refused_before_any_write {
+    // specs/b/same/m.t27 into same_SameName.json, which records specs/a/same/m.t27
+    assert dest_check(true, true, false) == 1;
+    // `module upper;` in d/case into case_Upper.json, which records c/case: the name lookup is
+    // case-insensitive, so the destination exists
+    assert names_collide(false, true) == true;
+    assert dest_check(names_collide(false, true), true, false) == 1;
+    // two names that differ beyond case are two files
+    assert names_collide(false, false) == false;
+}
+
+test an_unreadable_owner_fails_closed {
+    // a file that answers to the name but records no readable spec_path is nobody's to overwrite
+    assert dest_check(true, false, false) == 2;
+    assert dest_check(true, false, true) == 2;
+}
+
+test negative_control_today_writes_the_collision {
+    // today's save says OK where the rule refuses. If the rule is ever weakened to today's, these
+    // two lines stop differing and this test fails.
+    assert dest_check_today(true, true, false) == WRITE_OK;
+    assert dest_check(true, true, false) != dest_check_today(true, true, false);
+    assert dest_check(true, false, false) != dest_check_today(true, false, false);
+}
+
+test negative_control_refusing_every_existing_file_is_wrong_too {
+    // a rule that refuses any existing file would block every reseal; the own-seal case must pass
+    assert dest_check(true, true, true) == WRITE_OK;
+}
+
+test the_written_seal_names_the_bytes_it_tested {
+    // nothing moved: hashed, tested and re-hashed bytes agree and the read-back matches
+    assert post_write_check(0xeef95aea, 0xeef95aea, 0xeef95aea, true) == 0;
+}
+
+test the_lab_swap_is_refused {
+    // 14 of 18 trials: spec_hash of the failing bytes (eef95aea...), tests run on the passing
+    // bytes, the failing bytes back on disk by the time the seal is written
+    assert post_write_check(0xeef95aea, 0xeef95aea, 0x2b, true) == 4;
+}
+
+test an_edit_during_the_tests_is_refused {
+    // hashed and tested the same bytes, but the spec changed before the write: stale on arrival
+    assert post_write_check(0xeef95aea, 0x3c, 0xeef95aea, true) == 3;
+}
+
+test a_short_or_torn_write_is_refused {
+    assert post_write_check(0xeef95aea, 0xeef95aea, 0xeef95aea, false) == 5;
+}
+
+test negative_control_today_seals_the_swap {
+    // today's save says OK to the forged certificate the lab produced. Weaken the rule to today's
+    // and these lines fail.
+    assert post_write_check_today(0xeef95aea, 0xeef95aea, 0x2b, true) == WRITE_OK;
+    assert post_write_check(0xeef95aea, 0xeef95aea, 0x2b, true) != WRITE_OK;
+    assert post_write_check(0xeef95aea, 0x3c, 0xeef95aea, true) != WRITE_OK;
+    assert post_write_check(0xeef95aea, 0xeef95aea, 0xeef95aea, false) != WRITE_OK;
+}
+
+test negative_control_a_check_of_the_hash_alone_misses_the_swap {
+    // re-hashing the spec after the write is not enough on its own: in the swap trials the
+    // failing bytes were back, so after == recorded; only the tested-bytes check catches it
+    var recorded : u64 = 0xeef95aea;
+    var after : u64 = 0xeef95aea;
+    assert after == recorded;
+    assert post_write_check(recorded, after, 0x2b, true) == WRITE_TESTED_OTHER;
+}
+
+test stage_then_rename_survives_every_cut {
+    assert proto_cut_safe(PROTO_STAGE_THEN_RENAME) == true;
+    assert after_cut(PROTO_STAGE_THEN_RENAME, CUT_DURING_WRITE, false) == DISK_OLD;
+    assert after_cut(PROTO_STAGE_THEN_RENAME, CUT_AFTER_WRITE, true) == DISK_OLD;
+    assert after_cut(PROTO_STAGE_THEN_RENAME, CUT_AFTER_COMMIT, false) == DISK_NEW_CHECKED;
+}
+
+test negative_control_todays_protocols_do_not {
+    // seal --save: fs::write in place, no check after it
+    assert proto_cut_safe(PROTO_IN_PLACE) == false;
+    assert after_cut(PROTO_IN_PLACE, CUT_DURING_WRITE, false) == DISK_TORN;
+    assert after_cut(PROTO_IN_PLACE, CUT_AFTER_COMMIT, true) == DISK_FOREIGN;
+    // frontier --reseal: the lab kill of the parent while its child wrote specs/b into specs/a's
+    // file left specs/a's file naming specs/b
+    assert proto_cut_safe(PROTO_WRITE_THEN_RESTORE) == false;
+    assert after_cut(PROTO_WRITE_THEN_RESTORE, CUT_AFTER_WRITE, true) == DISK_FOREIGN;
+    // when the parent lives to restore, the old seal is back (the lab control: "kept the old seal")
+    assert after_cut(PROTO_WRITE_THEN_RESTORE, CUT_AFTER_COMMIT, true) == DISK_OLD;
+}
+
+test a_cut_never_reaches_back {
+    // pattern 3: each spec has its own file, so a cut while sealing one spec leaves every other
+    // spec where the run left it. A spec not reached yet is at CUT_BEFORE_WRITE under any protocol,
+    // and a finished one was committed before the cut. SIGINT, SIGTERM and SIGKILL after 6 s left
+    // 4, 2 and 3 finished seals, all verifying.
+    assert after_cut(PROTO_IN_PLACE, CUT_BEFORE_WRITE, true) == DISK_OLD;
+    assert after_cut(PROTO_WRITE_THEN_RESTORE, CUT_BEFORE_WRITE, true) == DISK_OLD;
+    assert after_cut(PROTO_STAGE_THEN_RENAME, CUT_BEFORE_WRITE, true) == DISK_OLD;
+}
+
+test force_lifts_an_unknown_owner_and_never_a_collision {
+    // a free or own destination needs no force
+    assert dest_allowed(dest_check(false, false, false), false) == true;
+    assert dest_allowed(dest_check(true, true, true), false) == true;
+    // a torn or legacy seal (owner unreadable) stays closed until the person sealing says --force
+    assert dest_allowed(WRITE_OWNER_UNKNOWN, false) == false;
+    assert dest_allowed(WRITE_OWNER_UNKNOWN, true) == true;
+    // another spec's seal: --force does not open it
+    assert dest_allowed(WRITE_COLLISION, true) == false;
+    assert dest_allowed(dest_check(true, true, false), true) == false;
+}
+
+test negative_control_force_for_everything_would_reopen_the_collision {
+    // a rule where --force lifts every refusal agrees on the unknown owner and differs only on the
+    // collision; if dest_allowed is ever weakened to that, this line fails
+    assert dest_allowed(WRITE_COLLISION, true) != dest_allowed(WRITE_OWNER_UNKNOWN, true);
+}
+
+test a_second_generation_must_give_the_recorded_code {
+    assert gens_check(WRITE_OK, true) == 0;
+    assert gens_check(WRITE_OK, false) == 6;
+    // the spec check speaks first: a moved spec is reported as moved, not as moved gens
+    assert gens_check(post_write_check(0xeef95aea, 0x3c, 0xeef95aea, true), false) == 3;
+    assert gens_check(post_write_check(0xeef95aea, 0xeef95aea, 0x2b, true), true) == 4;
+}
+
+test negative_control_the_spec_check_alone_misses_moved_gens {
+    // nothing about the spec moved, so post_write_check says OK; only gens_check refuses
+    assert post_write_check(0xeef95aea, 0xeef95aea, 0xeef95aea, true) == WRITE_OK;
+    assert gens_check(post_write_check(0xeef95aea, 0xeef95aea, 0xeef95aea, true), false) != WRITE_OK;
+}
+
+test the_stage_suffix_is_not_a_seal_name {
+    // readers take *.json; the staged name ends in SEAL_STAGE_SUFFIX-<pid>, never in .json
+    assert SEAL_STAGE_SUFFIX == ".part";
+    assert SEAL_STAGE_SUFFIX != ".json";
+}
