@@ -10,7 +10,7 @@
 const url = new URL('t27f.wasm', import.meta.url)
 const refuse = (m) => ({ refused: true, message: m })
 const NS = 'http://www.w3.org/2000/svg'
-const C = { bg:'#0d1117',text:'#8b949e',bright:'#c9d1d9',spawn:'#3fb950',active:'#58a6ff',down:'#f85149',restart:'#d29922',exit:'#484f58',edge:'#30363d',particle:'#f0883e' }
+const C = { bg:'#000000',text:'#8b949e',bright:'#c9d1d9',spawn:'#3fb950',active:'#58a6ff',down:'#f85149',restart:'#d29922',exit:'#484f58',edge:'#30363d',particle:'#f0883e' }
 const col = (st) => st==='spawning'?C.spawn:st==='down'?C.down:st==='restarting'?C.restart:st==='exit'?C.exit:C.active
 
 // THE GX CONSUMER -- the law's own graph, dormant until the module carries it. The LAW is
@@ -88,7 +88,7 @@ export async function replay(el, log) {
   const ks = document.getElementById('live-kf') || document.head.append(Object.assign(document.createElement('style'),{id:'live-kf',textContent:'@keyframes live-pulse{from{r:14;opacity:.7}to{r:44;opacity:0}}@keyframes live-shake{0%,100%{transform:translateX(0)}25%{transform:translateX(-3px)}75%{transform:translateX(3px)}}'}))
 
   const wrap=document.createElement('div'); wrap.style.cssText='display:grid;grid-template-columns:1fr 260px;gap:10px'
-  const gc=document.createElement('div'); gc.style.cssText='position:relative;border:1px solid #30363d;border-radius:8px;background:#0d1117;overflow:hidden;min-height:400px'
+  const gc=document.createElement('div'); gc.style.cssText='position:relative;border:1px solid #333;border-radius:8px;background:#000000;overflow:hidden;min-height:400px'
   const sc=document.createElement('div'); sc.style.cssText='display:flex;flex-direction:column;gap:8px'
   const W=640,H=400
   const svg=document.createElementNS(NS,'svg'); svg.setAttribute('viewBox',`0 0 ${W} ${H}`); svg.setAttribute('width','100%'); svg.setAttribute('height','100%'); svg.style.cssText='position:absolute;inset:0'
@@ -102,7 +102,7 @@ export async function replay(el, log) {
   sc.append(stream,stats)
   wrap.append(gc,sc)
   const tl=document.createElement('div'); tl.style.cssText='border:1px solid #30363d;border-radius:8px;padding:6px;display:flex;align-items:center;gap:6px;margin-top:8px'
-  const mkB=(t,fn)=>{const b=document.createElement('button');b.textContent=t;b.onclick=fn;b.style.cssText='background:#21262d;border:1px solid #30363d;color:#c9d1d9;border-radius:4px;padding:3px 8px;cursor:pointer;font:12px monospace';return b}
+  const mkB=(t,fn)=>{const b=document.createElement('button');b.textContent=t;b.onclick=fn;b.style.cssText='background:#000000;border:1px solid #333;color:#c9d1d9;border-radius:4px;padding:3px 8px;cursor:pointer;font:12px monospace';return b}
   const pb=mkB('\u25B6',()=>reset())
   const fe=document.createElement('span'); fe.style.cssText='color:#8b949e;font:11px monospace;margin-left:auto'
   tl.append(pb,fe)
@@ -261,7 +261,7 @@ function gxName(R, i) {
 function gxReplay(el, R, log, evts, feed) {
   document.getElementById('live-kf') || document.head.append(Object.assign(document.createElement('style'),{id:'live-kf',textContent:'@keyframes live-pulse{from{r:14;opacity:.7}to{r:44;opacity:0}}'}))
   const wrap=document.createElement('div'); wrap.style.cssText='display:grid;grid-template-columns:1fr 260px;gap:10px'
-  const gc=document.createElement('div'); gc.style.cssText='position:relative;border:1px solid #30363d;border-radius:8px;background:#0d1117;overflow:hidden;min-height:400px'
+  const gc=document.createElement('div'); gc.style.cssText='position:relative;border:1px solid #333;border-radius:8px;background:#000000;overflow:hidden;min-height:400px'
   const sc=document.createElement('div'); sc.style.cssText='display:flex;flex-direction:column;gap:8px'
   const W=640,H=400
   const svg=document.createElementNS(NS,'svg'); svg.setAttribute('viewBox',`0 0 ${W} ${H}`); svg.setAttribute('width','100%'); svg.setAttribute('height','100%'); svg.style.cssText='position:absolute;inset:0'
@@ -277,7 +277,7 @@ function gxReplay(el, R, log, evts, feed) {
   sc.append(stream,stats)
   wrap.append(gc,sc)
   const tl=document.createElement('div'); tl.style.cssText='border:1px solid #30363d;border-radius:8px;padding:6px;display:flex;align-items:center;gap:6px;margin-top:8px'
-  const mkB=(t,fn)=>{const b=document.createElement('button');b.textContent=t;b.onclick=fn;b.style.cssText='background:#21262d;border:1px solid #30363d;color:#c9d1d9;border-radius:4px;padding:3px 8px;cursor:pointer;font:12px monospace';return b}
+  const mkB=(t,fn)=>{const b=document.createElement('button');b.textContent=t;b.onclick=fn;b.style.cssText='background:#000000;border:1px solid #333;color:#c9d1d9;border-radius:4px;padding:3px 8px;cursor:pointer;font:12px monospace';return b}
   const pb=mkB('\u25B6',()=>reset())
   const fe=document.createElement('span'); fe.style.cssText='color:#8b949e;font:11px monospace;margin-left:auto'
   tl.append(pb,fe)
@@ -375,7 +375,7 @@ function gxReplay(el, R, log, evts, feed) {
 // GitHub API, refreshed on a slow cycle that respects the anonymous rate limit
 // (60/h). No keys, no server: the visitor's browser reads the public API.
 const REPO='Trinity-S-AI-DNA/t27', API=`https://api.github.com/repos/${REPO}`
-const FC={ok:'#3fb950',info:'#58a6ff',dim:'#8b949e',text:'#c9d1d9',bg:'#0d1117',border:'#30363d'}
+const FC={ok:'#3fb950',info:'#58a6ff',dim:'#8b949e',text:'#c9d1d9',bg:'#000000',border:'#333'}
 function mountFleet(root){
   root.style.cssText='margin-top:12px'
   const hd=document.createElement('div'); hd.style.cssText=`display:flex;align-items:center;gap:10px;font:12px monospace;color:${FC.text};padding:8px 12px;border:1px solid ${FC.border};border-radius:8px;background:${FC.bg}`
