@@ -3,6 +3,31 @@ import type { PostMeta } from './types'
 /** Индекс блога: список и метаданные без тяжёлых тел публикаций. */
 export const postsIndex: PostMeta[] = [
   {
+    slug: 'graph-neural-networks-the-2026-field-guide',
+    title: 'Graph neural networks: the 2026 field guide',
+    summary: 'The Distill classic, five years later: the ladder kept, and what the field learned to NAME -- oversmoothing, oversquashing, the Weisfeiler-Leman ceiling, the transformer convergence. With a runnable three-line message-passing core and the design lessons revisited.',
+    date: '2026-10-25',
+    readingMinutes: 11,
+    tags: ['GNN', 'Graphs', 'Explainer', 'Machine learning'],
+    receipts: [
+      { label: 'The original: A Gentle Introduction to Graph Neural Networks, Distill 2021', href: 'https://distill.pub/2021/gnn-intro/' },
+      { label: 'Understanding Convolutions on Graphs, Distill 2021', href: 'https://distill.pub/2021/understanding-gnns/' },
+    ],
+    openQuestions: [
+      'Whether the LLM-encoder-plus-GNN or graph-into-context side wins on text-attributed graphs is open; both hybrids beat each other on alternating benchmarks.',
+      'The 2026 rule of thumb for global attention versus local message passing is a reading of benchmark trends, not a theorem; scaling laws for graph transformers are not settled.',
+    ],
+    published: false,
+    ru: {
+      title: 'Графовые нейросети: полевой справочник 2026',
+      summary: 'Классика Distill пять лет спустя: лестница сохранена, и добавлено то, что область научилась НАЗЫВАТЬ — oversmoothing, oversquashing, потолок Вейсфейлера-Лемана, схождение с трансформерами. С запускаемым трёхстрочным ядром передачи сообщений и уроками дизайна пять лет спустя.',
+      openQuestions: [
+        'Кто победит на графах с текстом — связка LLM-кодировщик плюс GNN или сериализация графа в контекст — открытый вопрос; гибриды поочерёдно бьют друг друга на бенчмарках.',
+        'Правило 2026 «глобальное внимание против локальной передачи» — чтение трендов бенчмарков, а не теорема; законы масштабирования графовых трансформеров не устоялись.',
+      ],
+    },
+  },
+  {
     slug: "the-queen-and-the-hive-a-course-on-how-the-project-builds-itself",
     title: "The Queen and the hive: a course on how the project builds itself, 27 widgets on compiled specs",
     summary: "[every widget runs fn bodies of a gHashTag/t27 specs/queen or specs/automation spec compiled to wasm; no widget reads the live Queen; the game widgets are flat sketches] Course 11 opens the rules the Queen runs the hive by: shaping an issue and its boundary, priority, aging and review first, a task's state machine, the ship in the game, a deploy mid-flight, the reviewer's concurrency and back-off, the merge gate, the review jam and inherited red, refused keys and the next key, credit and token prices, agent bots in one group, the night watch, the public board and the comb.",

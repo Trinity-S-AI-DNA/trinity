@@ -27,6 +27,7 @@ import { body as body_the_fpga_flow_layer_by_layer, ruBody as ruBody_the_fpga_fl
 import { body as body_bypass_or_a_broken_shift, ruBody as ruBody_bypass_or_a_broken_shift } from './bodies/bypass-or-a-broken-shift'
 import { body as body_the_back_half_of_openxc7_from_a_spec, ruBody as ruBody_the_back_half_of_openxc7_from_a_spec } from './bodies/the-back-half-of-openxc7-from-a-spec'
 import { body as body_how_to_join_the_swarm, ruBody as ruBody_how_to_join_the_swarm } from './bodies/how-to-join-the-swarm'
+import { body as body_graph_neural_networks_the_2026_field_guide, ruBody as ruBody_graph_neural_networks_the_2026_field_guide } from './bodies/graph-neural-networks-the-2026-field-guide'
 import { postsIndex } from './index'
 import { body as body_queen_browser_actions_you_can_follow, ruBody as ruBody_queen_browser_actions_you_can_follow } from './bodies/queen-browser-actions-you-can-follow'
 import { body as body_a_partial_module_needs_its_own_verdict, ruBody as ruBody_a_partial_module_needs_its_own_verdict } from './bodies/a-partial-module-needs-its-own-verdict'
@@ -211,6 +212,7 @@ const bodies: Record<string, PostBody> = {
   'eleven-verdicts-were-windows-not-checkpoints': { body: body_eleven_verdicts_were_windows_not_checkpoints, ruBody: ruBody_eleven_verdicts_were_windows_not_checkpoints },
   'each-half-imported-the-other': { body: body_each_half_imported_the_other, ruBody: ruBody_each_half_imported_the_other },
   'a-suite-that-runs-nothing-exits-zero': { body: body_a_suite_that_runs_nothing_exits_zero, ruBody: ruBody_a_suite_that_runs_nothing_exits_zero },
+  'graph-neural-networks-the-2026-field-guide': { body: body_graph_neural_networks_the_2026_field_guide, ruBody: ruBody_graph_neural_networks_the_2026_field_guide },
   'a-repair-reaches-only-the-copy-it-lands-in': { body: body_a_repair_reaches_only_the_copy_it_lands_in, ruBody: ruBody_a_repair_reaches_only_the_copy_it_lands_in },
   'green-ci-does-not-mean-usable': { body: body_green_ci_does_not_mean_usable, ruBody: ruBody_green_ci_does_not_mean_usable },
   'scale-field-width-already-published': { body: body_scale_field_width_already_published, ruBody: ruBody_scale_field_width_already_published },
