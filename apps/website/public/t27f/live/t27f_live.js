@@ -4,7 +4,8 @@
 // law's tick grid, rendered at display frame rate. Every frame number comes
 // from the wasm module's arrival_frame law. Below the graph: the fleet panel,
 // live from the GitHub API -- pull requests, activity, and the queen lane
-// (workflow dispatches and crons). The log can grow: it is re-fetched
+// (workflow dispatches and crons), then the static $0 model-fleet matrix
+// (the probe receipt on t27#12170). The log can grow: it is re-fetched
 // cache-busted every 5 minutes and the delta replays. See PROVENANCE.txt.
 const url = new URL('t27f.wasm', import.meta.url)
 const refuse = (m) => ({ refused: true, message: m })
@@ -356,13 +357,38 @@ function mountFleet(root){
   const qP=document.createElement('div'); qP.style.cssText=`border:1px solid ${FC.border};border-radius:8px;background:${FC.bg};padding:10px;overflow-y:auto;max-height:240px;margin-top:8px`
   const h3=document.createElement('div'); h3.textContent='the queen -- dispatches and crons (workflow runs)'; h3.style.cssText=`color:${FC.text};font:bold 12px monospace;margin:0 0 8px`
   qP.append(h3)
+  // The model fleet: the $0 capacity matrix, STATIC from the probe receipt on
+  // t27#12170 (2026-10-25). The pool flapped 8->2 alive cells within hours that
+  // day, so the law (specs/queen/api_fleet.t27) is re-probe, never replace the
+  // pool. The live scanner lands as t27#12375; this panel switches to its fresh
+  // matrix then. No fetch, no timer: a dated snapshot, honestly labelled.
+  const flP=document.createElement('div'); flP.style.cssText=`border:1px solid ${FC.border};border-radius:8px;background:${FC.bg};padding:10px;margin-top:8px`
+  const h5=document.createElement('div'); h5.textContent='the model fleet -- $0 capacity (probe 2026-10-25)'; h5.style.cssText=`color:${FC.text};font:bold 12px monospace;margin:0 0 8px`
+  const flT=document.createElement('table'); flT.style.cssText='width:100%;border-collapse:collapse;font:11px monospace'
+  const flRows=[['route','model','keys alive','price'],
+    ['zai-coding-plan','glm-5.3-flash','probe subagent','$0'],
+    ['z.ai','glm-4.5-flash','5/5 keys that day','$0'],
+    ['z.ai','glm-4.7-flash','3 probed','$0'],
+    ['zai-coding-plan','glm-5.3-highspeed','REFUSED by plan','--']]
+  flRows.forEach((r,ri)=>{ const tr=document.createElement('tr')
+    r.forEach((c,ci)=>{ const td=document.createElement('td'); td.style.cssText='padding:3px 6px;border-bottom:1px solid #21262d;color:'+FC.text
+      if(ri===0)td.style.color=FC.dim
+      else if(c.indexOf('REFUSED')===0)td.style.color='#f85149'
+      else if(c==='$0')td.style.color='#d29922'
+      td.textContent=c; tr.append(td) })
+    flT.append(tr) })
+  const flF=document.createElement('div'); flF.style.cssText=`color:${FC.dim};font:10px monospace;margin-top:6px`
+  flF.textContent='re-probe before routing; 401 refuses the ROUTE, never the key (specs/queen/api_fleet.t27)'
+  const flC=document.createElement('div'); flC.style.cssText=`color:${FC.dim};font:10px monospace;margin-top:3px`
+  flC.textContent='static matrix from the probe receipt (t27#12170); the live scanner lands as t27#12375 and this panel switches to its fresh matrix then'
+  flP.append(h5,flT,flF,flC)
   const vid=document.createElement('div'); vid.style.cssText=`border:1px solid ${FC.border};border-radius:8px;background:${FC.bg};padding:10px;margin-top:8px`
   const h4=document.createElement('div'); h4.textContent='recorded footage -- 900 frames from frame_render.t27, rendered by the lab (110.11 fps, 9.08 ms/frame)'; h4.style.cssText=`color:${FC.text};font:bold 12px monospace;margin:0 0 8px`
   const v=document.createElement('video'); v.controls=true; v.playsInline=true; v.preload='metadata'
   v.style.cssText='width:100%;max-height:420px;border-radius:6px;background:#000'
   v.src='./queen-live.mp4'
   vid.append(h4,v)
-  prP.append(h1); acP.append(h2); cols.append(prP,acP); root.append(cols,qP,vid)
+  prP.append(h1); acP.append(h2); cols.append(prP,acP); root.append(cols,qP,flP,vid)
   const etags=new Map()
   const gh=async(p)=>{ const h={Accept:'application/vnd.github+json'}; if(etags.has(p))h['If-None-Match']=etags.get(p)
     const r=await fetch(API+p,{headers:h})
