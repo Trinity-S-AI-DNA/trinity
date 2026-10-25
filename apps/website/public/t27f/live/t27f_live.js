@@ -136,7 +136,13 @@ function mountFleet(root){
   const qP=document.createElement('div'); qP.style.cssText=`border:1px solid ${FC.border};border-radius:8px;background:${FC.bg};padding:10px;overflow-y:auto;max-height:240px;margin-top:8px`
   const h3=document.createElement('div'); h3.textContent='the queen -- dispatches and crons (workflow runs)'; h3.style.cssText=`color:${FC.text};font:bold 12px monospace;margin:0 0 8px`
   qP.append(h3)
-  prP.append(h1); acP.append(h2); cols.append(prP,acP); root.append(cols,qP)
+  const vid=document.createElement('div'); vid.style.cssText=`border:1px solid ${FC.border};border-radius:8px;background:${FC.bg};padding:10px;margin-top:8px`
+  const h4=document.createElement('div'); h4.textContent='recorded footage -- 900 frames from frame_render.t27, rendered by the lab (110.11 fps, 9.08 ms/frame)'; h4.style.cssText=`color:${FC.text};font:bold 12px monospace;margin:0 0 8px`
+  const v=document.createElement('video'); v.controls=true; v.playsInline=true; v.preload='metadata'
+  v.style.cssText='width:100%;max-height:420px;border-radius:6px;background:#000'
+  v.src='./queen-live.mp4'
+  vid.append(h4,v)
+  prP.append(h1); acP.append(h2); cols.append(prP,acP); root.append(cols,qP,vid)
   const etags=new Map()
   const gh=async(p)=>{ const h={Accept:'application/vnd.github+json'}; if(etags.has(p))h['If-None-Match']=etags.get(p)
     const r=await fetch(API+p,{headers:h})
