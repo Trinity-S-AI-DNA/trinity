@@ -1,0 +1,330 @@
+name: Auto Merge Ready PRs
+
+# TRINITY MERGE AUTOPILOT (Trinity-S-AI-DNA/t27#12145). The cross-repo subset of
+# t27's gate, .github/workflows/auto-merge-ready-prs.yml, for pull requests on
+# trinity main. Two halves:
+#
+# 1. THE WORK-REPORT HALF -- live today. For every open PR on main whose body
+#    carries a <!-- t27-work-report --> block: when the head SHA has no
+#    "T27 work report" commit status yet (missing entirely, or stale after a
+#    push -- a pushed head is a new SHA that carries none), dispatch the
+#    existing "PR work report and blog" workflow (pr-blog-report.yml) with
+#    pr=N. That workflow validates the report block and binds the status to
+#    the head. A head whose status is a FAILURE is not re-dispatched: a
+#    failure means the report block is missing or stale, and only the PR's
+#    author fixes that. The report workflow also fires on its own
+#    pull_request_target events; the dispatch here is the recovery path.
+#
+# 2. THE MERGE HALF -- DORMANT BY DESIGN. Owner's rule, 2026-10-02: "the Queen
+#    must not merge by herself!! the Queen only manages!" A merge happens only
+#    after a reviewer bee has reviewed the pull request, and its signal is the
+#    `bee-reviewed` label applied by the bee's own login
+#    (vars.BEE_REVIEWER_LOGIN, default `t27-bees[bot]`) AFTER the head arrived
+#    -- the same rule t27's gate reads (#5547, #5525). No reviewer bee runs on
+#    trinity yet, so that login can have applied no label here, so the gate
+#    below fails closed for every pull request and merges NOTHING. That is
+#    deliberate: this half stays dormant until the reviewer bee reaches
+#    trinity. The work-report half above is the part that works today.
+#
+# The gate mirrored from t27 (cross-repo subset). Merge --squash ONLY when ALL
+# hold:
+#   - the "T27 work report" commit status is SUCCESS on the head SHA;
+#   - the `bee-reviewed` label is present, was applied by BEE_REVIEWER_LOGIN,
+#     and post-dates the head. The head's time is the LATEST of its committer
+#     date, the first check run GitHub started on it, and the last force-push
+#     of the branch: a commit made at 10:00 and pushed at 10:10 carries 10:10,
+#     so a label put on at 10:05 must not pass it (t27's rule, kept verbatim).
+#     Every read FAILS CLOSED: a fetch that errors skips the pull request;
+#   - no required check of the base branch is failing. The base's required
+#     checks are read from its ruleset; an unreadable ruleset makes every
+#     check required, as in t27's gate. A pending or never-posted required
+#     check is not green. Non-required red checks do not block in this subset
+#     -- on t27 the bee answers for those, and no bee runs here yet;
+#   - the pull request is mergeable (open, not draft, no conflicts).
+# A pull request without the bee-reviewed label is NEVER merged.
+#
+# Not carried over from t27's gate (they live with the bee): the bee's own
+# APPROVED review of the head, and the discounted-check machinery that lets
+# the bee answer for a red check master also says red for. When the reviewer
+# bee reaches trinity, those come with it.
+#
+# No pull request head is ever checked out or executed; this workflow checks
+# out nothing and only reads the API.
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run (no dispatch, no merge)'
+        required: false
+        type: boolean
+        default: false
+
+# One sweep at a time: a second sweep waits behind the first, it never cancels
+# it mid-merge.
+concurrency:
+  group: auto-merge-sweep
+  cancel-in-progress: false
+
+permissions:
+  contents: write        # the squash merge into main
+  pull-requests: write   # merging pull requests
+  actions: write         # dispatching "PR work report and blog" with pr=N
+
+jobs:
+  auto-merge:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_REPO: ${{ github.repository }}
+    steps:
+      # HALF 1: recover missing work reports. A status that is a FAILURE is
+      # left alone (the report block itself is wrong); only a head with NO
+      # "T27 work report" status at all is dispatched for.
+      - name: Dispatch missing work reports
+        id: dispatch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DRY_RUN: ${{ inputs.dry_run || 'false' }}
+        run: |
+          set -euo pipefail
+          DISPATCHED=0
+          PR_LIST=$(gh pr list --state open --base main --limit 200 --json number --jq '.[].number')
+          for pr in $PR_LIST; do
+            META=$(gh pr view "$pr" --json body,headRefOid 2>/dev/null) || { echo "#$pr: cannot read metadata"; continue; }
+            BODY=$(printf '%s' "$META" | jq -r '.body // ""')
+            SHA=$(printf '%s' "$META" | jq -r '.headRefOid // ""')
+            if [ -z "$SHA" ]; then echo "#$pr: no head SHA"; continue; fi
+            if ! printf '%s' "$BODY" | grep -q '<!-- t27-work-report -->'; then
+              continue
+            fi
+            STATE=$(gh api "repos/$GH_REPO/commits/$SHA/status" \
+              --jq '[.statuses[] | select(.context == "T27 work report") | .state] | first // ""') || STATE=""
+            if [ -n "$STATE" ]; then
+              continue
+            fi
+            if [ "$DRY_RUN" = "true" ]; then
+              echo "#$pr: dry run -- would dispatch 'PR work report and blog' for head ${SHA:0:9}"
+              continue
+            fi
+            echo "#$pr: head ${SHA:0:9} carries no 'T27 work report' status; dispatching pr-blog-report.yml"
+            if gh workflow run pr-blog-report.yml --ref main -f pr="$pr"; then
+              DISPATCHED=$((DISPATCHED + 1))
+            else
+              echo "::warning::dispatch of pr-blog-report.yml failed for #$pr"
+            fi
+          done
+          echo "dispatched=$DISPATCHED" >> "$GITHUB_OUTPUT"
+          echo "work reports dispatched: $DISPATCHED"
+
+      # HALF 2: the merge gate. Dormant by design until the reviewer bee
+      # reaches trinity -- see the header comment.
+      - name: Find ready PRs
+        id: find-ready
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BEE_REVIEWER_LOGIN: ${{ vars.BEE_REVIEWER_LOGIN || 't27-bees[bot]' }}
+          SELF_WORKFLOW: ${{ github.workflow }}
+          DRY_RUN: ${{ inputs.dry_run || 'false' }}
+        run: |
+          set -euo pipefail
+          READY_HEADS=()
+          SKIPPED=0
+
+          # FAIL CLOSED on the identity, exactly as t27's gate: a bot login is
+          # `<slug>[bot]`; anything else -- a human account, an empty or
+          # mistyped variable -- would let a person's label stand in for a
+          # bee's, so nothing merges at all.
+          if ! [[ "$BEE_REVIEWER_LOGIN" =~ ^[a-z0-9][a-z0-9-]*\[bot\]$ ]]; then
+            echo "::error::BEE_REVIEWER_LOGIN='$BEE_REVIEWER_LOGIN' is not a bot login (<slug>[bot]); merging nothing."
+            echo "ready_heads=" >> "$GITHUB_OUTPUT"
+            echo "count=0" >> "$GITHUB_OUTPUT"
+            echo "skipped=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "Reviewer bee identity: $BEE_REVIEWER_LOGIN"
+
+          PR_LIST=$(gh pr list --state open --base main --limit 200 --json number --jq '.[].number')
+          REPO_API="repos/$GH_REPO"
+
+          for pr in $PR_LIST; do
+            echo "Evaluating PR #$pr..."
+            META=$(gh pr view "$pr" --json state,isDraft,mergeable,labels,headRefOid,baseRefName,statusCheckRollup 2>/dev/null) || { echo "  Skipped: cannot fetch PR metadata"; SKIPPED=$((SKIPPED + 1)); continue; }
+
+            # 4) MERGEABLE: open, not a draft, no conflicts. A draft or a
+            # conflicting pull request is skipped, never failed.
+            STATE=$(printf '%s' "$META" | jq -r '.state // ""')
+            IS_DRAFT=$(printf '%s' "$META" | jq -r '.isDraft')
+            MERGEABLE=$(printf '%s' "$META" | jq -r '.mergeable // ""')
+            if [ "$STATE" != "OPEN" ] || [ "$IS_DRAFT" = "true" ]; then
+              echo "  Skipped: not an open, non-draft pull request"
+              SKIPPED=$((SKIPPED + 1)); continue
+            fi
+            if [ "$MERGEABLE" != "MERGEABLE" ]; then
+              echo "  Skipped: mergeable=$MERGEABLE (conflicted or unknown)"
+              SKIPPED=$((SKIPPED + 1)); continue
+            fi
+
+            # 1) THE WORK REPORT: the "T27 work report" commit status must be
+            # SUCCESS on THIS head. The pr-blog-report workflow binds it to
+            # the head after validating the report block, so a stale report
+            # (a push after it) reads as missing here.
+            SHA=$(printf '%s' "$META" | jq -r '.headRefOid // ""')
+            if [ -z "$SHA" ]; then
+              echo "  Skipped: no head SHA"
+              SKIPPED=$((SKIPPED + 1)); continue
+            fi
+            WR_STATE=$(gh api "$REPO_API/commits/$SHA/status" \
+              --jq '[.statuses[] | select(.context == "T27 work report") | .state] | first // ""') || WR_STATE=""
+            if [ "$WR_STATE" != "success" ]; then
+              echo "  Skipped: 'T27 work report' status on the head is '${WR_STATE:-absent}' (dispatched above when recoverable)"
+              SKIPPED=$((SKIPPED + 1)); continue
+            fi
+
+            # 2) THE BEE-REVIEWED LABEL. Present, applied by the bee's own
+            # login, and post-dating the head. WHEN THE HEAD ARRIVED, not
+            # when it was committed: the head's time is the latest of its
+            # committer date, the first check run GitHub started on it (a
+            # push starts them), and the last force-push of the branch. Every
+            # read below FAILS CLOSED: a fetch that errors skips the pull
+            # request, because a missing date would make the gate lenient.
+            if ! printf '%s' "$META" | jq -e '[.labels[]?.name] | index("bee-reviewed")' >/dev/null; then
+              echo "  Skipped: no bee-reviewed label -- only a reviewer bee's review merges (owner's rule, 2026-10-02)"
+              SKIPPED=$((SKIPPED + 1)); continue
+            fi
+            if ! COMMIT_AT=$(gh api "$REPO_API/commits/$SHA" --jq '.commit.committer.date') \
+              || ! RUN_AT=$(gh api "$REPO_API/commits/$SHA/check-runs?per_page=100" \
+                   --jq '[.check_runs[].started_at | select(. != null)] | min // ""') \
+              || ! EVENTS=$(gh api "$REPO_API/issues/$pr/events" --paginate --jq \
+                   '.[] | select(.event == "labeled" or .event == "head_ref_force_pushed")
+                        | [.event, (.label.name // "-"), .created_at, (.actor.login // "-")] | @tsv'); then
+              echo "  Skipped: could not read when the head arrived or when it was labeled"
+              SKIPPED=$((SKIPPED + 1)); continue
+            fi
+            PUSHED_AT=$(printf '%s\n' "$EVENTS" | awk -F'\t' '$1 == "head_ref_force_pushed" { print $3 }' | sort | tail -1)
+            HEAD_AT=$(printf '%s\n' "$COMMIT_AT" "$RUN_AT" "$PUSHED_AT" | sort | tail -1)
+            # The LAST bee-reviewed label event, and who applied it. A label
+            # put on by anyone but the reviewer bee is not the bee's word.
+            LABEL_LAST=$(printf '%s\n' "$EVENTS" | awk -F'\t' '$1 == "labeled" && $2 == "bee-reviewed" { print $3 "\t" $4 }' | sort | tail -1)
+            LABELED_AT=$(printf '%s' "$LABEL_LAST" | cut -f1)
+            LABELED_BY=$(printf '%s' "$LABEL_LAST" | cut -f2)
+            if [ -z "$HEAD_AT" ] || [ -z "$LABELED_AT" ] || [[ "$LABELED_AT" < "$HEAD_AT" ]]; then
+              echo "  Skipped: bee-reviewed ($LABELED_AT) does not post-date the head ($HEAD_AT)"
+              SKIPPED=$((SKIPPED + 1)); continue
+            fi
+            if [ "$LABELED_BY" != "$BEE_REVIEWER_LOGIN" ]; then
+              echo "  Skipped: bee-reviewed was applied by '$LABELED_BY', not by $BEE_REVIEWER_LOGIN"
+              SKIPPED=$((SKIPPED + 1)); continue
+            fi
+
+            # 3) THE CHECK GATE. Names and states are normalised first: a
+            # commit status (StatusContext) has `context`/`state`, not
+            # `name`/`conclusion`. This sweep's own check never counts against
+            # the pull request it is judging.
+            CHECKS=$(printf '%s' "$META" | jq --arg self "$SELF_WORKFLOW" '[.statusCheckRollup[]?
+              | select((.workflowName // "") != $self)
+              | if has("context") and (has("name") | not)
+                then {name: .context, conclusion: (.state // ""), workflow: "",
+                      done: ((.state // "") | IN("", "PENDING", "EXPECTED") | not)}
+                else {name: (.name // ""), conclusion: (.conclusion // ""), workflow: (.workflowName // ""),
+                      done: ((.conclusion // "") != "")} end]')
+            POSTED=$(printf '%s' "$CHECKS" | jq 'length')
+            if [ "$POSTED" = "0" ]; then
+              echo "  Skipped: no check has posted yet -- zero checks is not zero failures"
+              SKIPPED=$((SKIPPED + 1)); continue
+            fi
+            PENDING=$(printf '%s' "$CHECKS" | jq -r '[.[] | select(.done | not) | .name] | unique | join(", ")')
+            if [ -n "$PENDING" ]; then
+              echo "  Skipped: checks still running: $PENDING"
+              SKIPPED=$((SKIPPED + 1)); continue
+            fi
+            BASE_REF=$(printf '%s' "$META" | jq -r '.baseRefName // empty')
+            REQUIRED=null
+            if [ -n "$BASE_REF" ] && RULES=$(gh api "$REPO_API/rules/branches/$BASE_REF" --jq \
+                 '[.[] | select(.type == "required_status_checks") | .parameters.required_status_checks[].context]'); then
+              REQUIRED="$RULES"
+            fi
+            # A red check blocks when it is required, when it never posted but
+            # is required, or when the ruleset is unreadable (null -> every
+            # check is required). A red NON-required check is logged and
+            # allowed by this cross-repo subset: on t27 the bee answers for
+            # those, and no bee runs here yet.
+            BLOCKING=$(printf '%s' "$CHECKS" | jq -r --argjson req "$REQUIRED" '
+              [ ($req // [])[] as $r | select([.[] | select(.name == $r)] | length == 0)
+                | "\($r) (required, never posted)" ]
+              + [ .[] | select(.conclusion | IN("SUCCESS", "SKIPPED") | not)
+                  | if $req == null then "\(.name) (\(.conclusion); ruleset unreadable, nothing passes the gate)"
+                    elif (.name | IN($req[])) then "\(.name) (\(.conclusion); required)"
+                    else empty end ]
+              | unique | join("; ")')
+            ALLOWED_RED=$(printf '%s' "$CHECKS" | jq -r --argjson req "$REQUIRED" '
+              [ .[] | select(.conclusion | IN("SUCCESS", "SKIPPED") | not)
+                  | select($req != null) | select(.name | IN($req[]) | not) | .name ] | unique | join(", ")')
+            if [ -n "$BLOCKING" ]; then
+              echo "  Skipped: $BLOCKING"
+              SKIPPED=$((SKIPPED + 1)); continue
+            fi
+
+            READY_HEADS+=("$pr:$SHA")
+            echo "  Ready to merge${ALLOWED_RED:+ (red but not required, allowed by the cross-repo subset: $ALLOWED_RED)}"
+          done
+
+          echo "ready_heads=${READY_HEADS[*]}" >> "$GITHUB_OUTPUT"
+          echo "count=${#READY_HEADS[@]}" >> "$GITHUB_OUTPUT"
+          echo "skipped=$SKIPPED" >> "$GITHUB_OUTPUT"
+
+      - name: Dry Run Check
+        if: inputs.dry_run
+        run: |
+          echo "DRY RUN - nothing was dispatched or merged"
+          echo "Ready PRs: ${{ steps.find-ready.outputs.count }}"
+          echo "Skipped PRs: ${{ steps.find-ready.outputs.skipped }}"
+
+      - name: Merge Ready PRs
+        if: ${{ steps.find-ready.outputs.count != '0' && !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          READY_HEADS: ${{ steps.find-ready.outputs.ready_heads }}
+        run: |
+          set -euo pipefail
+          echo "Merging ${{ steps.find-ready.outputs.count }} PRs..."
+          MERGED=0
+          FAILED=0
+          for item in $READY_HEADS; do
+            pr="${item%%:*}"
+            sha="${item#*:}"
+            if ! [[ "$pr" =~ ^[0-9]+$ && "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "  Refusing malformed ready entry '$item'"
+              FAILED=$((FAILED + 1))
+              continue
+            fi
+            echo "  Merging PR #$pr at $sha..."
+            # --match-head-commit: the head that passed the gate above. A push
+            # that lands between the gate and this line is a head no bee
+            # reviewed; GitHub refuses the merge instead of taking it. Merged
+            # with github.token, whose events start no workflow.
+            if gh pr merge "$pr" --squash --delete-branch --match-head-commit "$sha"; then
+              MERGED=$((MERGED + 1))
+            elif [ "$(gh pr view "$pr" --json state --jq .state)" = "MERGED" ]; then
+              echo "  PR #$pr was merged by another run"
+            else
+              echo "  Failed to merge PR #$pr"
+              FAILED=$((FAILED + 1))
+            fi
+          done
+          echo "merged $MERGED, failed $FAILED"
+          if [ "$FAILED" != "0" ]; then
+            echo "::error::$FAILED merge(s) failed. A batch that merged nothing must not report success -- that is how a refused merge goes unread." >&2
+            exit 1
+          fi
+
+      - name: Post Summary
+        if: always()
+        run: |
+          echo "## Auto Merge sweep" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Work reports dispatched:** ${{ steps.dispatch.outputs.dispatched || 0 }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "**PRs ready:** ${{ steps.find-ready.outputs.count || 0 }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "**PRs skipped:** ${{ steps.find-ready.outputs.skipped || 0 }}" >> "$GITHUB_STEP_SUMMARY"
