@@ -12,6 +12,26 @@ const NS = 'http://www.w3.org/2000/svg'
 const C = { bg:'#0d1117',text:'#8b949e',bright:'#c9d1d9',spawn:'#3fb950',active:'#58a6ff',down:'#f85149',restart:'#d29922',exit:'#484f58',edge:'#30363d',particle:'#f0883e' }
 const col = (st) => st==='spawning'?C.spawn:st==='down'?C.down:st==='restarting'?C.restart:st==='exit'?C.exit:C.active
 
+// THE GX CONSUMER -- the law's own graph, dormant until the module carries it. The LAW is
+// specs/t27f/live_graph_export.t27 (gHashTag/t27#12148, MERGED) over the ONE WorkGraph of
+// specs/t27f/work_graph.t27: it exports gx_node_count/gx_node_kind/gx_node_name_ptr/
+// gx_node_name_len per node, gx_edge_count/gx_edge_kind/gx_edge_from/gx_edge_to per edge,
+// and the two event paths gx_replay (a whole recorded log) and gx_apply_event (one staged
+// record). The wasm beside this file today exports only the scalar trio, so hasGx is false,
+// none of this runs and the page keeps its simulated agents; the day t27f.build serves the
+// stateful module this branch takes over with zero further PRs. Node kinds (work_graph.t27):
+// 0 SPEC, 1 AGENT, 2 TASK, 3 ACTION, 4 ARTIFACT. Edge kinds: 0 READS, 1 ASSIGNED, 2 PERFORMS,
+// 3 PRODUCES, 4 VERIFIES, 5 BLOCKS. A name is the module's own bytes at the ptr/len pair: a
+// SPEC path, or the tagged form -- two kind letters, a colon, the node's id as 8
+// little-endian bytes; the page renders the number it reads (the module converts none). A
+// record is 32 bytes little-endian: kind +0, deliver +1, reason +2, reserved +3 (must be 0),
+// task_no +4, seq +8, spec_id +12, from_pid +16, to_pid +24.
+const GX_EV = { spawn:0, exit:1, down:2, restart:3, deliver:4, delivers:5 }
+const GX_DV = { offer:1, result:2, cancel:3 }
+const GX_KC = [C.restart, C.active, '#a371f7', C.text, C.spawn] // spec amber, agent blue, task violet, action grey, artifact green
+const GX_KN = ['spec','agent','task','action','artifact']
+const GX_SEED = [[96,96],[320,200],[544,96],[544,304],[320,336]] // kind clusters, then the force layout
+
 export async function replay(el, log) {
   let R
   try { R = (await WebAssembly.instantiateStreaming(fetch(url),{}).catch(async()=>WebAssembly.instantiate(await(await fetch(url)).arrayBuffer(),{}))).instance.exports }
@@ -19,6 +39,16 @@ export async function replay(el, log) {
   if (typeof R.arrival_frame !== 'function') return refuse('the module lacks arrival_frame.')
   const evts = Array.isArray(log.events) ? log.events : []
   if (!evts.length) return refuse('the recorded log holds no events.')
+
+  // The gx consumer: when the module carries the law's own graph (live_graph_export.t27,
+  // t27#12148), the page stops simulating agents and reads the real topology out of the
+  // module -- nodes, names and edges straight from linear memory. Today's module exports
+  // none of it, so this stays dormant and the simulation below runs exactly as before;
+  // any gx_ refusal or throw below falls back to that path silently.
+  if (typeof R.gx_node_count === 'function') {
+    try { const feed = gxFeed(R, evts); if (feed) return gxReplay(el, R, log, evts, feed) }
+    catch { /* the module refused its own graph: the simulation path stands */ }
+  }
 
   const ks = document.getElementById('live-kf') || document.head.append(Object.assign(document.createElement('style'),{id:'live-kf',textContent:'@keyframes live-pulse{from{r:14;opacity:.7}to{r:44;opacity:0}}@keyframes live-shake{0%,100%{transform:translateX(0)}25%{transform:translateX(-3px)}75%{transform:translateX(3px)}}'}))
 
@@ -114,6 +144,171 @@ export async function replay(el, log) {
       let s1=0; const st=()=>{ layout(); if(s1++<40)requestAnimationFrame(st) }; requestAnimationFrame(st) } }catch{} },300000)
 
   return { refused:false, message:`${evts.length} events on the law's tick grid, ${agents.size} named agents at display frame rate; below: pull requests, activity and the queen lane, live from the GitHub API. Press play to watch the replay.` }
+}
+
+// Encode one log event as its 32-byte #12005 record at offset o. Fields the log does not
+// carry are written 0 -- the module, never this file, is the judge of what then stands.
+function gxPut(v, o, ev) {
+  const k = typeof ev.kind === 'number' ? ev.kind : GX_EV[ev.kind]
+  if (k === undefined) return false
+  const d = typeof ev.deliver === 'number' ? ev.deliver : GX_DV[ev.deliver]
+  v.setUint8(o, k); v.setUint8(o + 1, d === undefined ? 0 : d)
+  v.setUint8(o + 2, ev.reason ?? 0); v.setUint8(o + 3, 0)
+  v.setUint32(o + 4, ev.task ?? ev.task_no ?? 0, true)
+  v.setUint32(o + 8, ev.seq ?? ev.tick ?? 0, true)
+  v.setUint32(o + 12, ev.spec ?? ev.spec_id ?? 0, true)
+  v.setBigUint64(o + 16, BigInt(ev.from ?? ev.from_pid ?? 0), true)
+  v.setBigUint64(o + 24, BigInt(ev.to ?? ev.to_pid ?? 0), true)
+  return true
+}
+
+// Feed the module: the load path first (the whole recorded log through gx_replay, accepted
+// only if the module answers ok and holds nodes), else the live path (gx_apply_event per
+// event, staged one record at a time). A partial load path stands in the law's own
+// semantics, so the live path is entered only behind a gx_reset that clears it.
+function gxFeed(R, evts) {
+  if (!(R.memory instanceof WebAssembly.Memory)) return null
+  const base = R.gx_log_ptr(), cap = R.gx_log_cap(), v = new DataView(R.memory.buffer)
+  let tried = false
+  if (typeof R.gx_replay === 'function' && evts.length * 32 <= cap) {
+    tried = true; let ok = true
+    for (let i = 0; i < evts.length && ok; i++) ok = gxPut(v, base + i * 32, evts[i])
+    if (ok && R.gx_log_set_len(evts.length * 32) && R.gx_replay(base, evts.length * 32) === 0
+        && R.gx_node_count() > 0) return { mode: 'replay' }
+  }
+  if (typeof R.gx_apply_event !== 'function') return null
+  if (tried && (typeof R.gx_reset !== 'function' || R.gx_reset() !== 0)) return null
+  if (!gxPut(v, base, evts[0]) || !R.gx_log_set_len(32)) return null
+  const k = typeof evts[0].kind === 'number' ? evts[0].kind : GX_EV[evts[0].kind]
+  if (R.gx_apply_event(k, evts[0].tick ?? 0, evts[0].task ?? evts[0].task_no ?? 0) !== 0
+      || R.gx_node_count() === 0) return null
+  return { mode: 'apply' }
+}
+
+// Node i's name from the module's own bytes: the tagged form renders the id the law wrote
+// as 8 little-endian bytes (the page renders the number, the module converts none); every
+// other name decodes as text -- a spec path the fixture's join named.
+function gxName(R, i) {
+  const p = R.gx_node_name_ptr(i), n = R.gx_node_name_len(i)
+  if (!n) return 'node ' + i
+  const buf = R.memory.buffer, b = new Uint8Array(buf, p, n)
+  if (n === 11 && b[2] === 58)
+    return String.fromCharCode(b[0], b[1]) + ':' + new DataView(buf).getBigUint64(p + 3, true)
+  return new TextDecoder().decode(b)
+}
+
+// The gx page: the same chrome as the simulation, but the graph is the law's own topology.
+function gxReplay(el, R, log, evts, feed) {
+  document.getElementById('live-kf') || document.head.append(Object.assign(document.createElement('style'),{id:'live-kf',textContent:'@keyframes live-pulse{from{r:14;opacity:.7}to{r:44;opacity:0}}'}))
+  const wrap=document.createElement('div'); wrap.style.cssText='display:grid;grid-template-columns:1fr 260px;gap:10px'
+  const gc=document.createElement('div'); gc.style.cssText='position:relative;border:1px solid #30363d;border-radius:8px;background:#0d1117;overflow:hidden;min-height:400px'
+  const sc=document.createElement('div'); sc.style.cssText='display:flex;flex-direction:column;gap:8px'
+  const W=640,H=400
+  const svg=document.createElementNS(NS,'svg'); svg.setAttribute('viewBox',`0 0 ${W} ${H}`); svg.setAttribute('width','100%'); svg.setAttribute('height','100%'); svg.style.cssText='position:absolute;inset:0'
+  const eG=document.createElementNS(NS,'g'),nG=document.createElementNS(NS,'g'),fG=document.createElementNS(NS,'g')
+  svg.append(eG,nG,fG); gc.append(svg)
+  const lg=document.createElement('div'); lg.style.cssText='position:absolute;bottom:6px;left:8px;display:flex;gap:10px;font:11px monospace;color:#8b949e;pointer-events:none;flex-wrap:wrap'
+  for(let k=0;k<5;k++){const s=document.createElement('span');s.innerHTML=`<span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:${GX_KC[k]};margin-right:3px"></span>${GX_KN[k]}`;lg.append(s)}
+  gc.append(lg)
+  const tag=document.createElement('div'); tag.style.cssText='position:absolute;top:6px;right:8px;font:10px monospace;color:#8b949e;pointer-events:none'
+  tag.textContent='gx '+(feed.mode==='replay'?'replay: the whole log':'apply: per event'); gc.append(tag)
+  const stream=document.createElement('div'); stream.style.cssText='flex:1;border:1px solid #30363d;border-radius:8px;padding:6px;overflow-y:auto;font:11px/1.5 monospace;color:#8b949e;max-height:320px'
+  const stats=document.createElement('div'); stats.style.cssText='border:1px solid #30363d;border-radius:8px;padding:6px 10px;font:11px monospace;color:#8b949e;display:flex;gap:12px;flex-wrap:wrap'
+  sc.append(stream,stats)
+  wrap.append(gc,sc)
+  const tl=document.createElement('div'); tl.style.cssText='border:1px solid #30363d;border-radius:8px;padding:6px;display:flex;align-items:center;gap:6px;margin-top:8px'
+  const mkB=(t,fn)=>{const b=document.createElement('button');b.textContent=t;b.onclick=fn;b.style.cssText='background:#21262d;border:1px solid #30363d;color:#c9d1d9;border-radius:4px;padding:3px 8px;cursor:pointer;font:12px monospace';return b}
+  const pb=mkB('\u25B6',()=>reset())
+  const fe=document.createElement('span'); fe.style.cssText='color:#8b949e;font:11px monospace;margin-left:auto'
+  tl.append(pb,fe)
+  const fleet=document.createElement('div')
+  el.replaceChildren(wrap,tl,fleet)
+  mountFleet(fleet)
+
+  const nodes=[],edges=[],prods=[]
+  let lastN=0,lastM=0,cur=0,nextIx=0,lastFrame=0,rr=0,raf=null,playT0=0
+  const SLOW=25 // 25 law-frames per second of wall clock: one law tick (16 frames) every 400 ms
+  const dv=()=>new DataView(R.memory.buffer)
+  function addNode(i){ const kind=R.gx_node_kind(i); if(kind>=5)return
+    const a={kind,x:GX_SEED[kind][0]+(Math.random()-.5)*90,y:GX_SEED[kind][1]+(Math.random()-.5)*70,vx:0,vy:0}
+    const g=document.createElementNS(NS,'g')
+    const c=document.createElementNS(NS,'circle'); c.setAttribute('r','2'); c.setAttribute('fill',GX_KC[kind]); c.setAttribute('stroke','#c9d1d9'); c.setAttribute('stroke-width','1'); c.style.transition='r .3s'
+    const t=document.createElementNS(NS,'text'); t.setAttribute('y','-16'); t.setAttribute('text-anchor','middle'); t.setAttribute('fill',C.text); t.setAttribute('font-size','8'); t.setAttribute('font-family','monospace'); t.textContent=gxName(R,i)
+    g.append(c,t); nG.append(g); a.el=g; a.c=c; nodes.push(a)
+    requestAnimationFrame(()=>c.setAttribute('r','9'))
+    const p=document.createElementNS(NS,'circle'); p.setAttribute('r','9'); p.setAttribute('fill','none'); p.setAttribute('stroke',GX_KC[kind]); p.setAttribute('stroke-width','2'); p.style.cssText='animation:live-pulse .8s ease-out forwards'; g.append(p); setTimeout(()=>p.remove(),900) }
+  function addEdge(j){ const kind=R.gx_edge_kind(j); if(kind>=6)return
+    const f=R.gx_edge_from(j),to=R.gx_edge_to(j); if(f>=nodes.length||to>=nodes.length)return
+    const l=document.createElementNS(NS,'polyline'); l.setAttribute('stroke',kind===3?C.particle:C.edge); l.setAttribute('stroke-width',kind===3?'1.5':'1'); l.setAttribute('fill','none'); eG.append(l)
+    edges.push({f,to,el:l}); if(kind===3)prods.push(edges.length-1) }
+  function statsUp(){ stats.innerHTML=`<span style="color:${C.active}">\u25CF ${R.gx_node_count()} nodes</span><span>\u2192 ${R.gx_edge_count()} edges</span><span>\u26A1 ${cur} events</span><span>\u23F1 frame ${lastFrame}</span>` }
+  function sync(){ const N=R.gx_node_count(),M=R.gx_edge_count()
+    for(let i=lastN;i<N;i++)addNode(i)
+    for(let j=lastM;j<M;j++)addEdge(j)
+    lastN=N; lastM=M; statsUp() }
+  function fire(ix){ const e=edges[ix]; if(!e)return
+    const a=nodes[e.f],b=nodes[e.to]; if(!a||!b)return
+    const d=document.createElementNS(NS,'circle'); d.setAttribute('r','3'); d.setAttribute('fill',C.particle); fG.append(d)
+    const s=performance.now(),dur=500
+    const an=(t)=>{ const p=Math.min(1,(t-s)/dur); d.setAttribute('cx',a.x+(b.x-a.x)*p); d.setAttribute('cy',a.y+(b.y-a.y)*p); if(p<1)requestAnimationFrame(an); else d.remove() }
+    requestAnimationFrame(an) }
+  function layout(){ const n=nodes.length; if(!n)return
+    for(let i=0;i<n;i++)for(let j=i+1;j<n;j++){ const a=nodes[i],b=nodes[j]; let dx=b.x-a.x,dy=b.y-a.y; const d2=dx*dx+dy*dy||1; if(d2>25600)continue; const d=Math.sqrt(d2),f=2600/d2; dx/=d;dy/=d; a.vx-=dx*f;a.vy-=dy*f;b.vx+=dx*f;b.vy+=dy*f }
+    for(const e of edges){ const a=nodes[e.f],b=nodes[e.to]; if(!a||!b)continue
+      let dx=b.x-a.x,dy=b.y-a.y; const d=Math.sqrt(dx*dx+dy*dy)||1,f=(d-70)*.006; dx/=d;dy/=d; a.vx+=dx*f;a.vy+=dy*f;b.vx-=dx*f;b.vy-=dy*f }
+    for(const a of nodes){ a.vx+=(GX_SEED[a.kind][0]-a.x)*.004; a.vy+=(GX_SEED[a.kind][1]-a.y)*.004; a.vx*=.82;a.vy*=.82; a.x+=a.vx;a.y+=a.vy; a.x=Math.max(24,Math.min(W-24,a.x)); a.y=Math.max(24,Math.min(H-24,a.y)); a.el.setAttribute('transform',`translate(${a.x},${a.y})`) }
+    for(const e of edges){ const a=nodes[e.f],b=nodes[e.to]; if(a&&b)e.el.setAttribute('points',`${a.x},${a.y} ${b.x},${b.y}`) } }
+  function apply(e){ if(!gxPut(dv(),R.gx_log_ptr(),e))return -1
+    const k=typeof e.kind==='number'?e.kind:GX_EV[e.kind]
+    return R.gx_apply_event(k,e.tick??0,e.task??e.task_no??0) }
+  function tick(){ if(cur>=evts.length){stop();return}
+    const e=evts[cur],k=e.kind??'?',tk=e.tick??cur,frame=R.arrival_frame(tk*16)
+    lastFrame=frame
+    const before=feed.mode==='apply'?R.gx_node_count():0
+    let code=0
+    if(feed.mode==='apply'){ code=apply(e); sync() } else statsUp()
+    const grew=feed.mode==='apply'?R.gx_node_count()-before:0
+    const ln=document.createElement('div'); ln.style.cssText=`padding:1px 0;border-bottom:1px solid #21262d;color:${k==='spawn'?C.spawn:k==='down'?C.down:k==='restart'?C.restart:k==='exit'?C.exit:C.text}`
+    ln.textContent=`[${String(frame).padStart(2,'0')}] ${k}${grew>0?` +${grew}`:''}${code>0?` (refused ${code})`:''} t=${tk}`; stream.append(ln); stream.scrollTop=stream.scrollHeight
+    if(k==='deliver'||k==='delivers'){ if(prods.length)fire(prods[rr++%prods.length]); else if(edges.length)fire(rr++%edges.length) }
+    cur++; fe.textContent=`${cur}/${evts.length}` }
+  function frame(ts){ if(!raf)return
+    const lawF=(ts-playT0)/SLOW
+    while(nextIx<evts.length && (evts[nextIx].tick??nextIx)*16<=lawF){ tick(); nextIx++ }
+    layout()
+    if(nextIx>=evts.length){ raf=null; pb.textContent='\u25B6'; return }
+    raf=requestAnimationFrame(frame) }
+  function stop(){ if(raf){cancelAnimationFrame(raf);raf=null} pb.textContent='\u25B6' }
+  function settle(){ let s0=0; const st=()=>{ layout(); if(s0++<50)requestAnimationFrame(st) }; requestAnimationFrame(st) }
+  function reset(){ stop(); cur=0; nextIx=0; stream.replaceChildren(); fe.textContent=`0/${evts.length}`
+    if(feed.mode==='apply'){
+      if(typeof R.gx_reset==='function'){ if(R.gx_reset()!==0)return }
+      nG.replaceChildren(); eG.replaceChildren(); fG.replaceChildren(); edges.length=0; prods.length=0; nodes.length=0; lastN=0; lastM=0
+      gxPut(dv(),R.gx_log_ptr(),evts[0]); R.gx_log_set_len(32); apply(evts[0]); sync(); cur=1; nextIx=1 }
+    settle(); pb.textContent='\u23F8'; playT0=performance.now(); raf=requestAnimationFrame(frame) }
+
+  if(feed.mode==='replay') sync()
+  else { const e=evts[0],fr=R.arrival_frame((e.tick??0)*16); lastFrame=fr
+    const ln=document.createElement('div'); ln.style.cssText=`padding:1px 0;border-bottom:1px solid #21262d;color:${e.kind==='spawn'?C.spawn:C.text}`
+    ln.textContent=`[${String(fr).padStart(2,'0')}] ${e.kind} +${R.gx_node_count()} t=${e.tick??0}`; stream.append(ln)
+    cur=1; nextIx=1; sync(); pb.textContent='\u23F8'; playT0=performance.now(); raf=requestAnimationFrame(frame) }
+  settle()
+
+  // the log can grow: re-fetch it cache-busted every 5 minutes; the load path re-feeds the
+  // whole log behind a gx_reset (the law's rows stand on a refusal, never roll back), the
+  // live path applies just the delta through gx_apply_event
+  const logUrl=new URL('./logs/recorded_log.json', import.meta.url)
+  setInterval(async()=>{ try{ const r=await fetch(logUrl+'?v='+Date.now()); if(!r.ok)return
+    const d=await r.json(); if(d.format!==log.format||!Array.isArray(d.events)||d.events.length<=evts.length)return
+    const add=d.events.slice(evts.length); for(const e of add) evts.push(e)
+    if(feed.mode==='replay'&&typeof R.gx_reset==='function'&&R.gx_reset()===0){
+      const base=R.gx_log_ptr(),v=dv(); let ok=true
+      for(let i=0;i<d.events.length&&ok;i++) ok=gxPut(v,base+i*32,d.events[i])
+      if(ok&&R.gx_log_set_len(d.events.length*32)&&R.gx_replay(base,d.events.length*32)===0) sync() }
+    else if(feed.mode==='apply') for(const e of add){ apply(e); sync() }
+    let s1=0; const st=()=>{ layout(); if(s1++<40)requestAnimationFrame(st) }; requestAnimationFrame(st) }catch{} },300000)
+
+  return { refused:false, message:`${evts.length} events through gx_${feed.mode==='replay'?'replay':'apply_event'}: ${R.gx_node_count()} nodes and ${R.gx_edge_count()} edges read from the module's own WorkGraph (specs/t27f/live_graph_export.t27, t27#12148) -- the law's real topology, not a simulation; below: the fleet, live from the GitHub API. Press play to watch the timeline.` }
 }
 
 // The fleet monitor: real pull requests and real repository activity from the
