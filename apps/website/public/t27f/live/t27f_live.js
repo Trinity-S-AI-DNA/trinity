@@ -403,7 +403,7 @@ function mountFleet(root){
   async function activity(){
     try{ const r=await fetch(ACT,{cache:'no-store'}); if(!r.ok)throw new Error('http '+r.status)
       const d=await r.json(); if(!Number.isFinite(d.cursor)||!Array.isArray(d.events))throw new Error('foreign format')
-      const E=d.events, seen=new Set(); let fl=0, fin=0, rf=0, rv=0
+      const E=d.events, seen=new Set(); let fl=0, fin=0, rf=0, rv=0; if(E.some(e=>!Number.isFinite(Date.parse(e.at))))throw new Error('foreign format') // every "at" is ISO
       for(const e of E){ if(e.kind==='finished'){ fin++; if(e.state==='refused')rf++ } else if(e.kind==='review')rv++
         // in flight: the issue's newest dispatch-or-finished event (list order) is a dispatch
         if((e.kind==='dispatch'||e.kind==='finished')&&!seen.has(e.issue)){ seen.add(e.issue); if(e.kind==='dispatch')fl++ } }
@@ -413,7 +413,7 @@ function mountFleet(root){
       aqP.querySelectorAll('.aq').forEach(x=>x.remove())
       for(const e of E.slice(0,10)){ const x=document.createElement('div'); x.className='aq'
         x.style.cssText=`padding:4px 0;border-bottom:1px solid #21262d;font:11px monospace;color:${e.state==='refused'?'#f85149':FC.text};white-space:nowrap;overflow:hidden;text-overflow:ellipsis`
-        x.textContent=String(e.at).slice(11,19)+'Z '+e.kind+(e.state?' ('+e.state+')':'')+' #'+e.issue+' '+(e.title||''); aqP.append(x) }
+        x.textContent=new Date(Date.parse(e.at)).toISOString().slice(11,19)+'Z '+e.kind+(e.state?' ('+e.state+')':'')+' #'+e.issue+' '+(e.title||''); aqP.append(x) }
     }catch{ aFail++ // presentation(): stale after a success, unavailable before one, offline when offline
       t.textContent=aOk&&navigator.onLine!==false?'THE FLEET, STALE':'THE FLEET'
       n.textContent=navigator.onLine===false?'offline':aOk?`last reading ${Math.round((Date.now()-aOk)/1000)}s ago`:'activity feed unavailable' }
