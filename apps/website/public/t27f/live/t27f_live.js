@@ -33,6 +33,35 @@ const GX_KC = [C.restart, C.active, '#a371f7', C.text, C.spawn] // spec amber, a
 const GX_KN = ['spec','agent','task','action','artifact']
 const GX_SEED = [[96,96],[320,200],[544,96],[544,304],[320,336]] // kind clusters, then the force layout
 
+// THE LAYOUT DISCOVERY SURFACE -- the struct-path's const plane landing in the browser. The LAW
+// is specs/t27f/live_glue_layout.t27 (gHashTag/t27#12040): 23 CONSTANT gx_ exports -- the
+// ptr/len pairs of the fixed 143,692-byte layout the contract card #12005 pins -- read OFF the
+// module at load, never hardcoded in this file, so a layout change in the card breaks the
+// module (this page refuses it) instead of silently shifting every region. Discovery only:
+// the scalar replay stays the live surface, and a missing or misshaped module is reported as
+// a refusal, never faked. The 10 stateful names (gx_replay/gx_live/gx_reset, the two set_len
+// commits, the stream getters) wait for the stateful emitter floors (t27#5980) and are
+// deliberately absent from the module.
+const LAYOUT_NAMES = [
+  'gx_ev_ptr','gx_ev_cap','gx_batch_ptr','gx_batch_cap',
+  'gx_graph_ptr','gx_graph_len','gx_digest_ptr','gx_digest_len','gx_stream_ptr',
+  'gx_node_kind_ptr','gx_node_kind_len','gx_node_label_ptr','gx_node_label_len',
+  'gx_node_id_ptr','gx_node_id_len','gx_edge_kind_ptr','gx_edge_kind_len',
+  'gx_edge_from_ptr','gx_edge_from_len','gx_edge_to_ptr','gx_edge_to_len',
+  'gx_edge_label_ptr','gx_edge_label_len',
+]
+async function discoverLayout() {
+  let L
+  try {
+    L = (await WebAssembly.instantiateStreaming(fetch(new URL('layout.wasm', import.meta.url)), {})
+      .catch(async () => WebAssembly.instantiate(await (await fetch(new URL('layout.wasm', import.meta.url))).arrayBuffer(), {}))).instance.exports
+  } catch { return { ok: false, line: 'gx layout refused: layout.wasm did not load -- the layout plane is not published; nothing is invented.' } }
+  for (const n of LAYOUT_NAMES) if (typeof L[n] !== 'function') return { ok: false, line: `gx layout refused: the module lacks ${n} -- nothing is invented.` }
+  const v = (n) => L[n]()
+  const pairs = `graph ${v('gx_graph_ptr')}+${v('gx_graph_len')}, ev ${v('gx_ev_ptr')}+${v('gx_ev_cap')}, batch ${v('gx_batch_ptr')}+${v('gx_batch_cap')}, stream@${v('gx_stream_ptr')}`
+  return { ok: true, line: `gx layout: ${LAYOUT_NAMES.length} constants discovered off layout.wasm (${pairs}); the struct path reads its regions from the module, not from this file (specs/t27f/live_glue_layout.t27, t27#12040).` }
+}
+
 export async function replay(el, log) {
   let R
   try { R = (await WebAssembly.instantiateStreaming(fetch(url),{}).catch(async()=>WebAssembly.instantiate(await(await fetch(url)).arrayBuffer(),{}))).instance.exports }
@@ -41,13 +70,18 @@ export async function replay(el, log) {
   const evts = Array.isArray(log.events) ? log.events : []
   if (!evts.length) return refuse('the recorded log holds no events.')
 
+  // The layout discovery surface: read the 23 gx_ layout constants off layout.wasm and report
+  // one honest line either way. Discovery never gates the replay: a refused or missing module
+  // leaves the scalar plane exactly as it was.
+  const gxLayout = await discoverLayout()
+
   // The gx consumer: when the module carries the law's own graph (live_graph_export.t27,
   // t27#12148), the page stops simulating agents and reads the real topology out of the
   // module -- nodes, names and edges straight from linear memory. Today's module exports
   // none of it, so this stays dormant and the simulation below runs exactly as before;
   // any gx_ refusal or throw below falls back to that path silently.
   if (typeof R.gx_node_count === 'function') {
-    try { const feed = gxFeed(R, evts); if (feed) return gxReplay(el, R, log, evts, feed) }
+    try { const feed = gxFeed(R, evts); if (feed) { const g = gxReplay(el, R, log, evts, feed); g.message = gxLayout.line + ' ' + g.message; return g } }
     catch { /* the module refused its own graph: the simulation path stands */ }
   }
 
@@ -171,7 +205,7 @@ export async function replay(el, log) {
   setInterval(async()=>{ try{ await pollFeed() }catch{ // feed down or foreign: the recorded log, at its own cadence
       if(Date.now()-lastLog<300000)return; lastLog=Date.now(); try{ await pollLog() }catch{} } },15000)
 
-  return { refused:false, message:`${evts.length} events on the law's tick grid, ${agents.size} named agents at display frame rate; below: pull requests, activity and the queen lane, live from the GitHub API. Press play to watch the replay.` }
+  return { refused:false, message: gxLayout.line + ` ${evts.length} events on the law's tick grid, ${agents.size} named agents at display frame rate; below: pull requests, activity and the queen lane, live from the GitHub API. Press play to watch the replay.` }
 }
 
 // Encode one log event as its 32-byte #12005 record at offset o. Fields the log does not

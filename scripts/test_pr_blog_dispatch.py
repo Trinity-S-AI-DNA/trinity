@@ -25,8 +25,8 @@ def merged_pr():
         "merged": True,
         "merged_at": "2026-09-13T01:02:03Z",
         "merge_commit_sha": "a" * 40,
-        "html_url": "https://github.com/gHashTag/trinity/pull/123",
-        "base": {"repo": {"full_name": "gHashTag/trinity"}},
+        "html_url": "https://github.com/Trinity-S-AI-DNA/trinity/pull/123",
+        "base": {"repo": {"full_name": "Trinity-S-AI-DNA/trinity"}},
         "title": "Expose unreachable tests",
         "body": "A source report, not an executable command.",
     }
@@ -43,11 +43,11 @@ class FakeGitHub:
 
     def __call__(self, path, method="GET", body=None):
         self.calls.append((path, method, copy.deepcopy(body)))
-        if path == "repos/gHashTag/trinity/actions/workflows/pr-blog-author.yml/dispatches" and method == "POST":
+        if path == "repos/Trinity-S-AI-DNA/trinity/actions/workflows/pr-blog-author.yml/dispatches" and method == "POST":
             if self.dispatch_error:
                 raise self.dispatch_error
             return None  # GitHub workflow_dispatch acknowledges with HTTP 204.
-        prefix = "repos/gHashTag/trinity/issues"
+        prefix = "repos/Trinity-S-AI-DNA/trinity/issues"
         if path.startswith(prefix + "?state=all&per_page=100&page="):
             page = int(path.rsplit("=", 1)[1])
             return copy.deepcopy(self.issues[(page - 1) * 100:page * 100])
@@ -57,7 +57,7 @@ class FakeGitHub:
                 "number": number,
                 "state": "open",
                 "user": {"login": "github-actions[bot]"},
-                "html_url": f"https://github.com/gHashTag/trinity/issues/{number}",
+                "html_url": f"https://github.com/Trinity-S-AI-DNA/trinity/issues/{number}",
                 **copy.deepcopy(body),
             }
             self.issues.append(issue)
@@ -79,7 +79,7 @@ class FakeGitHub:
             "state": state,
             "user": {"login": "github-actions[bot]"},
             "title": "Blog from merged PR #123",
-            "html_url": f"https://github.com/gHashTag/trinity/issues/{number}",
+            "html_url": f"https://github.com/Trinity-S-AI-DNA/trinity/issues/{number}",
             "body": "<!-- t27-pr-blog:123 -->\nExisting PR-specific task",
         }
         self.issues.append(issue)
@@ -130,7 +130,7 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(len(self.github.writes("/dispatches")), 1)
         issue = self.github.issues[0]
         self.assertIn("<!-- t27-pr-blog:123 -->", issue["body"])
-        self.assertIn("https://github.com/gHashTag/trinity/pull/123", issue["body"])
+        self.assertIn("https://github.com/Trinity-S-AI-DNA/trinity/pull/123", issue["body"])
         self.assertEqual(issue["state"], "open")
 
     def test_existing_topic_marker_is_reused(self):
@@ -267,10 +267,10 @@ class BoundaryTests(unittest.TestCase):
     def test_github_request_passes_untrusted_body_as_stdin_without_shell(self):
         malicious = "$(touch sentinel); `touch sentinel`; $GITHUB_TOKEN"
         with mock.patch.object(dispatch_module.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, '{"number":1}', "")) as run:
-            result = dispatch_module.gh("repos/gHashTag/trinity/issues", "POST", {"body": malicious})
+            result = dispatch_module.gh("repos/Trinity-S-AI-DNA/trinity/issues", "POST", {"body": malicious})
         self.assertEqual(result, {"number": 1})
         args, kwargs = run.call_args
-        self.assertEqual(args[0], ["gh", "api", "repos/gHashTag/trinity/issues", "--method", "POST", "--input", "-"])
+        self.assertEqual(args[0], ["gh", "api", "repos/Trinity-S-AI-DNA/trinity/issues", "--method", "POST", "--input", "-"])
         self.assertNotIn(malicious, args[0])
         self.assertEqual(json.loads(kwargs["input"]), {"body": malicious})
         self.assertFalse(kwargs.get("shell", False))
@@ -278,7 +278,7 @@ class BoundaryTests(unittest.TestCase):
     def test_workflow_dispatch_http_204_is_success(self):
         with mock.patch.object(dispatch_module.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")):
             self.assertIsNone(dispatch_module.gh(
-                "repos/gHashTag/trinity/actions/workflows/pr-blog-author.yml/dispatches", "POST",
+                "repos/Trinity-S-AI-DNA/trinity/actions/workflows/pr-blog-author.yml/dispatches", "POST",
                 {"ref": "main", "inputs": {"pr": "123", "outbox": "1000"}},
             ))
 
@@ -286,7 +286,7 @@ class BoundaryTests(unittest.TestCase):
         secret = "test-only-token-value-must-not-be-logged"
         with mock.patch.object(dispatch_module.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, secret, secret)):
             with self.assertRaises(RuntimeError) as caught:
-                dispatch_module.gh("repos/gHashTag/trinity/issues")
+                dispatch_module.gh("repos/Trinity-S-AI-DNA/trinity/issues")
         self.assertNotIn(secret, str(caught.exception))
         self.assertIn("response omitted", str(caught.exception))
 

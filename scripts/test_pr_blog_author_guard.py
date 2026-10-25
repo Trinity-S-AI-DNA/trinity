@@ -10,7 +10,7 @@ from pr_blog_author_guard import validate
 def source_pr():
     return {
         "number": 123,
-        "base": {"repo": {"full_name": "gHashTag/trinity"}},
+        "base": {"repo": {"full_name": "Trinity-S-AI-DNA/trinity"}},
         "state": "closed",
         "merged": True,
         "merged_at": "2026-09-13T04:00:00Z",
@@ -33,7 +33,7 @@ class AuthorGuardTests(unittest.TestCase):
         original_pr, original_issue = copy.deepcopy(pr), copy.deepcopy(issue)
         event = validate(pr, issue, "123", "456")
         self.assertEqual(event, {
-            "repository": {"full_name": "gHashTag/trinity"},
+            "repository": {"full_name": "Trinity-S-AI-DNA/trinity"},
             "number": 123,
             "pull_request": pr,
         })
@@ -41,7 +41,7 @@ class AuthorGuardTests(unittest.TestCase):
         self.assertEqual(issue, original_issue)
 
     def test_wrong_source_repository_is_rejected(self):
-        for repository in ("attacker/trinity", "gHashTag/another-repo", "gHashTag/trinity/../../elsewhere", ""):
+        for repository in ("attacker/trinity", "gHashTag/another-repo", "Trinity-S-AI-DNA/trinity/../../elsewhere", ""):
             with self.subTest(repository=repository):
                 pr = source_pr()
                 pr["base"]["repo"]["full_name"] = repository
@@ -62,7 +62,7 @@ class AuthorGuardTests(unittest.TestCase):
 
     def test_outbox_cannot_itself_be_a_pull_request(self):
         issue = outbox_issue()
-        issue["pull_request"] = {"url": "https://api.github.com/repos/gHashTag/trinity/pulls/456"}
+        issue["pull_request"] = {"url": "https://api.github.com/repos/Trinity-S-AI-DNA/trinity/pulls/456"}
         with self.assertRaisesRegex(ValueError, "Outbox is not the expected issue"):
             validate(source_pr(), issue, "123", "456")
 
