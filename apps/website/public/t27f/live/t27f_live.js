@@ -79,8 +79,12 @@ export async function replay(el, log) {
   function tick(){ if(cur>=evts.length){stop();return}
     const e=evts[cur],k=e.kind??'?',tk=e.tick??cur,frame=R.arrival_frame(tk*16),who=aid(cur)
     const ln=document.createElement('div'); ln.style.cssText=`padding:1px 0;border-bottom:1px solid #21262d;color:${k==='spawn'?C.spawn:k==='down'?C.down:k==='restart'?C.restart:k==='exit'?C.exit:C.text}`
-    const sp=SPEC_SPECS[who]?` (${SPEC_SPECS[who]})`:''
-    ln.textContent=`[${String(frame).padStart(2,'0')}] ${k}${sp} t=${tk}`; stream.append(ln); stream.scrollTop=stream.scrollHeight
+    // a feed event names its own spec (the actor's name) and task; the
+    // recorded log has neither, so the label prefers what the event carries
+    const lbl=SPEC_SPECS[who]||e.spec
+    const sp=lbl?` (${lbl})`:''
+    const tsk=e.task!=null?(' #'+e.task):''
+    ln.textContent=`[${String(frame).padStart(2,'0')}] ${k}${sp}${tsk} t=${tk}`; stream.append(ln); stream.scrollTop=stream.scrollHeight
     if(k==='spawn'){addA(who);assignSpec(who,cur)}
     else if(k==='down')setSt(who,'down')
     else if(k==='restart')setSt(who,'restarting')
@@ -104,14 +108,35 @@ export async function replay(el, log) {
   for(let i=0;i<evts.length;i++){ cur=i; tick() }
   let s0=0; const settle=()=>{ layout(); if(s0++<50)requestAnimationFrame(settle) }; requestAnimationFrame(settle)
 
-  // the log can grow: re-fetch it cache-busted every 5 minutes and replay the delta
+  // the log can grow -- and the Queen now publishes a live feed. The feed is
+  // tried first on every poll (15 s: seconds-level realtime, unauthenticated,
+  // CORS-open); only when it fails or answers a foreign format does the old
+  // recorded-log re-fetch run, and at its own old 5-minute cadence. Both
+  // deliver events down the SAME tick() path above -- the feed's carry
+  // kind/tick plus task/spec labels, which tick() now draws.
+  const FEED='https://trios-agent-server-production.up.railway.app/queen/public-feed'
   const logUrl=new URL('./logs/recorded_log.json', import.meta.url)
-  setInterval(async()=>{ try{ const r=await fetch(logUrl+'?v='+Date.now()); if(!r.ok)return
+  let lastSeq=evts.reduce((m,e)=>Math.max(m,Number(e.seq)||0),0), lastLog=0
+  const grow=(add)=>{ if(!add.length)return
+    for(const e of add){ evts.push(e); const s=Number(e.seq)||0; if(s>lastSeq)lastSeq=s }
+    for(let i=0;i<add.length;i++) tick()
+    let s1=0; const st=()=>{ layout(); if(s1++<40)requestAnimationFrame(st) }; requestAnimationFrame(st) }
+  async function pollFeed(){
+    const r=await fetch(FEED+'?since='+lastSeq+'&v='+Date.now()); if(!r.ok)throw new Error('http '+r.status)
+    const d=await r.json()
+    if(d.format!=='t27f-queen-feed-v1'||!Array.isArray(d.events))throw new Error('foreign format')
+    let add=d.events.filter(e=>(Number(e.seq)||0)>lastSeq)
+    if(d.resync&&Number.isFinite(d.cursor)){ lastSeq=d.cursor; return } // ask again from where the bus says
+    // a live answer whose events are ALL behind our cursor means the bus
+    // restarted (seed -> live, seq from 1 again): replay it from its start
+    if(!d.seed&&!add.length&&d.events.length&&d.events.every(e=>(Number(e.seq)||0)<=lastSeq)){ lastSeq=0; add=d.events }
+    grow(add) }
+  async function pollLog(){
+    const r=await fetch(logUrl+'?v='+Date.now()); if(!r.ok)return
     const d=await r.json(); if(d.format!==log.format||!Array.isArray(d.events))return
-    if(d.events.length>evts.length){ const add=d.events.slice(evts.length)
-      for(const e of add) evts.push(e)
-      for(let i=0;i<add.length;i++) tick()
-      let s1=0; const st=()=>{ layout(); if(s1++<40)requestAnimationFrame(st) }; requestAnimationFrame(st) } }catch{} },300000)
+    if(d.events.length>evts.length) grow(d.events.slice(evts.length)) }
+  setInterval(async()=>{ try{ await pollFeed() }catch{ // feed down or foreign: the recorded log, at its own cadence
+      if(Date.now()-lastLog<300000)return; lastLog=Date.now(); try{ await pollLog() }catch{} } },15000)
 
   return { refused:false, message:`${evts.length} events on the law's tick grid, ${agents.size} named agents at display frame rate; below: pull requests, activity and the queen lane, live from the GitHub API. Press play to watch the replay.` }
 }
