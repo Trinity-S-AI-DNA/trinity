@@ -668,7 +668,7 @@ function figPlayground() {
     const X = karateFeatures(10);
     const logits = model.fwd(X, n, nbrs);
     const P = model.probs(logits, n);
-    let acc = 0;
+    let acc = 0, loss = 0;
     const svg = mkSvg(hostG, 640, 460);
     for (const [a, b] of KARATE_EDGES) {
       svgEl('line', { x1: pts[a][0], y1: pts[a][1], x2: pts[b][0], y2: pts[b][1], stroke: '#30363d', 'stroke-width': 1.2 }, svg);
@@ -677,6 +677,7 @@ function figPlayground() {
       const pred = P[i * 2] < P[i * 2 + 1] ? 1 : 0;
       const conf = Math.max(P[i * 2], P[i * 2 + 1]);
       if (pred === Y[i]) acc++;
+      loss -= Math.log(Math.max(P[i * 2 + (Y[i] === 1 ? 1 : 0)], 1e-12));
       const correct = pred === Y[i];
       svgEl('circle', {
         cx: pts[i][0], cy: pts[i][1], r: 9,
@@ -714,11 +715,10 @@ function figPlayground() {
       const pl = hist.map((h, idx) => `${6 + (idx / (hist.length - 1)) * 288},${82 - ((h.loss - m0) / Math.max(m1 - m0, 1e-9)) * 70}`).join(' ');
       svgEl('polyline', { points: pl, fill: 'none', stroke: '#58a6ff', 'stroke-width': 1.4 }, svg3);
     }
-    const last = hist[hist.length - 1] || { loss: NaN, acc: NaN };
     svgEl('text', { x: 8, y: 14, fill: '#8b949e', 'font-size': 10, 'font-family': 'JetBrains Mono,monospace' }, svg3).textContent =
-      `epoch ${epoch}  loss ${last.loss.toFixed(4)}  acc ${(acc / n).toFixed(3)}`;
+      `epoch ${epoch}  loss ${loss.toFixed(4)}  acc ${(acc / n).toFixed(3)}`;
     readout.textContent =
-      `epoch ${epoch}/${MAXE} -- loss ${last.loss.toFixed(4)}, train accuracy ${(acc / n).toFixed(3)} ` +
+      `epoch ${epoch}/${MAXE} -- loss ${loss.toFixed(4)}, train accuracy ${(acc / n).toFixed(3)} ` +
       `(transductive: every node is both train and test; ${KARATE_CONSISTENT ? 'labels verified against the faction split' : 'LABEL CHECK FAILED'})`;
   }
   function frame() {
