@@ -4,11 +4,14 @@ import { usePageMeta } from '../hooks/usePageMeta'
 import { useI18n } from '../i18n/context'
 import Navigation from '../components/Navigation'
 import Footer from '../components/Footer'
+import ClawPromo from '../components/ClawPromo'
 import CourseShelf from '../components/CourseShelf'
 import { shareTagged } from '../lib/shareTags'
 import { COURSE, COURSES, type Course as CourseT, type CourseLesson } from '../lib/course.generated'
 import { LADDER, type LadderSay } from '../lib/courseLadder.generated'
-import { KEY_PARAM, ORDER_PARAM, STEP, notePromo, checkKey, checkoutOffer, courseState, freeLeft, openCourse, readOrder, startCheckout, startTonCheckout, type Offer, type TonTransfer, readKeys, readOpened, reportDone, saveKeys, startLink, type Keys, type Opened } from '../lib/courseLadder'
+import { VIEW, type ViewSay } from '../lib/courseView.generated'
+import { KEY_PARAM, STEP, checkKey, openCourse, readKeys, readOpened, reportDone, saveKeys, type Keys, type Opened } from '../lib/courseLadder'
+import '../styles/courseView.generated.css'
 import './Course.css'
 
 // Every word, the order of the courses and lessons and the widget each one opens
@@ -128,12 +131,14 @@ function Overview({ C, lang, say, done, shared }: { C: CourseT; lang: Lang; say:
       <h1 className="course-title">{say.TITLE}</h1>
       <p className="course-lead">{say.LEAD}</p>
       <p className="course-desc">{say.DESCRIPTION}</p>
+      <p className="course-counter">{(LADDER.say[lang] as LadderSay).LADDER}</p>
       <div className="course-hero-actions">
         <Link className="course-btn is-primary" to={`/${C.route}/${next.id}`}>
           {started ? `${say.CONTINUE}: ${next[lang].title}` : say.START}
         </Link>
         <span className="course-progress">{fmt(say.PROGRESS, done.length, TOTAL)}</span>
       </div>
+      <OnePageLink C={C} lang={lang} />
       <CourseShare C={C} lang={lang} say={say} title={say.TITLE} />
       <div className="course-bar" aria-hidden="true" style={{ gridTemplateColumns: `repeat(${TOTAL}, 1fr)` }}>
         {LESSONS.map((l) => (
@@ -155,6 +160,23 @@ function Overview({ C, lang, say, done, shared }: { C: CourseT; lang: Lang; say:
 
 /** The static page of a course or a lesson: the address to post, because a crawler drops the '#'. */
 const shareOf = (C: CourseT, lang: Lang, id?: string) => `${lang === 'ru' ? '/ru' : ''}/${id ? `learn/${id}/` : C.share}`
+
+/**
+ * The whole course on one page (specs/view/course-view.t27, scripts/course-onepage.mjs): a static
+ * page with its own card, so it is a link to post. Relative, so it opens wherever the site is served.
+ */
+const onePageOf = (C: CourseT, lang: Lang) => `${lang === 'ru' ? 'ru/' : ''}${C.share}${VIEW.onePageDir}/`
+
+/** The entry point to it: a course overview names the page, a lesson names its own place on it. */
+function OnePageLink({ C, lang, n }: { C: CourseT; lang: Lang; n?: number }) {
+  const vs = VIEW.say[lang] as ViewSay
+  return (
+    <a className="course-onepage" href={`${onePageOf(C, lang)}${n ? `#lesson-${n}` : ''}`}>
+      <span className="course-onepage-title">{vs.ONE_PAGE} →</span>
+      <span className="course-onepage-line">{vs.ONE_PAGE_LINE}</span>
+    </a>
+  )
+}
 
 /**
  * SHARE, AT THE TOP, WITH THE PAGE THAT CARRIES THE CARD.
@@ -249,7 +271,7 @@ function framesOf(l: CourseLesson): Frame[] {
   return [main, ...spec, ...also]
 }
 
-function Lesson({ C, lesson, lang, say, done, toggle, shared, ladder }: { C: CourseT; lesson: CourseLesson; lang: Lang; say: Say; done: string[]; toggle: (id: string) => void; shared?: string; ladder: ReturnType<typeof useLadder> }) {
+function Lesson({ C, lesson, lang, say, done, toggle, shared }: { C: CourseT; lesson: CourseLesson; lang: Lang; say: Say; done: string[]; toggle: (id: string) => void; shared?: string }) {
   const LESSONS = C.lessons as readonly CourseLesson[]
   const TOTAL = LESSONS.length
   const frames = useMemo(() => framesOf(lesson), [lesson])
@@ -288,6 +310,8 @@ function Lesson({ C, lesson, lang, say, done, toggle, shared, ladder }: { C: Cou
         <CourseShare C={C} lang={lang} say={say} id={lesson.id} title={t.title} />
       </header>
 
+      {/* Wide: the text and the task beside the widget. Stacked: the text, the task -- the
+          question -- and the widget that answers it right after, then the mark. */}
       <div className="course-lesson-grid">
         <div className="course-lesson-text">
           <p className="course-dropcap">{t.text}</p>
@@ -295,9 +319,6 @@ function Lesson({ C, lesson, lang, say, done, toggle, shared, ladder }: { C: Cou
             <span className="course-label">{say.TRY}</span>
             <p>{t.task}</p>
           </div>
-          <button type="button" className={`course-btn course-mark${isDone ? ' is-done' : ''}`} aria-pressed={isDone} onClick={() => toggle(lesson.id)}>
-            {isDone ? `✓ ${say.MARKED}` : say.MARK}
-          </button>
         </div>
 
         <div className="course-stage">
@@ -329,6 +350,7 @@ function Lesson({ C, lesson, lang, say, done, toggle, shared, ladder }: { C: Cou
               {say.ALSO}: {say.ALSO_HINT}
             </p>
           ) : null}
+          {/* The frame's height is reserved before it loads: nothing below it moves. */}
           <div className="course-frame" style={{ height: frame.height }}>
             <iframe key={`${frame.preview}${lang}`} src={inLang(frame.preview, lang)} title={frame.title} loading="lazy" allow="clipboard-write" />
           </div>
@@ -350,6 +372,13 @@ function Lesson({ C, lesson, lang, say, done, toggle, shared, ladder }: { C: Cou
               </span>
             )}
           </div>
+        </div>
+
+        <div className="course-lesson-mark">
+          <button type="button" className={`course-btn course-mark${isDone ? ' is-done' : ''}`} aria-pressed={isDone} onClick={() => toggle(lesson.id)}>
+            {isDone ? `✓ ${say.MARKED}` : say.MARK}
+          </button>
+          <OnePageLink C={C} lang={lang} n={lesson.n} />
         </div>
       </div>
 
@@ -376,7 +405,26 @@ function Lesson({ C, lesson, lang, say, done, toggle, shared, ladder }: { C: Cou
         )}
       </nav>
 
-      {lesson.n === 1 && !ladder.checking && !ladder.inClub ? <ClubTeaser C={C} lang={lang} /> : null}
+      {/* Under the thumb on a phone: the previous lesson, where this one is, the next. */}
+      <nav className="course-thumb" aria-label={(VIEW.say[lang] as ViewSay).JUMP}>
+        {prev ? (
+          <Link className="course-thumb-btn" to={`/${C.route}/${prev.id}`} aria-label={`${say.PREV}: ${prev[lang].title}`}>
+            ←
+          </Link>
+        ) : (
+          <span className="course-thumb-btn is-off" aria-hidden="true">←</span>
+        )}
+        <Link className="course-thumb-btn is-where" to={`/${C.route}`}>
+          {String(lesson.n).padStart(2, '0')}/{TOTAL} · {say.ALL}
+        </Link>
+        {next ? (
+          <Link className="course-thumb-btn" to={`/${C.route}/${next.id}`} aria-label={`${say.NEXT}: ${next[lang].title}`}>
+            →
+          </Link>
+        ) : (
+          <span className="course-thumb-btn is-off" aria-hidden="true">→</span>
+        )}
+      </nav>
 
       <CourseMap C={C} lang={lang} say={say} done={done} current={lesson.id} />
       <p className="course-progress is-foot">{fmt(say.PROGRESS, done.length, TOTAL)}</p>
@@ -385,90 +433,33 @@ function Lesson({ C, lesson, lang, say, done, toggle, shared, ladder }: { C: Cou
   )
 }
 
-
 /**
- * THE LADDER (specs/ladder/course-ladder.t27, rules course-access.t27): which courses this
- * reader opened, the keys the bot handed back, and whether each key still holds. A key
- * arrives in the address (#/<route>?unlock=<key>) from the bot's button, is checked with
- * the render, kept, and taken out of the address.
+ * THE READER'S COURSES (specs/ladder/course-ladder.t27, rules course-access.t27). Every course is
+ * free since rules VERSION 3 (owner, 2026-10-19), so a course is simply recorded as the reader's
+ * when he opens it -- the catalog and the shelves call it "Yours" -- and nothing is locked. A key
+ * the bot hands back arrives in the address (#/<route>?unlock=<key>), is checked with the render,
+ * kept and taken out of the address; with it, finished lessons reach the course author (may_report).
  */
-function useLadder(C: CourseT, allDone: string[]) {
+function useCourseKeys(C: CourseT, allDone: string[]) {
   const known = useMemo(() => COURSES.map((c) => c.id as string), [])
   const withProgress = useMemo(
     () => COURSES.filter((c) => c.lessons.some((l) => allDone.includes(l.id))).map((c) => c.id as string),
-    // Seeded once, from the progress the reader had when the ladder first met them.
+    // Seeded once, from the progress the reader had when the list first met them.
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [],
   )
-  const [opened, setOpened] = useState<Opened>(() => (typeof window === 'undefined' ? [] : readOpened(known, withProgress)))
   const [keys, setKeys] = useState<Keys>(() => (typeof window === 'undefined' ? {} : readKeys()))
   const [valid, setValid] = useState({ bot: false, paid: false })
-  const [checking, setChecking] = useState(true)
-  const [bad, setBad] = useState<string | null>(null)
   const { search, pathname } = useLocation()
   const navigate = useNavigate()
-  const [offer, setOffer] = useState<Offer>({ on: false })
-  // Back from Robokassa with ?order=: 'waiting' while the render has not heard the payment yet,
-  // 'slow' after half a minute of it, 'done' once the key is in hand.
-  const [paying, setPaying] = useState<'idle' | 'waiting' | 'slow' | 'done' | 'expired'>('idle')
-  // A TON order in progress: what to send, where, with which comment.
-  const [ton, setTon] = useState<TonTransfer | null>(null)
-
-  useEffect(() => notePromo(search), [search])
 
   useEffect(() => {
-    let live = true
-    void checkoutOffer().then((o) => live && setOffer(o))
-    return () => {
-      live = false
-    }
-  }, [])
-
-  useEffect(() => {
-    const order = new URLSearchParams(search).get(ORDER_PARAM)
-    if (!order) return
-    let live = true
-    const started = Date.now()
-    setPaying('waiting')
-    void (async () => {
-      // The render books the payment when Robokassa tells it, not when this browser comes back:
-      // ask until it has, for up to ten minutes. A TON order holds its amount for an hour and the
-      // render still looks a quarter of an hour after, so a TON order is asked for that long.
-      let limit = 600_000
-      while (live && Date.now() - started < limit) {
-        const r = await readOrder(order)
-        if (!live) return
-        if (r.ok && r.status === 'expired') {
-          setTon(null)
-          setPaying('expired')
-          navigate(pathname, { replace: true })
-          return
-        }
-        if (r.ton) {
-          setTon(r.ton)
-          limit = 75 * 60_000
-        }
-        if (r.ok && r.status === 'paid' && r.key) {
-          const held: Keys = { ...readKeys(), paid: r.key }
-          saveKeys(held)
-          const now = { bot: valid.bot, paid: true }
-          setKeys(held)
-          setValid(now)
-          setOpened((o) => openCourse(C.id, o, now))
-          setTon(null)
-          setPaying('done')
-          navigate(pathname, { replace: true })
-          return
-        }
-        if (!r.ton && Date.now() - started > 30_000) setPaying('slow')
-        await new Promise((res) => setTimeout(res, 2500))
-      }
-    })()
-    return () => {
-      live = false
-    }
+    if (typeof window === 'undefined') return
+    const opened: Opened = readOpened(known, withProgress)
+    openCourse(C.id, opened, valid)
+    // Once per course.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [search, C.id])
+  }, [C.id])
 
   useEffect(() => {
     let live = true
@@ -481,25 +472,16 @@ function useLadder(C: CourseT, allDone: string[]) {
           if (r.step === STEP.bot) held.bot = fresh
           else held.paid = fresh
           saveKeys(held)
-          if (live) setBad(null)
-        } else if (live) setBad(r.reason ?? 'unknown')
+        }
       }
       const [b, p] = await Promise.all([
         held.bot ? checkKey(held.bot) : Promise.resolve({ ok: false }),
         held.paid ? checkKey(held.paid) : Promise.resolve({ ok: false }),
       ])
       if (!live) return
-      const now = { bot: Boolean(b.ok), paid: Boolean(p.ok) }
       setKeys(held)
-      setValid(now)
-      setChecking(false)
-      // The key the bot just handed back opens the course it was handed for, and only then
-      // leaves the address: leaving first changed the address under this very effect,
-      // which dropped the open (measured in Chromium, 2026-10-11).
-      if (fresh) {
-        setOpened((o) => openCourse(C.id, o, now))
-        navigate(pathname, { replace: true })
-      }
+      setValid({ bot: Boolean(b.ok), paid: Boolean(p.ok) })
+      if (fresh) navigate(pathname, { replace: true })
     })()
     return () => {
       live = false
@@ -508,218 +490,8 @@ function useLadder(C: CourseT, allDone: string[]) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [search, C.id])
 
-  const state = courseState(C.id, opened, valid)
-  const open = () => setOpened((o) => openCourse(C.id, o, valid))
   // The key a lesson report travels with: the paid one while it holds, else the bot's.
-  const reportKey = valid.paid ? keys.paid : valid.bot ? keys.bot : undefined
-  const pay = async (email: string, lang: string) => {
-    const r = await startCheckout(email, C.route, lang)
-    if (r.ok && r.url) window.location.assign(r.url)
-    return r
-  }
-  const payTon = async (email: string, lang: string) => {
-    const r = await startTonCheckout(email, C.route, lang)
-    if (r.ok && r.order && r.ton) {
-      setTon(r.ton)
-      // The order rides in the address, so a reload keeps waiting for the same payment.
-      navigate(`${pathname}?${ORDER_PARAM}=${encodeURIComponent(r.order)}`, { replace: true })
-    }
-    return r
-  }
-  return { state, open, checking, bad, reportKey, inClub: valid.paid, left: freeLeft(opened), offer, paying, pay, ton, payTon }
-}
-
-/**
- * The club, named where a reader actually is. The gate below says the club only when a course
- * is locked, and a reader who never climbs past their first open course never meets it at all;
- * the bot's thirty-day funnel counted 1 club card against 56 new people. So lesson one carries
- * the teaser: its words are the ladder spec's (SAY_CLUB_*), its button is the same start link
- * the gate uses, and a reader already holding a paid key sees nothing (owner, 2026-10-13).
- */
-function ClubTeaser({ C, lang }: { C: CourseT; lang: Lang }) {
-  const say = LADDER.say[lang] as LadderSay
-  return (
-    <section className="course-hero course-ladder">
-      <h2 className="course-title">{say.CLUB_TITLE}</h2>
-      <p className="course-lead">{say.CLUB_LINE}</p>
-      <div className="course-hero-actions">
-        <a className="course-btn is-primary" href={startLink(STEP.paid, C.route)} target="_blank" rel="noopener noreferrer">
-          {say.PAID_PRESS}
-        </a>
-      </div>
-    </section>
-  )
-}
-
-/**
- * The club paid here, without the bot (owner, 2026-10-13): one field, one button, the price on
- * the button. The email only goes to Robokassa for its receipt; the key comes back to this page.
- */
-function PayForm({ lang, ladder, rub, ton }: { lang: Lang; ladder: ReturnType<typeof useLadder>; rub: boolean; ton: boolean }) {
-  const say = LADDER.say[lang] as LadderSay
-  const [email, setEmail] = useState('')
-  const [busy, setBusy] = useState(false)
-  const [error, setError] = useState<string | null>(null)
-  const go = async (via: 'rub' | 'ton') => {
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) {
-      setError(say.PAY_BAD_EMAIL)
-      return
-    }
-    setBusy(true)
-    setError(null)
-    const r = via === 'ton' ? await ladder.payTon(email.trim(), lang) : await ladder.pay(email.trim(), lang)
-    // Roubles leave for Robokassa; TON stays here and shows where to send. Either way a
-    // failure gives the buttons back.
-    if (!r.ok || via === 'ton') setBusy(false)
-    if (!r.ok) setError(fmt(say.PAY_ERROR, r.reason ?? 'unknown'))
-  }
-  const submit = (e: React.FormEvent) => {
-    e.preventDefault()
-    void go(rub ? 'rub' : 'ton')
-  }
-  return (
-    <form className="course-pay" onSubmit={submit}>
-      <label className="course-label" htmlFor="course-pay-email">
-        {rub ? say.PAY_EMAIL : say.TON_EMAIL}
-      </label>
-      <div className="course-pay-row">
-        <input
-          id="course-pay-email"
-          className="course-pay-input"
-          type="email"
-          inputMode="email"
-          autoComplete="email"
-          autoCapitalize="off"
-          autoCorrect="off"
-          spellCheck={false}
-          required
-          value={email}
-          onChange={(e) => setEmail(e.target.value)}
-        />
-        {rub ? (
-          <button type="submit" className="course-btn is-primary" disabled={busy}>
-            {fmt(say.PAY_PRESS, ladder.offer.rub ?? 0)}
-          </button>
-        ) : null}
-        {ton ? (
-          <button type={rub ? 'button' : 'submit'} className={rub ? 'course-btn' : 'course-btn is-primary'} disabled={busy} onClick={rub ? () => void go('ton') : undefined}>
-            {fmt(say.TON_PRESS, ladder.offer.ton?.amount ?? 0)}
-          </button>
-        ) : null}
-      </div>
-      {error ? <p className="course-desc course-ladder-bad">{error}</p> : null}
-      {rub ? <p className="course-desc">{say.PAY_SAFE}</p> : null}
-      {ton ? <p className="course-desc">{say.TON_LINE}</p> : null}
-    </form>
-  )
-}
-
-/** A TON order waiting for its payment: the three things to send, each one press to copy. */
-function TonWait({ lang, t }: { lang: Lang; t: TonTransfer }) {
-  const say = LADDER.say[lang] as LadderSay
-  const [copied, setCopied] = useState<string | null>(null)
-  const copy = (what: string, text: string) => {
-    void navigator.clipboard?.writeText(text).then(() => setCopied(what), () => undefined)
-  }
-  const until = t.expiresAt ? new Date(t.expiresAt) : null
-  const rows: [string, string, string][] = [
-    ['amount', say.TON_AMOUNT, String(t.amount)],
-    ['address', say.TON_ADDRESS, t.address],
-    ['comment', say.TON_COMMENT, t.comment],
-  ]
-  return (
-    <div className="course-pay course-ton">
-      <p className="course-desc">{fmt(say.TON_SEND, t.amount)}</p>
-      <dl className="course-ton-rows">
-        {rows.map(([what, label, value]) => (
-          <div key={what} className="course-ton-row">
-            <dt>{label}</dt>
-            <dd>
-              <code>{value}</code>
-              <button type="button" className="course-link" onClick={() => copy(what, value)}>
-                {copied === what ? say.TON_COPIED : say.TON_COPY}
-              </button>
-            </dd>
-          </div>
-        ))}
-      </dl>
-      <div className="course-pay-row">
-        <a className="course-btn is-primary" href={t.link}>
-          {say.TON_OPEN}
-        </a>
-      </div>
-      {until && !Number.isNaN(until.getTime()) ? (
-        <p className="course-counter" aria-live="polite">
-          {fmt(say.TON_UNTIL, until.toLocaleTimeString(lang === 'ru' ? 'ru-RU' : 'en-US', { hour: '2-digit', minute: '2-digit' }))}
-        </p>
-      ) : null}
-    </div>
-  )
-}
-
-function LadderGate({ C, lang, ladder }: { C: CourseT; lang: Lang; ladder: ReturnType<typeof useLadder> }) {
-  const say = LADDER.say[lang] as LadderSay
-  const { state, checking, bad } = ladder
-  const step = state.step
-  // Roubles for Russian-language readers only (owner, 2026-10-13); everyone else keeps the bot's Stars.
-  const rub = ladder.offer.on && lang === 'ru'
-  // TON for every language, once the render has a wallet and a rate (owner, 2026-10-13: "or with crypto").
-  const ton = ladder.offer.ton?.on === true
-  return (
-    <section className="course-hero course-ladder" aria-live="polite">
-      <p className="course-kicker">{fmt(say.RUNG, state.rung)}</p>
-      <h2 className="course-title">{step === STEP.free ? say.FREE_TITLE : step === STEP.bot ? say.BOT_TITLE : say.PAID_TITLE}</h2>
-      <p className="course-lead">
-        {step === STEP.free ? say.FREE_LINE : step === STEP.bot ? say.BOT_LINE : rub ? fmt(say.PAY_LINE, ladder.offer.days ?? 30) : say.PAID_LINE}
-      </p>
-      {step === STEP.free && !state.known ? (
-        <p className="course-desc">{ladder.left === 1 ? say.LAST_FREE : fmt(say.FREE_SLOT, state.rung)}</p>
-      ) : null}
-      {bad ? <p className="course-desc course-ladder-bad">{fmt(say.KEY_BAD, bad)}</p> : null}
-      {ladder.paying === 'expired' ? <p className="course-desc course-ladder-bad">{say.TON_EXPIRED}</p> : null}
-      {(ladder.paying === 'waiting' || ladder.paying === 'slow') && ladder.ton ? (
-        <TonWait lang={lang} t={ladder.ton} />
-      ) : ladder.paying === 'waiting' || ladder.paying === 'slow' ? (
-        <p className="course-counter" aria-live="polite">
-          {ladder.paying === 'slow' ? say.PAY_SLOW : say.PAY_WAITING}
-        </p>
-      ) : step === STEP.paid && (rub || ton) && !checking ? (
-        <PayForm lang={lang} ladder={ladder} rub={rub} ton={ton} />
-      ) : null}
-      <div className="course-hero-actions">
-        {checking && step !== STEP.free ? (
-          <span className="course-progress">{say.CHECKING}</span>
-        ) : 'mayOpenNow' in state && state.mayOpenNow ? (
-          <button type="button" className="course-btn is-primary" onClick={ladder.open}>
-            {say.OPEN}
-          </button>
-        ) : step === STEP.paid && (rub || ton) ? (
-          <a className="course-link" href={startLink(step, C.route)} target="_blank" rel="noopener noreferrer">
-            {say.PAY_OR_BOT}
-          </a>
-        ) : (
-          <a className="course-btn is-primary" href={startLink(step, C.route)} target="_blank" rel="noopener noreferrer">
-            {step === STEP.paid ? say.PAID_PRESS : say.BOT_PRESS}
-          </a>
-        )}
-        {step === STEP.paid ? (
-          <Link className="course-link" to="/courses">
-            {say.NOT_NOW}
-          </Link>
-        ) : null}
-      </div>
-      {step === STEP.paid && !checking ? (
-        <p className="course-desc">
-          <a className="course-link" href={startLink(STEP.paid, C.route)} target="_blank" rel="noopener noreferrer">
-            {say.SIGN_IN}
-          </a>
-        </p>
-      ) : null}
-      {step !== STEP.free ? <p className="course-desc">{say.BOT_SHARES}</p> : null}
-      {step === STEP.paid && !rub && !ton ? <p className="course-desc">{say.PAID_LATER}</p> : null}
-      <p className="course-shape">{say.LADDER}</p>
-    </section>
-  )
+  return { reportKey: valid.paid ? keys.paid : valid.bot ? keys.bot : undefined }
 }
 
 /** The course an address names: the first segment is its route (#/course, #/ai-numbers). */
@@ -733,17 +505,17 @@ export default function Course() {
   const lang: Lang = siteLang === 'ru' ? 'ru' : 'en'
   const say = C.say[lang] as Say
   const { done, all, toggle } = useProgress(C)
-  const ladder = useLadder(C, all)
+  const { reportKey } = useCourseKeys(C, all)
   // A finished lesson is marked here and, with a key, told to the course author (may_report).
   const mark = useCallback(
     (id: string) => {
       const finishing = !done.includes(id)
       toggle(id)
-      if (finishing) void reportDone(ladder.reportKey, C.route, id)
+      if (finishing) void reportDone(reportKey, C.route, id)
     },
-    [done, toggle, ladder.reportKey, C.route],
+    [done, toggle, reportKey, C.route],
   )
-  const shared = ladder.reportKey ? (LADDER.say[lang] as LadderSay).SHARED : undefined
+  const shared = reportKey ? (LADDER.say[lang] as LadderSay).SHARED : undefined
   const lesson = lessonId ? (C.lessons as readonly CourseLesson[]).find((l) => l.id === lessonId) : undefined
   // A lesson that moved to another course keeps its old address working.
   const moved = lessonId && !lesson ? COURSES.find((c) => c.lessons.some((l) => l.id === lessonId)) : undefined
@@ -751,7 +523,7 @@ export default function Course() {
   if (moved) return <Navigate replace to={`/${moved.route}/${lessonId}`} />
 
   return (
-    <div className="course-page">
+    <div className={`course-page${lesson ? ' has-thumb' : ''}`}>
       <Navigation />
       <main className="course-main">
         {lessonId && !lesson ? (
@@ -761,33 +533,15 @@ export default function Course() {
               {say.ALL}
             </Link>
           </div>
-        ) : !ladder.state.open ? (
-          <>
-            {/* The page that locks a course is the page that sells it: its name stays (owner, 2026-10-13). */}
-            <div className="course-hero course-locked-head">
-              <Crumbs C={C} lang={lang} say={say} />
-              <p className="course-kicker course-masthead">{say.KICKER}</p>
-              <h1 className="course-title">{say.TITLE}</h1>
-              <p className="course-desc">{say.DESCRIPTION}</p>
-            </div>
-            <LadderGate C={C} lang={lang} ladder={ladder} />
-            <CourseMap C={C} lang={lang} say={say} done={done} current={lesson?.id} />
-          </>
         ) : lesson ? (
-          <>
-          {ladder.paying === 'done' ? <p className="course-counter">{(LADDER.say[lang] as LadderSay).PAY_DONE}</p> : null}
-          <Lesson C={C} lesson={lesson} lang={lang} say={say} done={done} toggle={mark} shared={shared} ladder={ladder} />
-          </>
+          <Lesson C={C} lesson={lesson} lang={lang} say={say} done={done} toggle={mark} shared={shared} />
         ) : (
-          <>
-            {ladder.paying === 'done' ? <p className="course-counter">{(LADDER.say[lang] as LadderSay).PAY_DONE}</p> : null}
-            <Overview C={C} lang={lang} say={say} done={done} shared={shared} />
-          </>
+          <Overview C={C} lang={lang} say={say} done={done} shared={shared} />
         )}
         {/* Other courses at the foot of every course page (owner, 2026-10-13). */}
-        <CourseShelf lang={lang} placement={`course:${C.route}`} exclude={C.id} />
+        <CourseShelf lang={lang} exclude={C.id} />
       </main>
-      <Footer promo={false} />
+      <Footer promo={false} aside={<ClawPromo lang={lang} />} />
     </div>
   )
 }

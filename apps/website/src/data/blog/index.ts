@@ -3,6 +3,36 @@ import type { PostMeta } from './types'
 /** Индекс блога: список и метаданные без тяжёлых тел публикаций. */
 export const postsIndex: PostMeta[] = [
   {
+    slug: "every-course-free-and-the-whole-course-on-one-page",
+    title: "Every course is free now, and each one fits on one page that is also a widget",
+    summary: "[step_of in course-access.t27 VERSION 3 returns FREE for every rung, and the site runs it compiled; the keys screen of the free TRI CLAW path ships in the app separately; the GitHub App is linked only once it is open to other repositories] Every t27.ai course is free for every reader. Each course also has one page with all 27 lessons and their widgets, loaded 3 at a time, and the same course is one embeddable widget of widgets. The course footer offers TRI CLAW three ways.",
+    date: "2026-10-19",
+    readingMinutes: 4,
+    tags: ["t27", "Course", "TRI CLAW"],
+    receipts: [
+      { label: "trinity#1703: every course free, TRI CLAW in the footer, the whole course on one page", href: "https://github.com/gHashTag/trinity/issues/1703" },
+      { label: "t27#10799: course-access rules VERSION 3, every course free", href: "https://github.com/gHashTag/t27/pull/10799" },
+      { label: "The t27 basics course on one page", href: "https://t27.ai/learn/all/" },
+      { label: "Neural networks in t27 on one page", href: "https://t27.ai/learn/neural-networks/all/" },
+      { label: "The course deck widget", href: "https://t27.ai/widgets/course-deck/" },
+    ],
+    openQuestions: [
+      "The keys screen the free TRI CLAW path opens is added to the app in gHashTag/999-multibots-telegraf; until it ships, the button opens the bot.",
+      "The TRI CLAW GitHub App is not open to other repositories yet; the footer links its post until CLAW_APP_PUBLIC is true.",
+      "A static lesson page still scrolls 25 px sideways at 390 px in Chromium, as it did before; what widens it is not found yet.",
+    ],
+    published: true,
+    ru: {
+      title: "Все курсы теперь бесплатные, и каждый помещается на одну страницу, которая ещё и виджет",
+      summary: "[step_of в course-access.t27 VERSION 3 возвращает FREE на каждой ступени, и сайт исполняет её собранной; экран ключей бесплатного пути TRI CLAW выходит в приложении отдельно; GitHub-приложение ссылкой — только когда оно откроется другим репозиториям] Каждый курс t27.ai бесплатный для каждого читателя. У каждого курса есть одна страница со всеми 27 уроками и их виджетами, по 3 живых одновременно, и тот же курс — один встраиваемый виджет из виджетов. Подвал курса предлагает TRI CLAW тремя путями.",
+      openQuestions: [
+        "Экран ключей, который открывает бесплатный путь TRI CLAW, добавляется в приложение в gHashTag/999-multibots-telegraf; пока он не вышел, кнопка открывает бота.",
+        "GitHub-приложение TRI CLAW пока не открыто другим репозиториям; подвал ведёт на его пост, пока CLAW_APP_PUBLIC не станет true.",
+        "Статическая страница урока по-прежнему уезжает вбок на 25 px на 390 px в Chromium, как и раньше; что её расширяет, пока не найдено.",
+      ],
+    },
+  },
+  {
     slug: "the-queen-and-the-hive-a-course-on-how-the-project-builds-itself",
     title: "The Queen and the hive: a course on how the project builds itself, 27 widgets on compiled specs",
     summary: "[every widget runs fn bodies of a gHashTag/t27 specs/queen or specs/automation spec compiled to wasm; no widget reads the live Queen; the game widgets are flat sketches] Course 11 opens the rules the Queen runs the hive by: shaping an issue and its boundary, priority, aging and review first, a task's state machine, the ship in the game, a deploy mid-flight, the reviewer's concurrency and back-off, the merge gate, the review jam and inherited red, refused keys and the next key, credit and token prices, agent bots in one group, the night watch, the public board and the comb.",

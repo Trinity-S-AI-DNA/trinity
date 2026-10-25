@@ -3,7 +3,6 @@ import { motion } from 'framer-motion'
 import { Link } from 'react-router-dom'
 import { useI18n } from '../i18n/context'
 import { LADDER } from '../lib/courseLadder.generated'
-import { promoTo } from '../lib/courseLadder'
 
 // Smooth scrolling is animation-driven, so it silently does nothing when
 // animations are not running — a hidden or backgrounded tab, or a reader who has
@@ -61,7 +60,7 @@ function CoursePromo({ lang }: { lang: string }) {
         <p style={{ margin: '0.4rem 0 0', color: 'var(--muted)', fontSize: '0.9rem', lineHeight: 1.6 }}>{say.PROMO_LINE}</p>
       </div>
       <Link
-        to={promoTo('courses', 'footer')}
+        to="/courses"
         style={{
           padding: '0.7rem 1.2rem',
           borderRadius: '999px',
@@ -78,7 +77,12 @@ function CoursePromo({ lang }: { lang: string }) {
   )
 }
 
-export default function Footer({ promo = true }: { promo?: boolean } = {}) {
+/**
+ * `aside` is what a page puts above the links: the course pages pass their TRI CLAW block
+ * (components/ClawPromo.tsx). The footer imports none of a page's own stylesheets, so the landing
+ * page and the Queen board load only what they draw (qa/queen-contrast-contract.mjs walks them).
+ */
+export default function Footer({ promo = true, aside = null }: { promo?: boolean; aside?: React.ReactNode } = {}) {
   /* lang нужен подписи «Инвестиции» в списке ссылок: ключа nav[9] в локалях
      нет, и на русской странице там висело английское «Invest». */
   const { t, lang } = useI18n()
@@ -95,6 +99,7 @@ export default function Footer({ promo = true }: { promo?: boolean } = {}) {
       aria-label="Site footer"
     >
       <div style={{ maxWidth: '1200px', margin: '0 auto' }}>
+        {aside}
         {promo ? <CoursePromo lang={lang} /> : null}
         {/* Main Footer Content */}
         <div style={{ 

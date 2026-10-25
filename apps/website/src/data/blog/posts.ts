@@ -1,3 +1,4 @@
+import { body as body_every_course_free_and_the_whole_course_on_one_page, ruBody as ruBody_every_course_free_and_the_whole_course_on_one_page } from './bodies/every-course-free-and-the-whole-course-on-one-page'
 import { body as body_the_queen_and_the_hive_a_course_on_how_the_project_builds_itself, ruBody as ruBody_the_queen_and_the_hive_a_course_on_how_the_project_builds_itself } from './bodies/the-queen-and-the-hive-a-course-on-how-the-project-builds-itself'
 import { body as body_a_wasm_interpreter_ran_on_the_board, ruBody as ruBody_a_wasm_interpreter_ran_on_the_board } from './bodies/a-wasm-interpreter-ran-on-the-board'
 import { body as body_neural_networks_in_t27_a_widget_per_lesson, ruBody as ruBody_neural_networks_in_t27_a_widget_per_lesson } from './bodies/neural-networks-in-t27-a-widget-per-lesson'
@@ -116,6 +117,7 @@ import { body as body_features_that_change_no_bits, ruBody as ruBody_features_th
 import { body as body_one_commit_nine_workflow_outcomes, ruBody as ruBody_one_commit_nine_workflow_outcomes } from './bodies/one-commit-nine-workflow-outcomes'
 
 const bodies: Record<string, PostBody> = {
+  'every-course-free-and-the-whole-course-on-one-page': { body: body_every_course_free_and_the_whole_course_on_one_page, ruBody: ruBody_every_course_free_and_the_whole_course_on_one_page },
   'a-wasm-interpreter-ran-on-the-board': { body: body_a_wasm_interpreter_ran_on_the_board, ruBody: ruBody_a_wasm_interpreter_ran_on_the_board },
   'a-3-mb-compiler-spec-to-aarch64-in-5-ms': { body: body_a_3_mb_compiler_spec_to_aarch64_in_5_ms, ruBody: ruBody_a_3_mb_compiler_spec_to_aarch64_in_5_ms },
   'actors-beat-the-loop-on-recovery-not-everywhere': { body: body_actors_beat_the_loop_on_recovery_not_everywhere, ruBody: ruBody_actors_beat_the_loop_on_recovery_not_everywhere },

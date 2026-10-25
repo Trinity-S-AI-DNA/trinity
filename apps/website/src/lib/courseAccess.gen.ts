@@ -6,11 +6,11 @@
 export const KIND = "automation" satisfies string;
 export const ID = "course-access" satisfies string;
 export const REPO = "999-multibots-telegraf" satisfies string;
-export const VERSION = 2 satisfies number;
+export const VERSION = 3 satisfies number;
 export const STEP_FREE = 0 satisfies number;
 export const STEP_BOT = 1 satisfies number;
 export const STEP_PAID = 2 satisfies number;
-export const LADDER_RUNGS = 4 satisfies number;
+export const LADDER_RUNGS = 1 satisfies number;
 export const COURSES_KNOWN = 7 satisfies number;
 export const BOT = "t27ai_bot" satisfies string;
 export const START_PREFIX = "course_" satisfies string;
@@ -41,6 +41,9 @@ export const RUN_LIVE = false satisfies boolean;
 // t27c gen-ts: fn lesson_event was not emitted -- this backend lowers declarations, not bodies.
 // t27c gen-ts: fn tells_owner was not emitted -- this backend lowers declarations, not bodies.
 // t27c gen-ts: fn may_report was not emitted -- this backend lowers declarations, not bodies.
+// t27c gen-ts: a TestBlock was not emitted -- it is checked by the compiler, not by the artifact.
+// t27c gen-ts: a TestBlock was not emitted -- it is checked by the compiler, not by the artifact.
+// t27c gen-ts: a TestBlock was not emitted -- it is checked by the compiler, not by the artifact.
 // t27c gen-ts: a TestBlock was not emitted -- it is checked by the compiler, not by the artifact.
 // t27c gen-ts: a TestBlock was not emitted -- it is checked by the compiler, not by the artifact.
 // t27c gen-ts: a TestBlock was not emitted -- it is checked by the compiler, not by the artifact.
