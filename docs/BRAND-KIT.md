@@ -132,6 +132,42 @@ Math:      "Latin Modern Math" — LaTeX renders, whitepaper
 - **Φ-notation everywhere** — phases, constants, attention — all through golden ratio
 - **CLI as language** — `tri verify`, `tri route plan`, `tri pack` — commands sound like mantras
 
+### Site voice (2026-10-26): the announcement style
+
+The course catalog (`t27.ai/#/courses`) set the house style for every page that
+sells or explains: one measured sentence says what a thing is and what happens,
+and the labels are gone. The worked example is the ladder copy
+(`apps/website/specs/ladder/course-ladder.t27`, the release copy of
+2026-10-26):
+
+| Was (a label) | Now (the sentence) |
+|---|---|
+| badge `FREE` on every card | badge `Open` |
+| counter `Free courses left: 3 of 3` | `You can still pick {0} of your three.` |
+| gate title `This course is free for you` | `This course is yours to open` |
+| promo heading `Three courses free, no sign-up` | `Any three courses, no sign-up` |
+| catalog lead | `Every course is 27 short lessons in the browser, each with a live widget. Pick any three and they are free, with no sign-up and no email; the club opens the rest.` |
+
+The rules:
+
+1. **The sentence, not the label.** A badge does not teach; the announcement
+   sentence does. Every fact a reader needs lives in one calm sentence with its
+   counts: 27 lessons; any three; no sign-up and no email; the club opens the
+   rest.
+2. **A selling word appears once, in prose.** "free" lives inside the
+   announcement sentence, exactly where the owner's own post says it - never as
+   a badge, a counter, or a heading. A label that sells is a label that lies.
+3. **State what happens, not what to feel.** No urgency, no exclamation marks,
+   no nagging counters. "You can still pick {0} of your three." - one press,
+   what it uses, what it opens.
+4. **The gate answers "why is this locked"; the teaser answers "what is
+   next".** Two different pages, two different sentences - the ladder spec pins
+   this (`the_teaser_speaks_for_itself_not_for_the_gate`).
+
+The blog leads (`src/pages/Blog.tsx`) speak the same announcement form, and the
+verification habit above (precision > emotion, a range over an adjective)
+governs every number inside the sentence.
+
 ---
 
 ## README Badge Kit

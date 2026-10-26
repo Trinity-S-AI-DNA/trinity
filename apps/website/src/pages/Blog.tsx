@@ -18,7 +18,7 @@ const CourseShelf = lazy(() => import('../components/CourseShelf'))
 const UI = {
   en: {
     blog: 'Blog',
-    lede: 'Measured results and the methods behind them. Published here first; every other channel links back to this page.',
+    lede: 'Measured results and the methods behind them. Every number in a post traces to an artefact; a post goes live when it does. Published here first; every other channel links back to this page.',
     empty: 'No posts published yet. Drafts exist but still have gaps — a post goes live when every number in it can be traced to an artefact.',
     openLabel: 'Not proven / still open',
     receipts: 'Receipts',
@@ -38,7 +38,7 @@ const UI = {
   },
   ru: {
     blog: 'Блог',
-    lede: 'Измеренные результаты и методы, которыми они получены. Публикуется сначала здесь; все остальные площадки ссылаются сюда.',
+    lede: 'Измеренные результаты и методы, которыми они получены. Каждая цифра в посте возводится к артефакту — пост выходит, когда это так. Публикуется сначала здесь; все остальные площадки ссылаются сюда.',
     empty: 'Опубликованных постов пока нет. Черновики есть, но в них остались пробелы — пост выходит, когда каждую цифру в нём можно возвести к артефакту.',
     openLabel: 'Не доказано / остаётся открытым',
     receipts: 'Чем это подтверждено',
