@@ -212,15 +212,6 @@ const meta: React.CSSProperties = {
   textTransform: 'uppercase',
 }
 
-const card: React.CSSProperties = {
-  border: '1px solid var(--border, #2a2a2a)',
-  borderRadius: '12px',
-  marginBottom: '24px',
-  textDecoration: 'none',
-  color: 'inherit',
-  overflow: 'hidden',
-}
-
 /** Карточка поста в списке: обложка сверху, под ней мета, заголовок и резюме.
  *
  * Заголовок показывается всегда. Раньше он скрывался при видимой обложке,
@@ -229,21 +220,23 @@ const card: React.CSSProperties = {
  * заголовка пост в списке остался бы безымянным.
  */
 function BlogCard({ post, lang, minLabel }: { post: PostMeta; lang: string; minLabel: string }) {
+  // The courses card chrome (owner, 2026-10-27: "the blog preview in the courses
+  // style, and every preview present"): the grid, the badge chip, the 22px title,
+  // the foot line -- with the post's engraved cover staying on top of it.
   return (
-    <Link to={`/blog/${post.slug}`} style={card} className="blog-card">
-      <Cover slug={post.slug} title={post.title} lang={lang} className="blog-card-cover" />
-      <div className="blog-card-body">
-        <div style={meta}>
-          {post.date} · {post.readingMinutes} {minLabel} · <span className="blog-hashtag">{hashtagLine(post.tags)}</span>
+    <li className="blog-card">
+      <Link to={`/blog/${post.slug}`} className="blog-card-link">
+        <Cover slug={post.slug} title={post.title} lang={lang} className="blog-card-cover" />
+        <div className="blog-card-body">
+          <span className="blog-badge">{post.date}</span>
+          <span className="blog-card-title">{post.title}</span>
+          <p className="blog-card-desc">{post.summary}</p>
+          <span className="blog-card-foot">
+            {post.readingMinutes} {minLabel} · <span className="blog-hashtag">{hashtagLine(post.tags)}</span>
+          </span>
         </div>
-        <h2 style={{ margin: '10px 0 8px', fontSize: '1.25rem', fontWeight: 800 }}>
-          {post.title}
-        </h2>
-        <p style={{ margin: '10px 0 0', lineHeight: 1.7, color: 'var(--text-dim, #8a8a8a)' }}>
-          {post.summary}
-        </p>
-      </div>
-    </Link>
+      </Link>
+    </li>
   )
 }
 
@@ -617,7 +610,9 @@ export function BlogIndex() {
             {t.empty}
           </p>
         ) : (
-          items.map((p) => <BlogCard key={p.slug} post={p} lang={lang} minLabel={t.min} />)
+          <ul className="blog-catalog">
+            {items.map((p) => <BlogCard key={p.slug} post={p} lang={lang} minLabel={t.min} />)}
+          </ul>
         )}
       </div>
       <Footer />
