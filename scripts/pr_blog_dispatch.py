@@ -6,7 +6,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
-REPO = "gHashTag/trinity"
+REPO = "Trinity-S-AI-DNA/trinity"
 
 
 def gh(path, method="GET", body=None):

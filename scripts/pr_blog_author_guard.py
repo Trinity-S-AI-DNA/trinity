@@ -9,7 +9,7 @@ from pathlib import Path
 def validate(pr, issue, number, outbox):
     if not re.fullmatch(r"[1-9][0-9]*", number) or not re.fullmatch(r"[1-9][0-9]*", outbox):
         raise ValueError("Expected positive PR and outbox numbers")
-    repo = "gHashTag/trinity"
+    repo = "Trinity-S-AI-DNA/trinity"
     if pr.get("number") != int(number) or pr.get("base", {}).get("repo", {}).get("full_name") != repo:
         raise ValueError("Source PR identity mismatch")
     if pr.get("merged") is not True or not pr.get("merged_at") or pr.get("state") != "closed":

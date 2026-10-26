@@ -40,7 +40,7 @@ def valid_report():
 
 def valid_event(payload=None, state="open", merged=False):
     return {
-        "repository": {"full_name": "gHashTag/trinity"},
+        "repository": {"full_name": "Trinity-S-AI-DNA/trinity"},
         "number": 123,
         "pull_request": {
             "number": 123,
@@ -51,8 +51,8 @@ def valid_event(payload=None, state="open", merged=False):
             "created_at": "2026-09-13T04:00:00Z",
             "merged_at": "2026-09-14T04:00:00Z" if merged else None,
             "merge_commit_sha": MERGE if merged else None,
-            "html_url": "https://github.com/gHashTag/trinity/pull/123",
-            "base": {"repo": {"full_name": "gHashTag/trinity"}},
+            "html_url": "https://github.com/Trinity-S-AI-DNA/trinity/pull/123",
+            "base": {"repo": {"full_name": "Trinity-S-AI-DNA/trinity"}},
         },
     }
 
@@ -357,7 +357,7 @@ def dependabot_event(body="Bumps lodash from 4.17.20 to 4.17.21."):
         "body": body, "title": "deps: bump lodash from 4.17.20 to 4.17.21 in /docs",
         "user": {"login": "dependabot[bot]", "type": "Bot"}, "changed_files": 2, "commits": 1,
         "head": {"sha": HEAD, "ref": "dependabot/npm_and_yarn/docs/lodash-4.17.21",
-                 "repo": {"full_name": "gHashTag/trinity"}},
+                 "repo": {"full_name": "Trinity-S-AI-DNA/trinity"}},
     })
     return event
 
