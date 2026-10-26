@@ -27,8 +27,8 @@ The original demonstration displayed example data for:
 | Resource | URL | Status |
 |----------|-----|--------|
 | **Demonstration Dashboard** | `/trinity/dashboard` | Unavailable (HTTP 404, 2026-10-04) |
-| **Main Website** | https://ghashtag.github.io/trinity/ | ✅ Live |
-| **Documentation** | https://ghashtag.github.io/trinity/docs/ | ✅ Live |
+| **Main Website** | https://t27.ai | ✅ Live |
+| **Documentation** | https://t27.ai | ✅ Live |
 
 ### What Was Deployed
 
@@ -227,8 +227,8 @@ by this historical report.
 
 **Links:**
 - Historical dashboard route: `/trinity/dashboard` (unavailable)
-- Main Website: https://ghashtag.github.io/trinity/
-- Documentation: https://ghashtag.github.io/trinity/docs/
+- Main Website: https://t27.ai
+- Documentation: https://t27.ai
 - Repository: https://github.com/gHashTag/trinity
 
 ---

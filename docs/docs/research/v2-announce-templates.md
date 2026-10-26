@@ -132,7 +132,7 @@ zig build tri    # Run
 
 Built with Zig 0.15. No runtime dependencies. Statically linked.
 
-DOCS: https://gHashTag.github.io/trinity/docs/research
+DOCS: https://t27.ai
 ```
 
 ---

@@ -656,7 +656,7 @@ ralph --monitor             # Autonomous development
 | Resource | URL |
 |----------|-----|
 | Repository | https://github.com/gHashTag/trinity |
-| Documentation | https://gHashTag.github.io/trinity/docs |
+| Documentation | https://t27.ai |
 | Issues | https://github.com/gHashTag/trinity/issues |
 | Questions and discussion | https://github.com/gHashTag/trinity/issues (Discussions is not enabled) |
 | Code of Conduct | https://github.com/gHashTag/trinity/blob/main/CODE_OF_CONDUCT.md |

@@ -124,7 +124,7 @@ gh api repos/gHashTag/trinity/releases/tags/v2.1.0 \
 | Announce templates | `docsite/docs/research/v2-announce-templates.md` | Copy-paste posts |
 | Release notes | `RELEASE_NOTES.md` | Detailed changelog |
 | Release report | `docsite/docs/research/trinity-v2-release-report.md` | Technical deep dive |
-| Research docs | https://gHashTag.github.io/trinity/docs/research | Full cycle reports |
+| Research docs | https://t27.ai | Full cycle reports |
 
 ---
 

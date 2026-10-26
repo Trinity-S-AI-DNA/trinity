@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Production distribution across 4 platforms (npm, Homebrew, AUR, Docker)
 - 134 TRI CLI commands covering AI, math, chemistry, git workflows
-- Live dashboard at https://ghashtag.github.io/trinity/
+- Live dashboard at https://t27.ai
 
 ### Changed
 

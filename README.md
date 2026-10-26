@@ -26,7 +26,7 @@
   <a href="https://www.npmjs.com/package/@playra/tri"><img src="https://img.shields.io/npm/v/@playra/tri?style=flat-square&logo=npm" alt="npm"></a>
   <a href="https://github.com/gHashTag/homebrew-trinity"><img src="https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fraw.githubusercontent.com%2FgHashTag%2Fhomebrew-trinity%2Fmain%2FFormula%2Ftrinity.rb&query=$.version&label=homebrew&style=flat-square" alt="Homebrew"></a>
   <a href="https://aur.archlinux.org/packages/trinity-cli"><img src="https://img.shields.io/aur/version/trinity-cli?style=flat-square&logo=arch-linux" alt="AUR"></a>
-  <a href="https://github.com/gHashTag/trinity/pkgs/container/trinity"><img src="https://img.shields.io/github/actions/workflow/status/gHashTag/trinity/docker-cli.yml?label=Docker&style=flat-square&logo=docker" alt="Docker"></a>
+  <a href="https://github.com/Trinity-S-AI-DNA/trinity/actions/workflows/docker-cli.yml"><img src="https://img.shields.io/github/actions/workflow/status/gHashTag/trinity/docker-cli.yml?label=Docker&style=flat-square&logo=docker" alt="Docker"></a>
   <img src="https://img.shields.io/badge/Zig-0.15.x-F7A41D?style=flat-square&logo=zig" alt="Zig 0.15.x">
   <img src="https://img.shields.io/badge/License-MIT-yellow?style=flat-square" alt="MIT License">
   <a href="https://github.com/gHashTag/trinity"><img src="https://img.shields.io/github/stars/gHashTag/trinity?style=flat-square" alt="Stars"></a>
@@ -796,7 +796,7 @@ Your staked $TRI determines your API tier. No API keys -- your wallet is your id
 | **Power** | 1,000+ | 300 req/min | 2.0x |
 | **Whale** | 10,000+ | Unlimited | 3.0x |
 
-Include `X-Wallet: 0xYOUR_ADDRESS` in HTTP headers. See [Tokenomics docs](https://gHashTag.github.io/trinity/docs/depin/tokenomics) for full details.
+Include `X-Wallet: 0xYOUR_ADDRESS` in HTTP headers. See [Tokenomics docs](https://t27.ai) for full details.
 
 ---
 
@@ -955,7 +955,7 @@ curl http://localhost:9090/metrics
 | GET | `/v1/storage/status` | Storage layer status |
 | GET | `/metrics` | Prometheus metrics (port 9090) |
 
-See [API Reference](https://gHashTag.github.io/trinity/docs/depin/api) for full documentation.
+See [API Reference](https://t27.ai) for full documentation.
 
 ---
 
@@ -1117,12 +1117,12 @@ trinity/
 | **Changelog** | [CHANGELOG.md](CHANGELOG.md) — Version history |
 | **For Researchers** | [docs/papers/README_FOR_SCIENTISTS.md](docs/papers/README_FOR_SCIENTISTS.md) |
 | **Command Reference** | [docs/command_registry.md](docs/command_registry.md) (auto-generated) |
-| **DePIN Overview** | [gHashTag.github.io/trinity/docs/depin](https://gHashTag.github.io/trinity/docs/depin) |
-| **Quick Start** | [gHashTag.github.io/trinity/docs/depin/quickstart](https://gHashTag.github.io/trinity/docs/depin/quickstart) |
-| **Tokenomics** | [gHashTag.github.io/trinity/docs/depin/tokenomics](https://gHashTag.github.io/trinity/docs/depin/tokenomics) |
-| **Architecture** | [gHashTag.github.io/trinity/docs/depin/architecture](https://gHashTag.github.io/trinity/docs/depin/architecture) |
-| **Research** | [gHashTag.github.io/trinity/docs/research](https://gHashTag.github.io/trinity/docs/research) |
-| **Website** | [gHashTag.github.io/trinity](https://gHashTag.github.io/trinity) |
+| **DePIN Overview** | [gHashTag.github.io/trinity/docs/depin](https://t27.ai) |
+| **Quick Start** | [gHashTag.github.io/trinity/docs/depin/quickstart](https://t27.ai) |
+| **Tokenomics** | [gHashTag.github.io/trinity/docs/depin/tokenomics](https://t27.ai) |
+| **Architecture** | [gHashTag.github.io/trinity/docs/depin/architecture](https://t27.ai) |
+| **Research** | [gHashTag.github.io/trinity/docs/research](https://t27.ai) |
+| **Website** | [gHashTag.github.io/trinity](https://t27.ai) |
 
 ---
 
@@ -1291,8 +1291,8 @@ MIT -- see [LICENSE](LICENSE)
 
 <p align="center">
   <a href="https://github.com/gHashTag/trinity/releases/tag/v6.3.0"><strong>Download v6.3.0</strong></a> &bull;
-  <a href="https://gHashTag.github.io/trinity/">Dashboard</a> &bull;
-  <a href="https://gHashTag.github.io/trinity/docs/">Documentation</a>
+  <a href="https://t27.ai">Dashboard</a> &bull;
+  <a href="https://t27.ai">Documentation</a>
 </p>
 
 <p align="center">

@@ -1,6 +1,6 @@
 # Corona issue proof in the public map
 
-Issue: https://github.com/gHashTag/trinity/issues/1360
+Issue: https://github.com/Trinity-S-AI-DNA/trinity/issues/1360
 Dependency: https://github.com/gHashTag/tt-trinity-corona/pull/13
 
 The GitHub issue adapter formerly assigned `coverage: unknown` to every issue.

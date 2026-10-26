@@ -83,7 +83,7 @@ MIT License
 ## Links
 
 - **GitHub:** https://github.com/gHashTag/trinity
-- **Documentation:** https://gHashTag.github.io/trinity
+- **Documentation:** https://t27.ai
 - **DOI:** https://doi.org/10.5281/zenodo.19227865
 
 ---
@@ -561,7 +561,7 @@ MIT License
 ## Links
 
 - **GitHub:** https://github.com/gHashTag/trinity
-- **Documentation:** https://gHashTag.github.io/trinity
+- **Documentation:** https://t27.ai
 - **DOI:** https://doi.org/10.5281/zenodo.19227879
 
 ---

@@ -1,6 +1,6 @@
 # Queen evidence disclosure - 2026-09-30
 
-Issue: https://github.com/gHashTag/trinity/issues/1194
+Issue: https://github.com/Trinity-S-AI-DNA/trinity/issues/1194
 
 ## Sources and scope
 

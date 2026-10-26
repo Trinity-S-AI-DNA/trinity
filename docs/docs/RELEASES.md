@@ -240,7 +240,7 @@ First production-stable release with complete package distribution.
 
 - **Production Distribution** — All 4 major platforms supported
 - **134 TRI Commands** — Complete coverage of AI, math, chemistry, git
-- **Live Dashboard** — https://ghashtag.github.io/trinity/
+- **Live Dashboard** — https://t27.ai
 - **Performance** — 71.7% faster VSA bind, 73.4% faster SIMD bundle
 
 ### Performance
@@ -329,8 +329,8 @@ zig build test
 |----------|-----|
 | **GitHub** | https://github.com/gHashTag/trinity |
 | **Releases** | https://github.com/gHashTag/trinity/releases |
-| **Dashboard** | https://ghashtag.github.io/trinity/ |
-| **Documentation** | https://ghashtag.github.io/trinity/docs/ |
+| **Dashboard** | https://t27.ai |
+| **Documentation** | https://t27.ai |
 | **npm** | https://www.npmjs.com/package/@playra/tri |
 | **Homebrew** | https://github.com/gHashTag/homebrew-trinity |
 | **AUR** | https://aur.archlinux.org/packages/trinity-cli |

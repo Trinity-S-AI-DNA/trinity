@@ -369,7 +369,7 @@ After Upload:
 
 ## Support
 
-**Documentation:** https://gHashTag.github.io/trinity
+**Documentation:** https://t27.ai
 
 **Issues:** https://github.com/gHashTag/trinity/issues
 

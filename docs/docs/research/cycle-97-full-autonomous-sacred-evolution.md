@@ -101,7 +101,7 @@ Approval Gates:              3 layers (safeguard → metrics → human)
     ┌────────────────────────────────────────────────────────────┐
     │                 PRODUCTION DASHBOARD                         │
     │  Real-time visualization of sacred intelligence metrics    │
-    │  Deployed to: https://ghashtag.github.io/trinity/          │
+    │  Deployed to: https://t27.ai          │
     └────────────────────────────────────────────────────────────┘
                               │
                               ▼
@@ -353,7 +353,7 @@ git add -A && git commit -m "Deploy: Cycle 97 dashboard"
 git remote add origin git@github.com:gHashTag/trinity.git
 git push origin gh-pages --force
 
-# Live at: https://ghashtag.github.io/trinity/
+# Live at: https://t27.ai
 ```
 
 **Integration Points:**
@@ -682,7 +682,7 @@ tri dashboard-deploy --verbose
   ✓ Docsite copied to /tmp/gh-pages-deploy/docs/
 [φ] Pushing to gh-pages branch...
   ✓ Force push complete
-[φ] Deployment URL: https://ghashtag.github.io/trinity/
+[φ] Deployment URL: https://t27.ai
 [φ] Wait 1-2 minutes for GitHub Pages to update...
 
 ✓ Dashboard deployment complete
@@ -1385,7 +1385,7 @@ tri self-hosting status
 [φ] Commits today: 3 | Success rate: 97.3%
 
 # 4. View results on dashboard
-open https://ghashtag.github.io/trinity/
+open https://t27.ai
 ```
 
 ---

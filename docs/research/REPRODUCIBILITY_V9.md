@@ -306,7 +306,7 @@ Using [ML CO2 Impact](https://mlco2impact.com/):
 
 **Repository:** https://github.com/gHashTag/trinity
 
-**Documentation:** https://gHashTag.github.io/trinity
+**Documentation:** https://t27.ai
 
 ---
 

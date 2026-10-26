@@ -174,8 +174,8 @@ zig build vibee -- chat --model models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
 |----------|-----|
 | GitHub Release | https://github.com/gHashTag/trinity/releases/tag/v2.1.0 |
 | Repository | https://github.com/gHashTag/trinity |
-| Research Docs | https://gHashTag.github.io/trinity/docs/research |
-| Benchmarks | https://gHashTag.github.io/trinity/docs/benchmarks |
+| Research Docs | https://t27.ai |
+| Benchmarks | https://t27.ai |
 
 ---
 

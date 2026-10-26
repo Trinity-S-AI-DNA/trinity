@@ -94,7 +94,7 @@ All 8 Trinity bundles (B001-B007 + PARENT) are fully prepared for Zenodo publica
 - Open access (CC-BY-4.0 license)
 - DOI resolution via Zenodo
 - GitHub repository (https://github.com/gHashTag/trinity)
-- Documentation (https://gHashTag.github.io/trinity)
+- Documentation (https://t27.ai)
 
 ### F3: Interoperable ✅
 
@@ -285,7 +285,7 @@ URL:         https://doi.org/10.5281/zenodo.19227865
 **Maintainer:** Dmitrii Vasilev (ORCID: 0009-0008-4294-6159)  
 **Email:** dmitrii@trinity.ai  
 **GitHub:** https://github.com/gHashTag/trinity  
-**Documentation:** https://gHashTag.github.io/trinity
+**Documentation:** https://t27.ai
 
 ---
 

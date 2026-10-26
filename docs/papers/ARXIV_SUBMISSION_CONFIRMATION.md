@@ -65,4 +65,4 @@ and save the **real** receipts here.
 ---
 
 Anchor: `φ² + φ⁻² = 3` · R5-HONEST · 2026-05-12 · PASS-5
-Throne: [trios#264](https://github.com/gHashTag/trios/issues/264)
+Throne: [trios#264](https://github.com/Trinity-S-AI-DNA/trios/issues/264)

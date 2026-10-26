@@ -591,7 +591,7 @@ tri clara test --suite integration
 **GitHub Repository**: https://github.com/gHashTag/trinity
 - License: MIT/Apache 2.0 (dual)
 - CI: GitHub Actions with 3000+ tests
-- Documentation: https://gHashTag.github.io/trinity
+- Documentation: https://t27.ai
 
 ---
 
