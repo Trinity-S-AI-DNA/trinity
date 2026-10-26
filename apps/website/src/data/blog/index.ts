@@ -2,6 +2,21 @@ import type { PostMeta } from './types'
 
 /** Индекс блога: список и метаданные без тяжёлых тел публикаций. */
 export const postsIndex: PostMeta[] = [
+export const postsIndex: PostMeta[] = [
+  {
+    slug: "merge-train-and-repo-hygiene",
+    title: "The merge train: 55 open pull requests down to 25 in one night. 54 merged.",
+    summary: "[measured: gh pr list at both ends of the night; every merge through armed squash auto-merge with the four required checks deciding] The open queue went 55 to 25, 54 pull requests merged in one UTC day, 5713 dead branches deleted with their 4466 orphans recorded by SHA before deletion, and the wasm spec gained floor 18 -- the LOCALS MOUNT -- beside floor 17, with 108/108 tests and the seal verified against all five backend hashes. The Actions queue held 502 runs behind the free tier's ~20-job ceiling; the priced levers are filed.",
+    date: "2026-10-26",
+    readingMinutes: 4,
+    tags: ["Automation", "Compiler", "Measurement", "TRI-NET"],
+    receipts: [
+      { label: "Epic #12660: the Dashboard with every command named", href: "https://github.com/Trinity-S-AI-DNA/t27/issues/12660" },
+      { label: "Branch sweep record #1453: 4466 orphans with tip SHAs", href: "https://github.com/Trinity-S-AI-DNA/t27/issues/1453" },
+      { label: "Floor 18 landing #12610: 108/108 tests, seal --verify all MATCH", href: "https://github.com/Trinity-S-AI-DNA/t27/pull/12610" },
+      { label: "The Actions queue measurement #12606: 502 queued / 16 in flight", href: "https://github.com/Trinity-S-AI-DNA/t27/issues/12606" }
+    ]
+  },
   {
     slug: 'graph-neural-networks-the-2026-field-guide',
     title: 'Graph neural networks: the 2026 field guide',
