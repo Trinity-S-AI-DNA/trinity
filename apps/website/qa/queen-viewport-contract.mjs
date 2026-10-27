@@ -22,6 +22,7 @@ import { createServer } from 'node:http';
 import { readFileSync, existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join, extname, normalize } from 'node:path';
 import { tmpdir } from 'node:os';
+import { readinessDataExpr, sectorsAssertedAt } from './queen-viewport-readiness.mjs';
 
 const ROOT = new URL('..', import.meta.url).pathname;
 const DIST = join(ROOT, 'dist');
@@ -94,7 +95,7 @@ if (TRI_BUTTONS.length < 1) {
   process.exit(1);
 }
 const RAIL_COMMANDS = RAIL_VIEW_COUNT - (RAIL_VIEWS.includes('tri') ? 1 : 0) + TRI_BUTTONS.length;
-const DATA_WAIT_MS = 60000; // under the gate chain's load the sectors rows render late (the "sectors=0" readiness flake, cycles 015 and 035): a minute, like the windows gate
+const DATA_WAIT_MS = 60000; // under the gate chain's load the sectors rows render late (the "sectors=0" readiness flake, cycles 015 and 035): a minute, like the windows gate -- and since 2026-10-24 readiness holds out for the rows themselves at the sizes that assert them, not the pill alone
 const SETTLE_MS = 700;
 
 const CHROMES = [
@@ -613,9 +614,12 @@ for (const [w, h] of (DEAD ? SIZES.filter(([w]) => w === 1440 || w === 390) : SI
     const t = setTimeout(r, 20000);
     listeners.push(m => { if (m.sessionId === sessionId && m.method === 'Page.loadEventFired') { clearTimeout(t); r(); } });
   });
-  // Wait for the round slot and, when the backend answers, the live pill; the
-  // countdown reads "—" until both endpoints have answered (and stays "—"
-  // with the scheduler off), so the pill is the data signal, not the clock.
+  // Wait for the round slot and the data signal; the countdown reads "—" until
+  // both endpoints have answered (and stays "—" with the scheduler off), so the
+  // pill is the usual data signal, not the clock. At the sizes whose probe
+  // asserts six sector rows, the rows are the signal: the pill answered before
+  // the rows rendered on the loaded gate chain and wars counted zero
+  // (qa/queen-viewport-readiness.mjs holds both ends to one predicate).
   const start = Date.now();
   let ready = false;
   while (Date.now() - start < DATA_WAIT_MS) {
@@ -625,7 +629,7 @@ for (const [w, h] of (DEAD ? SIZES.filter(([w]) => w === 1440 || w === 390) : SI
       const live = !!document.querySelector('#stat-status.is-live');
       const dead = !!document.querySelector('#stat-status.is-cold');
       const rows = document.querySelectorAll('.queen27-sectors-row').length;
-      const data = ${DEAD} ? dead : (live || rows === 6);
+      const data = ${readinessDataExpr(w, phone, DEAD)};
       const rail = document.querySelector('.queen27-hud-command');
       const declared = rail ? Number(rail.getAttribute('data-views')) : 0;
       // the rail declares its own count (data-views from commandItems); the gate follows it rather than a hardcoded eight
@@ -680,7 +684,7 @@ for (const [w, h] of (DEAD ? SIZES.filter(([w]) => w === 1440 || w === 390) : SI
     // qa/agents-spec-contract.mjs holds HUD_VIEWS itself to the modules.
     if (counts.commands !== RAIL_COMMANDS) zero.push(`commands=${counts.commands} (the rail draws ${RAIL_COMMANDS}: ${RAIL_VIEW_COUNT} doors, tri as ${TRI_BUTTONS.length} screens)`);
     if (counts.resources < 7) zero.push(`resources=${counts.resources}`);
-    if (!DEAD && !phone && w > 1100 && counts.sectors !== 6) zero.push(`sectors=${counts.sectors}`);
+    if (sectorsAssertedAt(w, phone, DEAD) && counts.sectors !== 6) zero.push(`sectors=${counts.sectors}`);
     if (DEAD && counts.sectors !== 0) fail.push(`sectors rendered without a board: ${counts.sectors}`);
     if (DEAD && result.live) fail.push('status pill reads LIVE with a dead API');
     if (DEAD) for (const z of result.zeros) fail.push('BARE ZERO ' + z);
