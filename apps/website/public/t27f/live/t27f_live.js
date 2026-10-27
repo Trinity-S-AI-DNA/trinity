@@ -10,7 +10,7 @@
 const url = new URL('t27f.wasm', import.meta.url)
 const refuse = (m) => ({ refused: true, message: m })
 const NS = 'http://www.w3.org/2000/svg'
-const C = { bg:'#0d1117',text:'#8b949e',bright:'#c9d1d9',spawn:'#3fb950',active:'#58a6ff',down:'#f85149',restart:'#d29922',exit:'#484f58',edge:'#30363d',particle:'#f0883e' }
+const C = { bg:'#000000',text:'#8b949e',bright:'#c9d1d9',spawn:'#3fb950',active:'#58a6ff',down:'#f85149',restart:'#d29922',exit:'#484f58',edge:'#30363d',particle:'#f0883e' }
 const col = (st) => st==='spawning'?C.spawn:st==='down'?C.down:st==='restarting'?C.restart:st==='exit'?C.exit:C.active
 
 // THE GX CONSUMER -- the law's own graph, dormant until the module carries it. The LAW is
@@ -88,7 +88,7 @@ export async function replay(el, log) {
   const ks = document.getElementById('live-kf') || document.head.append(Object.assign(document.createElement('style'),{id:'live-kf',textContent:'@keyframes live-pulse{from{r:14;opacity:.7}to{r:44;opacity:0}}@keyframes live-shake{0%,100%{transform:translateX(0)}25%{transform:translateX(-3px)}75%{transform:translateX(3px)}}'}))
 
   const wrap=document.createElement('div'); wrap.style.cssText='display:grid;grid-template-columns:1fr 260px;gap:10px'
-  const gc=document.createElement('div'); gc.style.cssText='position:relative;border:1px solid #30363d;border-radius:8px;background:#0d1117;overflow:hidden;min-height:400px'
+  const gc=document.createElement('div'); gc.style.cssText='position:relative;border:1px solid #333;border-radius:8px;background:#000000;overflow:hidden;min-height:400px'
   const sc=document.createElement('div'); sc.style.cssText='display:flex;flex-direction:column;gap:8px'
   const W=640,H=400
   const svg=document.createElementNS(NS,'svg'); svg.setAttribute('viewBox',`0 0 ${W} ${H}`); svg.setAttribute('width','100%'); svg.setAttribute('height','100%'); svg.style.cssText='position:absolute;inset:0'
@@ -102,7 +102,7 @@ export async function replay(el, log) {
   sc.append(stream,stats)
   wrap.append(gc,sc)
   const tl=document.createElement('div'); tl.style.cssText='border:1px solid #30363d;border-radius:8px;padding:6px;display:flex;align-items:center;gap:6px;margin-top:8px'
-  const mkB=(t,fn)=>{const b=document.createElement('button');b.textContent=t;b.onclick=fn;b.style.cssText='background:#21262d;border:1px solid #30363d;color:#c9d1d9;border-radius:4px;padding:3px 8px;cursor:pointer;font:12px monospace';return b}
+  const mkB=(t,fn)=>{const b=document.createElement('button');b.textContent=t;b.onclick=fn;b.style.cssText='background:#000000;border:1px solid #333;color:#c9d1d9;border-radius:4px;padding:3px 8px;cursor:pointer;font:12px monospace';return b}
   const pb=mkB('\u25B6',()=>reset())
   const fe=document.createElement('span'); fe.style.cssText='color:#8b949e;font:11px monospace;margin-left:auto'
   tl.append(pb,fe)
@@ -203,7 +203,7 @@ export async function replay(el, log) {
   setInterval(async()=>{ try{ await pollFeed() }catch{ // feed down or foreign: the recorded log, at its own cadence
       if(Date.now()-lastLog<300000)return; lastLog=Date.now(); try{ await pollLog() }catch{} } },15000)
 
-  return { refused:false, message: gxLayout.line + ` ${evts.length} events on the law's tick grid, ${agents.size} named agents at display frame rate; below: pull requests, activity and the queen lane, live from the GitHub API. Press play to watch the replay.` }
+  return { refused:false, message: gxLayout.line + ` ${evts.length} events on the law's tick grid, ${agents.size} named agents at display frame rate; below: the Queen's live activity, then pull requests, activity and the queen lane from the GitHub API. Press play to watch the replay.` }
 }
 
 // Encode one log event as its 32-byte #12005 record at offset o. Fields the log does not
@@ -261,7 +261,7 @@ function gxName(R, i) {
 function gxReplay(el, R, log, evts, feed) {
   document.getElementById('live-kf') || document.head.append(Object.assign(document.createElement('style'),{id:'live-kf',textContent:'@keyframes live-pulse{from{r:14;opacity:.7}to{r:44;opacity:0}}'}))
   const wrap=document.createElement('div'); wrap.style.cssText='display:grid;grid-template-columns:1fr 260px;gap:10px'
-  const gc=document.createElement('div'); gc.style.cssText='position:relative;border:1px solid #30363d;border-radius:8px;background:#0d1117;overflow:hidden;min-height:400px'
+  const gc=document.createElement('div'); gc.style.cssText='position:relative;border:1px solid #333;border-radius:8px;background:#000000;overflow:hidden;min-height:400px'
   const sc=document.createElement('div'); sc.style.cssText='display:flex;flex-direction:column;gap:8px'
   const W=640,H=400
   const svg=document.createElementNS(NS,'svg'); svg.setAttribute('viewBox',`0 0 ${W} ${H}`); svg.setAttribute('width','100%'); svg.setAttribute('height','100%'); svg.style.cssText='position:absolute;inset:0'
@@ -277,7 +277,7 @@ function gxReplay(el, R, log, evts, feed) {
   sc.append(stream,stats)
   wrap.append(gc,sc)
   const tl=document.createElement('div'); tl.style.cssText='border:1px solid #30363d;border-radius:8px;padding:6px;display:flex;align-items:center;gap:6px;margin-top:8px'
-  const mkB=(t,fn)=>{const b=document.createElement('button');b.textContent=t;b.onclick=fn;b.style.cssText='background:#21262d;border:1px solid #30363d;color:#c9d1d9;border-radius:4px;padding:3px 8px;cursor:pointer;font:12px monospace';return b}
+  const mkB=(t,fn)=>{const b=document.createElement('button');b.textContent=t;b.onclick=fn;b.style.cssText='background:#000000;border:1px solid #333;color:#c9d1d9;border-radius:4px;padding:3px 8px;cursor:pointer;font:12px monospace';return b}
   const pb=mkB('\u25B6',()=>reset())
   const fe=document.createElement('span'); fe.style.cssText='color:#8b949e;font:11px monospace;margin-left:auto'
   tl.append(pb,fe)
@@ -368,18 +368,18 @@ function gxReplay(el, R, log, evts, feed) {
     else if(feed.mode==='apply') for(const e of add){ apply(e); sync() }
     let s1=0; const st=()=>{ layout(); if(s1++<40)requestAnimationFrame(st) }; requestAnimationFrame(st) }catch{} },300000)
 
-  return { refused:false, message:`${evts.length} events through gx_${feed.mode==='replay'?'replay':'apply_event'}: ${R.gx_node_count()} nodes and ${R.gx_edge_count()} edges read from the module's own WorkGraph (specs/t27f/live_graph_export.t27, t27#12148) -- the law's real topology, not a simulation; below: the fleet, live from the GitHub API. Press play to watch the timeline.` }
+  return { refused:false, message:`${evts.length} events through gx_${feed.mode==='replay'?'replay':'apply_event'}: ${R.gx_node_count()} nodes and ${R.gx_edge_count()} edges read from the module's own WorkGraph (specs/t27f/live_graph_export.t27, t27#12148) -- the law's real topology, not a simulation; below: the fleet, live from the Queen's activity feed and the GitHub API. Press play to watch the timeline.` }
 }
 
 // The fleet monitor: real pull requests and real repository activity from the
 // GitHub API, refreshed on a slow cycle that respects the anonymous rate limit
 // (60/h). No keys, no server: the visitor's browser reads the public API.
 const REPO='Trinity-S-AI-DNA/t27', API=`https://api.github.com/repos/${REPO}`
-const FC={ok:'#3fb950',info:'#58a6ff',dim:'#8b949e',text:'#c9d1d9',bg:'#0d1117',border:'#30363d'}
+const FC={ok:'#3fb950',info:'#58a6ff',dim:'#8b949e',text:'#c9d1d9',bg:'#000000',border:'#333'}
 function mountFleet(root){
   root.style.cssText='margin-top:12px'
   const hd=document.createElement('div'); hd.style.cssText=`display:flex;align-items:center;gap:10px;font:12px monospace;color:${FC.text};padding:8px 12px;border:1px solid ${FC.border};border-radius:8px;background:${FC.bg}`
-  const t=document.createElement('strong'); t.textContent='THE FLEET, LIVE'; t.style.color=FC.text
+  const t=document.createElement('strong'); t.textContent='THE FLEET'; t.style.color=FC.text
   const n=document.createElement('span'); n.style.color=FC.dim; n.textContent='loading...'
   const tm=document.createElement('span'); tm.style.cssText=`color:${FC.dim};margin-left:auto;font-size:11px`
   hd.append(t,n,tm); root.append(hd)
@@ -391,6 +391,33 @@ function mountFleet(root){
   const qP=document.createElement('div'); qP.style.cssText=`border:1px solid ${FC.border};border-radius:8px;background:${FC.bg};padding:10px;overflow-y:auto;max-height:240px;margin-top:8px`
   const h3=document.createElement('div'); h3.textContent='the queen -- dispatches and crons (workflow runs)'; h3.style.cssText=`color:${FC.text};font:bold 12px monospace;margin:0 0 8px`
   qP.append(h3)
+  // The live headline (specs/t27f/live_fleet.t27, t27#12382): the Queen's own
+  // activity feed -- public, no credential, CORS-open -- every 15 s, backing off
+  // 30/60/120 s on failure. Only this reading carries the LIVE badge; the GitHub
+  // panels are a second reading (3 calls per 150 s is 72/h, over the anonymous 60/h).
+  const ACT='https://api.t27.ai/queen/public-activity'
+  const aqP=document.createElement('div'); aqP.style.cssText=qP.style.cssText
+  const h6=document.createElement('div'); h6.textContent='the queen -- live activity (api.t27.ai/queen/public-activity, every 15 s)'; h6.style.cssText=h3.style.cssText
+  aqP.append(h6)
+  let aFail=0, aOk=0
+  async function activity(){
+    try{ const r=await fetch(ACT,{cache:'no-store'}); if(!r.ok)throw new Error('http '+r.status)
+      const d=await r.json(); if(!Number.isFinite(d.cursor)||!Array.isArray(d.events))throw new Error('foreign format')
+      const E=d.events, seen=new Set(); let fl=0, fin=0, rf=0, rv=0; if(E.some(e=>!Number.isFinite(Date.parse(e.at))))throw new Error('foreign format') // every "at" is ISO
+      for(const e of E){ if(e.kind==='finished'){ fin++; if(e.state==='refused')rf++ } else if(e.kind==='review')rv++
+        // in flight: the issue's newest dispatch-or-finished event (list order) is a dispatch
+        if((e.kind==='dispatch'||e.kind==='finished')&&!seen.has(e.issue)){ seen.add(e.issue); if(e.kind==='dispatch')fl++ } }
+      const age=E.length?Math.max(0,Math.floor((d.cursor-Date.parse(E[0].at))/1000)):-1 // server clock, not the visitor's
+      aFail=0; aOk=Date.now(); t.textContent='THE FLEET, LIVE'
+      n.textContent=age<0?'no events':`${fl} in flight \u00B7 ${fin} finished (${rf} refused) \u00B7 ${rv} reviews \u00B7 newest ${age}s ago${age>600?' (quiet)':''}`
+      aqP.querySelectorAll('.aq').forEach(x=>x.remove())
+      for(const e of E.slice(0,10)){ const x=document.createElement('div'); x.className='aq'
+        x.style.cssText=`padding:4px 0;border-bottom:1px solid #21262d;font:11px monospace;color:${e.state==='refused'?'#f85149':FC.text};white-space:nowrap;overflow:hidden;text-overflow:ellipsis`
+        x.textContent=new Date(Date.parse(e.at)).toISOString().slice(11,19)+'Z '+e.kind+(e.state?' ('+e.state+')':'')+' #'+e.issue+' '+(e.title||''); aqP.append(x) }
+    }catch{ aFail++ // presentation(): stale after a success, unavailable before one, offline when offline
+      t.textContent=aOk&&navigator.onLine!==false?'THE FLEET, STALE':'THE FLEET'
+      n.textContent=navigator.onLine===false?'offline':aOk?`last reading ${Math.round((Date.now()-aOk)/1000)}s ago`:'activity feed unavailable' }
+    setTimeout(activity,Math.min(15*2**aFail,120)*1000) } // next_wait_s
   // The model fleet: the $0 capacity matrix, STATIC from the probe receipt on
   // t27#12170 (2026-10-25). The pool flapped 8->2 alive cells within hours that
   // day, so the law (specs/queen/api_fleet.t27) is re-probe, never replace the
@@ -422,7 +449,7 @@ function mountFleet(root){
   v.style.cssText='width:100%;max-height:420px;border-radius:6px;background:#000'
   v.src='./queen-live.mp4'
   vid.append(h4,v)
-  prP.append(h1); acP.append(h2); cols.append(prP,acP); root.append(cols,qP,flP,vid)
+  prP.append(h1); acP.append(h2); cols.append(prP,acP); root.append(aqP,cols,qP,flP,vid)
   const etags=new Map()
   const gh=async(p)=>{ const h={Accept:'application/vnd.github+json'}; if(etags.has(p))h['If-None-Match']=etags.get(p)
     const r=await fetch(API+p,{headers:h})
@@ -434,7 +461,7 @@ function mountFleet(root){
     return s<60?s+'s':s<3600?Math.floor(s/60)+'m':s<86400?Math.floor(s/3600)+'h':Math.floor(s/86400)+'d' }
   async function prs(){ const L=await gh('/pulls?state=all&sort=updated&direction=desc&per_page=12')
     if(!L)return
-    n.textContent=L.filter(p=>p.state==='open').length+' open'
+    h1.textContent='pull requests -- '+L.filter(p=>p.state==='open').length+' open'
     prP.querySelectorAll('.pr').forEach(e=>e.remove())
     for(const p of L){ const m=p.merged_at!==null, st=m?'MERGED':p.state==='open'?'OPEN':'CLOSED', c=m?FC.ok:p.state==='open'?FC.info:FC.dim
       const d=document.createElement('div'); d.className='pr'; d.style.cssText=`padding:7px;border:1px solid ${FC.border};border-radius:6px;margin-bottom:6px;font:11px monospace;display:flex;gap:8px;align-items:baseline`
@@ -479,5 +506,5 @@ function mountFleet(root){
     tm.textContent=bad?('rate-limited, backing off '+Math.round(wait/60)+'m'):('live \u00B7 cycle '+Math.round(wait/60)+'m') }
   setInterval(()=>{ if(!nextAt)return; const s=Math.max(0,Math.ceil((nextAt-Date.now())/1000))
     tm.textContent=s>0?('next refresh '+s+'s'):'\u21BB refreshing...' },1000)
-  refresh()
+  refresh(); activity()
 }
