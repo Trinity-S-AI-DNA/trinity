@@ -823,6 +823,12 @@ const COPY = {
     // ---- single-screen HUD ----
     hudBrand: "TRINITY QUEEN",
     hudBees: "BEES",
+    capacityTitle: "Can more bees run?",
+    capacityMeaning: "The counter shows active bees / current dispatch capacity. The second number is not a permanent ceiling.",
+    capacityMaximum: "Maximum after expansion: not yet known",
+    capacityMissing: "The service does not report the runners' current capacity. Key count alone cannot tell how many bees can safely run at once.",
+    capacityAction: "Increasing capacity requires checking runner resources and model limits, then adjusting the dispatch limit. This panel does not change tasks or settings.",
+    capacityClose: "Close capacity details",
     hudDone: "DONE",
     hudVerdicts: "VERDICTS",
     hud24h: "24h",
@@ -1351,6 +1357,12 @@ const COPY = {
     // ---- single-screen HUD ----
     hudBrand: "TRINITY QUEEN",
     hudBees: "ПЧЁЛЫ",
+    capacityTitle: "Можно запустить больше пчёл?",
+    capacityMeaning: "Счётчик показывает активных пчёл / текущую вместимость диспетчера. Второе число — не постоянный потолок.",
+    capacityMaximum: "Максимум после увеличения: пока неизвестен",
+    capacityMissing: "Сервис не сообщает текущую вместимость раннеров. По одному числу ключей нельзя определить, сколько пчёл безопасно запустить одновременно.",
+    capacityAction: "Для увеличения нужны проверка ресурсов раннеров и лимитов моделей, затем настройка лимита диспетчера. Эта панель не меняет задачи или настройки.",
+    capacityClose: "Закрыть сведения о вместимости",
     hudDone: "ГОТОВО",
     hudVerdicts: "ВЕРДИКТЫ",
     hud24h: "24ч",
@@ -5340,7 +5352,15 @@ export default function Queen({sharedCatalog}:{sharedCatalog?:UniverseAtlas}={})
         </Link>
 
         <div className="queen27-hud-res queen27-hud-res-bees">
-          <i aria-hidden="true">◆</i>
+          <button
+            type="button"
+            className="queen27-capacity-trigger"
+            popoverTarget="queen-capacity-info"
+            aria-label={c.capacityTitle}
+            title={c.capacityTitle}
+          >
+            <span aria-hidden="true">ⓘ</span>
+          </button>
           <small>{c.hudBees}</small>
           {/* One response for the whole tile: /queen/status's started, unfinished
               bees over its slots, the reading idleReason takes free slots from.
@@ -5373,6 +5393,22 @@ export default function Queen({sharedCatalog}:{sharedCatalog?:UniverseAtlas}={})
               `${data?.workers ? data.workers.capacity - data.workers.active : (workers?.idle ?? "—")} ${c.factoryIdle}`
             )}
           </span>
+          <div
+            id="queen-capacity-info"
+            className="queen27-capacity-info"
+            popover="auto"
+            role="dialog"
+            aria-labelledby="queen-capacity-title"
+          >
+            <h2 id="queen-capacity-title">{c.capacityTitle}</h2>
+            <p>{c.capacityMeaning}</p>
+            <strong>{c.capacityMaximum}</strong>
+            <p>{c.capacityMissing}</p>
+            <p>{c.capacityAction}</p>
+            <button type="button" popoverTarget="queen-capacity-info" popoverTargetAction="hide">
+              {c.capacityClose}
+            </button>
+          </div>
         </div>
 
         <div className="queen27-hud-res">
