@@ -6,4 +6,4 @@ echo "Verifying 2FA..."
 curl --max-time 30 -s -X POST "$BRIDGE/api/v1/auth/2fa" \
   -H "Content-Type: application/json" \
   -H "X-Session-ID: $SESSION" \
-  -d '{"password": "Vishnu8087"}'
+  -d "{\"password\": \"${TELEGRAM_2FA_PASSWORD:?set TELEGRAM_2FA_PASSWORD in the environment}\"}"
