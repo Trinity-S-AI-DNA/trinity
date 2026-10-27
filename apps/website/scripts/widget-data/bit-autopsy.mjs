@@ -9,7 +9,7 @@
 //                   artix, kintex7, virtex7 and zynq, taken from public/widgets/idcode/parts.json (which
 //                   scripts/widget-data/idcode.mjs extracts from the pinned part.hpp), cross-checked
 //                   against the idcode field of every prjxray-db part.json.
-//   samples.json    the autopsy of six real bitstreams (public/widgets/bit-autopsy/autopsy.js), with
+//   samples.json    the autopsy of six real bitstreams (scripts/widget-data/bit-autopsy-autopsy.js), with
 //                   sha256 and where each came from. The bitstreams themselves are not shipped.
 //
 // Each sample is also read by prjxray's bitread, independently of autopsy.js: its configuration
@@ -26,7 +26,7 @@ import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSy
 import { tmpdir, homedir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import * as A from '../../public/widgets/bit-autopsy/autopsy.js'
+import * as A from './bit-autopsy-autopsy.js'
 
 const SITE = join(dirname(fileURLToPath(import.meta.url)), '..', '..')
 const OUT_DIR = join(SITE, 'public/widgets/bit-autopsy')

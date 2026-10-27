@@ -21,7 +21,7 @@ import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { pinType, parseXdc, lintXdc, summarize } from '../../public/widgets/pin-map/xdc.js'
+import { pinType, parseXdc, lintXdc, summarize } from './pin-map-xdc.js'
 
 const SITE = join(dirname(fileURLToPath(import.meta.url)), '..', '..')
 const OUT_DIR = join(SITE, 'public/widgets/pin-map')

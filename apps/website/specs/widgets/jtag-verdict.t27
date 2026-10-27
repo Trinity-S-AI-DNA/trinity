@@ -32,6 +32,26 @@
 
 module widget_jtag_verdict;
 
+use widgets::html_out::ok;
+use widgets::html_out::OVER;
+use widgets::html_out::put;
+use widgets::html_out::raw;
+use widgets::html_out::put_escaped;
+use widgets::html_out::text;
+use widgets::html_out::num;
+use widgets::html_out::attr;
+use widgets::html_out::fill;
+use widgets::html_out::H_LT;
+use widgets::html_out::H_GT;
+use widgets::html_out::H_AMP;
+use widgets::html_out::H_QUOTE;
+use widgets::html_out::H_APOS;
+use widgets::html_out::H_SPACE;
+use widgets::html_out::H_SLASH;
+use widgets::html_out::H_EQ;
+use widgets::page_reader::match_in;
+
+
 pub const KIND : str = "widget-tool";
 pub const ID : str = "jtag-verdict";
 pub const TITLE : str = "JTAG verdict: IR capture and DR word, BYPASS or a broken shift";
@@ -156,4 +176,514 @@ test the_page_opens_on_bypass {
     assert K_V_IDCODE == 5;
     assert K_START_CASE < 7;
     assert K_CASE_WANT[K_START_CASE] == K_V_BYPASS;
+}
+
+; =================================================================================================
+; THE NATIVE PAGE (epic gHashTag/t27#10937, stage "page" of specs/t27f/widget_factory.t27)
+; Everything below replaces public/widgets/jtag-verdict/tool.js (171 lines of hand-written JavaScript).
+; The words and numbers above are unchanged. The page is these functions, built to wasm (t27c gen-c,
+; then zig cc --target=wasm32-wasi) and driven by the one host glue every native widget shares: it
+; forwards input, click and hashchange events, then sets the bytes w_render() wrote as the page's
+; innerHTML, keeping the focused input. Host protocol, all exports of this module:
+;   w_init(hash)       the page opens; hash is the address's #fragment bytes (empty when none)
+;   w_input(id, text)  a field changed: id 0 is the IR field, 1 the DR field; its whole text
+;   w_click(i)         preset button i was pressed
+;   w_hash(hash)       the address changed
+;   w_render(dst)      write the page's HTML into dst, return its length (0 on overflow)
+;   w_hash_out(dst)    the address to show after the last event (length 0: leave it)
+; The state is the two field texts; the rest is derived on every render, as tool.js's update() did.
+; Not carried over from JavaScript: Unicode white space around a typed number (its \s) is not ASCII;
+; field text is cut at W_FIELD_CAP bytes; a malformed %-escape in the address is read as no value
+; (decodeURIComponent would throw).
+; MEASURED 2026-10-19: t27c gen, a 6-line Zig export wrapper and `zig build-exe -target
+; wasm32-freestanding -O ReleaseSmall` give a 9269-byte wasm. A browser harness loaded the original
+; page (tool.js) and this one side by side and compared their DOM (tag, attributes, text, the two
+; input values, the address) after 3015 actions: the initial page, the 7 preset buttons, 3000 typed
+; values (valid hex with and without 0x, spaces and underscores, 9-digit overflow, empty, quotes,
+; markup, random ASCII) and 7 hash changes, plus 7 page loads that carry an address: 0 differences.
+; Changing one text node of the native page makes the harness report a difference (control).
+; Not carried over from the page: nothing else; focus after a preset click is kept by the host.
+
+pub const W_FIELD_CAP : u32 = 255;
+pub var IR_TEXT : [255]u8 = [0; 255];
+pub var IR_LEN : u32 = 0;
+pub var DR_TEXT : [255]u8 = [0; 255];
+pub var DR_LEN : u32 = 0;
+pub var PRESSED : [7]u8 = [0; 7];
+pub var HASH_NEW : [64]u8 = [0; 64];
+pub var HASH_NEW_LEN : u32 = 0;
+pub var HEX_A : [16]u8 = [0; 16];
+pub var HEX_B : [16]u8 = [0; 16];
+pub var BIN2 : [2]u8 = [0; 2];
+pub var DECODED : [64]u8 = [0; 64];
+pub const W_NOT_HEX : i64 = -1;
+
+/// The five checks, in the order of specs/port/tools/jtag/tdo_verdict.t27 (written in an older dialect
+/// that cannot be imported; the seven vectors above are its test vectors and the tests below hold this to them).
+pub fn jtag_verdict(ir: u32, dr: u32) -> u8 {
+    if (dr == K_ALL_ONES) { return K_V_STUCK_HIGH; }
+    if (dr == 0 and ir == 0) { return K_V_STUCK_LOW; }
+    if ((ir & K_IR_MASK) != K_IR_LOW) { return K_V_BROKEN_SHIFT; }
+    if ((dr & 1) == 0) { return K_V_BYPASS; }
+    return K_V_IDCODE;
+}
+
+fn is_ws(b: u8) -> bool {
+    return b == 32 or (b >= 9 and b <= 13);
+}
+
+fn hex_val(b: u8) -> i64 {
+    if (b >= 48 and b <= 57) { return (b - 48) as i64; }
+    if (b >= 97 and b <= 102) { return (b - 97) as i64 + 10; }
+    if (b >= 65 and b <= 70) { return (b - 65) as i64 + 10; }
+    return -1;
+}
+
+/// parseHex: trim, drop white space and underscores, optional 0x, one to eight hex digits; else -1.
+pub fn parse_hex(s: []const u8) -> i64 {
+    var pos : u32 = 0;
+    var first : u8 = 0;
+    var digits : u32 = 0;
+    var val : i64 = 0;
+    var i : usize = 0;
+    while (i < s.len) {
+        const b : u8 = s[i];
+        i = i + 1;
+        if (is_ws(b) or b == 95) { continue; }
+        if (pos == 1 and first == 48 and (b == 120 or b == 88)) {
+            digits = 0;
+            val = 0;
+            pos = pos + 1;
+            continue;
+        }
+        const h : i64 = hex_val(b);
+        if (h < 0) { return W_NOT_HEX; }
+        if (pos == 0) { first = b; }
+        digits = digits + 1;
+        if (digits <= 8) { val = val * 16 + h; }
+        pos = pos + 1;
+    }
+    if (digits < 1 or digits > 8) { return W_NOT_HEX; }
+    return val;
+}
+
+/// hexN: "0x" and the lowercase hex digits of v, at least min_digits of them; written to dst, length returned.
+pub fn hex_to(dst: []u8, v: u32, min_digits: u32) -> u32 {
+    dst[0] = 48;
+    dst[1] = 120;
+    var count : u32 = 1;
+    var t : u32 = v / 16;
+    while (t > 0) {
+        count = count + 1;
+        t = t / 16;
+    }
+    var width : u32 = count;
+    if (min_digits > width) { width = min_digits; }
+    var k : u32 = width;
+    while (k > 0) {
+        k = k - 1;
+        var d : u32 = v;
+        var sh : u32 = 0;
+        while (sh < k) {
+            d = d / 16;
+            sh = sh + 1;
+        }
+        const nib : u32 = d % 16;
+        if (nib < 10) { dst[(2 + width - 1 - k) as usize] = (nib as u8) + 48; } else { dst[(2 + width - 1 - k) as usize] = (nib as u8) + 87; }
+    }
+    return 2 + width;
+}
+
+fn ir_value() -> i64 {
+    return parse_hex(IR_TEXT[0..(IR_LEN as usize)]);
+}
+
+fn dr_value() -> i64 {
+    return parse_hex(DR_TEXT[0..(DR_LEN as usize)]);
+}
+
+fn set_text(which: u32, s: []const u8) -> u32 {
+    var n : usize = s.len;
+    if (n > (W_FIELD_CAP as usize)) { n = W_FIELD_CAP as usize; }
+    var i : usize = 0;
+    while (i < n) {
+        if (which == 0) { IR_TEXT[i] = s[i]; } else { DR_TEXT[i] = s[i]; }
+        i = i + 1;
+    }
+    if (which == 0) { IR_LEN = n as u32; } else { DR_LEN = n as u32; }
+    return 0;
+}
+
+fn set_field_hex(which: u32, v: u32, digits: u32) -> u32 {
+    const n : u32 = hex_to(HEX_A[0..], v, digits);
+    return set_text(which, HEX_A[0..(n as usize)]);
+}
+
+/// The two fields are good when both parse; then the pressed preset and the new address follow.
+fn recompute(write_hash: bool) -> u32 {
+    HASH_NEW_LEN = 0;
+    const ir : i64 = ir_value();
+    const dr : i64 = dr_value();
+    if (ir < 0 or dr < 0) { return 0; }
+    var i : u32 = 0;
+    while (i < 7) {
+        PRESSED[i as usize] = 0;
+        if (K_CASE_IR[i as usize] == (ir as u32) and K_CASE_DR[i as usize] == (dr as u32)) { PRESSED[i as usize] = 1; }
+        i = i + 1;
+    }
+    if (write_hash) {
+        var n : u32 = 0;
+        HASH_NEW[0] = 35;
+        n = 1;
+        var k : usize = 0;
+        while (k < SAY_HASH_IR.len) { HASH_NEW[n as usize] = SAY_HASH_IR[k]; n = n + 1; k = k + 1; }
+        HASH_NEW[n as usize] = 61;
+        n = n + 1;
+        n = n + hex_to(HASH_NEW[(n as usize)..], ir as u32, 2);
+        HASH_NEW[n as usize] = 38;
+        n = n + 1;
+        k = 0;
+        while (k < SAY_HASH_DR.len) { HASH_NEW[n as usize] = SAY_HASH_DR[k]; n = n + 1; k = k + 1; }
+        HASH_NEW[n as usize] = 61;
+        n = n + 1;
+        n = n + hex_to(HASH_NEW[(n as usize)..], dr as u32, 8);
+        HASH_NEW_LEN = n;
+    }
+    return 0;
+}
+
+/// fromHash's get(): the hex value of #key=... or &key=... in the address, -1 when absent or unreadable.
+fn hash_get(h: []const u8, key: []const u8) -> i64 {
+    var p : usize = 0;
+    while (p + 1 + key.len < h.len) {
+        if ((h[p] == 35 or h[p] == 38) and match_in(h, p + 1, h.len, key) and h[p + 1 + key.len] == 61) {
+            var a : usize = p + 2 + key.len;
+            var e : usize = a;
+            while (e < h.len and h[e] != 38) { e = e + 1; }
+            if (e == a) { return W_NOT_HEX; }
+            var n : usize = 0;
+            var i : usize = a;
+            while (i < e) {
+                if (n >= 64) { return W_NOT_HEX; }
+                if (h[i] == 37) {
+                    if (i + 2 >= e) { return W_NOT_HEX; }
+                    const hi : i64 = hex_val(h[i + 1]);
+                    const lo : i64 = hex_val(h[i + 2]);
+                    if (hi < 0 or lo < 0) { return W_NOT_HEX; }
+                    DECODED[n] = ((hi * 16 + lo) as u8);
+                    i = i + 3;
+                } else {
+                    DECODED[n] = h[i];
+                    i = i + 1;
+                }
+                n = n + 1;
+            }
+            return parse_hex(DECODED[0..n]);
+        }
+        p = p + 1;
+    }
+    return W_NOT_HEX;
+}
+
+pub fn w_init(h: []const u8) -> u32 {
+    const ir : i64 = hash_get(h, SAY_HASH_IR);
+    const dr : i64 = hash_get(h, SAY_HASH_DR);
+    var start : u32 = K_START_CASE as u32;
+    if (ir >= 0) { set_field_hex(0, ir as u32, 2); } else { set_field_hex(0, K_CASE_IR[start as usize], 2); }
+    if (dr >= 0) { set_field_hex(1, dr as u32, 8); } else { set_field_hex(1, K_CASE_DR[start as usize], 8); }
+    return recompute(false);
+}
+
+pub fn w_input(id: u32, s: []const u8) -> u32 {
+    set_text(id, s);
+    return recompute(true);
+}
+
+pub fn w_click(i: u32) -> u32 {
+    if (i >= 7) { return 0; }
+    set_field_hex(0, K_CASE_IR[i as usize], 2);
+    set_field_hex(1, K_CASE_DR[i as usize], 8);
+    return recompute(true);
+}
+
+pub fn w_hash(h: []const u8) -> u32 {
+    const ir : i64 = hash_get(h, SAY_HASH_IR);
+    const dr : i64 = hash_get(h, SAY_HASH_DR);
+    if (ir < 0 or dr < 0) { return recompute(false); }
+    set_field_hex(0, ir as u32, 2);
+    set_field_hex(1, dr as u32, 8);
+    return recompute(false);
+}
+
+pub fn w_hash_out(dst: []u8) -> u32 {
+    var i : u32 = 0;
+    while (i < HASH_NEW_LEN) {
+        dst[i as usize] = HASH_NEW[i as usize];
+        i = i + 1;
+    }
+    return HASH_NEW_LEN;
+}
+
+fn agree_count() -> u32 {
+    var n : u32 = 0;
+    var i : u32 = 0;
+    while (i < 7) {
+        if (jtag_verdict(K_CASE_IR[i as usize], K_CASE_DR[i as usize]) == K_CASE_WANT[i as usize]) { n = n + 1; }
+        i = i + 1;
+    }
+    return n;
+}
+
+fn bit_cells(dst: []u8, n0: u32, v: u32, count: u32) -> u32 {
+    var n : u32 = n0;
+    n = raw(dst, n, "<span class=\"jv-bits\">");
+    var i : u32 = 0;
+    while (i < count) {
+        n = raw(dst, n, "<span class=\"jv-bit\">");
+        n = put(dst, n, (((v >> i) % 2) as u8) + 48);
+        n = raw(dst, n, "</span>");
+        i = i + 1;
+    }
+    n = raw(dst, n, "</span>");
+    return n;
+}
+
+fn field(dst: []u8, n0: u32, id: u32, label: []const u8, hint: []const u8) -> u32 {
+    var n : u32 = n0;
+    if (id == 0) {
+        n = raw(dst, n, "<label class=\"jv-field\" for=\"jv-ir\"><span class=\"jv-label\">");
+    } else {
+        n = raw(dst, n, "<label class=\"jv-field\" for=\"jv-dr\"><span class=\"jv-label\">");
+    }
+    n = text(dst, n, label);
+    if (id == 0) {
+        n = raw(dst, n, "</span><input class=\"jv-input\" id=\"jv-ir\" inputmode=\"text\" autocomplete=\"off\" spellcheck=\"false\"");
+        n = attr(dst, n, "value", IR_TEXT[0..(IR_LEN as usize)]);
+    } else {
+        n = raw(dst, n, "</span><input class=\"jv-input\" id=\"jv-dr\" inputmode=\"text\" autocomplete=\"off\" spellcheck=\"false\"");
+        n = attr(dst, n, "value", DR_TEXT[0..(DR_LEN as usize)]);
+    }
+    n = raw(dst, n, "><span class=\"jv-hint\">");
+    n = text(dst, n, hint);
+    n = raw(dst, n, "</span></label>");
+    return n;
+}
+
+fn verdict_panel(dst: []u8, n0: u32, ir: u32, dr: u32) -> u32 {
+    var n : u32 = n0;
+    const v : u32 = jtag_verdict(ir, dr) as u32;
+    n = raw(dst, n, "<div class=\"jv-verdict jv-");
+    if (v == 5) { n = raw(dst, n, "ok"); } else { if (v == 4) { n = raw(dst, n, "warn"); } else { n = raw(dst, n, "bad"); } }
+    n = raw(dst, n, "\"><p class=\"jv-big\">");
+    n = text(dst, n, SAY_VERDICT_NAMES[(v - 1) as usize]);
+    n = raw(dst, n, "</p><p class=\"jv-why\">");
+    const na : u32 = hex_to(HEX_A[0..], ir, 2);
+    BIN2[0] = (((ir & 3) >> 1) as u8) + 48;
+    BIN2[1] = ((ir & 1) as u8) + 48;
+    n = fill(dst, n, SAY_VERDICT_WHY[(v - 1) as usize], HEX_A[0..(na as usize)], BIN2[0..2], "", 2);
+    n = raw(dst, n, "</p>");
+    if (v == 5) {
+        n = raw(dst, n, "<p class=\"jv-device\">");
+        const masked : u32 = dr & K_VERSION_MASK;
+        var known : u32 = 99;
+        var i : u32 = 0;
+        while (i < 2) {
+            if (K_KNOWN_IDCODE[i as usize] == masked) { known = i; break; }
+            i = i + 1;
+        }
+        const nm : u32 = hex_to(HEX_A[0..], masked, 8);
+        if (known < 2) {
+            n = fill(dst, n, SAY_DEVICE_KNOWN, HEX_A[0..(nm as usize)], SAY_DEVICE_NAMES[known as usize], "", 2);
+        } else {
+            n = fill(dst, n, SAY_DEVICE_UNKNOWN, HEX_A[0..(nm as usize)], "", "", 1);
+        }
+        n = raw(dst, n, " <a");
+        const nd : u32 = hex_to(HEX_B[0..], dr, 8);
+        n = fill_attr_href(dst, n, SAY_DECODER_HREF, HEX_B[0..(nd as usize)]);
+        n = raw(dst, n, ">");
+        n = text(dst, n, SAY_DECODER_LINK);
+        n = raw(dst, n, "</a></p>");
+    }
+    n = raw(dst, n, "</div>");
+    return n;
+}
+
+/// The href attribute of the decoder link: the template filled with one value, escaped as an attribute.
+fn fill_attr_href(dst: []u8, n0: u32, t: []const u8, a: []const u8) -> u32 {
+    var n : u32 = n0;
+    n = raw(dst, n, " href=\"");
+    n = fill(dst, n, t, a, "", "", 1);
+    n = raw(dst, n, "\"");
+    return n;
+}
+
+fn out_panel(dst: []u8, n0: u32, ir: u32, dr: u32) -> u32 {
+    var n : u32 = n0;
+    const v : u32 = jtag_verdict(ir, dr) as u32;
+    n = verdict_panel(dst, n, ir, dr);
+    n = raw(dst, n, "<div class=\"jv-grid\"><section class=\"jv-panel\"><p class=\"jv-label\">");
+    n = text(dst, n, SAY_LADDER_TITLE);
+    n = raw(dst, n, "</p><ol class=\"jv-ladder\">");
+    var i : u32 = 0;
+    while (i < 5) {
+        const code : u32 = i + 1;
+        n = raw(dst, n, "<li class=\"jv-step jv-");
+        if (code < v) { n = raw(dst, n, "passed"); } else { if (code == v) { n = raw(dst, n, "decided"); } else { n = raw(dst, n, "skipped"); } }
+        n = raw(dst, n, "\"><span class=\"jv-step-name\">");
+        n = text(dst, n, SAY_LADDER_STEPS[i as usize]);
+        n = raw(dst, n, "</span><span class=\"jv-step-state\">");
+        if (code < v) { n = text(dst, n, SAY_LADDER_PASSED); } else { if (code == v) { n = text(dst, n, SAY_LADDER_DECIDED); } else { n = text(dst, n, SAY_LADDER_SKIPPED); } }
+        n = raw(dst, n, "</span></li>");
+        i = i + 1;
+    }
+    n = raw(dst, n, "</ol></section><section class=\"jv-panel\"><p class=\"jv-label\">");
+    n = text(dst, n, SAY_BITS_TITLE);
+    n = raw(dst, n, "</p><p class=\"jv-bitline\"><span class=\"jv-k\">");
+    n = text(dst, n, SAY_BITS_IR);
+    n = raw(dst, n, "</span>");
+    n = bit_cells(dst, n, ir, 6);
+    if ((ir & K_IR_MASK) == K_IR_LOW) { n = raw(dst, n, "<span class=\"jv-rule jv-ok\">"); } else { n = raw(dst, n, "<span class=\"jv-rule jv-bad\">"); }
+    n = text(dst, n, SAY_BITS_IR_RULE);
+    n = raw(dst, n, "</span></p><p class=\"jv-bitline\"><span class=\"jv-k\">");
+    n = text(dst, n, SAY_BITS_DR);
+    n = raw(dst, n, "</span>");
+    n = bit_cells(dst, n, dr, 1);
+    n = raw(dst, n, "</p><p class=\"jv-label\">");
+    n = text(dst, n, SAY_CLI_TITLE);
+    n = raw(dst, n, "</p><pre class=\"jv-cli\">$ ");
+    const n8 : u32 = hex_to(HEX_A[0..], dr, 8);
+    const n2 : u32 = hex_to(HEX_B[0..], ir, 2);
+    n = fill(dst, n, SAY_CLI_LINE, HEX_A[0..(n8 as usize)], HEX_B[0..(n2 as usize)], "", 2);
+    n = put(dst, n, 10);
+    if (v == 5) { n = fill(dst, n, SAY_CLI_EXIT, "0", "", "", 1); } else { n = fill(dst, n, SAY_CLI_EXIT, "1", "", "", 1); }
+    n = raw(dst, n, "</pre></section></div>");
+    return n;
+}
+
+/// The whole page, as tool.js's root.replaceChildren(...) then update() left it. 0 on overflow.
+pub fn w_render(dst: []u8) -> u32 {
+    const ir : i64 = ir_value();
+    const dr : i64 = dr_value();
+    var n : u32 = 0;
+    n = raw(dst, n, "<div class=\"jv-form\">");
+    n = field(dst, n, 0, SAY_IR_LABEL, SAY_IR_HINT);
+    n = field(dst, n, 1, SAY_DR_LABEL, SAY_DR_HINT);
+    n = raw(dst, n, "</div><p class=\"jv-msg\" role=\"status\">");
+    if (ir < 0) {
+        if (IR_LEN == 0) { n = fill(dst, n, SAY_BAD_HEX, "\"\"", "", "", 1); } else { n = fill(dst, n, SAY_BAD_HEX, IR_TEXT[0..(IR_LEN as usize)], "", "", 1); }
+    } else {
+        if (dr < 0) {
+            if (DR_LEN == 0) { n = fill(dst, n, SAY_BAD_HEX, "\"\"", "", "", 1); } else { n = fill(dst, n, SAY_BAD_HEX, DR_TEXT[0..(DR_LEN as usize)], "", "", 1); }
+        }
+    }
+    n = raw(dst, n, "</p><p class=\"jv-label\">");
+    n = text(dst, n, SAY_CASES_LABEL);
+    n = raw(dst, n, "</p><div class=\"jv-presets\">");
+    var i : u32 = 0;
+    while (i < 7) {
+        n = raw(dst, n, "<button class=\"t27-btn jv-preset\" type=\"button\" data-i=\"");
+        n = num(dst, n, i as u64);
+        n = raw(dst, n, "\" aria-pressed=\"");
+        if (PRESSED[i as usize] == 1) { n = raw(dst, n, "true"); } else { n = raw(dst, n, "false"); }
+        n = raw(dst, n, "\">");
+        n = text(dst, n, SAY_CASE_NAMES[i as usize]);
+        n = raw(dst, n, "</button>");
+        i = i + 1;
+    }
+    n = raw(dst, n, "</div><div class=\"jv-out\" aria-live=\"polite\">");
+    if (ir >= 0 and dr >= 0) { n = out_panel(dst, n, ir as u32, dr as u32); }
+    n = raw(dst, n, "</div><p class=\"jv-self\">");
+    var agree_text : [3]u8 = [0; 3];
+    agree_text[0] = (agree_count() as u8) + 48;
+    agree_text[1] = 47;
+    agree_text[2] = 55;
+    n = fill(dst, n, SAY_SELF_CHECK, "7", agree_text[0..3], "", 2);
+    n = raw(dst, n, "</p><p class=\"jv-note\">");
+    n = text(dst, n, SAY_NOTE);
+    n = raw(dst, n, " <a");
+    n = attr(dst, n, "href", SAY_SPEC_HREF);
+    n = raw(dst, n, " target=\"_blank\" rel=\"noopener\">");
+    n = text(dst, n, SAY_SPEC_LINK);
+    n = raw(dst, n, "</a></p>");
+    if (!ok(n)) { return 0; }
+    return n;
+}
+
+/// The splicer follows only the names a module itself mentions, not the names the imported writer
+/// functions mention. This anchor mentions them so that put(), raw(), text() and fill() arrive whole.
+/// It is never called.
+pub fn html_out_anchor(o: []u8) -> u32 {
+    var n : u32 = put(o, 0, 0);
+    n = put_escaped(o, n, 0);
+    return n + OVER + (H_LT + H_GT + H_AMP + H_QUOTE + H_APOS + H_SPACE + H_SLASH + H_EQ) as u32;
+}
+
+test the_seven_vectors_get_the_spec_verdicts {
+    var i : u32 = 0;
+    while (i < 7) {
+        assert jtag_verdict(K_CASE_IR[i as usize], K_CASE_DR[i as usize]) == K_CASE_WANT[i as usize];
+        i = i + 1;
+    }
+    assert agree_count() == 7;
+}
+
+test hex_is_parsed_the_way_parseHex_does {
+    assert parse_hex("0x35") == 53;
+    assert parse_hex("  0X13_63 6093 ") == 325279891;
+    assert parse_hex("35") == 53;
+    assert parse_hex("0x") == W_NOT_HEX;
+    assert parse_hex("") == W_NOT_HEX;
+    assert parse_hex("0x123456789") == W_NOT_HEX;
+    assert parse_hex("0xg") == W_NOT_HEX;
+    assert parse_hex("00x1") == W_NOT_HEX;
+    assert parse_hex("ffffffff") == 4294967295;
+}
+
+test hex_is_written_the_way_hexN_does {
+    var b : [16]u8 = [0; 16];
+    assert hex_to(b[0..], 53, 2) == 4;
+    assert b[2] == 51 and b[3] == 53;
+    assert hex_to(b[0..], 0, 2) == 4;
+    assert hex_to(b[0..], 325279891, 8) == 10;
+    assert hex_to(b[0..], 15, 8) == 10;
+    assert b[9] == 102 and b[2] == 48;
+    assert hex_to(b[0..], 4294967295, 2) == 10;
+}
+
+test the_address_is_read_and_written_both_ways {
+    assert hash_get("#ir=0x35&dr=0x13636092", "ir") == 53;
+    assert hash_get("#ir=0x35&dr=0x13636092", "dr") == 325279890;
+    assert hash_get("#dr=1&ir=%30x35", "ir") == 53;
+    assert hash_get("#ir=&dr=1", "ir") == W_NOT_HEX;
+    assert hash_get("#xir=1", "ir") == W_NOT_HEX;
+    assert hash_get("", "ir") == W_NOT_HEX;
+    assert w_init("#ir=0x35&dr=0x13636092") == 0;
+    assert IR_LEN == 4 and DR_LEN == 10;
+    assert PRESSED[1] == 1;
+    w_init("#ir=0x36&dr=0x13636093");
+    assert PRESSED[3] == 1;
+    assert PRESSED[1] == 0;
+    w_init("");
+    assert PRESSED[1] == 1;
+    assert PRESSED[0] == 0;
+    assert hash_get("#ir=%3", "ir") == W_NOT_HEX;
+}
+
+test events_move_the_state_and_the_render_follows {
+    var buf : [4096]u8 = [0; 4096];
+    w_init("");
+    w_click(0);
+    assert PRESSED[0] == 1;
+    assert PRESSED[1] == 0;
+    var hash : [64]u8 = [0; 64];
+    assert w_hash_out(hash[0..]) == 22;
+    w_input(0, "0x34");
+    assert PRESSED[0] == 0;
+    const n : u32 = w_render(buf[0..]);
+    assert n > 0;
+    w_input(1, "zz");
+    assert w_hash_out(hash[0..]) == 0;
+    const m : u32 = w_render(buf[0..]);
+    assert m > 0;
+    assert m < n;
 }
