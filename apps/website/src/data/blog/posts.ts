@@ -26,6 +26,7 @@ import { body as body_tri_cast_from_command_to_card, ruBody as ruBody_tri_cast_f
 import { body as body_the_fpga_flow_layer_by_layer, ruBody as ruBody_the_fpga_flow_layer_by_layer } from './bodies/the-fpga-flow-layer-by-layer'
 import { body as body_bypass_or_a_broken_shift, ruBody as ruBody_bypass_or_a_broken_shift } from './bodies/bypass-or-a-broken-shift'
 import { body as body_the_back_half_of_openxc7_from_a_spec, ruBody as ruBody_the_back_half_of_openxc7_from_a_spec } from './bodies/the-back-half-of-openxc7-from-a-spec'
+import { body as body_merge_train_and_repo_hygiene, ruBody as ruBody_merge_train_and_repo_hygiene } from './bodies/merge-train-and-repo-hygiene'
 import { body as body_how_to_join_the_swarm, ruBody as ruBody_how_to_join_the_swarm } from './bodies/how-to-join-the-swarm'
 import { body as body_graph_neural_networks_the_2026_field_guide, ruBody as ruBody_graph_neural_networks_the_2026_field_guide } from './bodies/graph-neural-networks-the-2026-field-guide'
 import { postsIndex } from './index'
@@ -148,6 +149,7 @@ const bodies: Record<string, PostBody> = {
   'arithmetic-and-dsp-a-widget-per-lesson': { body: body_arithmetic_and_dsp_a_widget_per_lesson, ruBody: ruBody_arithmetic_and_dsp_a_widget_per_lesson },
   'the-back-half-of-openxc7-from-a-spec': { body: body_the_back_half_of_openxc7_from_a_spec, ruBody: ruBody_the_back_half_of_openxc7_from_a_spec },
   'tri-mined-not-sold': { body: body_tri_mined_not_sold, ruBody: ruBody_tri_mined_not_sold },
+  'merge-train-and-repo-hygiene': { body: body_merge_train_and_repo_hygiene, ruBody: ruBody_merge_train_and_repo_hygiene },
   'how-to-join-the-swarm': { body: body_how_to_join_the_swarm, ruBody: ruBody_how_to_join_the_swarm },
   'queen-browser-actions-you-can-follow': { body: body_queen_browser_actions_you_can_follow, ruBody: ruBody_queen_browser_actions_you_can_follow },
   'a-partial-module-needs-its-own-verdict': { body: body_a_partial_module_needs_its_own_verdict, ruBody: ruBody_a_partial_module_needs_its_own_verdict },
