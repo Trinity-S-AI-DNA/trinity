@@ -17,6 +17,8 @@ import { body as body_course_three_verifying_hardware, ruBody as ruBody_course_t
 import { body as body_course_zero_t27_basics, ruBody as ruBody_course_zero_t27_basics } from './bodies/course-zero-t27-basics'
 import { body as body_tri_test_now_runs_the_tests, ruBody as ruBody_tri_test_now_runs_the_tests } from './bodies/tri-test-now-runs-the-tests'
 import { body as body_two_courses_twenty_seven_lessons_each, ruBody as ruBody_two_courses_twenty_seven_lessons_each } from './bodies/two-courses-twenty-seven-lessons-each'
+import { body as body_a_widget_card_drawn_from_its_spec, ruBody as ruBody_a_widget_card_drawn_from_its_spec } from './bodies/a-widget-card-drawn-from-its-spec'
+import { body as body_the_queen_knows_how_to_build_a_course, ruBody as ruBody_the_queen_knows_how_to_build_a_course } from './bodies/the-queen-knows-how-to-build-a-course'
 import { body as body_a_course_pr_carries_its_post, ruBody as ruBody_a_course_pr_carries_its_post } from './bodies/a-course-pr-carries-its-post'
 import { body as body_one_outlier_twenty_three_zeros, ruBody as ruBody_one_outlier_twenty_three_zeros } from './bodies/one-outlier-twenty-three-zeros'
 import { body as body_a_terminal_for_seven_backends_in_an_x_post, ruBody as ruBody_a_terminal_for_seven_backends_in_an_x_post } from './bodies/a-terminal-for-seven-backends-in-an-x-post'
@@ -133,6 +135,8 @@ const bodies: Record<string, PostBody> = {
   'course-zero-t27-basics': { body: body_course_zero_t27_basics, ruBody: ruBody_course_zero_t27_basics },
   'tri-test-now-runs-the-tests': { body: body_tri_test_now_runs_the_tests, ruBody: ruBody_tri_test_now_runs_the_tests },
   'two-courses-twenty-seven-lessons-each': { body: body_two_courses_twenty_seven_lessons_each, ruBody: ruBody_two_courses_twenty_seven_lessons_each },
+  'a-widget-card-drawn-from-its-spec': { body: body_a_widget_card_drawn_from_its_spec, ruBody: ruBody_a_widget_card_drawn_from_its_spec },
+  'the-queen-knows-how-to-build-a-course': { body: body_the_queen_knows_how_to_build_a_course, ruBody: ruBody_the_queen_knows_how_to_build_a_course },
   'a-course-pr-carries-its-post': { body: body_a_course_pr_carries_its_post, ruBody: ruBody_a_course_pr_carries_its_post },
   'one-outlier-twenty-three-zeros': { body: body_one_outlier_twenty_three_zeros, ruBody: ruBody_one_outlier_twenty_three_zeros },
   'a-terminal-for-seven-backends-in-an-x-post': { body: body_a_terminal_for_seven_backends_in_an_x_post, ruBody: ruBody_a_terminal_for_seven_backends_in_an_x_post },

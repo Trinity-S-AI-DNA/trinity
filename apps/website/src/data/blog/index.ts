@@ -675,6 +675,37 @@ export const postsIndex: PostMeta[] = [
     },
   },
   {
+    slug: "a-widget-card-drawn-from-its-spec",
+    title: "A widget's share card, drawn from its spec",
+    summary: "[run on one machine; none of the 27 hand-drawn cards replaced; Latin fonts only, no kerning; widget tools only] Every widget tool on t27.ai had a share card drawn by hand, and nothing checked that it still matched its spec. npm run cards:widgets now draws the card in black and white from the spec's TITLE and DESCRIPTION, with node alone: its own WOFF2 decoder, rasterizer and deflate, so the same spec gives the same bytes. check:widget-cards fails on a missing card and on a drawn card that lags its spec.",
+    date: "2026-10-07",
+    readingMinutes: 4,
+    tags: ["t27", "Widgets", "Generated assets"],
+    receipts: [
+      { label: "The script: apps/website/scripts/widget-cards-from-spec.mjs", href: "https://github.com/gHashTag/trinity/blob/feat/widget-cards-from-spec/apps/website/scripts/widget-cards-from-spec.mjs" },
+      { label: "The gallery the cards are drawn for: specs/widgets/gallery.t27", href: "https://github.com/gHashTag/trinity/blob/main/apps/website/specs/widgets/gallery.t27" },
+      { label: "Gatle, the widget used in the proof", href: "https://t27.ai/widgets/gatle/" },
+      { label: "trinity#1471: the generator, the check and this post", href: "https://github.com/gHashTag/trinity/pull/1471" },
+      { label: "W3C WOFF File Format 2.0, the font container the script decodes", href: "https://www.w3.org/TR/WOFF2/" },
+      { label: "RFC 1951, DEFLATE, the fixed Huffman block the PNG is written with", href: "https://www.rfc-editor.org/rfc/rfc1951" },
+    ],
+    openQuestions: [
+      "It was run on one Mac with node 22; that the bytes match on another machine is argued from the arithmetic, not yet measured. The CI run of the check is the first test.",
+      "None of the 27 cards on main was replaced: they are hand-drawn and the check holds them to being present only, so a stale hand-drawn card still passes.",
+      "The fonts are the Latin subsets, so a title in Russian would come out as question marks; there is no kerning and no hinting.",
+    ],
+    published: true,
+    ru: {
+      title: "Карточка виджета, нарисованная по его спеке",
+      summary: "[запуск на одной машине; ни одна из 27 нарисованных вручную карточек не заменена; только латинские шрифты, без кернинга; только инструменты-виджеты] У каждого инструмента-виджета на t27.ai была карточка для ссылки, нарисованная вручную, и никто не проверял, совпадает ли она со спекой. Теперь npm run cards:widgets рисует её чёрным по белому из TITLE и DESCRIPTION спеки, одним node: свой декодер WOFF2, своя растеризация и свой deflate, поэтому одна и та же спека даёт одни и те же байты. check:widget-cards падает, если карточки нет или нарисованная карточка разошлась со спекой.",
+      openQuestions: [
+        "Запуск был на одном Mac с node 22. Что на другой машине байты совпадут, следует из арифметики, но ещё не измерено. Первой проверкой станет запуск в CI.",
+        "Ни одна из 27 карточек в main не заменена: они нарисованы вручную, и проверка требует от них только наличия, поэтому устаревшая ручная карточка всё ещё проходит.",
+        "Шрифты — латинские подмножества, поэтому русский заголовок вышел бы вопросительными знаками; кернинга и хинтинга нет.",
+      ],
+    },
+  },
+  {
     slug: "nine-modules-of-three-again",
     title: "Every t27 course is 9 modules of 3 lessons again",
     summary: "On 7 October 2026 the t27 courses were wrongly flattened to 27 modules of one lesson. They are 9 modules of 3 lessons again: courses 1 and 2 get their old modules back word for word, course 0 gets 9 new ones, and the catalog's test holds the shape.",
@@ -808,6 +839,29 @@ export const postsIndex: PostMeta[] = [
         "15 новых уроков работают только в программе; ни один из них не запускался на плате.",
         "Записи используют tri test и tri mutate plant из t27#7400, который на момент написания не был влит, а t27c test-report выходит с кодом 0, когда тест падает (t27#7370), поэтому каждый вердикт читается из его текста.",
         "В сравнении оставлено 11 из 16 источников, чьи страницы читались 7 октября 2026 года; это не полный обзор. Курс, который уже подкладывает по одной ошибке на урок и показывает единственный упавший тест, сделал бы узкое утверждение поста неверным.",
+      ],
+    },
+  },
+  {
+    slug: "the-queen-knows-how-to-build-a-course",
+    title: "The Queen now knows how to build a course",
+    summary: "[a recipe, not a course; the recipe modules compile but no CI job runs their tests yet] The t27 course recipe moved from one agent's private folder into the repository as two t27 modules, and AGENTS.md points at them, so the Queen can assign a new 27-lesson course for any topic.",
+    date: "2026-10-07",
+    readingMinutes: 2,
+    tags: ["t27", "Course", "Agents"],
+    receipts: [
+      { label: "The recipe, specs/course_recipe/course-27.t27", href: "https://github.com/gHashTag/trinity/blob/main/specs/course_recipe/course-27.t27" },
+      { label: "The plan, specs/course_recipe/roadmap.t27", href: "https://github.com/gHashTag/trinity/blob/main/specs/course_recipe/roadmap.t27" },
+    ],
+    openQuestions: [
+      "No CI job runs the recipe's tests yet.",
+    ],
+    published: true,
+    ru: {
+      title: "Королева теперь знает, как собрать курс",
+      summary: "[рецепт, а не курс; модули рецепта собираются, но их тесты пока не запускает CI] Рецепт курса t27 переехал из личной папки одного агента в репозиторий двумя модулями t27, а AGENTS.md ссылается на них, так что Королева может поручить новый курс из 27 уроков на любую тему.",
+      openQuestions: [
+        "Тесты рецепта пока не запускает ни одно задание CI.",
       ],
     },
   },
