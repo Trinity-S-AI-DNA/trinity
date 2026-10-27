@@ -1,0 +1,296 @@
+module TrinityFpgaLoaderWbT27;
+
+// Wishbone master behind the UART loader's write and read ports (issue #63, part 2):
+// it takes the place of the block-RAM store (t27/rtl/fpga_loader_store.t27) and keeps
+// the port contract of docs/uart-loader.md ("Write and read ports") on UberDDR3's user
+// port, x16: one Wishbone word is 16 bytes (a burst address per word), byte n of the
+// word at bits 8n+7..8n, bytes 0-7 in the low u64 (lo) and 8-15 in the high one (hi).
+//
+// Write side (the packer). Every byte the loader hands over (wr_valid, wr_addr,
+// wr_data; a transfer on a clock with wr_valid and wr_ready) is merged into a buffer
+// word with a byte-select bit per byte that arrived. The buffer is issued as one
+// Wishbone write (wb_stb, wb_we, wb_addr = byte address >> 4, wb_sel, data) when a
+// byte for another word arrives (the new byte then starts the next buffer) or with
+// the chunk's last byte (wr_last), and before any read (flush). A presented request
+// stays unchanged until the clock that takes it (wb_stb and not stall). wr_ready is
+// low while a request is presented, while a flush waits, while a read is waiting for
+// its ack and while CAP requests are outstanding. UberDDR3 acknowledges in order, so
+// the outstanding count (requests taken minus acks) says when every write is done:
+// wr_idle is high only with no byte buffered, nothing presented and nothing
+// outstanding. The loader acknowledges a chunk only after wr_idle, so its ack means
+// the controller has acknowledged every write of the chunk.
+//
+// Read side. A read request (rd_req, rd_addr) is taken only when the write side is
+// idle (rd_ready = wr_idle), so a read never overtakes a write. The last word read
+// is kept (kept_*): a request for a byte of that word is answered from it on the next
+// clock (a hit) without a bus request; otherwise one Wishbone read of the word is
+// presented and the byte returns with rd_valid in the clock after its ack. Any write
+// byte taken for the kept word invalidates it, and so does `invalidate` (the arbiter,
+// t27/rtl/fpga_wb_arbiter.t27, raises it when another master's write is taken).
+// Watchdog (docs/uart-loader.md, "Port watchdog"): the loader gives up on a port that
+// makes no progress for one timeout and says so with `give_up` (one clock). A read
+// already taken on the bus is then still outstanding here: it is marked, and its ack,
+// whenever it comes, is dropped (counted, no rd_valid), so a late ack cannot answer a
+// later request; the next request is taken only after it. An rd_req while a read waits
+// marks it too (the loader asks for the next byte only after the answer or after giving
+// up). The dropped data still refresh the kept word (no write can happen meanwhile:
+// wr_ready is low while a read waits). Bytes of a word not yet written are dropped on
+// `give_up` (the loader nakked the chunk, the host sends it again), so wb_cyc falls and
+// the arbiter can give the port away once nothing is outstanding.
+// wb_cyc is high while the loader has work at the port (a byte buffered, a request
+// presented or outstanding, or a request from the loader): the arbiter keeps the port
+// for the loader while it is high, so it grants the port per chunk and per read.
+// Every statement of on_clock reads a variable before the same tick writes it, so the
+// C and the Verilog backends agree.
+const CAP: u32 = 8;
+const ALL_SEL: u32 = 65535;
+
+var wb_cyc: bool = false;
+var wb_stb: bool = false;
+var wb_we: bool = false;
+var wb_addr: u32 = 0;
+var wb_sel: u32 = 0;
+var wb_lo: u64 = 0;
+var wb_hi: u64 = 0;
+
+var buf_valid: bool = false;
+var buf_addr: u32 = 0;
+var buf_sel: u32 = 0;
+var buf_lo: u64 = 0;
+var buf_hi: u64 = 0;
+var flush: bool = false;
+
+var outst: u32 = 0;
+// Equivalent to outst<CAP on every cycle. Register its lookahead to keep
+// the outstanding comparator off the high-fanout buffer/command enables.
+var credit_available: bool = true;
+var rd_wait: bool = false;
+var rd_drop: bool = false;
+var rd_word: u32 = 0;
+var rd_lane: u32 = 0;
+var rd_clocks: u32 = 0;
+var kept_valid: bool = false;
+var kept_addr: u32 = 0;
+var kept_lo: u64 = 0;
+var kept_hi: u64 = 0;
+var rd_valid: bool = false;
+var rdata: u32 = 0;
+
+// Counters (docs/uart-loader.md, DDR3 status lines).
+var writes: u32 = 0;
+var reads: u32 = 0;
+var hits: u32 = 0;
+var dropped: u32 = 0;
+var stray: u32 = 0;
+var max_outst: u32 = 0;
+var rd_lat_max: u32 = 0;
+var cmd_stalls: u32 = 0;
+
+fn pick(sel: bool, x: u32, y: u32) -> u32 {
+    if (sel) { return x; }
+    return y;
+}
+
+fn pick64(sel: bool, x: u64, y: u64) -> u64 {
+    if (sel) { return x; }
+    return y;
+}
+
+// Byte `lane` (0..15) of the word (lo, hi).
+fn byte_of(lo: u64, hi: u64, lane: u32) -> u32 {
+    var sh: u64 = ((lane & 7) << 3) as u64;
+    var half: u64 = pick64(lane < 8, lo, hi);
+    return ((half >> sh) & 255) as u32;
+}
+
+// The half `h` (0 low, 1 high) of a word with byte `lane` replaced by `v`.
+fn merge_half(half: u64, h: u32, lane: u32, v: u32) -> u64 {
+    var sh: u64 = ((lane & 7) << 3) as u64;
+    var mask: u64 = 255;
+    var b: u64 = (v & 255) as u64;
+    if ((lane >> 3) != h) { return half; }
+    return (half & ~(mask << sh)) | (b << sh);
+}
+
+fn lane_bit(lane: u32) -> u32 {
+    var one: u32 = 1;
+    return one << (lane & 15);
+}
+
+// The outstanding count after this clock: + a request taken, - an ack (an ack while nothing
+// is outstanding, `ack` false here, is stray and changes nothing). n + 1 and n - 1 come from the
+// registered count; `taken` (which follows UberDDR3's o_wb_stall within the clock) only selects,
+// so no adder sits between the controller's stall and a register (the routed critical path of
+// the first netlist ran from o_wb_stall through such an adder and a compare).
+fn out_sel(taken: bool, ack: bool, n: u32, inc: u32, dec: u32) -> u32 {
+    if (taken && !ack) { return inc; }
+    if (!taken && ack) { return dec; }
+    return n;
+}
+
+// Module-level (combinational) values; see t27c-rtl-traps: on_clock locals are
+// declared where they appear in the generated Verilog.
+var credit_next: bool;
+var taken: bool;
+var w_word: u32;
+var w_lane: u32;
+var r_word: u32;
+var r_lane: u32;
+var port_busy: bool;
+var wr_ready: bool;
+var wr_idle: bool;
+var rd_ready: bool;
+var accept_w: bool;
+var accept_r: bool;
+var new_word: bool;
+var base_sel: u32;
+var base_lo: u64;
+var base_hi: u64;
+var m_sel: u32;
+var m_lo: u64;
+var m_hi: u64;
+var hit: bool;
+var read_ack: bool;
+var flush_now: bool;
+var out_next: u32;
+var ack_counted: bool;
+var out_inc: u32;
+var out_dec: u32;
+var ack_byte: u32;
+var kept_byte: u32;
+var drop_now: bool;
+taken = wb_stb && !stall;
+w_word = wr_addr >> 4;
+w_lane = wr_addr & 15;
+r_word = rd_addr >> 4;
+r_lane = rd_addr & 15;
+port_busy = wb_stb || flush || rd_wait;
+wr_ready = !port_busy && credit_available;
+wr_idle = !port_busy && !buf_valid && outst == 0;
+rd_ready = wr_idle;
+accept_w = wr_valid && wr_ready;
+accept_r = rd_req && rd_ready;
+new_word = buf_valid && w_word != buf_addr;
+base_sel = pick(buf_valid && !new_word, buf_sel, 0);
+base_lo = pick64(buf_valid && !new_word, buf_lo, 0);
+base_hi = pick64(buf_valid && !new_word, buf_hi, 0);
+m_sel = base_sel | lane_bit(w_lane);
+m_lo = merge_half(base_lo, 0, w_lane, wr_data);
+m_hi = merge_half(base_hi, 1, w_lane, wr_data);
+hit = kept_valid && kept_addr == r_word;
+read_ack = ack && rd_wait && outst != 0;
+flush_now = !wb_stb && buf_valid && (flush || rd_req) && credit_available && !give_up;
+ack_counted = ack && outst != 0;
+out_inc = outst + 1;
+out_dec = outst - 1;
+out_next = out_sel(taken, ack_counted, outst, out_inc, out_dec);
+// Comparisons precede the late stall/ACK choice, as with out_sel itself.
+credit_next = (taken && !ack_counted && out_inc < CAP) ||
+              (!taken && ack_counted && out_dec < CAP) ||
+              (taken == ack_counted && outst < CAP);
+ack_byte = byte_of(rdata_lo, rdata_hi, rd_lane);
+kept_byte = byte_of(kept_lo, kept_hi, r_lane);
+drop_now = rd_drop || rd_req || give_up;
+
+fn on_clock(wr_valid: bool, wr_addr: u32, wr_data: u32, wr_last: bool, rd_req: bool, rd_addr: u32,
+            stall: bool, ack: bool, rdata_lo: u64, rdata_hi: u64, invalidate: bool, give_up: bool) {
+    rd_valid = false;
+    if (wb_stb && stall) { cmd_stalls = cmd_stalls + 1; }
+    if (taken) {
+        wb_stb = false;
+        if (wb_we) { writes = writes + 1; } else { reads = reads + 1; }
+    }
+    if (ack && outst == 0) { stray = stray + 1; }
+    if (outst > max_outst) { max_outst = outst; }
+    outst = out_next; credit_available = credit_next;
+
+    if (accept_w) {
+        if (new_word) {
+            // The buffer goes out; the new byte starts the next buffer word.
+            wb_stb = true;
+            wb_we = true;
+            wb_addr = buf_addr;
+            wb_sel = buf_sel;
+            wb_lo = buf_lo;
+            wb_hi = buf_hi;
+            buf_addr = w_word;
+            buf_sel = m_sel;
+            buf_lo = m_lo;
+            buf_hi = m_hi;
+            buf_valid = true;
+            if (wr_last) { flush = true; }
+        } else if (wr_last) {
+            wb_stb = true;
+            wb_we = true;
+            wb_addr = w_word;
+            wb_sel = m_sel;
+            wb_lo = m_lo;
+            wb_hi = m_hi;
+            buf_valid = false;
+        } else {
+            buf_addr = w_word;
+            buf_sel = m_sel;
+            buf_lo = m_lo;
+            buf_hi = m_hi;
+            buf_valid = true;
+        }
+        if (kept_valid && kept_addr == w_word) { kept_valid = false; }
+    } else if (flush_now) {
+        wb_stb = true;
+        wb_we = true;
+        wb_addr = buf_addr;
+        wb_sel = buf_sel;
+        wb_lo = buf_lo;
+        wb_hi = buf_hi;
+        buf_valid = false;
+        flush = false;
+    } else if (accept_r) {
+        if (hit) {
+            rd_valid = true;
+            rdata = kept_byte;
+            hits = hits + 1;
+        } else {
+            wb_stb = true;
+            wb_we = false;
+            wb_addr = r_word;
+            wb_sel = ALL_SEL;
+            rd_wait = true;
+            rd_drop = false;
+            rd_word = r_word;
+            rd_lane = r_lane;
+            rd_clocks = 0;
+            kept_valid = false;
+        }
+    }
+
+    if (read_ack) {
+        kept_lo = rdata_lo;
+        kept_hi = rdata_hi;
+        kept_addr = rd_word;
+        kept_valid = true;
+        rd_wait = false;
+        rd_drop = false;
+        if (drop_now) {
+            dropped = dropped + 1;
+        } else {
+            rd_valid = true;
+            rdata = ack_byte;
+        }
+        if (rd_clocks + 1 > rd_lat_max) { rd_lat_max = rd_clocks + 1; }
+    } else if (rd_wait) {
+        rd_clocks = rd_clocks + 1;
+        if (rd_req || give_up) { rd_drop = true; }
+    }
+    if (give_up) {
+        buf_valid = false;
+        flush = false;
+    }
+    if (invalidate) { kept_valid = false; }
+    wb_cyc = !wr_idle || wr_valid || rd_req || rd_wait;
+}
+
+test lanes_of_a_word { assert_eq(byte_of(578437695752307201, 1157159078456920585, 0), 1); assert_eq(byte_of(578437695752307201, 1157159078456920585, 7), 8); assert_eq(byte_of(578437695752307201, 1157159078456920585, 8), 9); assert_eq(byte_of(578437695752307201, 1157159078456920585, 15), 16); }
+test merge_one_byte { assert_eq(merge_half(0, 0, 3, 171), 2868903936); assert_eq(merge_half(0, 1, 3, 171), 0); assert_eq(merge_half(0, 1, 11, 171), 2868903936); assert_eq(merge_half(4294967295, 0, 0, 0), 4294967040); }
+test select_bits { assert_eq(lane_bit(0), 1); assert_eq(lane_bit(15), 32768); }
+test outstanding_count { assert_eq(out_sel(true, false, 0, 1, 0), 1); assert_eq(out_sel(false, true, 1, 2, 0), 0); assert_eq(out_sel(true, true, 2, 3, 1), 2); assert_eq(out_sel(false, false, 5, 6, 4), 5); }
+endmodule

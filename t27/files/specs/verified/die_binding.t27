@@ -1,0 +1,471 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/verified/die_binding.t27 -- the die's DNA as a signed receipt field: the v2 message, when
+; the producer may write the field, when a verifier counts it, and how many distinct dies a run
+; touched. Epic gHashTag/t27#6655, Round 3, item R3-2, slice 2 (issue #7439).
+; --
+; What already exists and is NOT restated here:
+; - specs/verified/device_dna.t27 (slice 1) owns the read: opcodes, decoding, well-formedness,
+;   agreement of the two instructions, and the 15-digit hex text. This rule only consumes it.
+; - specs/verified/signed_receipt.t27 (R3-1) owns authorship and freshness: the v1 message, the
+;   key, the signature, the nonce, LEVEL_NONE < LEVEL_AUTHOR < LEVEL_FRESH. Its line format is
+;   reused unchanged; only the domain line and the field list differ in v2.
+; --
+; Why: an IDCODE names the part and a host key names the host. Neither can say "these three
+; placements ran on three dies", which R3-3 (independence) needs. The DNA can, once it is inside
+; the signed bytes: outside them it is text anyone may edit.
+; --
+; The honest ceiling, stated first because it is the point most easily overclaimed: the DNA is a
+; NAME, not a SECRET. Anyone who has read a die's DNA once can write it into a receipt, and a
+; host key signing it proves only that the signer CLAIMS this die. So DIE_NAMED guards against
+; the honest mistake (wrong board, swapped cable, mislabelled bench) and makes cross-operator
+; claims checkable -- two operators who both claim one die cannot both be independent -- but it
+; does not stop a dishonest signer. Device rooting needs a secret only the die holds (for
+; example a fabric PUF answering the verifier's nonce, or a key inside a bitstream that only
+; this die's eFUSE/BBRAM key decrypts). No such level exists yet: DIE_ROOTED_LEVELS is 0.
+; Competitors, 2026-10-07: a TEE quote (Phala, NVIDIA CC) IS rooted in a die secret, but the
+; vendor holds the root; Gonka and EigenAI name an operator key, not a die. DIE_NAMED is weaker
+; than a TEE quote against a dishonest host and needs no vendor; a die-held secret would be both.
+; --
+; The rule:
+; - Message v2: the domain line RECEIPT_DOMAIN_V2, then SIGNED_FIELDS_V2 -- v1's nine with
+;   device_dna after full_idcode -- in the v1 line format. A v1 receipt stays a v1 receipt: it is
+;   judged by signed_receipt.t27 and names no die.
+; - The producer reads both instructions before the run and again after it, and writes device_dna
+;   only when die_read_first_wrong() answers READ_OK: each pair names one die, and it is the
+;   same die both times. A board swapped mid-run is refused, not recorded.
+; - The verifier judges, in order: authorship (signed_receipt's level is at least LEVEL_AUTHOR,
+;   so the DNA is inside verified bytes); the field is present; its text is DNA_HEX_LEN lowercase
+;   hex digits. All three give DIE_NAMED, any failure DIE_NONE. A run's die level is its lowest
+;   receipt's, like its authentication level.
+; - The reader runs only when exactly one JTAG cable is attached (dna_read_allowed): openocd opens
+;   the first FTDI cable it finds, and that order is not the --busdev-num (W838), so with two
+;   cables the DNA could be the neighbouring board's. No read means no device_dna, never a guess.
+; - The reader is DNA_READER, and its output is parsed here (reader_raw), so t27c's Rust only runs
+;   two commands. The tests tie each opcode, the IR length, the IDCODE and the cable to
+;   device_dna.t27, and parse the bench's own output back to DNA_OBSERVED.
+; - A receipt is v2 exactly when its device_dna is text (receipt_version). Stripping the field or
+;   adding one changes the message the signature covers, so neither forgery verifies.
+; - distinct_dies3() counts the dies a run's three placements name; R3-3 decides what count it
+;   requires. Equal DNA is the same die even under two keys.
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module VerifiedDieBinding;
+
+use verified::device_dna;
+use verified::signed_receipt;
+
+/// The v2 domain line: a v2 signature can never verify as a v1 one, or the reverse.
+pub const RECEIPT_DOMAIN_V2 : str = "t27-receipt-v2";
+
+/// v1's nine signed fields with device_dna after full_idcode, in message order.
+pub const SIGNED_FIELDS_V2 : [10]str = ["device_record", "full_idcode", "device_dna", "verdict_word", "seal_hash", "seeds", "toolchain", "spec", "utc_unix", "nonce"];
+pub const SIGNED_FIELD_COUNT_V2 : u8 = 10;
+pub const DEVICE_DNA_FIELD : str = "device_dna";
+
+/// die_read_first_wrong() answers, in judgment order (producer side).
+pub const READ_OK : u8 = 0;
+pub const READ_BEFORE_BAD : u8 = 1;
+pub const READ_AFTER_BAD : u8 = 2;
+pub const READ_DIE_CHANGED : u8 = 3;
+
+/// die_first_missing() answers, in judgment order (verifier side).
+pub const DIE_MISSING_NONE : u8 = 0;
+pub const DIE_NOT_AUTHORED : u8 = 1;
+pub const DIE_NO_FIELD : u8 = 2;
+pub const DIE_BAD_TEXT : u8 = 3;
+
+/// Die levels, lowest first, so a run's die level is a minimum.
+pub const DIE_NONE : u8 = 0;
+pub const DIE_NAMED : u8 = 1;
+
+/// The honest ceiling: no die level here rests on a die-held secret.
+pub const DIE_ROOTED_LEVELS : u8 = 0;
+
+/// Which message a receipt's signature covers.
+pub const RECEIPT_V1 : u8 = 1;
+pub const RECEIPT_V2 : u8 = 2;
+
+pub fn receipt_version(dna_is_text: bool) -> u8 {
+    if (dna_is_text) { return RECEIPT_V2; }
+    return RECEIPT_V1;
+}
+
+/// Whether the producer may read the DNA: only with exactly one cable attached.
+pub fn dna_read_allowed(cables: u32) -> bool {
+    return cables == 1;
+}
+
+/// The reader t27c runs: device_dna.t27's openocd recipe as one -c script. Tcl `concat`, not
+/// quotes, tags each read, so the string needs no escape. The tests tie every opcode, the IR
+/// length, the expected IDCODE and the cable to device_dna.t27's constants.
+pub const DNA_READER : str = "adapter driver ftdi; ftdi vid_pid 0x0403 0x6014; ftdi channel 0; ftdi layout_init 0x00e8 0x60eb; adapter speed 1000; transport select jtag; jtag newtap xc7 tap -irlen 6 -expected-id 0x13636093; init; irscan xc7.tap 0x32; echo [concat FUSE_DNA [drscan xc7.tap 32 0xffffffff 32 0xffffffff]]; irscan xc7.tap 0x10; runtest 64; irscan xc7.tap 0x17; echo [concat XSC_DNA [drscan xc7.tap 32 0xffffffff 32 0xffffffff]]; runtest 64; irscan xc7.tap 0x16; runtest 64; irscan xc7.tap 0x3f; shutdown";
+pub const READER_IRSCAN : str = "irscan xc7.tap 0x";
+pub const READER_FUSE_TAG : str = "FUSE_DNA ";
+pub const READER_XSC_TAG : str = "XSC_DNA ";
+
+/// The cable as `openFPGALoader --scan-usb` lists it; the producer counts these lines.
+pub const CABLE_VID_PID : str = "0x0403:0x6014";
+pub const CABLE_VID : u64 = 0x0403;
+pub const CABLE_PID : u64 = 0x6014;
+
+/// How many cables a --scan-usb listing names.
+pub fn cables_listed(scan: string) -> u32 {
+    var n : u32 = 0;
+    while (text_find(scan, CABLE_VID_PID, n) != TEXT_NONE) { n = n + 1; }
+    return n;
+}
+
+/// No such text, no such number.
+pub const TEXT_NONE : u32 = 65535;
+pub const HEX_NONE : u64 = 1099511627776;
+
+/// Where the n-th copy of pat starts in text, or TEXT_NONE.
+pub fn text_find(text: string, pat: string, n: u32) -> u32 {
+    var seen : u32 = 0;
+    var i : u32 = 0;
+    while (i + (pat.len as u32) <= (text.len as u32)) {
+        var same : bool = true;
+        var k : u32 = 0;
+        while (k < (pat.len as u32)) {
+            if ((text[i + k] as u32) != (pat[k] as u32)) { same = false; }
+            k = k + 1;
+        }
+        if (same) {
+            if (seen == n) { return i; }
+            seen = seen + 1;
+        }
+        i = i + 1;
+    }
+    return TEXT_NONE;
+}
+
+/// The value of one lowercase hex digit, or 16 when c is none.
+pub fn hex_digit(c: u32) -> u64 {
+    if (c >= 48) { if (c <= 57) { return (c - 48) as u64; } }
+    if (c >= 97) { if (c <= 102) { return (c - 87) as u64; } }
+    return 16;
+}
+
+/// Where the hex digits starting at text[at] end.
+pub fn text_hex_end(text: string, at: u32) -> u32 {
+    var i : u32 = at;
+    while (i < (text.len as u32)) {
+        if (hex_digit(text[i] as u32) == 16) { return i; }
+        i = i + 1;
+    }
+    return i;
+}
+
+/// The value of the 1 to 8 hex digits starting at text[at], or HEX_NONE.
+pub fn text_hex_at(text: string, at: u32) -> u64 {
+    var end : u32 = text_hex_end(text, at);
+    if (end == at) { return HEX_NONE; }
+    if (end > at + 8) { return HEX_NONE; }
+    var v : u64 = 0;
+    var i : u32 = at;
+    while (i < end) {
+        v = v * 16 + hex_digit(text[i] as u32);
+        i = i + 1;
+    }
+    return v;
+}
+
+/// The hex number right after the n-th copy of pat in text, or HEX_NONE.
+pub fn text_hex_after(text: string, pat: string, n: u32) -> u64 {
+    var at : u32 = text_find(text, pat, n);
+    if (at == TEXT_NONE) { return HEX_NONE; }
+    return text_hex_at(text, at + (pat.len as u32));
+}
+
+/// The raw 64-bit read the reader printed after tag (two 32-bit words, first word low), or
+/// HEX_NONE when the line is missing or malformed.
+pub fn reader_raw(out: string, tag: string) -> u64 {
+    var first : u64 = text_hex_after(out, tag, 0);
+    if (first == HEX_NONE) { return HEX_NONE; }
+    var at : u32 = text_hex_end(out, text_find(out, tag, 0) + (tag.len as u32));
+    if (at >= (out.len as u32)) { return HEX_NONE; }
+    if ((out[at] as u32) != 32) { return HEX_NONE; }
+    var second : u64 = text_hex_at(out, at + 1);
+    if (second == HEX_NONE) { return HEX_NONE; }
+    return raw_from_fields(first, second);
+}
+
+/// The producer's check: each read pair names one die, before and after, and it is one die.
+pub fn die_read_first_wrong(fuse_before: u64, xsc_before: u64, fuse_after: u64, xsc_after: u64) -> u8 {
+    if (dna_agreement(fuse_before, xsc_before) != AGREE_SAME_DIE) { return READ_BEFORE_BAD; }
+    if (dna_agreement(fuse_after, xsc_after) != AGREE_SAME_DIE) { return READ_AFTER_BAD; }
+    if (dna_from_xsc(xsc_before) != dna_from_xsc(xsc_after)) { return READ_DIE_CHANGED; }
+    return READ_OK;
+}
+
+/// Whether text is a DNA as receipts write it: DNA_HEX_LEN lowercase hex digits.
+pub fn dna_text_well_formed(text: string) -> bool {
+    if ((text.len as u32) != DNA_HEX_LEN) { return false; }
+    var k : u32 = 0;
+    while (k < DNA_HEX_LEN) {
+        var c : u32 = text[k] as u32;
+        var digit : bool = false;
+        if (c >= 48) { if (c <= 57) { digit = true; } }
+        if (c >= 97) { if (c <= 102) { digit = true; } }
+        if (digit == false) { return false; }
+        k = k + 1;
+    }
+    return true;
+}
+
+/// The first fact that keeps a receipt from naming its die, or DIE_MISSING_NONE. Authorship is
+/// judged first: a DNA outside verified bytes is just text.
+pub fn die_first_missing(auth_level: u8, field_present: bool, text_well_formed: bool) -> u8 {
+    if (auth_level < LEVEL_AUTHOR) { return DIE_NOT_AUTHORED; }
+    if (field_present == false) { return DIE_NO_FIELD; }
+    if (text_well_formed == false) { return DIE_BAD_TEXT; }
+    return DIE_MISSING_NONE;
+}
+
+pub fn die_level(auth_level: u8, field_present: bool, text_well_formed: bool) -> u8 {
+    if (die_first_missing(auth_level, field_present, text_well_formed) == DIE_MISSING_NONE) { return DIE_NAMED; }
+    return DIE_NONE;
+}
+
+/// The starting value of a run's die-level fold, and one receipt folded in.
+pub fn run_die_level_start() -> u8 {
+    return DIE_NAMED;
+}
+
+pub fn run_die_level_with(run_level: u8, next_receipt_level: u8) -> u8 {
+    if (next_receipt_level < run_level) { return next_receipt_level; }
+    return run_level;
+}
+
+/// How many distinct dies three placements name. Equal DNA is one die, whoever signed it.
+pub fn distinct_dies3(a: u64, b: u64, c: u64) -> u8 {
+    var n : u8 = 1;
+    if (b != a) { n = n + 1; }
+    if (c != a) { if (c != b) { n = n + 1; } }
+    return n;
+}
+
+; --- The v2 message's first line; field lines are signed_receipt.t27's field_line_* -----------
+
+pub fn domain_v2_line_len() -> u32 {
+    return (RECEIPT_DOMAIN_V2.len as u32) + 1;
+}
+
+pub fn domain_v2_line_char(k: u32) -> u32 {
+    if (k < (RECEIPT_DOMAIN_V2.len as u32)) { return RECEIPT_DOMAIN_V2[k] as u32; }
+    if (k == (RECEIPT_DOMAIN_V2.len as u32)) { return CH_NEWLINE; }
+    return LINE_END;
+}
+
+test "the live reads, taken before and after, name one die" {
+    var fuse : u64 = raw_from_fields(FUSE_LO_OBSERVED, FUSE_HI_OBSERVED);
+    var xsc : u64 = raw_from_fields(XSC_LO_OBSERVED, XSC_HI_OBSERVED);
+    assert die_read_first_wrong(fuse, xsc, fuse, xsc) == READ_OK;
+    assert dna_hex_matches(dna_from_xsc(xsc), "050d58218fd9854") == true;
+    assert dna_text_well_formed("050d58218fd9854") == true;
+}
+
+test "a bad read before or after the run is refused, before first" {
+    var fuse : u64 = raw_from_fields(FUSE_LO_OBSERVED, FUSE_HI_OBSERVED);
+    var xsc : u64 = raw_from_fields(XSC_LO_OBSERVED, XSC_HI_OBSERVED);
+    assert die_read_first_wrong(0, xsc, fuse, xsc) == READ_BEFORE_BAD;
+    assert die_read_first_wrong(fuse, 0, fuse, xsc) == READ_BEFORE_BAD;
+    assert die_read_first_wrong(fuse, xsc, 0, xsc) == READ_AFTER_BAD;
+    assert die_read_first_wrong(fuse, xsc, fuse, 0) == READ_AFTER_BAD;
+    assert die_read_first_wrong(0, 0, 0, 0) == READ_BEFORE_BAD;
+}
+
+test "a die swapped during the run is refused" {
+    // the same die with DNA bit 0 flipped: in the XSC read that is the 57th shifted bit (bit 56),
+    // in the FUSE read bit 63 -- a well-formed read of another die
+    var fuse : u64 = raw_from_fields(FUSE_LO_OBSERVED, FUSE_HI_OBSERVED);
+    var xsc : u64 = raw_from_fields(XSC_LO_OBSERVED, XSC_HI_OBSERVED);
+    var fuse2 : u64 = fuse + pow2(63);
+    var xsc2 : u64 = xsc + pow2(56);
+    assert dna_agreement(fuse2, xsc2) == AGREE_SAME_DIE;
+    assert die_read_first_wrong(fuse, xsc, fuse2, xsc2) == READ_DIE_CHANGED;
+    assert die_read_first_wrong(fuse2, xsc2, fuse2, xsc2) == READ_OK;
+}
+
+test "a pair that names two dies is refused even if each read is well formed" {
+    var fuse : u64 = raw_from_fields(FUSE_LO_OBSERVED, FUSE_HI_OBSERVED);
+    var xsc : u64 = raw_from_fields(XSC_LO_OBSERVED, XSC_HI_OBSERVED);
+    var xsc2 : u64 = xsc + pow2(56);
+    assert die_read_first_wrong(fuse, xsc2, fuse, xsc) == READ_BEFORE_BAD;
+    assert die_read_first_wrong(fuse, xsc, fuse, xsc2) == READ_AFTER_BAD;
+}
+
+test "the DNA text is fifteen lowercase hex digits" {
+    assert dna_text_well_formed("050d58218fd9854") == true;
+    assert dna_text_well_formed("000000000000000") == true;
+    assert dna_text_well_formed("1ffffffffffffff") == true;
+    assert dna_text_well_formed("050D58218FD9854") == false;
+    assert dna_text_well_formed("50d58218fd9854") == false;
+    assert dna_text_well_formed("0050d58218fd9854") == false;
+    assert dna_text_well_formed("0x0d58218fd9854") == false;
+    assert dna_text_well_formed("050d58218fd985g") == false;
+    assert dna_text_well_formed("050d58218fd985/") == false;
+    assert dna_text_well_formed("050d58218fd985:") == false;
+    assert dna_text_well_formed("050d58218fd985`") == false;
+    assert dna_text_well_formed("") == false;
+}
+
+test "a signed, present, well-formed DNA names the die" {
+    assert die_first_missing(LEVEL_AUTHOR, true, true) == DIE_MISSING_NONE;
+    assert die_first_missing(LEVEL_FRESH, true, true) == DIE_MISSING_NONE;
+    assert die_level(LEVEL_AUTHOR, true, true) == DIE_NAMED;
+    assert die_level(LEVEL_FRESH, true, true) == 1;
+}
+
+test "each missing die fact names itself, authorship first" {
+    assert die_first_missing(LEVEL_NONE, false, false) == 1;
+    assert die_first_missing(LEVEL_NONE, true, true) == DIE_NOT_AUTHORED;
+    assert die_first_missing(LEVEL_AUTHOR, false, false) == 2;
+    assert die_first_missing(LEVEL_AUTHOR, true, false) == 3;
+    assert die_level(LEVEL_NONE, true, true) == DIE_NONE;
+    assert die_level(LEVEL_AUTHOR, false, true) == DIE_NONE;
+    assert die_level(LEVEL_AUTHOR, true, false) == DIE_NONE;
+}
+
+test "a run names its dies only if every receipt does" {
+    assert run_die_level_start() == DIE_NAMED;
+    assert run_die_level_with(run_die_level_with(run_die_level_with(run_die_level_start(), 1), 1), 1) == DIE_NAMED;
+    assert run_die_level_with(run_die_level_with(run_die_level_with(run_die_level_start(), 1), 0), 1) == DIE_NONE;
+    assert run_die_level_with(0, 1) == 0;
+    assert run_die_level_with(1, 0) == 0;
+}
+
+test "distinct dies are counted by DNA" {
+    assert distinct_dies3(1, 2, 3) == 3;
+    assert distinct_dies3(1, 1, 1) == 1;
+    assert distinct_dies3(1, 1, 2) == 2;
+    assert distinct_dies3(1, 2, 1) == 2;
+    assert distinct_dies3(2, 1, 1) == 2;
+    assert distinct_dies3(1, 2, 2) == 2;
+    assert distinct_dies3(DNA_OBSERVED, DNA_OBSERVED, DNA_OBSERVED) == 1;
+}
+
+test "the v2 message differs from v1 in its first line and one field" {
+    assert domain_v2_line_len() == 15;
+    assert domain_v2_line_char(0) == 116;
+    assert domain_v2_line_char(12) == 118;
+    assert domain_v2_line_char(13) == 50;
+    assert domain_v2_line_char(14) == CH_NEWLINE;
+    assert domain_v2_line_char(15) == LINE_END;
+    assert domain_line_char(13) == 49;
+    assert SIGNED_FIELD_COUNT_V2 == 10;
+    assert SIGNED_FIELD_COUNT_V2 == SIGNED_FIELD_COUNT + 1;
+    assert field_line_len(DEVICE_DNA_FIELD, "050d58218fd9854") == 27;
+}
+
+test "a receipt is v2 exactly when it carries the DNA as text" {
+    var t : bool = true;
+    assert receipt_version(t) == 2;
+    assert receipt_version(t == false) == 1;
+    assert receipt_version(t) != receipt_version(t == false);
+}
+
+test "the DNA is read only when exactly one cable is attached" {
+    var n : u32 = 0;
+    var allowed : u32 = 0;
+    while (n < 4) {
+        if (dna_read_allowed(n)) { allowed = allowed + 1; }
+        n = n + 1;
+    }
+    assert allowed == 1;
+    assert dna_read_allowed(1) == true;
+    assert dna_read_allowed(0) == false;
+    assert dna_read_allowed(2) == false;
+}
+
+test "no die level rests on a die-held secret" {
+    // no input reaches past DIE_NAMED, and DIE_NAMED is the signer's claim
+    var rooted : u8 = 0;
+    var a : u8 = 0;
+    while (a <= LEVEL_FRESH) {
+        if (die_level(a, true, true) > DIE_NAMED) { rooted = rooted + 1; }
+        if (die_level(a, false, true) > DIE_NAMED) { rooted = rooted + 1; }
+        a = a + 1;
+    }
+    assert rooted == DIE_ROOTED_LEVELS;
+    assert rooted == DEVICE_ROOTED_LEVELS;
+}
+
+test "the reader's opcodes are device_dna.t27's, in order" {
+    var r : string = DNA_READER;
+    assert text_hex_after(r, READER_IRSCAN, 0) == (OP_FUSE_DNA as u64);
+    assert text_hex_after(r, READER_IRSCAN, 1) == (OP_ISC_ENABLE as u64);
+    assert text_hex_after(r, READER_IRSCAN, 2) == (OP_XSC_DNA as u64);
+    assert text_hex_after(r, READER_IRSCAN, 3) == (OP_ISC_DISABLE as u64);
+    assert text_hex_after(r, READER_IRSCAN, 4) == (OP_BYPASS as u64);
+    assert text_hex_after(r, READER_IRSCAN, 5) == HEX_NONE;
+}
+
+test "the reader names the die's IR length, IDCODE and cable" {
+    var r : string = DNA_READER;
+    assert text_hex_after(r, "-irlen ", 0) == (IR_LEN as u64);
+    assert text_hex_after(r, "-expected-id 0x", 0) == IDCODE_OBSERVED;
+    assert text_hex_after(r, "vid_pid 0x", 0) == CABLE_VID;
+    var at : u32 = text_find(r, "vid_pid 0x", 0) + 10;
+    assert text_hex_at(r, text_hex_end(r, at) + 3) == CABLE_PID;
+    assert text_hex_after(CABLE_VID_PID, "0x", 0) == CABLE_VID;
+    assert text_hex_after(CABLE_VID_PID, ":0x", 0) == CABLE_PID;
+}
+
+test "each read is tagged between its own opcodes" {
+    var r : string = DNA_READER;
+    var f : u32 = text_find(r, READER_FUSE_TAG, 0);
+    var x : u32 = text_find(r, READER_XSC_TAG, 0);
+    assert text_find(r, READER_IRSCAN, 0) < f;
+    assert f < text_find(r, READER_IRSCAN, 1);
+    assert text_find(r, READER_IRSCAN, 2) < x;
+    assert x < text_find(r, READER_IRSCAN, 3);
+    assert text_find(r, READER_FUSE_TAG, 1) == TEXT_NONE;
+    assert text_find(r, READER_XSC_TAG, 1) == TEXT_NONE;
+}
+
+test "the bench's own output parses to the observed die" {
+    // openocd 0.12.0 on the Wukong bench, 2026-10-07, lines joined with |
+    var out : string = "Info : JTAG tap: xc7.tap | FUSE_DNA 41ab0a4f 2a19bf18 | XSC_DNA 30835614 fe54337e | shutdown";
+    var f : u64 = reader_raw(out, READER_FUSE_TAG);
+    var x : u64 = reader_raw(out, READER_XSC_TAG);
+    assert f == raw_from_fields(FUSE_LO_OBSERVED, FUSE_HI_OBSERVED);
+    assert x == raw_from_fields(XSC_LO_OBSERVED, XSC_HI_OBSERVED);
+    assert die_read_first_wrong(f, x, f, x) == READ_OK;
+    assert dna_from_xsc(x) == DNA_OBSERVED;
+}
+
+test "a missing or malformed read is no read" {
+    assert reader_raw("", READER_FUSE_TAG) == HEX_NONE;
+    assert reader_raw("FUSE_DNA 41ab0a4f", READER_FUSE_TAG) == HEX_NONE;
+    assert reader_raw("FUSE_DNA 41ab0a4f|2a19bf18", READER_FUSE_TAG) == HEX_NONE;
+    assert reader_raw("FUSE_DNA 41ab0a4f|XSC_DNA 30835614 fe54337e", READER_FUSE_TAG) == HEX_NONE;
+    assert reader_raw("FUSE_DNA x 2a19bf18", READER_FUSE_TAG) == HEX_NONE;
+    assert reader_raw("FUSE_DNA 41ab0a4f0 2a19bf18", READER_FUSE_TAG) == HEX_NONE;
+    assert reader_raw("FUSE_DNA 41ab0a4f 2a19bf18", READER_XSC_TAG) == HEX_NONE;
+    assert reader_raw("FUSE_DNA  2a19bf18", READER_FUSE_TAG) == HEX_NONE;
+    assert reader_raw("FUSE_DNA 41ab0a4f ", READER_FUSE_TAG) == HEX_NONE;
+    assert reader_raw("FUSE_DNA 41ab0a4f x", READER_FUSE_TAG) == HEX_NONE;
+    assert text_hex_at("x", 0) == HEX_NONE;
+    assert reader_raw("FUSE_DNA 1 2", READER_FUSE_TAG) == raw_from_fields(1, 2);
+}
+
+test "a pattern is found up to the text's last byte" {
+    // seen >= n in text_find is an equivalent mutant: seen counts up from 0, so the first copy
+    // with seen >= n is the copy with seen == n
+    assert text_find(CABLE_VID_PID, CABLE_VID_PID, 0) == 0;
+    assert text_find("ab", "b", 0) == 1;
+    assert text_find("ab", "b", 1) == TEXT_NONE;
+    assert text_find("a", "ab", 0) == TEXT_NONE;
+    assert cables_listed(CABLE_VID_PID) == 1;
+}
+
+test "the scan's cable count gates the read" {
+    var one : string = "Bus device vid:pid probe_type | 000 002 0x0403:0x6014 ft232H Digilent";
+    var two : string = "000 002 0x0403:0x6014 ft232H | 000 004 0x0403:0x6014 ft232H";
+    assert cables_listed("empty") == 0;
+    assert cables_listed(one) == 1;
+    assert cables_listed(two) == 2;
+    assert dna_read_allowed(cables_listed(one));
+    assert dna_read_allowed(cables_listed(two)) == false;
+}

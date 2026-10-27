@@ -1,0 +1,395 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/ci/derived_data.t27 -- when a checked-in derived file is valid, and who may write it (epic #6595 item B, #6601)
+//
+// Derived data is a file a tool computes from other files: the seals in .trinity/seals/*.json and the t27b
+// ledger docs/reports/t27b_expectations.json. Both are checked in, and both go stale without anyone doing
+// anything wrong. Measured on master, 2026-09-15 .. 2026-10-06 (git history of .trinity/seals):
+//   - 934 seal rewrites followed a spec edit (spec_hash moved), 673 followed a compiler edit alone
+//     (spec_hash the same, a gen_hash_* moved). The two latest reseal commits, 26c013c5c and 8fe285735,
+//     rewrote 311 seals and touched no spec. A seal hashes the compiler's OUTPUT, so it is a function of
+//     the spec AND of t27c; no compiler identity is recorded in it, so a reader cannot tell which moved.
+//   - Seal Coverage had 42 failed runs on 2026-10-05, on master and on unrelated PRs. Every log read
+//     named the same three seals: one spec PR merged without a reseal (kanban-card-chat,
+//     runtime/process), and every PR after it carried master's debt.
+//   - The ledger is a function of the corpus, of t27b and of a lab run that measures master only (#6444).
+//     The ratchet marks an IMPROVEMENT (UNEXPECTED PASS) red, so each t27b gain needed a bless PR;
+//     two of them (#6565, #6576) were behind master within an hour.
+//
+// The rule below follows Bazel and Chromium. Bazel never checks an output in: an output is keyed by the
+// hash of its inputs and its toolchain, and is recomputed or fetched from a cache. Chromium keeps the few
+// checked-in generated files honest with a presubmit that regenerates and diffs, and moves expectation
+// files and DEPS with bots (rebaseline, autoroller) that open one CL each, never hand edits. So here:
+//   1. A pull request is red only for a REGRESSION it causes, or for a derived value it wrote that the
+//      tool would not write. Lag is never red: it is PENDING, and the refresh bot owes it.
+//   2. A PR that moves derived output (a compiler fix) gets a REPORT of what moved, not a red check.
+//   3. On master (merge or schedule) one bot recomputes every lagging record and opens or updates ONE
+//      pull request that touches derived files only. A bot PR whose base is not master's tip is
+//      regenerated from the tip, never rebased or force-pushed.
+//   4. The bot never writes what a human must judge: bootstrap/stage0/FROZEN_HASH (owner-only), a
+//      ledger cap rise, a non-pass reason.
+//
+// Published figures (#7174). tools/published_figures.py pins counts quoted in published issues (#3479,
+// #3489, #3495, #3497, #3501, #3473), each with the matcher that produced it. A figure is a function of
+// the spec corpus AND of its matcher, so it is derived data too. Its --check failed on every merge that
+// added or removed spec text, from any lane: the pins were re-set by hand in #6899, #6894 and #6969 within
+// two days, and each re-pin lagged master before its own CI ran. Under this rule that lag is PENDING on a
+// pull request and REFRESH on master. What stays red is what the gate was written for: a matcher whose
+// count on the same corpus moved (the published sentence now means something else) without its pin being
+// restated, and a hand pin the tool would not write.
+//
+// The wiring (workflow YAML, the checker scripts) is not here: own_language.t27 denies .yml and .py.
+// The list of files that would change is on the issue, as an owner decision.
+// phi^2 + 1/phi^2 = 3 | TRINITY
+
+module DerivedData;
+
+/// Kinds of derived record.
+pub const KIND_SEAL_SPEC_HASH : u8 = 0;   // spec_hash of a seal: sha256 of the spec bytes
+pub const KIND_SEAL_GEN_HASH : u8 = 1;    // gen_hash_{zig,c,rust,verilog}: sha256 of what t27c emits
+pub const KIND_SEAL_TESTS : u8 = 2;       // the seal's `tests` field: the spec's tests run through zig
+pub const KIND_T27B_LEDGER : u8 = 3;      // docs/reports/t27b_expectations.json, from a lab run of master
+pub const KIND_FROZEN_HASH : u8 = 4;      // bootstrap/stage0/FROZEN_HASH: the owner's pin of compiler.rs
+pub const KIND_PUBLISHED_FIGURE : u8 = 5; // a pin in tools/published_figures.py: a count over specs/ (#7174)
+
+/// Inputs a record is a function of, as bits.
+pub const IN_SPEC : u8 = 1;
+pub const IN_COMPILER : u8 = 2;
+pub const IN_TOOLCHAIN : u8 = 4;
+pub const IN_LAB_RUN : u8 = 8;
+pub const IN_OWNER : u8 = 16;
+pub const IN_MATCHER : u8 = 32;           // the regex and comment rule that count a published figure
+
+/// Where the check runs.
+pub const EV_PULL_REQUEST : u8 = 0;
+pub const EV_MASTER : u8 = 1;             // a merge to master, or the scheduled run on master's tip
+
+/// Who wrote the change.
+pub const BY_HUMAN : u8 = 0;              // a person, an agent or a bee: anyone but the refresh bot
+pub const BY_BOT : u8 = 1;                // the refresh bot, on its own branch
+pub const BY_OWNER : u8 = 2;              // a PR carrying the owner's label
+
+/// Verdicts.
+pub const V_OK : u8 = 0;                  // the record holds
+pub const V_PENDING : u8 = 1;             // the record lags; the bot refreshes it after merge. Not red.
+pub const V_REPORT : u8 = 2;              // this PR moves the record; list it for the reviewer. Not red.
+pub const V_REFRESH : u8 = 3;             // on master: the bot rewrites the record from the recomputation
+pub const V_OWNER : u8 = 4;               // lags, and only the owner may write it. Not red, not bot.
+pub const V_RED : u8 = 5;                 // the check fails
+
+/// The t27b ratchet codes of specs/tri/t27b/steward.t27, restated by number only.
+pub const R_NONE : u8 = 0;
+pub const R_VACUITY_MEASURED : u8 = 1;
+pub const R_UNEXPECTED_FAILURE : u8 = 2;
+pub const R_UNEXPECTED_PASS : u8 = 3;
+pub const R_MOVED : u8 = 4;
+pub const R_STALE : u8 = 5;
+pub const R_UNJUDGED : u8 = 6;
+pub const R_UNLISTED : u8 = 7;
+pub const R_OVER_CAP : u8 = 8;
+pub const R_BAD_REASON : u8 = 9;
+
+/// What a record is a function of.
+pub fn inputs_of(kind: u8) -> u8 {
+    if (kind == KIND_SEAL_SPEC_HASH) { return IN_SPEC; }
+    if (kind == KIND_SEAL_GEN_HASH) { return IN_SPEC + IN_COMPILER; }
+    if (kind == KIND_SEAL_TESTS) { return IN_SPEC + IN_COMPILER + IN_TOOLCHAIN; }
+    if (kind == KIND_T27B_LEDGER) { return IN_SPEC + IN_COMPILER + IN_LAB_RUN; }
+    if (kind == KIND_PUBLISHED_FIGURE) { return IN_SPEC + IN_MATCHER; }
+    return IN_OWNER;
+}
+
+/// Can a PR's own CI recompute the record? Seals: yes, t27c is built in CI. The ledger: no, the lab
+/// measures master only (#6444). FROZEN_HASH: it is a decision, not a computation.
+pub fn recomputable_in_pr(kind: u8) -> bool {
+    if (kind == KIND_T27B_LEDGER) { return false; }
+    if (kind == KIND_FROZEN_HASH) { return false; }
+    return true;
+}
+
+/// May the refresh bot write the record? Everything a tool computes, nothing the owner decides.
+pub fn bot_may_write(kind: u8) -> bool {
+    return kind != KIND_FROZEN_HASH;
+}
+
+/// Does the PR's diff move any input of the record? `moved` is the bitmask of inputs the diff touches:
+/// IN_SPEC for the spec file, IN_COMPILER for bootstrap/src/** or cli/t27b/**, IN_TOOLCHAIN for the
+/// pinned zig version.
+pub fn pr_moves_inputs(kind: u8, moved: u8) -> bool {
+    return (inputs_of(kind) & moved) != 0;
+}
+
+/// The verdict on one derived record.
+///   touched     the change edits the record itself
+///   matches     the committed record equals the recomputation on this tree (for a record CI cannot
+///               recompute: equals the latest bot value)
+///   moved       inputs the change touches (bits above)
+///   regression  the change makes something fail that passed: a spec that no backend accepted any
+///               more, a spec whose tests now fail, a t27b UNEXPECTED FAILURE, a ledger cap rise
+pub fn verdict(kind: u8, event: u8, by: u8, touched: bool, matches: bool, moved: u8, regression: bool) -> u8 {
+    // A regression is a defect in the change, not lag in a record. It is red wherever it is seen.
+    if (regression) { return V_RED; }
+    if (kind == KIND_FROZEN_HASH) {
+        if (touched) {
+            if (by == BY_OWNER) { return V_OK; }
+            return V_RED;
+        }
+        if (matches) { return V_OK; }
+        return V_OWNER;
+    }
+    if (event == EV_MASTER) {
+        if (matches) { return V_OK; }
+        return V_REFRESH;
+    }
+    // A pull request.
+    if (touched) {
+        if (by == BY_BOT) {
+            if (matches) { return V_OK; }
+            return V_RED;
+        }
+        if (by == BY_OWNER) { return V_OK; }
+        // A hand edit is tolerated only when it is exactly what the tool writes, and only where CI can
+        // tell: a hand-written ledger cannot be checked before merge, so it is refused.
+        if (recomputable_in_pr(kind)) {
+            if (matches) { return V_OK; }
+        }
+        return V_RED;
+    }
+    if (matches) { return V_OK; }
+    if (pr_moves_inputs(kind, moved)) { return V_REPORT; }
+    return V_PENDING;
+}
+
+/// Is a published figure's change a regression? `moved` has IN_MATCHER when the tool of this change and
+/// the tool of its base count DIFFERENT numbers on the same corpus: the matcher changed meaning, so every
+/// published sentence quoting the old pin now silently means something else. That is the defect this
+/// gate exists for (#3489: `len(` 142 was a diagnostic count, not the population). It is red unless the
+/// change restates the pin in the same diff, where a reviewer reads both; `verdict` then holds the
+/// restated pin to the recount. Corpus movement alone (IN_SPEC) is never a regression.
+pub fn figure_regression(moved: u8, touched: bool) -> bool {
+    if ((moved & IN_MATCHER) == 0) { return false; }
+    return touched == false;
+}
+
+/// Red verdicts are the only ones that fail a check.
+pub fn is_red(v: u8) -> bool {
+    return v == V_RED;
+}
+
+/// The ratchet code of one spec, as it affects a pull request under this rule. Improvements and lag
+/// (UNEXPECTED PASS, MOVED, STALE, UNLISTED) are what the bot blesses on master; regressions and hand
+/// errors stay red. steward.t27's ratchet_is_red() marks 3, 5 and 7 red as well -- that is the
+/// difference this rule makes, and why the bless PRs stopped being needed.
+pub fn ledger_code_verdict(code: u8) -> u8 {
+    if (code == R_UNEXPECTED_FAILURE) { return V_RED; }
+    if (code == R_OVER_CAP) { return V_RED; }
+    if (code == R_BAD_REASON) { return V_RED; }
+    if (code == R_UNEXPECTED_PASS) { return V_PENDING; }
+    if (code == R_MOVED) { return V_PENDING; }
+    if (code == R_STALE) { return V_PENDING; }
+    if (code == R_UNLISTED) { return V_PENDING; }
+    return V_OK;
+}
+
+/// May the bot bless a ledger run on its own? Only when it lowers or keeps the cap: a rise means
+/// something stopped passing, and that needs a human reason in a reviewed PR.
+pub fn bot_may_bless(old_cap: u32, new_not_pass: u32) -> bool {
+    return new_not_pass <= old_cap;
+}
+
+/// Bot PR actions.
+pub const B_WAIT : u8 = 0;                // checks still running
+pub const B_MERGE : u8 = 1;               // merge with --merge
+pub const B_REGENERATE : u8 = 2;          // master moved: recompute from the tip on a new branch, close this one
+pub const B_CLOSE : u8 = 3;               // nothing lags any more: close without merging
+pub const B_ESCALATE : u8 = 4;            // red on the bot's own PR: a human reads it
+
+/// What the refresh bot does with its one open PR.
+///   base_is_tip  the PR's base is master's current tip
+///   lagging      records still lag at master's tip (0 = none)
+///   checks       0 success, 1 pending, 2 red
+///   only_derived the PR's diff touches derived files and nothing else
+pub fn bot_pr_action(base_is_tip: bool, lagging: u32, checks: u8, only_derived: bool) -> u8 {
+    if (only_derived == false) { return B_ESCALATE; }
+    if (lagging == 0) { return B_CLOSE; }
+    if (base_is_tip == false) { return B_REGENERATE; }
+    if (checks == 2) { return B_ESCALATE; }
+    if (checks == 1) { return B_WAIT; }
+    return B_MERGE;
+}
+
+// ---- tests -----------------------------------------------------------------------------------
+
+test a_seal_hashes_the_compiler_not_only_the_spec {
+    assert inputs_of(KIND_SEAL_SPEC_HASH) == IN_SPEC;
+    assert (inputs_of(KIND_SEAL_GEN_HASH) & IN_COMPILER) != 0;
+    assert (inputs_of(KIND_SEAL_TESTS) & IN_TOOLCHAIN) != 0;
+    assert (inputs_of(KIND_T27B_LEDGER) & IN_LAB_RUN) != 0;
+    assert inputs_of(KIND_FROZEN_HASH) == IN_OWNER;
+}
+
+test a_compiler_fix_moves_gen_hashes_but_not_spec_hashes {
+    assert pr_moves_inputs(KIND_SEAL_GEN_HASH, IN_COMPILER);
+    assert pr_moves_inputs(KIND_SEAL_SPEC_HASH, IN_COMPILER) == false;
+}
+
+// The 2026-10-05 failure: a bee PR edits neither spec nor compiler, master's seals lag, and the bee
+// went red. Under this rule it is PENDING, and PENDING is not red.
+test master_debt_does_not_turn_an_unrelated_pr_red {
+    let v = verdict(KIND_SEAL_SPEC_HASH, EV_PULL_REQUEST, BY_HUMAN, false, false, 0, false);
+    assert v == V_PENDING;
+    assert is_red(v) == false;
+}
+
+test a_spec_edit_without_a_reseal_is_a_report_not_a_failure {
+    let v = verdict(KIND_SEAL_SPEC_HASH, EV_PULL_REQUEST, BY_HUMAN, false, false, IN_SPEC, false);
+    assert v == V_REPORT;
+    assert is_red(v) == false;
+}
+
+test a_compiler_fix_reports_every_gen_hash_it_moves {
+    assert verdict(KIND_SEAL_GEN_HASH, EV_PULL_REQUEST, BY_HUMAN, false, false, IN_COMPILER, false) == V_REPORT;
+}
+
+test on_master_the_bot_refreshes_what_lags {
+    assert verdict(KIND_SEAL_GEN_HASH, EV_MASTER, BY_BOT, false, false, 0, false) == V_REFRESH;
+    assert verdict(KIND_T27B_LEDGER, EV_MASTER, BY_BOT, false, false, 0, false) == V_REFRESH;
+    assert verdict(KIND_SEAL_GEN_HASH, EV_MASTER, BY_BOT, false, true, 0, false) == V_OK;
+}
+
+test a_current_record_is_ok_everywhere {
+    assert verdict(KIND_SEAL_SPEC_HASH, EV_PULL_REQUEST, BY_HUMAN, false, true, IN_SPEC, false) == V_OK;
+    assert verdict(KIND_SEAL_TESTS, EV_PULL_REQUEST, BY_HUMAN, false, true, 0, false) == V_OK;
+}
+
+// Negative controls: each red arm is planted once.
+test negative_a_regression_is_red_even_when_every_record_matches {
+    assert verdict(KIND_SEAL_TESTS, EV_PULL_REQUEST, BY_HUMAN, false, true, IN_SPEC, true) == V_RED;
+    assert verdict(KIND_SEAL_GEN_HASH, EV_MASTER, BY_BOT, false, true, 0, true) == V_RED;
+    assert verdict(KIND_SEAL_GEN_HASH, EV_PULL_REQUEST, BY_BOT, true, true, 0, true) == V_RED;
+}
+
+test negative_a_hand_written_seal_the_tool_would_not_write_is_red {
+    assert verdict(KIND_SEAL_GEN_HASH, EV_PULL_REQUEST, BY_HUMAN, true, false, 0, false) == V_RED;
+    // ...while a reseal identical to the tool's output is tolerated, so no open PR breaks on day one.
+    assert verdict(KIND_SEAL_GEN_HASH, EV_PULL_REQUEST, BY_HUMAN, true, true, IN_COMPILER, false) == V_OK;
+}
+
+test negative_a_hand_blessed_ledger_is_red_because_ci_cannot_check_it {
+    assert verdict(KIND_T27B_LEDGER, EV_PULL_REQUEST, BY_HUMAN, true, true, 0, false) == V_RED;
+    assert verdict(KIND_T27B_LEDGER, EV_PULL_REQUEST, BY_BOT, true, true, 0, false) == V_OK;
+}
+
+test negative_the_bot_cannot_write_a_value_ci_disagrees_with {
+    assert verdict(KIND_SEAL_SPEC_HASH, EV_PULL_REQUEST, BY_BOT, true, false, 0, false) == V_RED;
+}
+
+test frozen_hash_is_owner_only {
+    assert bot_may_write(KIND_FROZEN_HASH) == false;
+    assert bot_may_write(KIND_SEAL_GEN_HASH);
+    assert verdict(KIND_FROZEN_HASH, EV_PULL_REQUEST, BY_BOT, true, true, 0, false) == V_RED;
+    assert verdict(KIND_FROZEN_HASH, EV_PULL_REQUEST, BY_HUMAN, true, true, 0, false) == V_RED;
+    assert verdict(KIND_FROZEN_HASH, EV_PULL_REQUEST, BY_OWNER, true, true, 0, false) == V_OK;
+    // Lag on master goes to the owner, never to the bot.
+    assert verdict(KIND_FROZEN_HASH, EV_MASTER, BY_BOT, false, false, 0, false) == V_OWNER;
+}
+
+test only_the_ledger_and_frozen_hash_need_the_lab_or_the_owner {
+    assert recomputable_in_pr(KIND_SEAL_SPEC_HASH);
+    assert recomputable_in_pr(KIND_SEAL_GEN_HASH);
+    assert recomputable_in_pr(KIND_SEAL_TESTS);
+    assert recomputable_in_pr(KIND_T27B_LEDGER) == false;
+    assert recomputable_in_pr(KIND_FROZEN_HASH) == false;
+}
+
+// #6565 and #6576 were bless PRs for UNEXPECTED PASS 6 and MOVED 2. Under this rule neither is red.
+test a_t27b_improvement_is_not_red {
+    assert is_red(ledger_code_verdict(R_UNEXPECTED_PASS)) == false;
+    assert is_red(ledger_code_verdict(R_MOVED)) == false;
+    assert is_red(ledger_code_verdict(R_UNLISTED)) == false;
+    assert is_red(ledger_code_verdict(R_STALE)) == false;
+    assert ledger_code_verdict(R_VACUITY_MEASURED) == V_OK;
+    assert ledger_code_verdict(R_UNJUDGED) == V_OK;
+    assert ledger_code_verdict(R_NONE) == V_OK;
+}
+
+test negative_a_t27b_regression_stays_red {
+    assert is_red(ledger_code_verdict(R_UNEXPECTED_FAILURE));
+    assert is_red(ledger_code_verdict(R_OVER_CAP));
+    assert is_red(ledger_code_verdict(R_BAD_REASON));
+}
+
+test the_bot_blesses_only_a_cap_that_holds_or_falls {
+    assert bot_may_bless(49, 44);
+    assert bot_may_bless(44, 44);
+    assert bot_may_bless(44, 45) == false;
+}
+
+test the_bot_pr_is_regenerated_not_rebased {
+    assert bot_pr_action(false, 3, 0, true) == B_REGENERATE;
+    assert bot_pr_action(true, 3, 0, true) == B_MERGE;
+    assert bot_pr_action(true, 3, 1, true) == B_WAIT;
+    assert bot_pr_action(true, 0, 0, true) == B_CLOSE;
+}
+
+test negative_a_bot_pr_that_strays_or_goes_red_goes_to_a_human {
+    assert bot_pr_action(true, 3, 0, false) == B_ESCALATE;
+    assert bot_pr_action(true, 3, 2, true) == B_ESCALATE;
+}
+
+test a_published_figure_counts_the_corpus_and_its_matcher {
+    assert inputs_of(KIND_PUBLISHED_FIGURE) == IN_SPEC + IN_MATCHER;
+    assert recomputable_in_pr(KIND_PUBLISHED_FIGURE);
+    assert bot_may_write(KIND_PUBLISHED_FIGURE);
+    assert pr_moves_inputs(KIND_PUBLISHED_FIGURE, IN_SPEC);
+    assert pr_moves_inputs(KIND_PUBLISHED_FIGURE, IN_MATCHER);
+    assert pr_moves_inputs(KIND_PUBLISHED_FIGURE, IN_COMPILER) == false;
+}
+
+// The 2026-10-06/07 failure (#7174): other lanes merged specs, the pin lagged, and every PR that touched
+// specs/ went red for it. Lag is PENDING; a PR whose own specs move the count gets a REPORT.
+test published_figure_lag_from_other_merges_is_not_red {
+    let lag = verdict(KIND_PUBLISHED_FIGURE, EV_PULL_REQUEST, BY_HUMAN, false, false, 0, figure_regression(0, false));
+    assert lag == V_PENDING;
+    let own = verdict(KIND_PUBLISHED_FIGURE, EV_PULL_REQUEST, BY_HUMAN, false, false, IN_SPEC, figure_regression(IN_SPEC, false));
+    assert own == V_REPORT;
+    assert is_red(lag) == false;
+    assert is_red(own) == false;
+}
+
+test on_master_a_drifted_figure_is_refreshed_not_red {
+    let v = verdict(KIND_PUBLISHED_FIGURE, EV_MASTER, BY_HUMAN, false, false, IN_SPEC, figure_regression(IN_SPEC, false));
+    assert v == V_REFRESH;
+    assert is_red(v) == false;
+}
+
+test a_restated_pin_that_equals_the_recount_is_ok {
+    assert verdict(KIND_PUBLISHED_FIGURE, EV_PULL_REQUEST, BY_HUMAN, true, true, IN_SPEC, figure_regression(IN_SPEC, true)) == V_OK;
+    // A matcher change that restates its pin, in the same diff, is a decision a reviewer can read.
+    assert figure_regression(IN_SPEC + IN_MATCHER, true) == false;
+    assert verdict(KIND_PUBLISHED_FIGURE, EV_PULL_REQUEST, BY_HUMAN, true, true, IN_MATCHER, figure_regression(IN_MATCHER, true)) == V_OK;
+}
+
+// Negative controls: each red arm for a figure is planted once.
+test negative_a_matcher_that_changed_meaning_without_its_pin_is_red {
+    assert figure_regression(IN_MATCHER, false);
+    assert figure_regression(IN_SPEC + IN_MATCHER, false);
+    assert is_red(verdict(KIND_PUBLISHED_FIGURE, EV_PULL_REQUEST, BY_HUMAN, false, false, IN_MATCHER, figure_regression(IN_MATCHER, false)));
+    // ...on master too: a squash merge that changed a matcher is checked against the commit before it.
+    assert is_red(verdict(KIND_PUBLISHED_FIGURE, EV_MASTER, BY_HUMAN, false, false, IN_MATCHER, figure_regression(IN_MATCHER, false)));
+    // Even when the corpus happens to still equal the old pin, the meaning moved.
+    assert is_red(verdict(KIND_PUBLISHED_FIGURE, EV_PULL_REQUEST, BY_HUMAN, false, true, IN_MATCHER, figure_regression(IN_MATCHER, false)));
+}
+
+test negative_a_hand_pin_the_tool_would_not_write_is_red {
+    assert is_red(verdict(KIND_PUBLISHED_FIGURE, EV_PULL_REQUEST, BY_HUMAN, true, false, 0, figure_regression(0, true)));
+    assert is_red(verdict(KIND_PUBLISHED_FIGURE, EV_PULL_REQUEST, BY_HUMAN, true, false, IN_MATCHER, figure_regression(IN_MATCHER, true)));
+}
+
+invariant only_a_regression_or_a_bad_write_is_red {
+    assert is_red(verdict(KIND_SEAL_GEN_HASH, EV_PULL_REQUEST, BY_HUMAN, false, false, 0, false)) == false;
+    assert is_red(verdict(KIND_SEAL_GEN_HASH, EV_PULL_REQUEST, BY_HUMAN, false, false, IN_COMPILER, false)) == false;
+    assert is_red(verdict(KIND_T27B_LEDGER, EV_PULL_REQUEST, BY_HUMAN, false, false, IN_SPEC, false)) == false;
+    assert is_red(verdict(KIND_T27B_LEDGER, EV_MASTER, BY_BOT, false, false, 0, false)) == false;
+    assert is_red(verdict(KIND_PUBLISHED_FIGURE, EV_PULL_REQUEST, BY_HUMAN, false, false, IN_SPEC, false)) == false;
+    assert is_red(verdict(KIND_PUBLISHED_FIGURE, EV_MASTER, BY_HUMAN, false, false, IN_SPEC, false)) == false;
+}

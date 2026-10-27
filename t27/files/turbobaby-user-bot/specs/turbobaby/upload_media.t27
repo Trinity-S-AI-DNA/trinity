@@ -1,0 +1,948 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/turbobaby/upload_media.t27 -- the one route that accepts bytes, and everything that
+; stands between those bytes and a stored object.
+; This contract owns the media write route at src/api/upload.rs:19 and the storage module it
+; hands off to, src/s3.rs: what is compiled, what is admitted, what a name may be, how large a
+; body may grow, what the stored key is made of, who may read it back, and what a refusal says.
+; It owns no identity rule, no limiter mechanism, no customer-facing message table and no
+; catalog column bound. Who may upload belongs to request_identity.t27; the sliding window and
+; its key derivation belong to rate_limit.t27; what a failed request is told belongs to
+; client_errors.t27; what the returned URL may become once it is written onto a bike belongs to
+; catalog_write.t27. All four are named below by ID and by the declaration that carries the
+; decision, and not one of their numbers is copied here. ASCII only (L3), English only (LANG-EN).
+; --
+; WHY (measured 2026-09-21). Fifteen refusal sites live in the 317 production lines of
+; src/api/upload.rs, and they are the whole of the boundary: no other route in this repository
+; takes a body it did not itself define the shape of. The route is also the single exception to
+; the general body limit -- src/api/mod.rs:103-106 merges it AFTER the limit layer on purpose,
+; so its own ceiling at src/api/upload.rs:20 admits a body 55 times the general one and its
+; handler ceiling at :23 admits 50 times. A boundary that large, with fifteen ways to say no and
+; one way to say yes, had no contract. What is on the far side of the yes is a filename the
+; handler invents: src/api/upload.rs:239-240 draws a v4 UUID and keeps its first eight hex
+; characters, 32 bits of the 122 the draw produced, and src/s3.rs:48 makes that the object key.
+; On the local branch that key is the entire access control: src/main.rs:935 serves
+; /data/uploads through a static directory service carrying a cache header and a nosniff header
+; and no gate of any kind (until 2026-09-26: see the owner's answer below), while the write at
+; src/api/upload.rs:108 is admin-only. Nothing in src/ or migrations/ ever deletes a stored object
+; -- delete_object and DeleteObject both return 0 occurrences across src/ on 2026-09-21 -- and no
+; migration declares an uploads table, so it records who wrote an object nowhere, and unwrites none.
+; --
+; WHERE THE BRIEF IS REFUTED. Four corrections, each measured, each with its line.
+;   1. "The only write route behind a feature gate" is wrong about the gate twice over. There is
+;      no route-scoped feature gate anywhere in src/api/. The only #[cfg(feature = ...)] in
+;      src/api/mod.rs is at :21 and it guards the openapi module, not upload; the whole crate
+;      contains exactly two such attributes, src/api/mod.rs:21 and src/main.rs:1132, and both
+;      name utoipa. A real gate does exist and it is crate-scoped, not route-scoped:
+;      src/lib.rs:101-102 compiles the entire api module only under feature backend on a
+;      non-wasm target, and Cargo.toml:65 makes the server binary require it. Its default is OFF
+;      -- Cargo.toml:174 reads default = [] -- so on a default build this route does not exist,
+;      and neither does any other API route. Nothing here is upload's own.
+;   2. The survey's src/api/mod.rs:105 (:106 since 2026-09-26) is load-bearing, but not a gate. It
+;      is the merge that places this route AFTER the body-limit layer set at :105, and the two
+;      comment lines at :103-104 say so. Mistaking it for a gate inverts its meaning: it does not
+;      restrict this route, it is the single line that exempts it.
+;   3. "The content-type allowlist" does not exist in the form the phrase implies. The multipart
+;      part's declared content type is never read: content_type() returns 0 occurrences across
+;      src/api/ on 2026-09-21. What is shipped is an EXTENSION allowlist of eight entries at
+;      src/api/upload.rs:24, plus a leading-bytes check at :85-99, and a media type DERIVED from
+;      the same filename at src/s3.rs:120-137 and attached to the stored object. The caller's
+;      claim about its own type is not consulted at any of the three points.
+;   4. The size cap is two caps, not one, and the second of them is unreachable. The incremental
+;      check inside the streaming loop at src/api/upload.rs:181 already guarantees the buffer
+;      never exceeds the ceiling, so the too-large branch of validate_filename, reached at :226,
+;      cannot refuse anything a real request produced; only its empty-file branch can. That
+;      branch is covered by a unit test at :562-569 (:445-452 until 2026-09-26) and by no request.
+; --
+; WHAT THIS FILE NEVER DOES. It names no bucket, no endpoint, no region, no public URL base and
+; no credential: every one of those is read from the environment at src/config.rs:150-158 and is
+; a deployment fact, not a contract, so this file declares the SHAPE of the storage switch and
+; the key, never a value either would take. It invents no size, no signature and no media type
+; for a format the eight-entry allowlist does not carry. It quotes no shipped Russian string:
+; the one this boundary touches is the photo-URL refusal at src/api/bikes.rs:1047, cited by path
+; and line and never by its wording. It declares no retention period and no scan result, because
+; the repository implements neither and an honest refusal is recorded instead. It restates no
+; limiter window, no attempt cap, no admin-auth bound and no catalog column ceiling. On HTTP
+; numerals the sentence has to be narrower than the one that stood here, and the correction is
+; RE-MEASURED 2026-09-21 over all 43 files of the corpus: this file declares four refusal
+; numerals, and two of them -- 400 and 500 -- are declared by siblings for their own surfaces
+; too, so "no HTTP numeral a sibling already owns" was false. What IS true is the deferral that
+; sentence was reaching for: the gate numerals 401, 403 and 429 belong to
+; turbobaby/request-identity, and this file counts their SITES and never writes their numbers.
+; The measurement is pinned as constants below rather than left as a phrase.
+; Nothing from D14 -- no renter, handle, phone, key code, plate, debt,
+; purchase price or personal note -- in a constant, a comment or a test.
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module turbobaby-upload-media;
+
+pub const KIND : str = "write-route-contract";
+pub const ID : str = "turbobaby/upload-media";
+pub const NAME : str = "TurboBaby media upload route and object key";
+pub const WORLD : str = "gHashTag/turbobaby-user-bot";
+pub const MEASURED_AT : str = "2026-09-21";
+
+; --- Sources --------------------------------------------------------------------------------
+pub const ROUTE_SOURCE : str = "src/api/upload.rs";
+pub const STORAGE_SOURCE : str = "src/s3.rs";
+pub const WIRING_SOURCE : str = "src/api/mod.rs";
+pub const COMPILE_GATE_SOURCE : str = "src/lib.rs";
+pub const SWITCH_SOURCE : str = "src/config.rs";
+pub const READ_SIDE_SOURCE : str = "src/main.rs";
+pub const CALLER_SOURCE : str = "src/ui/screens/admin_screen.rs";
+; wc -l over the tracked sources, 2026-09-21; the route file 2026-09-26 (489/317 before its read-back).
+pub const ROUTE_SOURCE_LINES : u16 = 722;
+pub const ROUTE_PRODUCTION_LINES : u16 = 434;
+pub const STORAGE_SOURCE_LINES : u16 = 260;
+
+; --- Ownership edges ------------------------------------------------------------------------
+; The pinned compiler lowers a brace import to an empty UseDecl and the gate rejects it, so a
+; cross-contract edge is a string naming the owner's ID plus a test asserting the literal. Each
+; edge below also names the DECLARATION that carries the decision, never a line in a sibling
+; file: the commit this file arrived in added THIRTEEN contracts at once, and the corpus reached
+; its 42 under specs/turbobaby across five commits of 10, 1, 8, 10 and 13. Contracts written in
+; parallel made every line citation between them stale within the hour -- re-measured 2026-09-21,
+; the sibling line citations still standing in the corpus had drifted by between 3 and 59 lines.
+; A name survives a reorder that a number does not.
+;
+; turbobaby/rate-limit owns the sliding window, the key derivation and the shared fallback
+; bucket, and attempt_admitted is the decision this route consumes. That contract already
+; carries this route as its worked exemplar, so its window and its attempt cap are its numbers
+; and appear nowhere below; this file declares only that the guard runs, where, and that it
+; guards a route the identity gate has already closed.
+; turbobaby/request-identity owns who a request is; admin_gate_step and admin_step_names_a_person
+; are the declarations that matter here, because the second of them is why an admitted upload can
+; have no person behind it at all. The refusal numerals of that gate are its own.
+; turbobaby/client-errors owns what a failed request is told, including the general body limit
+; this route is the single exemption from; its budget_admits and outcome_http_status are the
+; neighbouring decisions, and the numeral it declares for a general body is not copied here.
+; turbobaby/catalog-write owns what an admin write may produce once this route's URL becomes a
+; bike's photo field; WRITE_IMAGE_URL_MAX_CHARS is that bound and it is named, not restated.
+pub const REUSES_RATE_LIMIT_ID : str = "turbobaby/rate-limit";
+pub const REUSES_REQUEST_IDENTITY_ID : str = "turbobaby/request-identity";
+pub const REUSES_CLIENT_ERRORS_ID : str = "turbobaby/client-errors";
+pub const REUSES_CATALOG_WRITE_ID : str = "turbobaby/catalog-write";
+pub const REUSE_EDGE_COUNT : u8 = 4;
+pub const LIMITER_VERDICT_INPUT : str = "under_rate_limit, supplied by the rate-limit contract";
+pub const IDENTITY_VERDICT_INPUT : str = "identity_admits, supplied by the identity contract";
+pub const LIMITER_WINDOW_IS_RESTATED_HERE : bool = false;
+pub const LIMITER_ATTEMPT_CAP_IS_RESTATED_HERE : bool = false;
+pub const ADMIN_AUTH_BOUND_IS_RESTATED_HERE : bool = false;
+pub const GENERAL_BODY_LIMIT_IS_RESTATED_HERE : bool = false;
+pub const CATALOG_FIELD_CAP_IS_RESTATED_HERE : bool = false;
+pub const WHO_MAY_UPLOAD_IS_NOT_THIS_FILES_SUBJECT : bool = true;
+
+; --- The route ---------------------------------------------------------------------------------
+; routes() at src/api/upload.rs:17-21 registers exactly one path and one method, and attaches its
+; own body limit in the same builder. Nothing else in this module is mounted. What routes()
+; spells at :19 is /upload; the /api below is the prefix src/api/mod.rs:77 nests the whole API
+; under, so the path a caller types is the two of them joined and traces to two files, not one.
+pub const ROUTE_METHOD : str = "POST";
+pub const ROUTE_PATH : str = "/api/upload";
+pub const ROUTE_COUNT : u8 = 1;
+pub const ROUTE_DECLARATION : str = "src/api/upload.rs:19";
+pub const HANDLER_WRITES_A_DATABASE_ROW : bool = false;
+pub const REPOSITORY_HAS_AN_UPLOADS_TABLE : bool = false;
+
+; --- What is compiled: the real gate, and where it is not -------------------------------------
+; Refutation 1 and 2 of the header, as constants. The gate is a crate feature, its default is
+; off, and it is not this route's. src/lib.rs:101-102, Cargo.toml:65, Cargo.toml:174.
+pub const COMPILE_GATE_FEATURE : str = "backend";
+pub const COMPILE_GATE_IS_ROUTE_SCOPED : bool = false;
+pub const COMPILE_GATE_IS_CRATE_SCOPED : bool = true;
+pub const COMPILE_GATE_DEFAULT_IS_ON : bool = false;
+pub const SERVER_BINARY_REQUIRES_THE_FEATURE : bool = true;
+pub const FEATURE_ATTRIBUTES_IN_THE_API_MODULE : u8 = 1;
+pub const FEATURE_ATTRIBUTES_NAMING_THIS_ROUTE : u8 = 0;
+pub const SURVEY_PLACED_A_GATE_AT_THE_MERGE_LINE : bool = true;
+pub const MERGE_LINE_IS_AN_EXEMPTION_NOT_A_GATE : bool = true;
+
+pub fn route_is_compiled(backend_feature_on: bool, target_is_wasm: bool) bool {
+  return backend_feature_on and !target_is_wasm;
+}
+
+; --- Where the bytes land: a runtime switch, not a gate ----------------------------------------
+; src/config.rs:187-189 tests two settings and nothing else. It never decides whether the route
+; exists; it decides which of two branches at src/api/upload.rs:258 and :296 receives the bytes.
+; Credentials are read at src/s3.rs:21-22 and default to the empty string, so they are outside
+; the switch entirely: a bucket and an endpoint with no key still choose the object branch, and
+; the failure surfaces as a server error at :280 rather than as a configuration refusal.
+pub const STORAGE_UNSET : u8 = 0;
+pub const STORAGE_LOCAL : u8 = 1;
+pub const STORAGE_OBJECT_STORE : u8 = 2;
+pub const STORAGE_BRANCH_COUNT : u8 = 2;
+pub const SWITCH_SETTING_COUNT : u8 = 2;
+pub const SWITCH_DEFAULT_IS_THE_OBJECT_STORE : bool = false;
+pub const SWITCH_SELECTS_A_BRANCH_NOT_THE_ROUTE : bool = true;
+pub const CREDENTIALS_ARE_PART_OF_THE_SWITCH : bool = false;
+pub const OBJECT_STORE_CALL_HAS_A_HARD_TIMEOUT : bool = true;
+pub const OBJECT_STORE_TIMEOUT_SECONDS : u8 = 90;
+pub const CALLER_GIVES_UP_AFTER_SECONDS : u8 = 120;
+
+pub fn object_store_enabled(bucket_set: bool, endpoint_set: bool) bool {
+  return bucket_set and endpoint_set;
+}
+
+pub fn storage_branch(bucket_set: bool, endpoint_set: bool) u8 {
+  if (object_store_enabled(bucket_set, endpoint_set)) {
+    return STORAGE_OBJECT_STORE;
+  }
+  return STORAGE_LOCAL;
+}
+
+pub fn branch_is_known(branch: u8) bool {
+  return branch == STORAGE_LOCAL or branch == STORAGE_OBJECT_STORE;
+}
+
+pub fn half_configured_store_takes_the_object_branch(bucket_set: bool, endpoint_set: bool, credentials_set: bool) bool {
+  return storage_branch(bucket_set, endpoint_set) == STORAGE_OBJECT_STORE and !credentials_set;
+}
+
+; The server abandons the store before the browser abandons the server, so a stuck PutObject is
+; reported as a refusal rather than as a hung tab. src/api/upload.rs:270, admin_screen.rs:670.
+pub fn server_gives_up_first(server_seconds: u8, caller_seconds: u8) bool {
+  return server_seconds < caller_seconds;
+}
+
+; --- Who may upload ----------------------------------------------------------------------------
+; The gate is check_admin, called first, at src/api/upload.rs:108. Its verdict arrives here as a
+; boolean and its refusal numerals stay with the contract that owns them. Two facts about that
+; gate matter to THIS boundary and are recorded without restating it: its password path yields a
+; sentinel principal rather than a person, and this handler stores no principal anywhere, so a
+; stored object is unattributable even when the admitted request was not.
+pub const IDENTITY_GATE_NAME : str = "check_admin";
+pub const IDENTITY_GATE_CALL_SITE : str = "src/api/upload.rs:108";
+pub const IDENTITY_GATE_RUNS_FIRST : bool = true;
+pub const ANONYMOUS_UPLOAD_IS_ADMITTED : bool = false;
+pub const ADMITTED_PRINCIPAL_MAY_BE_A_SENTINEL : bool = true;
+pub const STORED_OBJECT_RECORDS_ITS_UPLOADER : bool = false;
+pub const CALLER_SENDS_HEADER_COUNT : u8 = 3;
+pub const HEADERS_THE_GATE_READS : u8 = 2;
+pub const CALLER_SENDS_A_HEADER_THE_GATE_NEVER_READS : bool = true;
+
+; --- The admission ladder ----------------------------------------------------------------------
+; Four rungs in the order the handler climbs them: identity (:108), limiter (:116), name shape
+; (:168), then and only then bytes (:176-205). The third rung is the one worth naming: the
+; extension check is deliberately hoisted ABOVE the streaming loop, and the comment at :166-167
+; says why, so a disallowed type costs no memory at all.
+pub const ADMISSION_STEP_UNSET : u8 = 0;
+pub const ADMISSION_STEP_IDENTITY : u8 = 1;
+pub const ADMISSION_STEP_RATE : u8 = 2;
+pub const ADMISSION_STEP_SHAPE : u8 = 3;
+pub const ADMISSION_STEP_BYTES : u8 = 4;
+pub const ADMISSION_STEP_COUNT : u8 = 4;
+pub const EXTENSION_CHECK_PRECEDES_BUFFERING : bool = true;
+pub const SIGNATURE_CHECK_PRECEDES_BUFFERING : bool = false;
+pub const LIMITER_GUARDS_AN_ALREADY_GATED_ROUTE : bool = true;
+pub const LIMITER_CALL_SITE : str = "src/api/upload.rs:116";
+
+pub fn admission_step_reached(identity_admits: bool, under_rate_limit: bool, extension_allowed: bool) u8 {
+  if (!identity_admits) {
+    return ADMISSION_STEP_IDENTITY;
+  }
+  if (!under_rate_limit) {
+    return ADMISSION_STEP_RATE;
+  }
+  if (!extension_allowed) {
+    return ADMISSION_STEP_SHAPE;
+  }
+  return ADMISSION_STEP_BYTES;
+}
+
+pub fn bytes_are_buffered(identity_admits: bool, under_rate_limit: bool, extension_allowed: bool) bool {
+  return admission_step_reached(identity_admits, under_rate_limit, extension_allowed) == ADMISSION_STEP_BYTES;
+}
+
+; --- The type allowlist ------------------------------------------------------------------------
+; Eight extensions at src/api/upload.rs:24, five still images and three moving. The stored media
+; type is derived from the same name at src/s3.rs:120-137, where seven distinct types come out of
+; those eight names because jpg and jpeg share one. The declared content type of the multipart
+; part is read nowhere: refutation 3 of the header.
+pub const ACCEPTED_EXTENSION_COUNT : u8 = 8;
+pub const ACCEPTED_EXTENSIONS : [8]str = [
+  "jpg",
+  "jpeg",
+  "png",
+  "gif",
+  "webp",
+  "mp4",
+  "mov",
+  "webm",
+];
+pub const STILL_IMAGE_EXTENSION_COUNT : u8 = 5;
+pub const MOVING_IMAGE_EXTENSION_COUNT : u8 = 3;
+pub const DISTINCT_MEDIA_TYPES : u8 = 7;
+pub const ALLOWLIST_KEYS_ON_THE_EXTENSION : bool = true;
+pub const ALLOWLIST_KEYS_ON_THE_DECLARED_CONTENT_TYPE : bool = false;
+pub const MEDIA_TYPE_IS_DERIVED_FROM_THE_NAME : bool = true;
+pub const UNMATCHED_NAME_YIELDS_A_GENERIC_MEDIA_TYPE : bool = true;
+; Both name bounds below are BYTE bounds, not character bounds: src/api/upload.rs:47 tests
+; filename.len() and :51 tests ext.len(), and str::len() counts bytes. The distinction is
+; load-bearing inside this very boundary, because the one clamp downstream that DOES count
+; characters is the storage sanitizer's, and src/s3.rs:109-111 says so in as many words. A name
+; of three hundred two-byte characters is six hundred bytes and the bound below refuses it, so
+; the count that decides is never the count a person reading the name would make.
+pub const FILENAME_MAX_BYTES : u16 = 500;
+pub const EXTENSION_MAX_BYTES : u8 = 50;
+pub const EXTENSION_IS_LOWERCASED_BEFORE_THE_TEST : bool = true;
+
+; --- The leading-bytes check ---------------------------------------------------------------------
+; src/api/upload.rs:85-99. Six arms cover the eight extensions, the default arm fails closed, and
+; the comment at :79-84 gives the reason: an extension is attacker-supplied and a .png can carry
+; anything. Two of the arms do not test a contiguous prefix -- webp reads bytes 0..4 and 8..12,
+; and the ISO container arm reads only 4..8 -- which is why the shortest and longest PREFIX
+; lengths below do not describe them and a separate minimum is declared for the container case.
+pub const SIGNATURE_ARM_COUNT : u8 = 6;
+pub const SIGNATURE_DEFAULT_FAILS_CLOSED : bool = true;
+pub const GIF_HAS_TWO_ACCEPTED_SIGNATURES : bool = true;
+pub const SHORTEST_PREFIX_SIGNATURE_BYTES : u8 = 3;
+pub const LONGEST_PREFIX_SIGNATURE_BYTES : u8 = 8;
+pub const CONTAINER_CHECK_MIN_BYTES : u8 = 12;
+pub const ISO_CONTAINER_CHECK_IGNORES_THE_BOX_SIZE : bool = true;
+pub const ISO_CONTAINER_NOTE : str = "The mp4 and mov arm at src/api/upload.rs:93 tests bytes 4..8 for ftyp and places no constraint on bytes 0..4, which the ISO Base Media File Format uses for the box size. Any twelve-byte run whose fifth through eighth bytes spell ftyp is therefore accepted under a .mp4 or .mov name, and the two unit tests at :496-497 (:379-380 until 2026-09-26) both supply a well-formed box size so neither exercises the gap. This is recorded as a shape of the shipped check and not as a severity: closing it needs a decision about which box sizes and brands are admissible, which the repository has not made.";
+
+pub fn type_is_accepted(extension_in_allow_list: bool, signature_matches: bool) bool {
+  return extension_in_allow_list and signature_matches;
+}
+
+pub fn iso_container_admits(bytes_available: u8, ftyp_at_offset_four: bool) bool {
+  return bytes_available >= CONTAINER_CHECK_MIN_BYTES and ftyp_at_offset_four;
+}
+
+; --- The size cap: two ceilings, one of them reachable twice -------------------------------------
+; The layer at src/api/upload.rs:20 and the handler constant at :23. The gap between them is the
+; multipart framing the layer must also carry. Refutation 4 of the header lives in the third
+; function: the loop at :181 makes the post-loop re-check at :226 unable to refuse any value a
+; request can produce, so it is dead by reachability rather than by logic, and the function below
+; is written to show exactly that -- it answers true only for an argument the loop cannot hand it.
+pub const HANDLER_MAX_BYTES : u32 = 104857600;
+pub const LAYER_MAX_BYTES : u32 = 115343360;
+pub const LAYER_HEADROOM_BYTES : u32 = 10485760;
+pub const HANDLER_CEILING_OVER_THE_GENERAL_LIMIT : u8 = 50;
+pub const LAYER_CEILING_OVER_THE_GENERAL_LIMIT : u8 = 55;
+pub const ROUTE_ESCAPES_THE_GENERAL_BODY_LIMIT : bool = true;
+pub const ESCAPE_IS_AN_ORDERING_OF_MERGES : bool = true;
+pub const EMPTY_FILE_IS_REFUSED : bool = true;
+pub const CAP_IS_ENFORCED_PER_CHUNK : bool = true;
+pub const SIZE_IS_CHECKED_TWICE : bool = true;
+pub const SECOND_SIZE_CHECK_IS_REACHABLE : bool = false;
+pub const LAYER_REFUSAL_STATUS_IS_MEASURED : bool = false;
+
+pub fn size_admitted(byte_len: u32) bool {
+  return byte_len >= 1 and byte_len <= HANDLER_MAX_BYTES;
+}
+
+pub fn chunk_is_accepted(buffered: u32, chunk_len: u32) bool {
+  return buffered + chunk_len <= HANDLER_MAX_BYTES;
+}
+
+pub fn second_size_check_can_refuse(buffered_after_loop: u32) bool {
+  return buffered_after_loop > HANDLER_MAX_BYTES;
+}
+
+; --- The whole ladder, end to end ----------------------------------------------------------------
+pub fn upload_reaches_storage(identity_admits: bool, under_rate_limit: bool, extension_allowed: bool, signature_matches: bool, byte_len: u32) bool {
+  if (!bytes_are_buffered(identity_admits, under_rate_limit, extension_allowed)) {
+    return false;
+  }
+  if (!size_admitted(byte_len)) {
+    return false;
+  }
+  return type_is_accepted(extension_allowed, signature_matches);
+}
+
+; --- The object key ------------------------------------------------------------------------------
+; src/api/upload.rs:239-240 draws a v4 UUID and keeps eight hex characters of it; src/s3.rs:48
+; prefixes that with the key folder. The client's own filename reaches the key in no form: it is
+; consulted for its extension and discarded. So the key carries no customer id, no telegram id,
+; no order number, no timestamp and no original name -- and nothing to identify the uploader
+; either, which is the same fact read from the other side.
+; What it does carry is 32 bits of a 122-bit draw. The remaining 90 are discarded. No collision
+; check precedes either write: PutObject at src/s3.rs:64-71 and the local write at
+; src/api/upload.rs:303 both replace an existing object silently.
+pub const KEY_PREFIX : str = "uploads/";
+pub const KEY_RANDOM_HEX_CHARS : u8 = 8;
+pub const KEY_RANDOM_BITS_USED : u8 = 32;
+pub const UUID_RANDOM_BITS_AVAILABLE : u8 = 122;
+pub const RANDOM_BITS_DISCARDED : u8 = 90;
+pub const KEY_CARRIES_THE_CLIENT_FILENAME : bool = false;
+pub const KEY_CARRIES_A_CUSTOMER_ID : bool = false;
+pub const KEY_CARRIES_A_TIMESTAMP : bool = false;
+pub const KEY_IS_SEQUENTIAL : bool = false;
+pub const KEY_IS_DERIVED_FROM_ANY_REQUEST_FIELD : bool = false;
+pub const KEY_COLLISION_IS_CHECKED_BEFORE_WRITE : bool = false;
+pub const A_COLLIDING_WRITE_REPLACES_THE_OBJECT : bool = true;
+pub const LONGEST_KEY_NAME_THE_HANDLER_CAN_PRODUCE_CHARS : u16 = 13;
+
+pub fn key_space_log2(hex_chars: u8) u8 {
+  return hex_chars * 4;
+}
+
+pub fn key_uses_all_available_randomness(bits_used: u8, bits_available: u8) bool {
+  return bits_used == bits_available;
+}
+
+; --- The sanitizer that never sees an attacker ------------------------------------------------------
+; src/s3.rs:112-118 strips traversal, separators and query punctuation and clamps to 255 chars
+; -- characters and not bytes, which is the whole point of the cycle-#75 note at :44-47 -- and
+; the six tests at :209-259 exercise it with traversal, cyrillic and emoji. upload_to_s3 has
+; exactly one call site, src/api/upload.rs:269, and it is always handed a name the handler just
+; built out of hex digits, a dot and one of eight lowercase extensions -- at most thirteen
+; characters, none of them a separator. The defense is real code and it is unreachable from the
+; network on the only path that exists; it is recorded here so a later second caller knows the
+; guarantee is already written rather than discovering it is not.
+pub const KEY_NAME_IS_SANITIZED_A_SECOND_TIME : bool = true;
+pub const SANITIZER_EVER_SEES_CLIENT_TEXT : bool = false;
+pub const SANITIZER_CALL_SITES : u8 = 1;
+pub const SANITIZER_CLAMP_CHARS : u16 = 255;
+
+pub fn sanitizer_clamp_can_fire(name_chars: u16) bool {
+  return name_chars > SANITIZER_CLAMP_CHARS;
+}
+
+pub fn name_survives_the_sanitizer_unchanged(name_chars: u16, contains_separator: bool) bool {
+  return name_chars <= SANITIZER_CLAMP_CHARS and !contains_separator;
+}
+
+; --- Reading the object back -------------------------------------------------------------------------
+; The asymmetry, measured on the branch this repository can see. The write is admin-gated at
+; src/api/upload.rs:108. The local branch's read is src/main.rs:935, a static directory service
+; over the same folder the handler writes to at :296, carrying two response-header layers set at
+; src/main.rs:816-827 and no authorization of any kind. Knowing the key is therefore the whole of
+; the read permission. The object store's own read policy is not a fact this repository holds and
+; is refused below rather than guessed.
+; CORRECTED 2026-09-26, on the owner's answer below: the key is no longer the whole of the local
+; read permission. The same line of src/main.rs now nests served_uploads (src/api/upload.rs), which
+; serves a name only when the rental data references it; the headers and the ungated identity are
+; unchanged, so the read is still not authenticated.
+pub const LOCAL_BRANCH_READ_PATH_IS_SERVED : bool = true;
+pub const LOCAL_BRANCH_READ_IS_AUTHENTICATED : bool = false;
+pub const READ_RESPONSE_SETS_NOSNIFF : bool = true;
+pub const READ_RESPONSE_IS_BROWSER_CACHEABLE : bool = true;
+pub const KEY_IS_THE_WHOLE_READ_PERMISSION : bool = false;
+pub const KEY_IS_THE_WHOLE_READ_PERMISSION_BEFORE_2026_09_26 : bool = true;
+
+pub fn access_requires_identity(is_write: bool) bool {
+  return is_write;
+}
+
+; --- The previous shop's media: stop serving it (owner, 2026-09-26) ---------------------------------
+; Asked about the previous shop's media still reachable by a direct link -- files under /uploads on
+; the server's volume, and objects in the bucket -- the owner asked what he needs them for at all
+; (verbatim, in Russian, beside the read path in src/api/upload.rs; this file stays ASCII). The
+; operator read it as OWNER_MEDIA_ANSWER_READ_AS: stop serving them. Deleting the files themselves
+; is the owner's own irreversible act and is NOT done here: nothing in this change deletes, moves or
+; rewrites a file or an object, and no row is written (A_STORED_OBJECT_IS_EVER_DELETED_BY_THIS_
+; REPOSITORY stays false).
+; WHAT WRITES TO THE FOLDER TODAY. The local branch of the upload handler, whenever no object store
+; is configured (storage_branch above); every current admin form that uploads -- the bike form, the
+; event form and the broadcast photo -- goes through it. So the read path cannot simply go: a
+; deployment without a store would lose the pictures of its own bikes. It serves instead only what
+; the rental data references (LOCAL_READ_REQUIRES_A_RENTAL_REFERENCE): a name is served when some
+; bike's stored picture is exactly /uploads/<name> (LOCAL_READ_REFERENCE_COLUMN,
+; LOCAL_READ_REFERENCE_SHAPE), the value the local branch returns and the bike form stores. The
+; bikes are the rental catalogue, and the picture is the one media column a rental row holds.
+; Every other name answers exactly as a missing file does, not found
+; (LOCAL_READ_UNREFERENCED_ANSWERS_AS_A_MISSING_FILE): what the previous shop left on the volume, an
+; event poster, a broadcast photo, and anything a name alone used to open. These answers belong to
+; the read path, not to the write route, so none of them is a refusal site or a numeral counted
+; below (REFUSAL_SITE_COUNT, HTTP_STATUSES_DECLARED_HERE); a failed reference lookup answers the
+; server's own error and is logged. A name that is not one path segment of ASCII letters, digits, dot, dash
+; and underscore, or starts with a dot, or holds two dots, or is longer than the sanitizer's clamp,
+; is refused before the database or the disk is asked (LOCAL_READ_NAME_MAX_CHARS). The reference is
+; read on every request, so a bike whose picture is replaced stops serving the old file at once.
+; The broadcast photo loses nothing it had: the admin broadcast parses the photo address as an
+; absolute URL before Telegram sees it (src/api/admin.rs), and a bare /uploads/<name> never parses,
+; so a local-branch photo was refused there before this change too.
+; THE OBJECT STORE. This server does not serve the bucket: an object's address is the bucket's own
+; public base plus its key (src/s3.rs), fetched from the store directly, so no line here can stop
+; serving one (OBJECT_STORE_IS_SERVED_BY_THIS_SERVER). And the previous shop's objects cannot be
+; told apart by code: every upload of this code -- the previous shop's bot and this shop alike,
+; since the first commit -- writes under the one key prefix KEY_PREFIX with an eight-hex name, and
+; the rental catalogue's own pictures sit under a folder no code writes (migration 084, placed by
+; hand). Telling them apart needs a PRODUCTION LISTING of the bucket's uploads/ keys against the
+; keys the rental rows reference, and stopping them is a change to the bucket's read policy, a
+; deployment fact (OBJECT_STORE_READ_POLICY_IS_A_REPOSITORY_FACT). Neither was done here.
+pub const OWNER_MEDIA_ANSWER_AT : str = "2026-09-26";
+pub const OWNER_MEDIA_ANSWER_READ_AS : str = "Stop serving the previous shop's media; deleting the files is the owner's own act, not done here.";
+pub const LOCAL_UPLOAD_FOLDER_HAS_A_CURRENT_WRITER : bool = true;
+pub const LOCAL_READ_REQUIRES_A_RENTAL_REFERENCE : bool = true;
+pub const LOCAL_READ_REFERENCE_COLUMN : str = "bikes.image_url";
+pub const LOCAL_READ_REFERENCE_LOOKUPS_ON_BIKES : u8 = 1;
+pub const LOCAL_READ_SERVICE_NESTS : u8 = 1;
+pub const LOCAL_READ_REFERENCE_SHAPE : str = "/uploads/<name>";
+pub const LOCAL_READ_UNREFERENCED_ANSWERS_AS_A_MISSING_FILE : bool = true;
+pub const LOCAL_READ_NAME_MAX_CHARS : u16 = 255;
+pub const LOCAL_READ_SITE : str = "served_uploads, src/api/upload.rs";
+pub const LOCAL_READ_WITNESS : str = "only_a_file_a_bike_references_is_served, src/api/upload.rs";
+pub const MEDIA_ANSWER_DELETES_A_FILE : bool = false;
+pub const MEDIA_ANSWER_WRITES_A_ROW : bool = false;
+pub const OBJECT_STORE_IS_SERVED_BY_THIS_SERVER : bool = false;
+pub const OBJECT_STORE_PREVIOUS_SHOP_KEYS_TELL_APART_BY_CODE : bool = false;
+pub const OBJECT_STORE_NEEDS_A_PRODUCTION_LISTING : bool = true;
+
+; Whether the local read serves a name: only a well-formed name the rental data references.
+pub fn local_read_is_served(name_is_well_formed: bool, referenced_by_a_bike: bool) bool {
+  if (!name_is_well_formed) {
+    return false;
+  }
+  return referenced_by_a_bike;
+}
+
+; --- What a rejected upload returns ---------------------------------------------------------------
+; Fifteen refusal sites. Fourteen name a status literally in src/api/upload.rs; the fifteenth, at
+; :110, passes through whatever the identity gate decided, and those numerals belong to the
+; identity contract. Five distinct numerals are written literally in that file and only four are
+; declared below: the fifth is the throttle at :132, whose numeral turbobaby/request-identity
+; already declares, so this file counts the SITE and leaves the NUMBER where it is owned. That is
+; why refusal_status_is_declared_here answers false for a status this route really does send. Every refusal body is the same one-key JSON object built at :36-39, and its
+; message is an English ASCII sentence written in this file -- never a localized key, and never
+; the raw error, which a source-scanning regression test at :450-480 (:333-363 until 2026-09-26) pins to the log instead.
+pub const REFUSAL_SITE_COUNT : u8 = 15;
+pub const REFUSAL_SITES_WITH_A_LITERAL_STATUS : u8 = 14;
+pub const REFUSAL_SITES_DELEGATING_THE_STATUS : u8 = 1;
+pub const HTTP_BAD_REQUEST : u16 = 400;
+pub const HTTP_PAYLOAD_TOO_LARGE : u16 = 413;
+pub const HTTP_UNSUPPORTED_MEDIA_TYPE : u16 = 415;
+pub const HTTP_SERVER_ERROR : u16 = 500;
+pub const HTTP_STATUSES_DECLARED_HERE : u8 = 4;
+pub const GATE_STATUSES_ARE_DECLARED_AT : str = "turbobaby/request-identity";
+; Which of the four this file shares, RE-MEASURED 2026-09-21 by grepping specs/ for a declaration
+; of each numeral across all 43 files. 413 and 415 are declared nowhere else: this route is the
+; only surface in the corpus that can refuse for size or for type. 400 and 500 are each declared
+; by four contracts -- turbobaby/catalog-api, turbobaby/order-status and turbobaby/cart-persistence
+; beside this file for 400, and turbobaby/catalog-api, turbobaby/cart-persistence and
+; turbobaby/happy-hour beside this file for 500. The corpus therefore has no single owner of
+; either, and this file is one voice of four rather than a second copy of one. The invariant
+; further down is named no_numeral_a_sibling_already_owns_is_re_declared_here; what it asserts,
+; and all it ever asserted, is that the three GATE numerals are not declared here. The name
+; overclaims, it is left standing rather than quietly rewritten, and these constants are the
+; measurement a reader should trust instead of it.
+pub const CORPUS_FILES_AT_REMEASUREMENT : u8 = 43;
+pub const NUMERALS_DECLARED_ONLY_HERE : u8 = 2;
+pub const NUMERALS_ALSO_DECLARED_BY_A_SIBLING : u8 = 2;
+pub const CONTRACTS_DECLARING_BAD_REQUEST : u8 = 4;
+pub const CONTRACTS_DECLARING_SERVER_ERROR : u8 = 4;
+pub const GATE_NUMERALS_DECLARED_HERE : u8 = 0;
+pub const BAD_REQUEST_SITES : u8 = 6;
+pub const PAYLOAD_TOO_LARGE_SITES : u8 = 2;
+pub const UNSUPPORTED_MEDIA_TYPE_SITES : u8 = 2;
+pub const SERVER_ERROR_SITES : u8 = 3;
+pub const TOO_MANY_REQUESTS_SITES : u8 = 1;
+pub const REFUSAL_BODY_KEY_COUNT : u8 = 1;
+pub const REFUSAL_BODY_KEY : str = "error";
+pub const REFUSAL_MESSAGE_IS_LOCALIZED : bool = false;
+pub const REFUSAL_MESSAGE_CARRIES_THE_RAW_ERROR : bool = false;
+pub const RAW_ERROR_LEAK_IS_PINNED_BY_A_SOURCE_SCANNING_TEST : bool = true;
+
+pub fn refusal_status_is_declared_here(status: u16) bool {
+  return status == HTTP_BAD_REQUEST or status == HTTP_PAYLOAD_TOO_LARGE or status == HTTP_UNSUPPORTED_MEDIA_TYPE or status == HTTP_SERVER_ERROR;
+}
+
+pub fn literal_status_sites_add_up(bad_request: u8, too_large: u8, wrong_type: u8, server_error: u8, throttled: u8) u8 {
+  return bad_request + too_large + wrong_type + server_error + throttled;
+}
+
+; Two refusal messages say more than the word no, and both are deliberate rather than accidental.
+; The size refusals at :73 and :190 disclose the server's own ceiling, which is the number the
+; operator needs. The disallowed-extension refusal at :58 echoes the caller's extension back --
+; up to fifty characters of caller-chosen text, lowercased and JSON-encoded, one site only. The
+; other 415, at :235, also names an extension, but by then it is necessarily one of the eight.
+pub const REFUSAL_MESSAGE_DISCLOSES_THE_SERVER_CEILING : bool = true;
+pub const REFLECTING_REFUSAL_SITES : u8 = 1;
+pub const REFLECTION_SITE : str = "src/api/upload.rs:58";
+pub const REFLECTED_TEXT_MAX_BYTES : u8 = 50;
+pub const REFLECTED_TEXT_IS_LOWERCASED : bool = true;
+pub const REFLECTED_TEXT_IS_JSON_ENCODED : bool = true;
+
+; --- What an accepted upload returns, and what it becomes -------------------------------------------
+; Two keys at :273-276 and :307-310. No status numeral is written in the source on either path,
+; so none is declared here. The shipped caller at src/ui/screens/admin_screen.rs:656 reads one of
+; the two keys and drops the other; at :648 it also looks for a key this route never sends.
+; The surviving key is a string. src/api/bikes.rs:1046-1047 bounds its length and checks its
+; scheme before it becomes a bike's photo field, and it never checks that the object is there --
+; a row may hold a URL to something that was never written or is no longer served, and no path in
+; this repository detects that, because no path deletes or re-reads a stored object at all.
+pub const SUCCESS_BODY_KEY_COUNT : u8 = 2;
+pub const SUCCESS_BODY_KEYS : [2]str = ["url", "filename"];
+pub const SUCCESS_KEYS_THE_CALLER_READS : u8 = 1;
+pub const SUCCESS_STATUS_IS_WRITTEN_IN_THE_SOURCE : bool = false;
+pub const CALLER_ACCEPTS_A_BODY_KEY_THE_ROUTE_NEVER_SENDS : bool = true;
+pub const CALLER_SHOWS_THE_SERVER_MESSAGE_VERBATIM : bool = true;
+pub const CALLER_TRUNCATES_THE_SHOWN_MESSAGE_CHARS : u16 = 500;
+pub const RESULT_BECOMES_A_CATALOG_FIELD : bool = true;
+pub const CATALOG_FIELD_BOUND_IS_DECLARED_AT : str = "turbobaby/catalog-write";
+pub const CATALOG_FIELD_BOUND_DECLARATION : str = "WRITE_IMAGE_URL_MAX_CHARS";
+pub const HANDOFF_IS_A_STRING_NOT_A_REFERENCE : bool = true;
+pub const CATALOG_WRITE_VERIFIES_THE_OBJECT_EXISTS : bool = false;
+pub const A_STORED_OBJECT_IS_EVER_DELETED_BY_THIS_REPOSITORY : bool = false;
+pub const ORPHAN_SWEEP_EXISTS : bool = false;
+
+; --- Honest refusals ------------------------------------------------------------------------------
+; Each of these is an absence measured over src/, migrations/ and Cargo.toml on 2026-09-21, not a
+; number withheld. Where a decision is missing, what is missing is named.
+pub const DEPLOYMENT_VALUES_ARE_DECLARED_HERE : bool = false;
+pub const DEPLOYMENT_VALUES_NOTE : str = "Bucket, endpoint, internal endpoint, public URL base, region, access key and secret are read from the environment at src/config.rs:150-158 and fall back where this module reads them unset at src/s3.rs:13-22: to the empty string for the endpoint, the public base, the access key and the secret, and at :20 to a literal default region, the one of them that is not empty and is a deployment fact all the same. Not one of them is a property of this boundary: the same code is correct against any store. The public URL is assembled at src/s3.rs:100-107 from a base this file refuses to name, and when the base is empty the assembled value is a scheme-and-bucket string that no browser can fetch -- which is a shape worth knowing and still not a value worth writing down.";
+pub const CONTENT_IS_SCANNED_BEYOND_ITS_LEADING_BYTES : bool = false;
+pub const CONTENT_SCANNING_NOTE : str = "The leading-bytes check at src/api/upload.rs:85-99 is the whole of content inspection. Case-insensitive greps over src/ on 2026-09-21 return 0 occurrences of clamav, virus and exif, Cargo.toml declares no image, infer or mime crate, and the bytes are never decoded, re-encoded or resized -- every resize hit under src/ is a CSS declaration or a browser error string. So a file whose first bytes are a valid signature is stored exactly as sent, with whatever follows them and whatever metadata it carries. Closing this needs a decode-and-re-encode step and a decision about what to do with a file that decodes but is not what it claims; no scan result is claimed here in its place.";
+pub const RETENTION_PERIOD_IS_IMPLEMENTED : bool = false;
+pub const RETENTION_NOTE : str = "No period is declared because none exists. delete_object and DeleteObject return 0 occurrences across src/ on 2026-09-21, no migration declares an uploads table, and the handler records nothing about the object it wrote, so there is no list to sweep and nothing to sweep it by. A retention rule needs a record of what was stored and when before it can need a period.";
+pub const PER_UPLOADER_QUOTA_EXISTS : bool = false;
+pub const PER_UPLOADER_QUOTA_NOTE : str = "The only budget on this route is keyed by a caller string the rate-limit contract derives from headers, so two admins behind one address share it and one admin across two addresses does not. A quota per person would key on the principal the identity gate returns, which this handler receives at src/api/upload.rs:108 and uses only for a log line. What is missing is the decision about whether the person or the address is the subject, not a number.";
+pub const OBJECT_STORE_READ_POLICY_IS_A_REPOSITORY_FACT : bool = false;
+pub const OBJECT_STORE_READ_POLICY_NOTE : str = "Whether a stored object is world-readable on the object-store branch cannot be settled here. PutObject at src/s3.rs:64-71 sets a bucket, a key, a body and a content type and no ACL, so the answer is the bucket's default and the bucket is a deployment fact. On the local branch the answer IS in this repository and is recorded above: served, cached, nosniff, ungated. A claim covering both branches would be an invention; a claim covering one is a measurement.";
+
+; --- Tests ---------------------------------------------------------------------------------------
+
+test the_gate_is_a_crate_feature_and_its_default_is_off {
+  assert COMPILE_GATE_FEATURE == "backend";
+  assert COMPILE_GATE_IS_ROUTE_SCOPED == false;
+  assert COMPILE_GATE_IS_CRATE_SCOPED == true;
+  assert COMPILE_GATE_DEFAULT_IS_ON == false;
+  assert FEATURE_ATTRIBUTES_NAMING_THIS_ROUTE == 0;
+  assert route_is_compiled(true, false) == true;
+  assert route_is_compiled(false, false) == false;
+  assert route_is_compiled(true, true) == false;
+  assert route_is_compiled(false, true) == false;
+}
+
+test the_merge_line_the_survey_read_as_a_gate_is_an_exemption {
+  assert SURVEY_PLACED_A_GATE_AT_THE_MERGE_LINE == true;
+  assert MERGE_LINE_IS_AN_EXEMPTION_NOT_A_GATE == true;
+  assert ROUTE_ESCAPES_THE_GENERAL_BODY_LIMIT == true;
+  assert ESCAPE_IS_AN_ORDERING_OF_MERGES == true;
+  assert GENERAL_BODY_LIMIT_IS_RESTATED_HERE == false;
+}
+
+test the_storage_switch_picks_a_branch_and_never_the_route {
+  assert storage_branch(true, true) == STORAGE_OBJECT_STORE;
+  assert storage_branch(true, false) == STORAGE_LOCAL;
+  assert storage_branch(false, true) == STORAGE_LOCAL;
+  assert storage_branch(false, false) == STORAGE_LOCAL;
+  assert branch_is_known(storage_branch(false, false)) == true;
+  assert branch_is_known(STORAGE_UNSET) == false;
+  assert SWITCH_DEFAULT_IS_THE_OBJECT_STORE == false;
+  assert SWITCH_SELECTS_A_BRANCH_NOT_THE_ROUTE == true;
+}
+
+test a_store_with_no_credentials_still_takes_the_object_branch {
+  assert CREDENTIALS_ARE_PART_OF_THE_SWITCH == false;
+  assert half_configured_store_takes_the_object_branch(true, true, false) == true;
+  assert half_configured_store_takes_the_object_branch(true, true, true) == false;
+  assert half_configured_store_takes_the_object_branch(false, true, false) == false;
+  assert half_configured_store_takes_the_object_branch(true, false, false) == false;
+}
+
+test the_server_abandons_the_store_before_the_browser_abandons_the_server {
+  assert OBJECT_STORE_CALL_HAS_A_HARD_TIMEOUT == true;
+  assert server_gives_up_first(OBJECT_STORE_TIMEOUT_SECONDS, CALLER_GIVES_UP_AFTER_SECONDS) == true;
+  assert server_gives_up_first(CALLER_GIVES_UP_AFTER_SECONDS, OBJECT_STORE_TIMEOUT_SECONDS) == false;
+}
+
+test the_ladder_stops_at_the_first_rung_that_refuses {
+  assert admission_step_reached(false, true, true) == ADMISSION_STEP_IDENTITY;
+  assert admission_step_reached(false, false, false) == ADMISSION_STEP_IDENTITY;
+  assert admission_step_reached(true, false, true) == ADMISSION_STEP_RATE;
+  assert admission_step_reached(true, true, false) == ADMISSION_STEP_SHAPE;
+  assert admission_step_reached(true, true, true) == ADMISSION_STEP_BYTES;
+}
+
+test a_disallowed_extension_costs_no_memory {
+  assert EXTENSION_CHECK_PRECEDES_BUFFERING == true;
+  assert bytes_are_buffered(true, true, false) == false;
+  assert bytes_are_buffered(true, true, true) == true;
+  assert bytes_are_buffered(false, true, true) == false;
+  assert bytes_are_buffered(true, false, true) == false;
+}
+
+test the_allowlist_is_eight_names_and_seven_types {
+  assert ACCEPTED_EXTENSION_COUNT == 8;
+  assert STILL_IMAGE_EXTENSION_COUNT + MOVING_IMAGE_EXTENSION_COUNT == ACCEPTED_EXTENSION_COUNT;
+  assert DISTINCT_MEDIA_TYPES == 7;
+  assert DISTINCT_MEDIA_TYPES < ACCEPTED_EXTENSION_COUNT;
+  assert ALLOWLIST_KEYS_ON_THE_EXTENSION == true;
+  assert ALLOWLIST_KEYS_ON_THE_DECLARED_CONTENT_TYPE == false;
+  assert MEDIA_TYPE_IS_DERIVED_FROM_THE_NAME == true;
+}
+
+test a_name_alone_never_admits_and_bytes_alone_never_admit {
+  assert type_is_accepted(true, true) == true;
+  assert type_is_accepted(true, false) == false;
+  assert type_is_accepted(false, true) == false;
+  assert type_is_accepted(false, false) == false;
+  assert SIGNATURE_DEFAULT_FAILS_CLOSED == true;
+}
+
+test the_container_arm_needs_twelve_bytes_and_ignores_the_first_four {
+  assert iso_container_admits(12, true) == true;
+  assert iso_container_admits(11, true) == false;
+  assert iso_container_admits(12, false) == false;
+  assert iso_container_admits(200, true) == true;
+  assert ISO_CONTAINER_CHECK_IGNORES_THE_BOX_SIZE == true;
+}
+
+test the_two_ceilings_and_the_gap_between_them {
+  assert HANDLER_MAX_BYTES == 104857600;
+  assert LAYER_MAX_BYTES == 115343360;
+  assert LAYER_MAX_BYTES - HANDLER_MAX_BYTES == LAYER_HEADROOM_BYTES;
+  assert LAYER_MAX_BYTES > HANDLER_MAX_BYTES;
+  assert LAYER_CEILING_OVER_THE_GENERAL_LIMIT > HANDLER_CEILING_OVER_THE_GENERAL_LIMIT;
+}
+
+test an_empty_body_is_refused_and_the_ceiling_itself_is_admitted {
+  assert size_admitted(0) == false;
+  assert size_admitted(1) == true;
+  assert size_admitted(HANDLER_MAX_BYTES) == true;
+  assert size_admitted(HANDLER_MAX_BYTES + 1) == false;
+  assert EMPTY_FILE_IS_REFUSED == true;
+}
+
+test the_cap_is_tested_before_the_chunk_is_appended {
+  assert chunk_is_accepted(0, 1) == true;
+  assert chunk_is_accepted(HANDLER_MAX_BYTES - 1, 1) == true;
+  assert chunk_is_accepted(HANDLER_MAX_BYTES, 1) == false;
+  assert chunk_is_accepted(HANDLER_MAX_BYTES - 1, 2) == false;
+  assert CAP_IS_ENFORCED_PER_CHUNK == true;
+}
+
+test the_second_size_check_answers_only_for_a_buffer_the_loop_cannot_build {
+  assert second_size_check_can_refuse(0) == false;
+  assert second_size_check_can_refuse(HANDLER_MAX_BYTES) == false;
+  assert second_size_check_can_refuse(HANDLER_MAX_BYTES + 1) == true;
+  assert SIZE_IS_CHECKED_TWICE == true;
+  assert SECOND_SIZE_CHECK_IS_REACHABLE == false;
+}
+
+test the_whole_ladder_admits_one_shape_and_refuses_every_other {
+  assert upload_reaches_storage(true, true, true, true, 1000) == true;
+  assert upload_reaches_storage(true, true, true, true, HANDLER_MAX_BYTES) == true;
+  assert upload_reaches_storage(false, true, true, true, 1000) == false;
+  assert upload_reaches_storage(true, false, true, true, 1000) == false;
+  assert upload_reaches_storage(true, true, false, true, 1000) == false;
+  assert upload_reaches_storage(true, true, true, false, 1000) == false;
+  assert upload_reaches_storage(true, true, true, true, 0) == false;
+  assert upload_reaches_storage(true, true, true, true, HANDLER_MAX_BYTES + 1) == false;
+}
+
+test the_key_carries_nothing_about_the_request_that_made_it {
+  assert KEY_CARRIES_THE_CLIENT_FILENAME == false;
+  assert KEY_CARRIES_A_CUSTOMER_ID == false;
+  assert KEY_CARRIES_A_TIMESTAMP == false;
+  assert KEY_IS_SEQUENTIAL == false;
+  assert KEY_IS_DERIVED_FROM_ANY_REQUEST_FIELD == false;
+  assert STORED_OBJECT_RECORDS_ITS_UPLOADER == false;
+}
+
+test the_key_keeps_thirty_two_of_the_hundred_and_twenty_two_bits_it_was_cut_from {
+  assert key_space_log2(KEY_RANDOM_HEX_CHARS) == KEY_RANDOM_BITS_USED;
+  assert key_space_log2(8) == 32;
+  assert KEY_RANDOM_BITS_USED + RANDOM_BITS_DISCARDED == UUID_RANDOM_BITS_AVAILABLE;
+  assert key_uses_all_available_randomness(KEY_RANDOM_BITS_USED, UUID_RANDOM_BITS_AVAILABLE) == false;
+  assert key_uses_all_available_randomness(UUID_RANDOM_BITS_AVAILABLE, UUID_RANDOM_BITS_AVAILABLE) == true;
+  assert KEY_COLLISION_IS_CHECKED_BEFORE_WRITE == false;
+  assert A_COLLIDING_WRITE_REPLACES_THE_OBJECT == true;
+}
+
+test the_second_sanitizer_cannot_fire_on_the_only_caller_there_is {
+  assert SANITIZER_CALL_SITES == 1;
+  assert SANITIZER_EVER_SEES_CLIENT_TEXT == false;
+  assert LONGEST_KEY_NAME_THE_HANDLER_CAN_PRODUCE_CHARS < SANITIZER_CLAMP_CHARS;
+  assert sanitizer_clamp_can_fire(LONGEST_KEY_NAME_THE_HANDLER_CAN_PRODUCE_CHARS) == false;
+  assert sanitizer_clamp_can_fire(SANITIZER_CLAMP_CHARS) == false;
+  assert sanitizer_clamp_can_fire(SANITIZER_CLAMP_CHARS + 1) == true;
+  assert name_survives_the_sanitizer_unchanged(LONGEST_KEY_NAME_THE_HANDLER_CAN_PRODUCE_CHARS, false) == true;
+  assert name_survives_the_sanitizer_unchanged(LONGEST_KEY_NAME_THE_HANDLER_CAN_PRODUCE_CHARS, true) == false;
+  assert name_survives_the_sanitizer_unchanged(SANITIZER_CLAMP_CHARS + 1, false) == false;
+}
+
+test the_write_is_gated_and_the_local_read_is_not {
+  assert access_requires_identity(true) == true;
+  assert access_requires_identity(false) == false;
+  assert ANONYMOUS_UPLOAD_IS_ADMITTED == false;
+  assert LOCAL_BRANCH_READ_IS_AUTHENTICATED == false;
+  // until 2026-09-26 the key was the whole read permission; since then a rental reference is too
+  assert KEY_IS_THE_WHOLE_READ_PERMISSION_BEFORE_2026_09_26 == true;
+  assert KEY_IS_THE_WHOLE_READ_PERMISSION == false;
+  assert READ_RESPONSE_SETS_NOSNIFF == true;
+}
+
+test the_local_read_serves_only_what_a_bike_references_and_deletes_nothing {
+  assert OWNER_MEDIA_ANSWER_AT == "2026-09-26";
+  assert OWNER_MEDIA_ANSWER_READ_AS != "";
+  assert LOCAL_UPLOAD_FOLDER_HAS_A_CURRENT_WRITER == true;
+  assert LOCAL_BRANCH_READ_PATH_IS_SERVED == true;
+  assert LOCAL_READ_REQUIRES_A_RENTAL_REFERENCE == true;
+  assert LOCAL_READ_REFERENCE_COLUMN == "bikes.image_url";
+  assert LOCAL_READ_REFERENCE_LOOKUPS_ON_BIKES == 1;
+  assert LOCAL_READ_SERVICE_NESTS == 1;
+  assert LOCAL_READ_REFERENCE_SHAPE == "/uploads/<name>";
+  assert local_read_is_served(true, true) == true;
+  assert local_read_is_served(true, false) == false;
+  assert local_read_is_served(false, true) == false;
+  assert local_read_is_served(false, false) == false;
+  assert LOCAL_READ_UNREFERENCED_ANSWERS_AS_A_MISSING_FILE == true;
+  assert LOCAL_READ_NAME_MAX_CHARS == SANITIZER_CLAMP_CHARS;
+  assert MEDIA_ANSWER_DELETES_A_FILE == false;
+  assert MEDIA_ANSWER_DELETES_A_FILE == A_STORED_OBJECT_IS_EVER_DELETED_BY_THIS_REPOSITORY;
+  assert MEDIA_ANSWER_WRITES_A_ROW == false;
+}
+
+test the_bucket_needs_a_production_listing_and_is_not_this_servers_to_gate {
+  assert OBJECT_STORE_IS_SERVED_BY_THIS_SERVER == false;
+  assert OBJECT_STORE_PREVIOUS_SHOP_KEYS_TELL_APART_BY_CODE == false;
+  assert OBJECT_STORE_NEEDS_A_PRODUCTION_LISTING == true;
+  assert OBJECT_STORE_READ_POLICY_IS_A_REPOSITORY_FACT == false;
+  assert KEY_PREFIX == "uploads/";
+}
+
+test fifteen_refusal_sites_and_four_numerals_of_our_own {
+  assert literal_status_sites_add_up(BAD_REQUEST_SITES, PAYLOAD_TOO_LARGE_SITES, UNSUPPORTED_MEDIA_TYPE_SITES, SERVER_ERROR_SITES, TOO_MANY_REQUESTS_SITES) == REFUSAL_SITES_WITH_A_LITERAL_STATUS;
+  assert REFUSAL_SITES_WITH_A_LITERAL_STATUS + REFUSAL_SITES_DELEGATING_THE_STATUS == REFUSAL_SITE_COUNT;
+  assert HTTP_STATUSES_DECLARED_HERE == 4;
+  assert refusal_status_is_declared_here(HTTP_BAD_REQUEST) == true;
+  assert refusal_status_is_declared_here(HTTP_PAYLOAD_TOO_LARGE) == true;
+  assert refusal_status_is_declared_here(HTTP_UNSUPPORTED_MEDIA_TYPE) == true;
+  assert refusal_status_is_declared_here(HTTP_SERVER_ERROR) == true;
+  assert refusal_status_is_declared_here(429) == false;
+  assert refusal_status_is_declared_here(401) == false;
+  assert refusal_status_is_declared_here(403) == false;
+}
+
+test two_of_the_four_numerals_are_also_a_siblings_and_that_is_measured {
+  assert CORPUS_FILES_AT_REMEASUREMENT == 43;
+  assert NUMERALS_DECLARED_ONLY_HERE == 2;
+  assert NUMERALS_ALSO_DECLARED_BY_A_SIBLING == 2;
+  assert NUMERALS_DECLARED_ONLY_HERE + NUMERALS_ALSO_DECLARED_BY_A_SIBLING == HTTP_STATUSES_DECLARED_HERE;
+  assert CONTRACTS_DECLARING_BAD_REQUEST == 4;
+  assert CONTRACTS_DECLARING_SERVER_ERROR == 4;
+  assert CONTRACTS_DECLARING_BAD_REQUEST > NUMERALS_ALSO_DECLARED_BY_A_SIBLING;
+  assert GATE_NUMERALS_DECLARED_HERE == 0;
+  assert GATE_STATUSES_ARE_DECLARED_AT == "turbobaby/request-identity";
+  assert GATE_STATUSES_ARE_DECLARED_AT == REUSES_REQUEST_IDENTITY_ID;
+}
+
+test a_refusal_body_is_one_key_and_never_the_raw_error {
+  assert REFUSAL_BODY_KEY_COUNT == 1;
+  assert REFUSAL_BODY_KEY == "error";
+  assert REFUSAL_MESSAGE_CARRIES_THE_RAW_ERROR == false;
+  assert RAW_ERROR_LEAK_IS_PINNED_BY_A_SOURCE_SCANNING_TEST == true;
+  assert REFUSAL_MESSAGE_IS_LOCALIZED == false;
+  assert REFLECTING_REFUSAL_SITES == 1;
+  assert REFLECTED_TEXT_MAX_BYTES == EXTENSION_MAX_BYTES;
+}
+
+test the_success_body_has_two_keys_and_the_caller_reads_one {
+  assert SUCCESS_BODY_KEY_COUNT == 2;
+  assert SUCCESS_KEYS_THE_CALLER_READS == 1;
+  assert SUCCESS_KEYS_THE_CALLER_READS < SUCCESS_BODY_KEY_COUNT;
+  assert SUCCESS_STATUS_IS_WRITTEN_IN_THE_SOURCE == false;
+  assert CALLER_ACCEPTS_A_BODY_KEY_THE_ROUTE_NEVER_SENDS == true;
+}
+
+test the_url_leaves_here_as_a_string_that_nobody_re_checks {
+  assert RESULT_BECOMES_A_CATALOG_FIELD == true;
+  assert CATALOG_FIELD_BOUND_IS_DECLARED_AT == "turbobaby/catalog-write";
+  assert CATALOG_FIELD_BOUND_DECLARATION == "WRITE_IMAGE_URL_MAX_CHARS";
+  assert CATALOG_FIELD_CAP_IS_RESTATED_HERE == false;
+  assert CATALOG_WRITE_VERIFIES_THE_OBJECT_EXISTS == false;
+  assert A_STORED_OBJECT_IS_EVER_DELETED_BY_THIS_REPOSITORY == false;
+  assert ORPHAN_SWEEP_EXISTS == false;
+}
+
+test four_edges_named_and_not_one_of_them_restated {
+  assert REUSES_RATE_LIMIT_ID == "turbobaby/rate-limit";
+  assert REUSES_REQUEST_IDENTITY_ID == "turbobaby/request-identity";
+  assert REUSES_CLIENT_ERRORS_ID == "turbobaby/client-errors";
+  assert REUSES_CATALOG_WRITE_ID == "turbobaby/catalog-write";
+  assert REUSE_EDGE_COUNT == 4;
+  assert LIMITER_WINDOW_IS_RESTATED_HERE == false;
+  assert LIMITER_ATTEMPT_CAP_IS_RESTATED_HERE == false;
+  assert ADMIN_AUTH_BOUND_IS_RESTATED_HERE == false;
+}
+
+test every_absence_is_measured_and_none_is_replaced_by_a_number {
+  assert DEPLOYMENT_VALUES_ARE_DECLARED_HERE == false;
+  assert CONTENT_IS_SCANNED_BEYOND_ITS_LEADING_BYTES == false;
+  assert RETENTION_PERIOD_IS_IMPLEMENTED == false;
+  assert PER_UPLOADER_QUOTA_EXISTS == false;
+  assert OBJECT_STORE_READ_POLICY_IS_A_REPOSITORY_FACT == false;
+  assert LAYER_REFUSAL_STATUS_IS_MEASURED == false;
+  assert REPOSITORY_HAS_AN_UPLOADS_TABLE == false;
+  assert HANDLER_WRITES_A_DATABASE_ROW == false;
+}
+
+; --- Invariants -----------------------------------------------------------------------------------
+
+invariant the_route_does_not_exist_on_a_default_build
+  assert route_is_compiled(false, false) == false and route_is_compiled(true, false) == true
+
+invariant no_feature_attribute_in_this_repository_names_this_route
+  assert FEATURE_ATTRIBUTES_NAMING_THIS_ROUTE == 0 and COMPILE_GATE_IS_ROUTE_SCOPED == false
+
+invariant the_storage_switch_can_never_turn_the_route_off
+  assert branch_is_known(storage_branch(false, false)) == true and branch_is_known(storage_branch(true, true)) == true
+
+invariant an_unidentified_caller_never_reaches_the_buffer
+  assert bytes_are_buffered(false, true, true) == false and upload_reaches_storage(false, true, true, true, 1000) == false
+
+invariant a_throttled_caller_never_reaches_the_buffer
+  assert bytes_are_buffered(true, false, true) == false and upload_reaches_storage(true, false, true, true, 1000) == false
+
+invariant a_disallowed_extension_is_refused_before_a_byte_is_kept
+  assert bytes_are_buffered(true, true, false) == false and EXTENSION_CHECK_PRECEDES_BUFFERING == true
+
+invariant a_matching_signature_cannot_rescue_a_disallowed_name
+  assert type_is_accepted(false, true) == false
+
+invariant a_permitted_name_cannot_rescue_a_wrong_signature
+  assert type_is_accepted(true, false) == false
+
+invariant an_empty_body_is_never_stored
+  assert size_admitted(0) == false and upload_reaches_storage(true, true, true, true, 0) == false
+
+invariant the_handler_ceiling_is_the_last_admitted_byte_count
+  assert size_admitted(HANDLER_MAX_BYTES) == true and size_admitted(HANDLER_MAX_BYTES + 1) == false
+
+invariant the_chunk_test_never_lets_the_buffer_pass_the_ceiling
+  assert chunk_is_accepted(HANDLER_MAX_BYTES, 1) == false and chunk_is_accepted(HANDLER_MAX_BYTES - 1, 1) == true
+
+invariant the_post_loop_size_check_cannot_refuse_a_buffer_the_loop_produced
+  assert second_size_check_can_refuse(HANDLER_MAX_BYTES) == false
+
+invariant the_layer_ceiling_stays_above_the_handler_ceiling
+  assert LAYER_MAX_BYTES > HANDLER_MAX_BYTES and LAYER_MAX_BYTES - HANDLER_MAX_BYTES == LAYER_HEADROOM_BYTES
+
+invariant the_key_never_names_a_person_or_a_request
+  assert KEY_CARRIES_A_CUSTOMER_ID == false and KEY_CARRIES_THE_CLIENT_FILENAME == false and KEY_IS_DERIVED_FROM_ANY_REQUEST_FIELD == false
+
+invariant the_key_does_not_use_the_randomness_it_was_given
+  assert key_uses_all_available_randomness(KEY_RANDOM_BITS_USED, UUID_RANDOM_BITS_AVAILABLE) == false and key_space_log2(KEY_RANDOM_HEX_CHARS) == KEY_RANDOM_BITS_USED
+
+invariant the_storage_sanitizer_is_unreachable_from_the_only_caller
+  assert sanitizer_clamp_can_fire(LONGEST_KEY_NAME_THE_HANDLER_CAN_PRODUCE_CHARS) == false and SANITIZER_CALL_SITES == 1
+
+invariant writing_needs_a_proof_of_identity_and_reading_the_local_branch_does_not
+  assert access_requires_identity(true) == true and access_requires_identity(false) == false
+
+invariant the_refusal_sites_add_up_to_fifteen
+  assert literal_status_sites_add_up(BAD_REQUEST_SITES, PAYLOAD_TOO_LARGE_SITES, UNSUPPORTED_MEDIA_TYPE_SITES, SERVER_ERROR_SITES, TOO_MANY_REQUESTS_SITES) + REFUSAL_SITES_DELEGATING_THE_STATUS == REFUSAL_SITE_COUNT
+
+invariant no_numeral_a_sibling_already_owns_is_re_declared_here
+  assert refusal_status_is_declared_here(401) == false and refusal_status_is_declared_here(403) == false and refusal_status_is_declared_here(429) == false
+
+invariant a_refusal_never_carries_the_raw_error
+  assert REFUSAL_MESSAGE_CARRIES_THE_RAW_ERROR == false and RAW_ERROR_LEAK_IS_PINNED_BY_A_SOURCE_SCANNING_TEST == true
+
+invariant reflected_caller_text_stays_inside_the_extension_bound
+  assert REFLECTED_TEXT_MAX_BYTES == EXTENSION_MAX_BYTES and REFLECTING_REFUSAL_SITES == 1
+
+invariant nothing_in_this_repository_removes_a_stored_object
+  assert A_STORED_OBJECT_IS_EVER_DELETED_BY_THIS_REPOSITORY == false and ORPHAN_SWEEP_EXISTS == false
+
+invariant a_local_upload_nothing_rental_references_is_never_served
+  assert local_read_is_served(true, false) == false and local_read_is_served(false, true) == false and LOCAL_READ_REQUIRES_A_RENTAL_REFERENCE == true and MEDIA_ANSWER_DELETES_A_FILE == false
+
+invariant no_deployment_value_is_declared_as_a_contract
+  assert DEPLOYMENT_VALUES_ARE_DECLARED_HERE == false and OBJECT_STORE_READ_POLICY_IS_A_REPOSITORY_FACT == false
+
+invariant no_sibling_decision_is_copied_into_this_file
+  assert LIMITER_WINDOW_IS_RESTATED_HERE == false and LIMITER_ATTEMPT_CAP_IS_RESTATED_HERE == false and ADMIN_AUTH_BOUND_IS_RESTATED_HERE == false and GENERAL_BODY_LIMIT_IS_RESTATED_HERE == false and CATALOG_FIELD_CAP_IS_RESTATED_HERE == false

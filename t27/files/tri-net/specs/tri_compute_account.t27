@@ -1,0 +1,444 @@
+// TRI-NET compute account: the conserved ledger the value layer was missing.
+// tri_compute_settle mints rewards, tri_compute_bond locks collateral, and
+// tri_compute_challenge slashes -- but nothing proved these move value without
+// creating or destroying it. This spec models one node's account as
+// (balance, locked) and pins the CONSERVATION invariants every operation must
+// obey: lock/release keep total unchanged (value only moves between the two
+// buckets), slash removes EXACTLY the bond (to the challenger, nothing else),
+// and settle mints EXACTLY the reward (from the pool). These are the guards
+// against double-credit and bond leakage.
+
+module TriComputeAccount {
+    use base::types;
+
+    // A node's total holdings = spendable balance + locked collateral.
+    fn total(balance: u32, locked: u32) -> u32 {
+        return balance + locked;
+    }
+
+    // lock: move `amt` from balance into locked (guarded, no underflow).
+    fn bal_after_lock(balance: u32, amt: u32) -> u32 {
+        if (amt <= balance) {
+            return balance - amt;
+        } else {
+            return balance;
+        }
+    }
+    fn locked_after_lock(balance: u32, locked: u32, amt: u32) -> u32 {
+        if (amt <= balance) {
+            return locked + amt;
+        } else {
+            return locked;
+        }
+    }
+
+    // release: honest resolution returns the whole locked bond to balance.
+    fn bal_after_release(balance: u32, locked: u32) -> u32 {
+        return balance + locked;
+    }
+
+    // slash: the locked bond leaves the account (goes to the challenger); the
+    // spendable balance is untouched.
+    fn bal_after_slash(balance: u32) -> u32 {
+        return balance;
+    }
+
+    // Saturating balance add (matches tri_compute_settle.balance_add): a mint into
+    // spendable balance must never wrap DOWN at the u32 ceiling -- a bare balance +
+    // reward would wrap a near-max balance to a small number, silently destroying
+    // value. Every balance-mint below (settle / finalize) routes through this.
+    fn bal_add_sat(balance: u32, amount: u32) -> u32 {
+        let sum: u32 = balance +% amount;
+        if (sum < balance) {
+            return 0xFFFFFFFF;
+        } else {
+            return sum;
+        }
+    }
+
+    // settle: mint `reward` (from the pool) into the spendable balance.
+    fn bal_after_settle(balance: u32, reward: u32) -> u32 {
+        return bal_add_sat(balance, reward);
+    }
+
+    // ---- Settlement finality: escrow the reward until the challenge window ----
+    //
+    // bal_after_settle mints straight into SPENDABLE balance -- but fraud is
+    // proven LATER (tri_compute_challenge). An executor paid instantly can
+    // withdraw before the dispute, and a later slash only takes the bond, so a
+    // bond < reward lets fraud pay. Optimistic settlement fixes this exactly as
+    // Arbitrum/Optimism (non-final withdrawals for a challenge window) and
+    // Gensyn/Truebit (escrowed payout): settle mints into a PENDING bucket, not
+    // spendable balance; only a window that elapses with no proven fraud
+    // finalizes it into balance; a fraud proven in-window claws the whole pending
+    // reward back to the pool AND the bond is slashed. settle_canonical still
+    // decides IF/HOW MUCH to pay; this layer decides WHEN it becomes spendable.
+
+    // Total now spans three buckets: spendable + locked collateral + escrowed
+    // (settled-but-not-yet-final) reward.
+    fn total3(balance: u32, locked: u32, pending: u32) -> u32 {
+        return balance + locked + pending;
+    }
+
+    // settle (optimistic): mint the reward into PENDING, never straight to
+    // spendable balance. Nothing is withdrawable until the window closes.
+    // SATURATING and byte-identical to outstanding_after_escrow: escrow_consistent
+    // pins pending == outstanding, but outstanding_after_escrow saturates while a
+    // bare `pending + reward` would WRAP at the u32 ceiling -- the two would then
+    // diverge (outstanding=max, pending=small), breaking the invariant and splitting
+    // the collateralization gate (reads outstanding) from conservation (reads
+    // pending). Saturate here too so they stay equal at every value.
+    fn pending_after_settle(pending: u32, reward: u32) -> u32 {
+        let sum: u32 = pending +% reward;
+        if (sum < pending) {
+            return 0xFFFFFFFF;
+        } else {
+            return sum;
+        }
+    }
+
+    // finalize: the challenge window elapsed with no successful challenge, so the
+    // whole pending reward becomes spendable (pending -> balance; pending then 0,
+    // as bal_after_release empties `locked`). total3 is conserved.
+    fn bal_after_finalize(balance: u32, pending: u32) -> u32 {
+        return bal_add_sat(balance, pending);
+    }
+
+    // clawback: a fraud proven inside the window reverts the pending reward to
+    // the pool -- it never reaches balance (pending then 0). Spendable balance is
+    // untouched; total3 drops by EXACTLY the reward that leaves to the pool.
+    fn bal_after_clawback(balance: u32) -> u32 {
+        return balance;
+    }
+
+    // ---- Outstanding escrow: the value-at-risk counter the bond gates against ----
+    //
+    // bond_covers / admit_result_bonded gate on `outstanding`, but nothing tracked
+    // it -- it was a bare parameter with no source. And bal_after_finalize moves the
+    // WHOLE pending, a single-task assumption: with CONCURRENT tasks, completing one
+    // must lower the at-risk total by only that task's reward. Maintain outstanding
+    // as the running sum of in-flight (settled-but-not-final) rewards: a new escrow
+    // raises it; a task LEAVING escrow -- finalized OR clawed back, it leaves exactly
+    // once either way -- lowers it by exactly that reward. This is what feeds the
+    // collateralization gate a real counter.
+
+    // A new escrow raises the at-risk total (saturating, like a ledger balance).
+    fn outstanding_after_escrow(outstanding: u32, reward: u32) -> u32 {
+        let sum: u32 = outstanding +% reward;
+        if (sum < outstanding) {
+            return 0xFFFFFFFF;
+        } else {
+            return sum;
+        }
+    }
+
+    // A task leaving escrow (finalized or clawed back) removes exactly its reward
+    // from the at-risk total; guarded so it never underflows below zero.
+    fn outstanding_after_release(outstanding: u32, reward: u32) -> u32 {
+        if (reward <= outstanding) {
+            return outstanding - reward;
+        } else {
+            return 0;
+        }
+    }
+
+    // The RELEASE-side counterpart to pending_after_settle, byte-identical to
+    // outstanding_after_release so escrow_consistent (pending == outstanding) survives
+    // a RELEASE, not just an escrow. pending had an add (pending_after_settle) but no
+    // matching subtract, so two things broke: (a) after any finalize/clawback,
+    // outstanding dropped while pending did not, silently violating pending ==
+    // outstanding; and (b) a fraud proven INSIDE the window slashed the bond but left
+    // the reward sitting in pending -- bal_after_finalize_gated gates on TIME ONLY, so
+    // once the window elapsed it minted that fraudulent reward into spendable balance.
+    // This implements the "pending then 0" transition bal_after_clawback's contract
+    // promised but no function performed: a clawed-back reward leaves pending and can
+    // never finalize. Guarded so it never underflows below zero.
+    fn pending_after_release(pending: u32, reward: u32) -> u32 {
+        if (reward <= pending) {
+            return pending - reward;
+        } else {
+            return 0;
+        }
+    }
+
+    // outstanding is the multi-task GENERALIZATION of the single `pending` scalar:
+    // both track the same at-risk escrow, so the collateralization gate (which
+    // reads outstanding) and the conservation model (which tracks pending inside
+    // total3) must never drift apart. There is NO fourth bucket -- a total4 adding
+    // outstanding on top of pending would double-count the same value. This is the
+    // invariant that keeps them one: pending == outstanding after every operation.
+    // (outstanding_after_escrow == pending_after_settle by construction; a single
+    // task's release zeroes outstanding exactly as finalize/clawback zero pending.)
+    fn escrow_consistent(pending: u32, outstanding: u32) -> bool {
+        return pending == outstanding;
+    }
+
+    // ---- The finality window on the one epoch axis ----
+    //
+    // finalize above is timeless -- it would let an executor cash out the instant
+    // it settles, defeating the escrow. Bind it to the SAME monotonic epoch the
+    // rest of the stack runs on (tri_a2a freshness -> tri_compute_challenge
+    // watermark -> here): a reward settled at settle_epoch is finalizable only
+    // once now_epoch has advanced a full challenge window past it. Inside the
+    // window the pending reward stays escrowed and clawback-able, so a fraud proof
+    // that lands before the window closes still reverts it.
+    //
+    // window is a parameter (policy), not hardcoded. is_final is underflow-safe:
+    // a clock reading before the settle epoch is never final.
+    fn is_final(settle_epoch: u32, now_epoch: u32, window: u32) -> bool {
+        if (now_epoch >= settle_epoch) {
+            return (now_epoch - settle_epoch) >= window;
+        } else {
+            return false;
+        }
+    }
+
+    // finalize is PERMITTED only once the window has elapsed; a premature call is
+    // a no-op on balance (the reward stays pending, still escrowed). The time
+    // condition is inlined (not is_final) so it composes inside a fn body.
+    fn bal_after_finalize_gated(balance: u32, pending: u32, settle_epoch: u32, now_epoch: u32, window: u32) -> u32 {
+        if (now_epoch >= settle_epoch) {
+            if ((now_epoch - settle_epoch) >= window) {
+                return bal_add_sat(balance, pending);
+            } else {
+                return balance;
+            }
+        } else {
+            return balance;
+        }
+    }
+
+    // Defense-in-depth over the time gate: a reward proven FRAUDULENT (slashed) must
+    // NEVER finalize, independent of the clock. pending_after_release is the primary
+    // path -- a fraud proof inside the window claws the reward out of pending so a
+    // later finalize mints nothing. But that assumes the clawback actually executed;
+    // if the slash is proven yet the clawback is missed (a dropped message, a crashed
+    // node) and finalize then runs after the window, the time-only gate would still
+    // mint the fraud. Bind the slash verdict at the finalize site too: slashed == 1
+    // blocks finalize forever, regardless of window; otherwise defer to the time gate.
+    // `slashed` is the caller's outcome == RESOLVE_SLASH verdict, kept a flag so the
+    // outcome vocabulary stays in tri_compute_challenge -- the same way this module
+    // takes sig_ok / fresh as flags rather than importing their producers.
+    fn bal_after_finalize_checked(balance: u32, pending: u32, settle_epoch: u32, now_epoch: u32, window: u32, slashed: u32) -> u32 {
+        if (slashed == 1) {
+            return balance;
+        } else {
+            return bal_after_finalize_gated(balance, pending, settle_epoch, now_epoch, window);
+        }
+    }
+
+    // ---- Tests / invariants ----
+
+    // Locking collateral conserves total holdings (value only shifts buckets).
+    test lock_conserves_total {
+        ba = bal_after_lock(1000, 200);
+        la = locked_after_lock(1000, 0, 200);
+        assert(total(ba, la) == total(1000, 0), "lock conserves total");
+        assert(ba == 800, "balance reduced by the bond");
+        assert(la == 200, "bond now locked");
+    }
+
+    // Releasing an honest bond conserves total (locked -> balance, whole).
+    test release_conserves_total {
+        ba = bal_after_release(800, 200);
+        assert(total(ba, 0) == total(800, 200), "release conserves total");
+        assert(ba == 1000, "the whole bond returns");
+    }
+
+    // A slash removes EXACTLY the bond from the account -- no more, no less.
+    test slash_removes_exactly_the_bond {
+        ba = bal_after_slash(800);
+        assert(total(ba, 0) == total(800, 200) - 200, "slash removes exactly the bond");
+        assert(ba == 800, "spendable balance is untouched by a slash");
+    }
+
+    // A settle mints EXACTLY the reward -- no double-credit.
+    test settle_mints_exactly_the_reward {
+        ba = bal_after_settle(1000, 16);
+        assert(total(ba, 0) == total(1000, 0) + 16, "settle mints exactly the reward");
+    }
+
+    // The balance-mint path saturates: settle / finalize into a near-max balance
+    // cap at u32 max instead of wrapping down and destroying value. Normal values
+    // are exact (regression).
+    test balance_mint_saturates {
+        assert(bal_add_sat(1000, 500) == 1500, "normal add exact");
+        assert(bal_add_sat(0xFFFFFFF0, 32) == 0xFFFFFFFF, "overflowing add saturates, no wrap");
+        assert(bal_after_settle(0xFFFFFFF0, 32) == 0xFFFFFFFF, "settle into near-max balance saturates");
+        assert(bal_after_finalize(0xFFFFFFF0, 32) == 0xFFFFFFFF, "finalize into near-max balance saturates");
+        assert(bal_after_finalize_gated(0xFFFFFFF0, 32, 1, 100, 10) == 0xFFFFFFFF, "gated finalize saturates too");
+        // regression: the small-value conservation path is unchanged.
+        assert(bal_after_finalize(800, 16) == 816, "finalize small values exact");
+        assert(bal_after_settle(1000, 16) == 1016, "settle small values exact");
+    }
+
+    // Round-trip: lock then release leaves the account exactly as it began.
+    test lock_release_round_trips {
+        ba = bal_after_lock(1000, 200);
+        la = locked_after_lock(1000, 0, 200);
+        back = bal_after_release(ba, la);
+        assert(back == 1000, "lock+release is a no-op on total and on balance");
+    }
+
+    // Optimistic settle escrows the reward: it lands in pending, NOT spendable
+    // balance, so it cannot be withdrawn before the challenge window closes.
+    test settle_escrows_not_spendable {
+        pend = pending_after_settle(0, 16);
+        assert(pend == 16, "reward escrowed in pending");
+        assert(total3(800, 200, pend) == total3(800, 200, 0) + 16, "settle mints exactly the reward into escrow");
+        assert(bal_after_clawback(800) == 800, "the reward is not in spendable balance yet");
+    }
+
+    // finalize (window elapsed, no fraud): the whole pending reward becomes
+    // spendable and total3 is conserved (escrow -> balance, nothing minted/burned).
+    test finalize_conserves_total {
+        b = bal_after_finalize(800, 16);
+        assert(b == 816, "pending reward becomes spendable");
+        assert(total3(b, 200, 0) == total3(800, 200, 16), "finalize conserves total3");
+    }
+
+    // clawback (fraud in window): the pending reward reverts to the pool; balance
+    // untouched; total3 drops by EXACTLY the reward (it left the node to the pool).
+    test clawback_reverts_reward_to_pool {
+        b = bal_after_clawback(800);
+        assert(b == 800, "spendable balance untouched by clawback");
+        assert(total3(b, 200, 0) == total3(800, 200, 16) - 16, "clawback removes exactly the escrowed reward");
+    }
+
+    // THE economic-security invariant: cheating is strictly worse than honesty.
+    // Both paths start post-bond at (balance=800, locked=200) with reward=16
+    // escrowed. Honest = finalize (+16 spendable) then release (+200 bond back).
+    // Fraud = clawback (reward gone, never spent) then slash (bond gone). The
+    // executor's holdings differ by EXACTLY reward + bond -- fraud forfeits both.
+    test fraud_nets_reward_plus_bond_worse {
+        honest = total3(bal_after_finalize(bal_after_release(800, 200), 16), 0, 0);
+        fraud = total3(bal_after_clawback(800), 0, 0);
+        assert(honest == 1016, "honest keeps balance + reward + returned bond");
+        assert(fraud == 800, "fraud loses the escrowed reward and the slashed bond");
+        assert(honest - fraud == 16 + 200, "cheating costs exactly reward + bond vs honesty");
+    }
+
+    // The finality window: not final until now_epoch is a full window past the
+    // settle epoch; underflow-safe for a clock reading before settle.
+    test finality_window_boundary {
+        assert(is_final(100, 105, 10) == false, "5 < 10 epochs: still in the window");
+        assert(is_final(100, 109, 10) == false, "one epoch short: not final");
+        assert(is_final(100, 110, 10) == true, "exactly a window elapsed: final");
+        assert(is_final(100, 200, 10) == true, "well past the window: final");
+        assert(is_final(100, 90, 10) == false, "clock before settle epoch: never final");
+    }
+
+    // A premature finalize is a no-op: inside the window the reward stays pending
+    // (escrowed, clawback-able); only after the window does it become spendable.
+    test finalize_is_gated_by_the_window {
+        assert(bal_after_finalize_gated(800, 16, 100, 105, 10) == 800, "premature finalize leaves balance put");
+        assert(bal_after_finalize_gated(800, 16, 100, 110, 10) == 816, "post-window finalize releases the reward");
+        // A fraud proof at epoch 105 (inside the window) can still clawback,
+        // because finalize could not have fired yet.
+        assert(bal_after_finalize_gated(800, 16, 100, 105, 10) == bal_after_clawback(800), "in-window: reward not yet spendable, clawback still bites");
+    }
+
+    // Outstanding accumulates across CONCURRENT tasks and a per-task completion
+    // decrements only that task's reward -- the counter the collateralization gate
+    // reads. Two tasks escrow 16 and 32 (outstanding 48); finalizing the 16 leaves
+    // 32 still at risk; releasing the 32 returns to zero.
+    test outstanding_tracks_concurrent_escrow {
+        o1 = outstanding_after_escrow(0, 16);
+        o2 = outstanding_after_escrow(o1, 32);
+        assert(o2 == 48, "two concurrent escrows sum to 48 at risk");
+        r1 = outstanding_after_release(o2, 16);
+        assert(r1 == 32, "finalizing one task lowers outstanding by only its reward");
+        r2 = outstanding_after_release(r1, 32);
+        assert(r2 == 0, "releasing the other returns outstanding to zero");
+    }
+
+    // A task leaves escrow exactly ONCE -- whether finalized or clawed back, the
+    // outstanding decrement is identical (the value is no longer at risk either way).
+    test finalize_and_clawback_release_equally {
+        assert(outstanding_after_release(48, 16) == outstanding_after_release(48, 16), "same release regardless of the reason");
+        // guarded: releasing more than outstanding drains to zero, never underflows.
+        assert(outstanding_after_release(16, 32) == 0, "over-release drains to zero, no underflow");
+        // saturating: escrow cannot wrap at the ceiling.
+        assert(outstanding_after_escrow(0xFFFFFFF0, 32) == 0xFFFFFFFF, "escrow saturates, no wrap");
+    }
+
+    // Conservation: escrow a batch, release the whole batch, outstanding returns to
+    // where it started -- every escrowed reward leaves exactly once.
+    test outstanding_round_trips {
+        o = outstanding_after_escrow(outstanding_after_escrow(outstanding_after_escrow(100, 5), 7), 9);
+        assert(o == 121, "100 + 5 + 7 + 9 in flight");
+        back = outstanding_after_release(outstanding_after_release(outstanding_after_release(o, 5), 7), 9);
+        assert(back == 100, "releasing the whole batch returns to the starting level");
+    }
+
+    // outstanding and pending never drift: they are the SAME at-risk value, so the
+    // collateralization gate reads exactly what total3 tracks -- no double-count,
+    // no fourth bucket.
+    test outstanding_agrees_with_pending {
+        // Accumulation is identical.
+        assert(outstanding_after_escrow(0, 16) == pending_after_settle(0, 16), "escrow raises both identically");
+        assert(outstanding_after_escrow(16, 32) == pending_after_settle(16, 32), "and accumulates identically");
+        assert(escrow_consistent(pending_after_settle(0, 16), outstanding_after_escrow(0, 16)) == true, "the two stay equal after an escrow");
+        // A single in-flight task: releasing its reward zeroes outstanding, exactly
+        // as finalize moves the whole pending out (pending -> 0).
+        assert(outstanding_after_release(16, 16) == 0, "releasing the one task zeroes outstanding, as finalize zeroes pending");
+        // The invariant detects a drift (defensive: they must be kept equal).
+        assert(escrow_consistent(48, 48) == true, "equal -> consistent");
+        assert(escrow_consistent(48, 32) == false, "a drift is flagged, never silently gated on");
+    }
+
+    // The RELEASE side is now symmetric: pending_after_release mirrors
+    // outstanding_after_release, so escrow_consistent survives a release too, and a
+    // release can never underflow pending.
+    test pending_release_mirrors_outstanding {
+        assert(pending_after_release(48, 16) == 32, "pending drops by exactly the released reward");
+        assert(pending_after_release(48, 16) == outstanding_after_release(48, 16), "pending and outstanding release identically");
+        assert(escrow_consistent(pending_after_release(48, 16), outstanding_after_release(48, 16)) == true, "consistent after a release, not only an escrow");
+        assert(pending_after_release(10, 20) == 0, "an over-release floors at 0, never underflows to ~4e9");
+    }
+
+    // The fraud-finalize path is closed. A reward clawed back inside the window is
+    // removed from pending, so once the window elapses finalize mints 0 -- not the
+    // fraudulent reward. Contrast: an honest, un-clawed reward finalizes normally.
+    test clawback_removes_reward_before_finalize {
+        pend0 = pending_after_settle(0, 16);
+        pend1 = pending_after_release(pend0, 16);
+        assert(pend1 == 0, "clawback empties pending (the 'pending then 0' contract, now real)");
+        assert(bal_after_finalize_gated(500, pend1, 0, 100, 10) == 500, "window elapsed but clawed-back reward cannot finalize -> balance unchanged");
+        assert(bal_after_finalize_gated(500, pend0, 0, 100, 10) == 516, "an honest un-clawed reward still finalizes to balance after the window");
+    }
+
+    // Defense-in-depth: even if the clawback was never executed (missed message,
+    // crashed node), a SLASHED reward can never finalize -- the slash verdict blocks
+    // the mint regardless of the elapsed window. A clean reward still respects the
+    // time gate exactly as before.
+    test slashed_reward_never_finalizes {
+        assert(bal_after_finalize_checked(500, 16, 0, 100, 10, 0) == 516, "not slashed + window elapsed -> finalizes");
+        assert(bal_after_finalize_checked(500, 16, 0, 100, 10, 1) == 500, "slashed -> never finalizes, even past the window (clawback bypassed)");
+        assert(bal_after_finalize_checked(500, 16, 0, 5, 10, 0) == 500, "not slashed but inside the window -> still no finalize (time gate intact)");
+        assert(bal_after_finalize_checked(500, 16, 0, 5, 10, 1) == 500, "slashed inside the window -> no finalize");
+    }
+
+    // At the u32 ceiling the two MUST still agree: pending_after_settle saturates
+    // exactly like outstanding_after_escrow, so an overflowing escrow keeps them
+    // equal instead of wrapping pending below a saturated outstanding.
+    test escrow_saturation_keeps_them_equal {
+        assert(pending_after_settle(0xFFFFFFF0, 32) == 0xFFFFFFFF, "overflowing escrow saturates pending, no wrap");
+        assert(pending_after_settle(0xFFFFFFF0, 32) == outstanding_after_escrow(0xFFFFFFF0, 32), "pending == outstanding at the ceiling");
+        assert(escrow_consistent(pending_after_settle(0xFFFFFFF0, 32), outstanding_after_escrow(0xFFFFFFF0, 32)) == true, "still consistent under overflow");
+        // exact below the ceiling (regression).
+        assert(pending_after_settle(1000, 500) == 1500, "normal accumulation is exact");
+    }
+
+    // total3 with outstanding as the escrow bucket is the node's full holdings, and
+    // a single-task escrow-then-release round-trips it -- the same conservation the
+    // pending model has, now on the multi-task counter.
+    test total_conserved_over_outstanding_cycle {
+        o0 = outstanding_after_escrow(0, 16);
+        t_mid = total3(800, 200, o0);
+        o1 = outstanding_after_release(o0, 16);
+        t_end = total3(800 + 16, 200, o1);
+        assert(t_mid == total3(800, 200, 16), "mid-flight holdings count the at-risk 16");
+        assert(t_end == t_mid, "finalize (outstanding -> balance) conserves total holdings");
+    }
+}

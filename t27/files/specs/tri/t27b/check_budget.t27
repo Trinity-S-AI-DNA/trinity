@@ -1,0 +1,205 @@
+module T27bCheckBudget;
+// How much reference-interpreter work `t27b test --check` may spend on one
+// file (gHashTag/t27#6664, Refs #6063). Owner's order, 2026-10-06: the policy
+// is written in t27. cli/t27b loads the `t27c gen-rust` output of this file
+// (gen/rust/tri/t27b/check_budget.rs) and only calls these functions.
+//
+// The problem. `t27b corpus` runs each file as `t27b test <file> --check`
+// with a 60 s timeout (one sequential retry, same timeout). `--check` re-runs
+// every test and invariant in t27b's interpreter, with a fuel of 50,000,000
+// steps PER TEST. A test that spends all of it stops on Stop::Fuel, which is
+// agreement with the JIT and prints `runtime asserts unknown`: the whole fuel
+// is spent and nothing is proven. Under qemu-aarch64 on the lab one
+// fuel-bound test costs about 31 s (repro in #6664: 31.8 s with --check,
+// 1.1 s without, so 50e6 steps in about 30.7 s, ~614 ns per step). Two such
+// tests in one file exceed the timeout. Measured on the lab, master binary,
+// one file at a time (#6664):
+//
+//   spec            test (JIT only)   test --check
+//   kernel_fib           1.2 s           112 s
+//   kernel_matmul        4.6 s           105 s
+//   kernel_ternary       1.1 s           115 s
+//   d_g22_test          29.8 s          65.8 s
+//
+// The three options #6664 lists, and why this file picks the first:
+//   1. A fuel budget per FILE instead of per test. Deterministic: the same
+//      file gets the same verdict, the same `runtime asserts` line, on an
+//      idle Mac or a loaded lab. Its cost is bounded by steps * step cost.
+//   2. A wall-clock budget derived from --timeout-ms. Rejected: whether the
+//      interpreter finishes would depend on host load (the lab's load average
+//      was ~60 on 48 CPUs from neighbours), so a file's `runtime asserts`
+//      count, and with it pass vs pass_vacuous, could flip between two runs
+//      of unchanged code -- the very drift #6664 reports.
+//   3. A longer retry timeout in lab.py. Rejected: it bounds nothing (the
+//      kernels need 105-115 s, so 3x only hides them until they grow) and
+//      costs up to 3 min of lab time per file on every run.
+//
+// The number. With a per-file budget F, a file costs at most
+// jit + min(interp, F * 614 ns). The slowest JIT of the four is d_g22_test,
+// 29.8 s; keeping it under 3/4 of the 60 s timeout (a 25% margin for load)
+// allows F <= (45000 - 29800) ms / 614 ns = 24.7e6 steps. FILE_FUEL is 20e6,
+// about 12.3 s under qemu and well under a second natively. A file whose
+// interpreter work finishes within 20e6 steps sees no change at all; past it,
+// the remaining tests keep their JIT verdict and the file reports `runtime
+// asserts unknown`, exactly what Stop::Fuel already produced per test.
+//
+// Not here: the interpreter, the clock, the process timeout. Those are Rust
+// in cli/t27b; this file only decides numbers.
+// phi^2 + 1/phi^2 = 3 | TRINITY
+
+/// Interpreter steps one file may spend under --check, over all its tests
+/// and invariants together.
+pub const FILE_FUEL : u64 = 20000000;
+
+/// Interpreter steps one test may spend at most (cli/t27b eval.rs default).
+pub const TEST_FUEL : u64 = 50000000;
+
+/// Measured cost of one interpreter step under qemu on the lab, in ns (#6664).
+pub const LAB_STEP_NS : u64 = 614;
+
+/// The corpus per-file timeout the lab runs with, in ms.
+pub const LAB_TIMEOUT_MS : u64 = 60000;
+
+/// Fuel granted to the next test when `left` steps of the file budget remain.
+pub fn test_fuel(left: u64) -> u64 {
+    if (left < TEST_FUEL) { return left; }
+    return TEST_FUEL;
+}
+
+/// File budget left after a test that was granted test_fuel(left) and
+/// stopped with `after` fuel unspent. Never wraps.
+pub fn spend(left: u64, after: u64) -> u64 {
+    const granted: u64 = test_fuel(left);
+    if (after >= granted) { return left; }
+    const used: u64 = granted - after;
+    if (used >= left) { return 0; }
+    return left - used;
+}
+
+/// Interpreter time, in ms, of `steps` steps at `step_ns` per step.
+pub fn steps_ms(steps: u64, step_ns: u64) -> u64 {
+    return (steps / 1000) * step_ns / 1000;
+}
+
+/// Predicted `test --check` time of a file in ms: its JIT time plus its
+/// interpreter time, cut at `fuel` steps.
+pub fn predicted_ms(jit_ms: u64, interp_ms: u64, fuel: u64, step_ns: u64) -> u64 {
+    const cap: u64 = steps_ms(fuel, step_ns);
+    if (interp_ms < cap) { return jit_ms + interp_ms; }
+    return jit_ms + cap;
+}
+
+/// True when a predicted time leaves a 25% margin under the timeout.
+pub fn fits(predicted: u64, timeout_ms: u64) -> bool {
+    return predicted * 4 <= timeout_ms * 3;
+}
+
+/// The largest per-file fuel that keeps a file whose JIT takes `worst_jit_ms`
+/// inside fits(); 0 when the JIT alone does not fit.
+pub fn max_file_fuel(timeout_ms: u64, worst_jit_ms: u64, step_ns: u64) -> u64 {
+    const room: u64 = timeout_ms * 3 / 4;
+    if (worst_jit_ms >= room) { return 0; }
+    return (room - worst_jit_ms) * 1000000 / step_ns;
+}
+
+test budget_is_inside_the_bound {
+    assert_eq(max_file_fuel(LAB_TIMEOUT_MS, 29800, LAB_STEP_NS), 24755700);
+    assert(FILE_FUEL <= max_file_fuel(LAB_TIMEOUT_MS, 29800, LAB_STEP_NS));
+    assert(FILE_FUEL <= TEST_FUEL);
+}
+
+test budget_costs_about_twelve_seconds_under_qemu {
+    assert_eq(steps_ms(FILE_FUEL, LAB_STEP_NS), 12280);
+    assert_eq(steps_ms(TEST_FUEL, LAB_STEP_NS), 30700);
+}
+
+// The four measured cases of #6664: interpreter time = (--check) - (JIT only).
+// Under the old per-test fuel the interpreter runs to its measured end and the
+// file times out; under FILE_FUEL every one of them fits.
+test kernel_fib_measured {
+    assert_eq(predicted_ms(1200, 110800, 4 * TEST_FUEL, LAB_STEP_NS), 112000);
+    assert(fits(112000, LAB_TIMEOUT_MS) == false);
+    assert_eq(predicted_ms(1200, 110800, FILE_FUEL, LAB_STEP_NS), 13480);
+    assert(fits(predicted_ms(1200, 110800, FILE_FUEL, LAB_STEP_NS), LAB_TIMEOUT_MS));
+}
+
+test kernel_matmul_measured {
+    assert_eq(predicted_ms(4600, 100400, 4 * TEST_FUEL, LAB_STEP_NS), 105000);
+    assert(fits(105000, LAB_TIMEOUT_MS) == false);
+    assert_eq(predicted_ms(4600, 100400, FILE_FUEL, LAB_STEP_NS), 16880);
+    assert(fits(predicted_ms(4600, 100400, FILE_FUEL, LAB_STEP_NS), LAB_TIMEOUT_MS));
+}
+
+test kernel_ternary_measured {
+    assert_eq(predicted_ms(1100, 113900, 4 * TEST_FUEL, LAB_STEP_NS), 115000);
+    assert(fits(115000, LAB_TIMEOUT_MS) == false);
+    assert_eq(predicted_ms(1100, 113900, FILE_FUEL, LAB_STEP_NS), 13380);
+    assert(fits(predicted_ms(1100, 113900, FILE_FUEL, LAB_STEP_NS), LAB_TIMEOUT_MS));
+}
+
+test d_g22_test_measured {
+    assert_eq(predicted_ms(29800, 36000, 4 * TEST_FUEL, LAB_STEP_NS), 65800);
+    assert(fits(65800, LAB_TIMEOUT_MS) == false);
+    assert_eq(predicted_ms(29800, 36000, FILE_FUEL, LAB_STEP_NS), 42080);
+    assert(fits(predicted_ms(29800, 36000, FILE_FUEL, LAB_STEP_NS), LAB_TIMEOUT_MS));
+}
+
+test cheap_file_is_unchanged {
+    // A file whose interpreter work ends inside the budget costs what it did.
+    assert_eq(predicted_ms(100, 2000, FILE_FUEL, LAB_STEP_NS), 2100);
+}
+
+test first_test_gets_the_per_test_cap {
+    assert_eq(test_fuel(FILE_FUEL), FILE_FUEL);
+    assert_eq(test_fuel(TEST_FUEL + 1), TEST_FUEL);
+    assert_eq(test_fuel(7), 7);
+    assert_eq(test_fuel(0), 0);
+}
+
+test spend_charges_used_steps {
+    assert_eq(spend(FILE_FUEL, FILE_FUEL - 1000), FILE_FUEL - 1000);
+    assert_eq(spend(FILE_FUEL, 0), 0);
+    assert_eq(spend(1000, 1000), 1000);
+    assert_eq(spend(0, 0), 0);
+}
+
+test spend_never_wraps {
+    assert_eq(spend(10, 20), 10);
+    assert_eq(spend(TEST_FUEL * 2, 0), TEST_FUEL);
+}
+
+test fuel_bound_file_spends_the_budget_once {
+    // Four fuel-bound tests, as in the kernels: the first spends the whole
+    // file budget, the other three are granted nothing.
+    const a: u64 = spend(FILE_FUEL, 0);
+    assert_eq(a, 0);
+    assert_eq(test_fuel(a), 0);
+    assert_eq(spend(a, 0), 0);
+}
+
+test jit_too_slow_allows_no_fuel {
+    assert_eq(max_file_fuel(LAB_TIMEOUT_MS, 45000, LAB_STEP_NS), 0);
+    assert_eq(max_file_fuel(LAB_TIMEOUT_MS, 50000, LAB_STEP_NS), 0);
+}
+
+invariant grant_never_exceeds_budget_or_cap {
+    assert(test_fuel(FILE_FUEL) <= FILE_FUEL);
+    assert(test_fuel(FILE_FUEL) <= TEST_FUEL);
+    assert(test_fuel(3) <= 3);
+    assert(test_fuel(TEST_FUEL * 3) <= TEST_FUEL);
+}
+
+invariant spend_never_grows_the_budget {
+    assert(spend(FILE_FUEL, 0) <= FILE_FUEL);
+    assert(spend(FILE_FUEL, FILE_FUEL) <= FILE_FUEL);
+    assert(spend(5, 99) <= 5);
+}
+
+invariant every_measured_case_fits {
+    assert(fits(predicted_ms(1200, 110800, FILE_FUEL, LAB_STEP_NS), LAB_TIMEOUT_MS));
+    assert(fits(predicted_ms(4600, 100400, FILE_FUEL, LAB_STEP_NS), LAB_TIMEOUT_MS));
+    assert(fits(predicted_ms(1100, 113900, FILE_FUEL, LAB_STEP_NS), LAB_TIMEOUT_MS));
+    assert(fits(predicted_ms(29800, 36000, FILE_FUEL, LAB_STEP_NS), LAB_TIMEOUT_MS));
+}
+
+endmodule

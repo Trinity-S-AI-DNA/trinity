@@ -1,0 +1,357 @@
+// SPDX-License-Identifier: Apache-2.0
+// t27/specs/tri/utils/template.t27
+// {{variable}} syntax | φ² + 1/φ² = 3 | TRINITY
+// Restored 2026-10-06 from trinity specs/tri/tri_template.tri. The port was
+// a stub: compile built an empty template and threw it away, render
+// discarded every part, and both tests claimed only
+// `result != undefined`. The .tri: Template { parts: []TemplatePart },
+// TemplatePart { is_literal: bool, text, variable: []const u8 };
+// compile(source, allocator) -> !Template, "Compile template";
+// render(template, context: StringHashMap([]const u8), allocator) ->
+// ![]u8, "Render template with context"; behaviour variables,
+// "{{variable}} syntax", "Double brace delimiters".
+// The language is the part of Jinja2 (3.1, Environment(
+// keep_trailing_newline=True), the oracle) the .tri names: text, and
+// "{{" name "}}" with optional spaces, tabs or newlines inside the braces,
+// a name being [A-Za-z_][A-Za-z0-9_]*. compile refuses everything else
+// Jinja would read as code -- "{%", "{#", a filter, an attribute, a
+// literal, an unclosed "{{" -- and the names Jinja reads as constants
+// (true, false, none, True, False, None) or as an operator (not). A
+// lone "{" or "}}" is text, as in Jinja. Without an allocator, compile fills a caller []TemplatePart
+// (slices of the source) and returns the count, NONE when refused or out
+// of room; render takes the context as a list of name/value entries
+// (the first equal name wins), writes into a caller buffer and
+// returns the length, NONE when out is short. A name the context lacks
+// renders as "", Jinja's default Undefined. A value is copied as is,
+// never expanded again and never escaped. Declared, not checked: Jinja
+// rewrites "\r\n" in text to "\n"; this keeps the bytes (no vector
+// carries a "\r").
+
+module TriTemplate;
+    use base::types;
+
+    // ═══════════════════════════════════════════════════════════
+    // 1. Types
+    // ═══════════════════════════════════════════════════════════
+
+    pub const TemplatePart = struct {
+        is_literal : bool,
+        text : []const u8,
+        variable : []const u8,
+    };
+
+    // one name of the context and its value (the .tri's StringHashMap
+    // entry; a slice of slices cannot be a parameter yet, #6669)
+    pub const TemplateEntry = struct {
+        name : []const u8,
+        value : []const u8,
+    };
+
+    pub const Template = struct {
+        parts : []TemplatePart,
+    };
+
+    pub const NONE : usize = 18446744073709551615;
+
+    // ═══════════════════════════════════════════════════════════
+    // 2. compile
+    // ═══════════════════════════════════════════════════════════
+
+    fn name_start(c: u8) -> bool {
+        return (c >= 65 and c <= 90) or (c >= 97 and c <= 122) or c == 95;
+    }
+
+    fn name_char(c: u8) -> bool {
+        return name_start(c) or (c >= 48 and c <= 57);
+    }
+
+    fn blank(c: u8) -> bool {
+        return c == 32 or c == 9 or c == 10;
+    }
+
+    fn same(a: []const u8, b: []const u8) -> bool {
+        if (a.len != b.len) {
+            return false;
+        }
+        var i : usize = 0;
+        while (i < a.len) {
+            if (a[i] != b[i]) {
+                return false;
+            }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    fn reserved(n: []const u8) -> bool {
+        return same(n, "not") or same(n, "true") or same(n, "false") or same(n, "none") or same(n, "True") or same(n, "False") or same(n, "None");
+    }
+
+    fn literal(s: []const u8, a: usize, b: usize) -> TemplatePart {
+        return TemplatePart{ .is_literal = true, .text = s[a .. b], .variable = "" };
+    }
+
+    fn compile(source: []const u8, parts: []TemplatePart) -> usize {
+        var n : usize = 0;
+        var start : usize = 0;
+        var i : usize = 0;
+        while (i < source.len) {
+            if (source[i] != 123 or i + 1 >= source.len) {
+                i = i + 1;
+            } else if (source[i + 1] == 37 or source[i + 1] == 35) {
+                return NONE;
+            } else if (source[i + 1] != 123) {
+                i = i + 1;
+            } else {
+                var j = i + 2;
+                while (j < source.len and blank(source[j])) {
+                    j = j + 1;
+                }
+                const a = j;
+                if (j >= source.len or name_start(source[j]) == false) {
+                    return NONE;
+                }
+                while (j < source.len and name_char(source[j])) {
+                    j = j + 1;
+                }
+                const b = j;
+                while (j < source.len and blank(source[j])) {
+                    j = j + 1;
+                }
+                if (j + 1 >= source.len or source[j] != 125 or source[j + 1] != 125 or reserved(source[a .. b])) {
+                    return NONE;
+                }
+                if (start < i) {
+                    if (n >= parts.len) {
+                        return NONE;
+                    }
+                    parts[n] = literal(source, start, i);
+                    n = n + 1;
+                }
+                if (n >= parts.len) {
+                    return NONE;
+                }
+                parts[n] = TemplatePart{ .is_literal = false, .text = "", .variable = source[a .. b] };
+                n = n + 1;
+                i = j + 2;
+                start = i;
+            }
+        }
+        if (start < source.len) {
+            if (n >= parts.len) {
+                return NONE;
+            }
+            parts[n] = literal(source, start, source.len);
+            n = n + 1;
+        }
+        return n;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // 3. render
+    // ═══════════════════════════════════════════════════════════
+
+    fn copy(out: []u8, at: usize, s: []const u8) -> usize {
+        if (at == NONE or at + s.len > out.len) {
+            return NONE;
+        }
+        var k : usize = 0;
+        while (k < s.len) {
+            out[at + k] = s[k];
+            k = k + 1;
+        }
+        return at + s.len;
+    }
+
+    fn lookup(name: []const u8, context: []const TemplateEntry) -> []const u8 {
+        var k : usize = 0;
+        while (k < context.len) {
+            if (same(context[k].name, name)) {
+                return context[k].value;
+            }
+            k = k + 1;
+        }
+        return "";
+    }
+
+    fn render(template: Template, context: []const TemplateEntry, out: []u8) -> usize {
+        var at : usize = 0;
+        var k : usize = 0;
+        while (k < template.parts.len) {
+            const p = template.parts[k];
+            if (p.is_literal) {
+                at = copy(out, at, p.text);
+            } else {
+                at = copy(out, at, lookup(p.variable, context));
+            }
+            k = k + 1;
+        }
+        return at;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // TDD: vectors from Jinja2 3.1 (Environment(keep_trailing_newline=
+    // True).from_string(src).render(ctx)); a refused source is one Jinja
+    // either rejects or reads as more than text and names
+    // ═══════════════════════════════════════════════════════════
+
+    // ctx is "name=value;name=value"; a value holds no ";"
+    fn renders(src: []const u8, ctx: []const u8, want: []const u8) -> usize {
+        var parts : [16]TemplatePart = [TemplatePart{ .is_literal = true, .text = "", .variable = "" }] ** 16;
+        const n = compile(src, &parts);
+        if (n == NONE) {
+            return 0;
+        }
+        var context : [4]TemplateEntry = [TemplateEntry{ .name = "", .value = "" }] ** 4;
+        var m : usize = 0;
+        var a : usize = 0;
+        var i : usize = 0;
+        while (i <= ctx.len and ctx.len > 0) {
+            if (i == ctx.len or ctx[i] == 59) {
+                var e = a;
+                while (ctx[e] != 61) {
+                    e = e + 1;
+                }
+                context[m] = TemplateEntry{ .name = ctx[a .. e], .value = ctx[e + 1 .. i] };
+                m = m + 1;
+                a = i + 1;
+            }
+            i = i + 1;
+        }
+        var out : [96]u8 = [0] ** 96;
+        const t = Template{ .parts = parts[0 .. n] };
+        const r = render(t, context[0 .. m], &out);
+        if (r != NONE and same(out[0 .. r], want)) {
+            return 1;
+        }
+        return 0;
+    }
+
+    fn refused(src: []const u8) -> usize {
+        var parts : [16]TemplatePart = [TemplatePart{ .is_literal = true, .text = "", .variable = "" }] ** 16;
+        if (compile(src, &parts) == NONE) {
+            return 1;
+        }
+        return 0;
+    }
+
+    fn rendered() -> usize {
+        var ok : usize = 0;
+        ok = ok + renders("Hello, {{name}}!", "name=World", "Hello, World!");
+        ok = ok + renders("{{ a }}{{b}}", "a=1;b=2", "12");
+        ok = ok + renders("no braces", "x=1", "no braces");
+        ok = ok + renders("", "", "");
+        ok = ok + renders("{{x}}", "x=", "");
+        ok = ok + renders("{{x}}", "x={{y}};y=no", "{{y}}");
+        ok = ok + renders("{ {x} }", "x=1", "{ {x} }");
+        ok = ok + renders("a}}b", "a=1", "a}}b");
+        ok = ok + renders("{{x}}}", "x=v", "v}");
+        ok = ok + renders("{x}}", "x=v", "{x}}");
+        ok = ok + renders("{", "x=1", "{");
+        ok = ok + renders("a{", "x=1", "a{");
+        ok = ok + renders("{{a9}}-{{ z_9 }}", "a9=q;z_9=w", "q-w");
+        ok = ok + renders("{{\tx\n}}", "x=tab", "tab");
+        ok = ok + renders("{{ missing }}", "x=1", "");
+        ok = ok + renders("[{{_a1}}]", "_a1=ok", "[ok]");
+        ok = ok + renders("{{A}}{{a}}", "A=up;a=lo", "uplo");
+        ok = ok + renders("line\n{{x}}\n", "x=y", "line\ny\n");
+        ok = ok + renders("{{x}}{{x}}{{x}}", "x=ab", "ababab");
+        ok = ok + renders("{{and}}", "and=1", "1");
+        ok = ok + renders("{{if}}", "if=1", "1");
+        ok = ok + renders("{{x}}{{y}}", "y=only", "only");
+        ok = ok + renders("{{x}}", "x=a=b", "a=b");
+        ok = ok + renders("p{{q}}r{{s}}t", "q=Q;s=S", "pQrSt");
+        ok = ok + renders("{{TRUE}}", "TRUE=t", "t");
+        ok = ok + renders("{{nonex}}", "nonex=n", "n");
+        ok = ok + renders("{{nota}}", "nota=1", "1");
+        ok = ok + renders("{{in}}{{is}}{{or}}", "in=1;is=2;or=3", "123");
+        return ok;
+    }
+
+    fn not_templates() -> usize {
+        var ok : usize = 0;
+        ok = ok + refused("{{");
+        ok = ok + refused("{{a}x}");
+        ok = ok + refused("{{a} }}");
+        ok = ok + refused("a{{");
+        ok = ok + refused("{{x");
+        ok = ok + refused("{{x}");
+        ok = ok + refused("{{ x }");
+        ok = ok + refused("{{x y}}");
+        ok = ok + refused("{{x.y}}");
+        ok = ok + refused("{{x|e}}");
+        ok = ok + refused("{{ x[0] }}");
+        ok = ok + refused("{{1}}");
+        ok = ok + refused("{{ 1x }}");
+        ok = ok + refused("{{x-1}}");
+        ok = ok + refused("{%if x%}{%endif%}");
+        ok = ok + refused("{# c #}");
+        ok = ok + refused("a{%");
+        ok = ok + refused("{#");
+        ok = ok + refused("{{true}}");
+        ok = ok + refused("{{None}}");
+        ok = ok + refused("{{ none }}");
+        ok = ok + refused("{{False}}");
+        ok = ok + refused("{{{x}}}");
+        ok = ok + refused("{{}}");
+        ok = ok + refused("{{ }}");
+        ok = ok + refused("{{x}}{%");
+        ok = ok + refused("{{\"s\"}}");
+        ok = ok + refused("{{x()}}");
+        ok = ok + refused("{{-x}}");
+        ok = ok + refused("{{x-}}");
+        ok = ok + refused("ok {{x}} then {{");
+        ok = ok + refused("{{not}}");
+        ok = ok + refused("{{ not }}");
+        ok = ok + refused("{{not x}}");
+        return ok;
+    }
+
+    // the parts compile makes, and the buffers it and render refuse
+    fn shapes() -> usize {
+        var ok : usize = 0;
+        var parts : [3]TemplatePart = [TemplatePart{ .is_literal = true, .text = "", .variable = "" }] ** 3;
+        const n = compile("ab{{ x }}c", &parts);
+        if (n == 3 and parts[0].is_literal and same(parts[0].text, "ab") and parts[1].is_literal == false and same(parts[1].variable, "x") and parts[2].is_literal and same(parts[2].text, "c")) {
+            ok = ok + 1;
+        }
+        if (compile("{{a}}{{b}}", &parts) == 2 and same(parts[1].variable, "b")) {
+            ok = ok + 1;
+        }
+        if (compile("", &parts) == 0) {
+            ok = ok + 1;
+        }
+        if (compile("a{{b}}c{{d}}", &parts) == NONE and compile("{{a}}b{{c}}d", &parts) == NONE) {
+            ok = ok + 1;
+        }
+        if (compile("{{a}}{{b}}{{c}}{{d}}", &parts) == NONE and compile("{{a}}{{b}}{{c}}d{{e}}", &parts) == NONE) {
+            ok = ok + 1;
+        }
+        var out : [4]u8 = [0] ** 4;
+        var context : [1]TemplateEntry = [TemplateEntry{ .name = "v", .value = "xyz" }] ** 1;
+        if (compile("{{v}}{{ v }}", &parts) == 2 and render(Template{ .parts = parts[0 .. 2] }, &context, &out) == NONE) {
+            ok = ok + 1;
+        }
+        if (compile("{{v}}{{v}}y", &parts) == 3 and render(Template{ .parts = parts[0 .. 3] }, &context, &out) == NONE) {
+            ok = ok + 1;
+        }
+        if (compile("{{v}}y", &parts) == 2 and render(Template{ .parts = parts[0 .. 2] }, &context, &out) == 4 and same(out[0 .. 4], "xyzy")) {
+            ok = ok + 1;
+        }
+        return ok;
+    }
+
+    test templates_render_as_jinja2_renders_them
+        given result = rendered()
+        when expected = 28
+        then result == expected
+
+    test code_jinja2_would_run_is_refused
+        given result = not_templates()
+        when expected = 34
+        then result == expected
+
+    test compile_parts_and_short_buffers
+        given result = shapes()
+        when expected = 8
+        then result == expected

@@ -1,0 +1,138 @@
+module TrinityFpgaWbArbiterT27;
+
+// Arbiter of UberDDR3's single user Wishbone port between two masters (issue #63,
+// part 2; the seam of #64: the loader writes the weights, a device reader or matvec
+// reads them). Master 0 is the UART loader's Wishbone master
+// (t27/rtl/fpga_loader_wb.t27), master 1 any other (in simulation the #62 burst
+// reader, t27/rtl/fpga_ddr3_reader.t27).
+//
+// Each master presents cyc (it wants the port: for the loader a chunk or a read in
+// progress, for a master that holds cyc high for ever, such as the #62 reader, the
+// wiring passes its stb), stb, we, a burst address, 16 byte selects and the 128-bit
+// data as two u64 halves. One master owns the port (owner, a register). The owner's
+// request goes to the controller; the other master sees stall high, so its request
+// waits unchanged (the Wishbone rule), and it sees no ack. The arbiter counts the
+// owner's requests taken and not yet acknowledged (outst); UberDDR3 acknowledges in
+// order, so every ack belongs to the owner's oldest request. Ownership changes only
+// on a clock where the owner does not want the port (cyc low), nothing of it is
+// outstanding and the other master wants the port; the new owner's request reaches
+// the controller from the next clock on. So a master keeps the port for a whole
+// chunk or phase, and every ack reaches the master that issued its request. An ack
+// with nothing outstanding is counted as stray and passed to the owner.
+// preempt_read1 optionally drains a continuously busy read-only master 1 when
+// master 0 is waiting; the default board wiring leaves this disabled.
+// cyc to the controller is always high (as the #61/#62 builds drive it): UberDDR3
+// then never drops a request in flight.
+// `m1_write` (to master 0's `invalidate`): master 1 had a write taken, so a word the
+// loader keeps may be stale.
+// Every statement of on_clock reads a variable before the same tick writes it.
+var owner: u32 = 0;
+var draining1: bool = false;
+var outst: u32 = 0;
+var switches: u32 = 0;
+var stray: u32 = 0;
+var max_outst: u32 = 0;
+var waits0: u32 = 0;
+var waits1: u32 = 0;
+var taken0: u32 = 0;
+var taken1: u32 = 0;
+
+fn pick(sel: bool, x: u32, y: u32) -> u32 {
+    if (sel) { return x; }
+    return y;
+}
+
+fn pick64(sel: bool, x: u64, y: u64) -> u64 {
+    if (sel) { return x; }
+    return y;
+}
+
+fn pickb(sel: bool, x: bool, y: bool) -> bool {
+    if (sel) { return x; }
+    return y;
+}
+
+// The outstanding count after this clock: + a request taken, - an ack (an ack while nothing
+// is outstanding, `ack` false here, is stray and changes nothing). n + 1 and n - 1 come from the
+// registered count; `taken` (which follows UberDDR3's o_wb_stall within the clock) only selects,
+// so no adder sits between the controller's stall and a register (the routed critical path of
+// the first netlist ran from o_wb_stall through such an adder and a compare).
+fn out_sel(taken: bool, ack: bool, n: u32, inc: u32, dec: u32) -> u32 {
+    if (taken && !ack) { return inc; }
+    if (!taken && ack) { return dec; }
+    return n;
+}
+
+var own0: bool;
+var cyc: bool;
+var stb: bool;
+var we: bool;
+var addr: u32;
+var sel: u32;
+var lo: u64;
+var hi: u64;
+var m0_stall: bool;
+var m1_stall: bool;
+var m0_ack: bool;
+var m1_ack: bool;
+var taken: bool;
+var own_cyc: bool;
+var other_cyc: bool;
+var handover: bool;
+var out_next: u32;
+var ack_counted: bool;
+var out_inc: u32;
+var out_dec: u32;
+var m1_write: bool;
+own0 = owner == 0;
+cyc = true;
+stb = pickb(own0, m0_stb, m1_stb && !draining1);
+we = pickb(own0, m0_we, m1_we);
+addr = pick(own0, m0_addr, m1_addr);
+sel = pick(own0, m0_sel, m1_sel);
+lo = pick64(own0, m0_lo, m1_lo);
+hi = pick64(own0, m0_hi, m1_hi);
+m0_stall = !own0 || wb_stall;
+m1_stall = own0 || wb_stall || draining1;
+m0_ack = own0 && wb_ack;
+m1_ack = !own0 && wb_ack;
+taken = stb && !wb_stall;
+own_cyc = pickb(own0, m0_cyc, m1_cyc);
+other_cyc = pickb(own0, m1_cyc, m0_cyc);
+handover = (!own_cyc || draining1) && outst == 0 && other_cyc;
+ack_counted = wb_ack && outst != 0;
+out_inc = outst + 1;
+out_dec = outst - 1;
+out_next = out_sel(taken, ack_counted, outst, out_inc, out_dec);
+m1_write = !own0 && taken && m1_we;
+
+fn on_clock(m0_cyc: bool, m0_stb: bool, m0_we: bool, m0_addr: u32, m0_sel: u32, m0_lo: u64, m0_hi: u64,
+            m1_cyc: bool, m1_stb: bool, m1_we: bool, m1_addr: u32, m1_sel: u32, m1_lo: u64, m1_hi: u64,
+            wb_stall: bool, wb_ack: bool, preempt_read1: bool) {
+    if (wb_ack && outst == 0) { stray = stray + 1; }
+    if (outst > max_outst) { max_outst = outst; }
+    outst = out_next;
+    if (taken && own0) { taken0 = taken0 + 1; }
+    if (taken && !own0) { taken1 = taken1 + 1; }
+    if (m0_stb && !own0) { waits0 = waits0 + 1; }
+    if (m1_stb && own0) { waits1 = waits1 + 1; }
+    // A faster read-only consumer can keep requests outstanding continuously.
+    // Give master 0 a turn without withdrawing a request stalled at the DDR3
+    // port: start draining only after an acceptance or a clock with no strobe.
+    // All old acks still go to master 1 until its outstanding count is zero.
+    // This opt-in applies only to read-only master 1; master 0's chunks remain
+    // uninterrupted. The matvec wiring enables it with compute_pipeline.
+    if (preempt_read1 && !own0 && m0_cyc && !m1_we && (!stb || taken)) {
+        draining1 = true;
+    }
+    if (own0 || !m0_cyc) { draining1 = false; }
+    if (handover) {
+        draining1 = false;
+        owner = pick(own0, 1, 0);
+        switches = switches + 1;
+    }
+}
+
+test select { assert_eq(pick(true, 1, 2), 1); assert_eq(pick64(false, 1, 2), 2); assert_eq(pickb(false, true, false), false); }
+test outstanding { assert_eq(out_sel(true, false, 0, 1, 0), 1); assert_eq(out_sel(false, true, 1, 2, 0), 0); assert_eq(out_sel(true, true, 3, 4, 2), 3); }
+endmodule

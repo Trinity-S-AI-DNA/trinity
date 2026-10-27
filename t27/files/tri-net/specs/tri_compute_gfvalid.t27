@@ -1,0 +1,273 @@
+// TRI-NET GoldenFloat validity, generalised across the GF family. The settle
+// gate's is_finite_gf16 was hardcoded to GF16 (exp field == 0x3F): it silently
+// passes inf/nan from GF4/GF8/GF14/GF20+ results, so garbage compute in any
+// non-GF16 format could be paid. A GF value is special (inf/nan) exactly when its
+// exponent field is all-ones; the field's width/position is per-format:
+//   GF4  E1 M2 | GF8 E3 M4 | GF12 E4 M7 | GF14 E5 M8 | GF16 E6 M9 | GF20 E7 M12
+// (from the phi-rule split e = round((N-1)/phi^2), m = N-1-e).
+
+module TriComputeGfValid {
+    use base::types;
+
+    // A GF result is FINITE iff its exponent field (exp_bits wide, sitting just
+    // above the mant_bits mantissa) is not all-ones.
+    fn is_finite_gf(result: u32, exp_bits: u32, mant_bits: u32) -> bool {
+        let exp_mask: u32 = (1 << exp_bits) - 1;
+        let exp: u32 = (result >> mant_bits) & exp_mask;
+        return exp != exp_mask;
+    }
+
+    // Canonically (gf_ref) ONLY GF16 reserves an all-ones exponent for Inf/NaN;
+    // every other GF width (GF4/GF8/GF12/...) uses EVERY exponent as a normal
+    // value. is_finite_gf above is the has_inf=1 case (correct for GF16 only) and
+    // would WRONGLY reject a valid max-exponent GF8 result as inf, paying zero.
+    // This gate takes the format's has_inf flag: with no special row, all finite.
+    fn is_finite_gf_h(result: u32, exp_bits: u32, mant_bits: u32, has_inf: u32) -> bool {
+        let exp_mask: u32 = (1 << exp_bits) - 1;
+        let exp: u32 = (result >> mant_bits) & exp_mask;
+        if (has_inf == 1) {
+            return exp != exp_mask;
+        } else {
+            return exp == exp;
+        }
+    }
+
+    // Format families the validity gate serves. Binary-exponent GF uses the
+    // all-ones-exponent rule above; GF-T16 (ternary-native) uses a balanced-
+    // ternary exponent whose reserved special row is a different value entirely,
+    // so it needs its own check -- a GF-T16 inf/nan would slip past is_finite_gf.
+    const FMT_GF_BINARY: u32 = 0;    // GF4..GF1024
+    const FMT_GFT16: u32 = 1;        // GF-T16, balanced-ternary exponent
+
+    // GF-T validity across the WHOLE ladder, not just width 16. A GF-T result
+    // (carried as its exponent offset) is special iff the offset hits the reserved
+    // row 3^Et - 1 for its exponent-trit count. is_finite_gft16 hardcoded Et=4
+    // (offset_max 80) and could not classify GF-T4/8/32. These three functions are
+    // byte-identical to tri_gft_ladder (gft_pow3/gft_offset_max/is_finite_gft_n),
+    // so the parallel GF-T ladder spec and this validity gate share ONE canonical
+    // finiteness rule -- a merge collapses the duplicate instead of reconciling two.
+    fn gft_pow3(exp_trits: u32) -> u32 {
+        if (exp_trits == 2) { return 9; }
+        if (exp_trits == 3) { return 27; }
+        if (exp_trits == 4) { return 81; }
+        if (exp_trits == 5) { return 243; }
+        if (exp_trits == 6) { return 729; }
+        if (exp_trits == 7) { return 2187; }
+        if (exp_trits == 8) { return 6561; }
+        if (exp_trits == 9) { return 19683; }      // GF-T64
+        if (exp_trits == 14) { return 4782969; }   // GF-T128 (largest 3^Et that fits u32)
+        return 0;
+    }
+
+    fn gft_offset_max(exp_trits: u32) -> u32 {
+        return gft_pow3(exp_trits) - 1;
+    }
+
+    // The GF-T ladder's exponent-trit count for a nominal rung WIDTH, per the RATIFIED
+    // golden (Fibonacci) rule Et = fib(k+1)+1 (tri_gft_ladder.width_to_et, the SSOT):
+    // GF-T4 -> 2, GF-T8 -> 3, GF-T16 -> 4, GF-T32 -> 6, GF-T64 -> 9, GF-T128 -> 14.
+    // (An earlier version used Et = log2(width); that coincides with fib+1 only through
+    // GF-T16 and wrongly gave GF-T32 -> 5. The silicon gft_mul32 uses bias 364 =
+    // (3^6-1)/2, i.e. Et 6 -- so log2 disagreed with the hardware.) Unknown width -> 0.
+    fn gft_exp_trits_for_width(width: u32) -> u32 {
+        if (width == 4) { return 2; }
+        if (width == 8) { return 3; }
+        if (width == 16) { return 4; }
+        if (width == 32) { return 6; }
+        if (width == 64) { return 9; }
+        if (width == 128) { return 14; }
+        return 0;
+    }
+
+    // The special-row offset_max DERIVED from the rung width, so a settlement can pin
+    // it to the ASSIGNMENT-bound width (tri_a2a.skill_width) instead of trusting a
+    // caller-supplied offset_max. If the runtime passed an executor-claimed offset_max
+    // into payable_flag, a claim of a huge ceiling would make the special/Inf row (and
+    // out-of-range garbage) test as payable; deriving it from the bound width closes
+    // that. FAIL-CLOSED: an unknown width yields offset_max 0 (nothing is < 0, so
+    // nothing is payable) -- never the gft_offset_max(0) = gft_pow3(0) - 1 = u32
+    // underflow to 0xFFFFFFFF, which would be fail-OPEN.
+    fn gft_offset_max_for_width(width: u32) -> u32 {
+        let et: u32 = gft_exp_trits_for_width(width);
+        if (et == 0) {
+            return 0;
+        } else {
+            return gft_offset_max(et);
+        }
+    }
+
+    // Finite iff the offset is below the reserved special row for its rung.
+    fn is_finite_gft_n(offset: u32, exp_trits: u32) -> bool {
+        return offset != gft_offset_max(exp_trits);
+    }
+
+    // Is the offset even a VALID encoding for this rung? A GF-T offset lives in
+    // 0 .. 3^Et - 1; anything at or above 3^Et is out of range. is_finite_gft_n
+    // uses `offset != offset_max`, so an OUT-OF-RANGE offset (> offset_max) would
+    // be classed FINITE -- a validity gate must reject it first. Byte-identical to
+    // tri_gft_ladder.gft_offset_in_range (canon), so the two never diverge; a
+    // caller checks range AND finiteness (both must hold for a payable GF-T value).
+    fn gft_offset_in_range(offset: u32, exp_trits: u32) -> bool {
+        return offset < gft_pow3(exp_trits);
+    }
+
+    // A GF-T value is PAYABLE iff it is BOTH in range (a valid encoding) AND finite
+    // (not the reserved special row). One gate so a caller never checks range and
+    // finiteness separately and forgets one -- an out-of-range offset (finite by
+    // is_finite_gft_n) or the special row (in range, not finite) both fail. The
+    // range test is inlined so the finiteness comparison stays a variable form.
+    fn is_valid_gft(offset: u32, exp_trits: u32) -> bool {
+        if (offset < gft_pow3(exp_trits)) {
+            return offset != gft_offset_max(exp_trits);
+        } else {
+            return offset != offset;
+        }
+    }
+
+    // GF-T16 validity: the Et=4 special case (offset_max 80 = 3^4 - 1). Kept as a
+    // thin alias for existing callers; delegates to the generalized rule.
+    const GFT16_OFFSET_MAX: u32 = 80;
+    fn is_finite_gft16(offset: u32) -> bool {
+        return is_finite_gft_n(offset, 4);
+    }
+
+    // Unified finiteness gate: route by the format FAMILY so a caller never has to
+    // pick between the binary (is_finite_gf_h) and GF-T (is_finite_gft_n) checks and
+    // risk choosing the wrong one -- a mis-picked gate would classify a GF-T offset
+    // by the binary all-ones rule (or vice versa) and pay garbage or reject a valid
+    // result. `value` is the binary bit-pattern for FMT_GF_BINARY, or the exponent
+    // offset for FMT_GFT16; the unused params are ignored on each branch.
+    fn is_finite_dispatch(fmt_family: u32, value: u32, exp_bits: u32, mant_bits: u32, has_inf: u32, exp_trits: u32) -> bool {
+        if (fmt_family == FMT_GFT16) {
+            return is_finite_gft_n(value, exp_trits);
+        } else {
+            return is_finite_gf_h(value, exp_bits, mant_bits, has_inf);
+        }
+    }
+
+    // ---- Tests / invariants ----
+
+    // GF16 (E6 M9): matches the old is_finite_gf16 exactly.
+    test gf16_specials {
+        assert(is_finite_gf(0x4200, 6, 9) == true, "GF16 4.0 finite");
+        assert(is_finite_gf(0x7E00, 6, 9) == false, "GF16 +inf (exp all-ones)");
+        assert(is_finite_gf(0x7E01, 6, 9) == false, "GF16 NaN");
+        assert(is_finite_gf(0xFE00, 6, 9) == false, "GF16 -inf");
+    }
+
+    // GF8 (E3 M4): inf/nan have the 3-bit exp == 7 (0x70 = 7<<4).
+    test gf8_specials {
+        assert(is_finite_gf(0x20, 3, 4) == true, "GF8 finite (exp=2)");
+        assert(is_finite_gf(0x70, 3, 4) == false, "GF8 +inf (exp=7, mant=0)");
+        assert(is_finite_gf(0x71, 3, 4) == false, "GF8 NaN (exp=7, mant!=0)");
+    }
+
+    // GF4 (E1 M2): the 1-bit exp == 1 is the special row (0x4 = 1<<2).
+    test gf4_specials {
+        assert(is_finite_gf(0x1, 1, 2) == true, "GF4 finite (exp=0)");
+        assert(is_finite_gf(0x4, 1, 2) == false, "GF4 special (exp=1)");
+    }
+
+    // GF14 (E5 M8): 5-bit exp == 31 is special (0x1F00 = 31<<8).
+    test gf14_specials {
+        assert(is_finite_gf(0x0100, 5, 8) == true, "GF14 finite (exp=1)");
+        assert(is_finite_gf(0x1F00, 5, 8) == false, "GF14 +inf (exp=31)");
+    }
+
+    // GF-T16 (ternary-native): the reserved offset 80 is special; a GF-T16 inf
+    // must NOT be classed finite by the binary rule (different family).
+    test gft16_specials {
+        assert(is_finite_gft16(40) == true, "GF-T16 unity exponent finite");
+        assert(is_finite_gft16(79) == true, "GF-T16 near-top finite");
+        assert(is_finite_gft16(80) == false, "GF-T16 offset 80 is special");
+    }
+
+    // The generalized rule classifies every confirmed rung by its own 3^Et-1
+    // special row, and is_finite_gft16 is exactly its Et=4 case.
+    test gft_ladder_finiteness {
+        assert(gft_offset_max(2) == 8, "GF-T4  special row = 3^2-1 = 8");
+        assert(gft_offset_max(3) == 26, "GF-T8  special row = 3^3-1 = 26");
+        assert(gft_offset_max(4) == 80, "GF-T16 special row = 3^4-1 = 80");
+        assert(gft_offset_max(6) == 728, "GF-T32 special row = 3^6-1 = 728 (Et6, golden rule)");
+        assert(gft_offset_max(9) == 19682, "GF-T64 special row = 3^9-1 = 19682");
+        assert(is_finite_gft_n(7, 2) == true, "GF-T4 offset 7 finite");
+        assert(is_finite_gft_n(8, 2) == false, "GF-T4 offset 8 is special");
+        assert(is_finite_gft_n(728, 6) == false, "GF-T32 offset 728 is special");
+        assert(is_finite_gft_n(242, 6) == true, "GF-T32 offset 242 is a NORMAL value (Et6), not special");
+        assert(is_finite_gft_n(80, 4) == is_finite_gft16(80), "the alias is the Et=4 case");
+        assert(is_finite_gft_n(40, 4) == is_finite_gft16(40), "alias agrees on finite too");
+    }
+
+    // The width-derived offset_max lets a settlement pin the special row to the
+    // ASSIGNMENT-bound width instead of trusting a caller-supplied ceiling. Each rung
+    // maps to its canonical offset_max, and an unknown width is FAIL-CLOSED at 0
+    // (never the gft_offset_max(0) u32 underflow).
+    test offset_max_from_width_is_bound_and_fail_closed {
+        assert(gft_exp_trits_for_width(8) == 3, "GF-T8 uses 3 exponent trits");
+        assert(gft_exp_trits_for_width(16) == 4, "GF-T16 uses 4 exponent trits");
+        assert(gft_offset_max_for_width(4) == 8, "GF-T4 special row via width");
+        assert(gft_offset_max_for_width(8) == 26, "GF-T8 special row via width");
+        assert(gft_offset_max_for_width(16) == 80, "GF-T16 special row via width");
+        assert(gft_offset_max_for_width(32) == 728, "GF-T32 special row via width (Et6, golden rule)");
+        assert(gft_offset_max_for_width(64) == 19682, "GF-T64 special row via width");
+        assert(gft_offset_max_for_width(128) == 4782968, "GF-T128 special row via width");
+        // width-derived offset_max agrees with the canonical rung constant.
+        assert(gft_offset_max_for_width(16) == gft_offset_max(4), "width 16 -> Et 4 -> 80");
+        assert(gft_offset_max_for_width(32) == gft_offset_max(6), "width 32 -> Et 6 -> 728");
+        // Unknown / crafted widths fail closed at 0, not the underflowed 0xFFFFFFFF.
+        assert(gft_offset_max_for_width(0) == 0, "width 0 -> fail-closed offset_max 0");
+        assert(gft_offset_max_for_width(7) == 0, "an off-ladder width -> fail-closed 0");
+        assert(gft_offset_max_for_width(4294967295) == 0, "a garbage width -> fail-closed 0, no underflow");
+    }
+
+    // has_inf gate: GF16 rejects all-ones exp (inf/nan); GF8 (no special row)
+    // treats the same all-ones exp as a NORMAL value -- the bug the flag fixes.
+    test has_inf_gate {
+        assert(is_finite_gf_h(0x7E00, 6, 9, 1) == false, "GF16 inf rejected (has_inf)");
+        assert(is_finite_gf_h(0x4200, 6, 9, 1) == true, "GF16 finite accepted");
+        assert(is_finite_gf_h(0x70, 3, 4, 0) == true, "GF8 max-exp is normal (no inf/nan)");
+        assert(is_finite_gf_h(0x70, 3, 4, 1) == false, "with has_inf it would (wrongly) reject");
+    }
+
+    // The unified dispatcher routes by family and agrees exactly with the
+    // underlying checks -- one gate, no wrong-check risk.
+    test dispatch_routes_by_family {
+        // Binary GF16 (has_inf): finite 0x4200, inf 0x7E00.
+        assert(is_finite_dispatch(FMT_GF_BINARY, 0x4200, 6, 9, 1, 0) == is_finite_gf_h(0x4200, 6, 9, 1), "GF16 finite via dispatch");
+        assert(is_finite_dispatch(FMT_GF_BINARY, 0x7E00, 6, 9, 1, 0) == false, "GF16 inf via dispatch -> not finite");
+        // Binary GF8 (no inf): max-exp is a normal value.
+        assert(is_finite_dispatch(FMT_GF_BINARY, 0x70, 3, 4, 0, 0) == true, "GF8 max-exp normal via dispatch");
+        // GF-T16 (Et=4): finite offset 40, special offset 80.
+        assert(is_finite_dispatch(FMT_GFT16, 40, 0, 0, 0, 4) == is_finite_gft_n(40, 4), "GF-T16 finite via dispatch");
+        assert(is_finite_dispatch(FMT_GFT16, 80, 0, 0, 0, 4) == false, "GF-T16 reserved offset via dispatch -> not finite");
+        // GF-T4 (Et=2): special row 8.
+        assert(is_finite_dispatch(FMT_GFT16, 8, 0, 0, 0, 2) == false, "GF-T4 special row 8 via dispatch");
+        assert(is_finite_dispatch(FMT_GFT16, 7, 0, 0, 0, 2) == true, "GF-T4 offset 7 finite via dispatch");
+    }
+
+    // Range validity is distinct from finiteness: valid offsets are 0..3^Et-1
+    // (offset_max included, the special row); anything >= 3^Et is out of range.
+    test gft_offset_range {
+        assert(gft_offset_in_range(0, 4) == true, "GF-T16 offset 0 in range");
+        assert(gft_offset_in_range(80, 4) == true, "GF-T16 offset_max 80 is a valid (special) encoding");
+        assert(gft_offset_in_range(81, 4) == false, "GF-T16 offset 81 (== 3^4) is out of range");
+        assert(gft_offset_in_range(8, 2) == true, "GF-T4 offset_max 8 in range");
+        assert(gft_offset_in_range(9, 2) == false, "GF-T4 offset 9 (== 3^2) out of range");
+        // The gap this closes: an out-of-range offset is classed FINITE by
+        // is_finite_gft_n but caught by the range gate.
+        assert(is_finite_gft_n(81, 4) == true, "is_finite alone WRONGLY calls out-of-range 81 finite");
+        assert(gft_offset_in_range(81, 4) == false, "...but the range gate rejects it");
+    }
+
+    // The single payable-GF-T gate: in-range AND finite in one call. Only offsets
+    // strictly below the reserved special row are payable.
+    test valid_gft_is_range_and_finite {
+        assert(is_valid_gft(0, 4) == true, "GF-T16 offset 0 is payable");
+        assert(is_valid_gft(79, 4) == true, "GF-T16 offset 79 (just below special) is payable");
+        assert(is_valid_gft(80, 4) == false, "GF-T16 special row 80 -> not payable (in range, not finite)");
+        assert(is_valid_gft(81, 4) == false, "GF-T16 offset 81 -> not payable (out of range)");
+        assert(is_valid_gft(7, 2) == true, "GF-T4 offset 7 payable");
+        assert(is_valid_gft(8, 2) == false, "GF-T4 special row 8 -> not payable");
+        assert(is_valid_gft(9, 2) == false, "GF-T4 offset 9 -> out of range, not payable");
+    }
+}

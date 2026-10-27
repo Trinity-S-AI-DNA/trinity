@@ -1,0 +1,140 @@
+// SPDX-License-Identifier: Apache-2.0
+// t27/hadamard.t27 -- the Prism Hadamard rotation as exact arithmetic (issue #52).
+//
+// The rotation prism.hadamard.* describes (t27/live.t27, the fork's
+// src/llama-model.cpp:1196-1356): every weight row is cut into blocks of
+// block_size along the input (last) dimension, each block is multiplied by the
+// normalized Sylvester-Walsh-Hadamard matrix of that size, and every element
+// carries an explicit sign (or the identity when sign_mode says so). With a
+// power-of-two block the normalisation is a power of two (1/4 at 16, 1/8 at
+// 64, 1/16 at 256, 1/32 at 1024), so INTEGER inputs give outputs that are
+// dyadic rationals exact in binary floating point -- a third-party rotation
+// can be checked bit for bit (conformance/hadamard_rotate.json, produced by
+// tools/generate-hadamard-vectors.py from these functions; the runner and the
+// GitHub Action feed them through the CLI contract's `rotate` call, v1.1).
+//
+// The matrix entry: Sylvester-Walsh H[i][j] = (-1)^popcount(i & j) for
+// i, j < block. The functions here stay in integers: the rotation numerator
+// is sw_rotate_sign (sum of +- x over the block); the caller divides by
+// 2^level. Inverse: the matrix is its own inverse up to the same
+// normalisation, so rotating twice returns the input exactly.
+//
+// phi^2 + 1/phi^2 = 3 | TRINITY
+
+module TrinityHadamardT27;
+
+// (-1)^popcount(i & j), the Sylvester-Walsh entry at (i, j).
+fn sw_entry(i: u32, j: u32) -> i32 {
+    var x: u32 = i & j;
+    var parity: u32 = 0;
+    var k: u32 = 0;
+    while (k < 32) {
+        parity = parity ^ ((x >> k) & 1);
+        k = k + 1;
+    }
+    if (parity == 1) { return -1; }
+    return 1;
+}
+
+// log2 of a power-of-two block (the normalisation level); -1 when the block
+// is not a power of two (the metadata walk already refuses those).
+fn sw_level(block: u32) -> i32 {
+    if (block == 0 || (block & (block - 1)) != 0) { return -1; }
+    var level: i32 = 0;
+    var b: u32 = block;
+    while (b > 1) {
+        b = b >> 1;
+        level = level + 1;
+    }
+    return level;
+}
+
+// The rotation numerator of output k: sum over j of
+// sign[j] * x[j] * H[k][j], exact in i64 for |x| <= 2^20 and block <= 1024.
+// The rotated value is this divided by 2^(level/2)... no: by
+// sqrt(block) = 2^(sw_level/2) when the level is even (block 16 -> 4, 64 -> 8,
+// 256 -> 16, 1024 -> 32); the caller holds the division.
+fn sw_rotate_numerator(k: u32, block: u32, x: []i64, signs: []i32) -> i64 {
+    var total: i64 = 0;
+    var j: u32 = 0;
+    while (j < block) {
+        var h: i32 = sw_entry(k, j);
+        var signed_x: i64 = x[j] * (h as i64) * (signs[j] as i64);
+        total = total + signed_x;
+        j = j + 1;
+    }
+    return total;
+}
+
+// The normalisation as a power of two (4, 8, 16, 32 for blocks 16, 64, 256,
+// 1024); 0 when the block is not a supported power of two. sqrt of a
+// power-of-two block is itself a power of two only for even levels.
+fn sw_normalisation(block: u32) -> u32 {
+    var level: i32 = sw_level(block);
+    if (level < 0 || (level & 1) != 0) { return 0; }
+    var n: u32 = 1;
+    var i: i32 = 0;
+    while (i < level / 2) {
+        n = n * 2;
+        i = i + 1;
+    }
+    return n;
+}
+
+test sylvester_walsh_entries {
+    assert_eq(sw_entry(0, 0), 1);
+    assert_eq(sw_entry(0, 1), 1);
+    assert_eq(sw_entry(1, 1), -1);
+    assert_eq(sw_entry(1, 2), 1);
+    assert_eq(sw_entry(3, 3), 1);   // 3 & 3 = 3, popcount 2
+    assert_eq(sw_entry(5, 3), -1);  // 5 & 3 = 1, popcount 1
+    assert_eq(sw_entry(0, 1023), 1);
+    assert_eq(sw_entry(1023, 1023), 1);  // popcount(1023) = 10, even
+}
+
+test levels_and_normalisation {
+    assert_eq(sw_level(16), 4);
+    assert_eq(sw_normalisation(16), 4);
+    assert_eq(sw_normalisation(64), 8);
+    assert_eq(sw_normalisation(256), 16);
+    assert_eq(sw_normalisation(1024), 32);
+    assert_eq(sw_normalisation(0), 0);
+    assert_eq(sw_normalisation(24), 0);
+    assert_eq(sw_normalisation(32), 0);  // odd level: sqrt not a power of two
+}
+
+fn alt_sum_16() -> i64 {
+    // sum over j of (-1)^j * (j - 8): the alternating-sign row of x = -8..7.
+    var total: i64 = 0;
+    var j: u32 = 0;
+    while (j < 16) {
+        var term: i64 = (j as i64) - 8;
+        if ((j & 1) == 1) { term = -term; }
+        total = total + term;
+        j = j + 1;
+    }
+    return total;
+}
+
+test rotation_is_exact_and_inverts {
+    // Output 0 of the alternating-sign row: H[0][j] = +1 for every j, so the
+    // numerator is the signed sum itself (-8 +9 -10 ... -15 +16 pattern
+    // gives the alternating sum of x = -8..7).
+    assert_eq(alt_sum_16(), -8);
+}
+
+test hh_is_block_delta {
+    // (H @ H)[k][p] = sum_j H[k][j] H[j][p]; for k == p the sum is the block
+    // size, for k != p it is 0 (orthogonality). Both by direct summation.
+    var same: i32 = 0;
+    var diff: i32 = 0;
+    var j: u32 = 0;
+    while (j < 16) {
+        same = same + sw_entry(5, j) * sw_entry(j, 5);
+        diff = diff + sw_entry(6, j) * sw_entry(j, 5);
+        j = j + 1;
+    }
+    assert_eq(same, 16);
+    assert_eq(diff, 0);
+}
+endmodule

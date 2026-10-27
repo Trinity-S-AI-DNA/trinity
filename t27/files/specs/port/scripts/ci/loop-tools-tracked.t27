@@ -1,0 +1,307 @@
+module port::scripts::ci::loop_tools_tracked;
+
+// Port of scripts/ci/loop-tools-tracked.sh (gHashTag/t27) to t27, so that this
+// check is generated from .t27 instead of written by hand.
+//
+// Loss of a loop tool must be impossible, not merely regrettable. Two scripts --
+// scripts/tri_loop/cost.py and scripts/tri_loop/diffbin.py -- were written, used
+// to produce numbers quoted in a pull request, and lost: they existed only in one
+// untracked working directory, and a re-clone took them with it. Nothing in the
+// repository could tell a tool that exists from a tool that exists only in one
+// untracked working directory. This check is that difference.
+//
+// The original fails when:
+//   1. a required loop tool is missing from the working tree
+//   2. a required loop tool exists but git does not track it -- the exact state
+//      that preceded the loss
+//   3. any file under scripts/tri_loop/ is untracked, so a NEW tool cannot be
+//      quietly added and then lost the same way
+//   4. a required tool is not executable via the dispatcher, i.e. `tri <cmd>`
+//      does not resolve
+//
+// Ported per "port the decision, not the plumbing". The plumbing -- `set -uo
+// pipefail`, the cd, `git ls-files`, the grep over scripts/tri, the `[[ -f ]]`
+// tests, the note() helper that prints each line -- stays with the caller. What
+// the script DECIDES on those observations is the pure functions below, and the
+// tests exercise every one:
+//
+//   check 1 `[[ -f $f ]]` per tool          -> present_note / present_fail
+//   check 2 ls-files --error-unmatch, skip  -> tracked_note / tracked_fail
+//   check 3 `[[ -z "$untracked" ]]`         -> tri_loop_dir_fail
+//   check 4a `grep -q 'exec python3 ...'`   -> dispatcher_fail
+//   check 4b `target=${c//-/_}.py`          -> cmd_char_to_file_char / is_resolution
+//   every loop's `fail=1`                   -> accumulate
+//   `cd ... || exit 2`, `exit $fail`        -> main
+//   PASS / FAIL wording                     -> final_word
+
+const EXIT_OK: i32 = 0;
+const EXIT_FAIL: i32 = 1;
+
+// The 16 tools the measurement loop depends on: REQUIRED_TOOLS in the original.
+const REQUIRED_TOOLS: [16][]const u8 = ["scripts/tri_loop/triage.py", "scripts/tri_loop/cost.py", "scripts/tri_loop/diffbin.py", "scripts/tri_loop/damage.py", "scripts/tri_loop/damage_freeze.py", "scripts/tri_loop/damage_repair.py", "scripts/tri_loop/corpus_parse.py", "scripts/tri_loop/corpus_status.py", "scripts/tri_loop/diffmodes.py", "scripts/tri_loop/loop_rules.py", "scripts/tri_loop/gate_sweep.py", "scripts/tri_loop/claims.py", "scripts/tri_loop/rule_observance.py", "scripts/tri_loop/pointers.py", "scripts/tri_loop/harness.py", "scripts/tri_loop/t27b.py"];
+
+// The 16 dispatcher subcommands: REQUIRED_SUBCOMMANDS in the original. Entry i
+// resolves, through the dispatcher's rule, to exactly REQUIRED_TOOLS[i].
+const REQUIRED_SUBCOMMANDS: [16][]const u8 = ["triage", "cost", "diffbin", "damage", "damage-freeze", "damage-repair", "corpus-parse", "corpus-status", "diffmodes", "loop-rules", "gate-sweep", "claims", "rule-observance", "pointers", "harness", "t27b"];
+
+// Decision behind check 1, per required tool: a file that is absent from the
+// working tree is MISSING, and MISSING forces fail.
+pub fn present_note(exists: bool) -> []const u8 {
+    if (exists) {
+        return "ok";
+    }
+    return "MISSING";
+}
+
+pub fn present_fail(exists: bool) -> i32 {
+    if (exists) {
+        return EXIT_OK;
+    }
+    return EXIT_FAIL;
+}
+
+// Decision behind check 2, per required tool: only a file that is present is
+// judged -- the original `continue`s past absent files, which check 1 already
+// flagged, and notes nothing for them -- and a file that exists but git does
+// not track is UNTRACKED: it exists here and nowhere else, and one re-clone
+// loses it.
+pub fn tracked_note(exists: bool, tracked: bool) -> []const u8 {
+    if (!exists) {
+        return "";
+    }
+    if (tracked) {
+        return "tracked";
+    }
+    return "UNTRACKED";
+}
+
+pub fn tracked_fail(exists: bool, tracked: bool) -> i32 {
+    if (!exists) {
+        return EXIT_OK;
+    }
+    if (tracked) {
+        return EXIT_OK;
+    }
+    return EXIT_FAIL;
+}
+
+// Decision behind check 3, verbatim: scripts/tri_loop/ is clean iff the
+// untracked listing -- `git ls-files --others --exclude-standard -- scripts/tri_loop/` --
+// printed nothing; one untracked path is enough to force fail. (The loop that
+// notes each path skips blank lines with `[[ -n "$u" ]]`, but fail is set by
+// the non-empty listing either way.)
+pub fn tri_loop_dir_fail(untracked_listing_len: usize) -> i32 {
+    if (untracked_listing_len == 0) {
+        return EXIT_OK;
+    }
+    return EXIT_FAIL;
+}
+
+// Decision behind check 4a: the honest dispatcher check is the generic exec
+// line -- `exec python3 "$LOOP_DIR/${cmd//-/_}.py"` in scripts/tri -- and not
+// the literal command names, which an earlier draft grepped for and passed for
+// `tri triage` only because the word appears in a comment. A check that
+// reports the presence of its own documentation is worth nothing.
+pub fn dispatcher_fail(exec_line_present: bool) -> i32 {
+    if (exec_line_present) {
+        return EXIT_OK;
+    }
+    return EXIT_FAIL;
+}
+
+// The dispatcher resolves `tri <cmd>` generically, to tri_loop/<cmd with - as
+// _>.py. Ported per character so the port needs no string building.
+pub fn cmd_char_to_file_char(c: u8) -> u8 {
+    if (c == '-') {
+        return '_';
+    }
+    return c;
+}
+
+// Whether target is the path `tri cmd` resolves to: scripts/tri_loop/, then
+// cmd with every - mapped through cmd_char_to_file_char, then .py. A candidate
+// that keeps the dash, sits in another directory, ends in anything but .py, or
+// has any other length at all is not a resolution.
+pub fn is_resolution(cmd: []const u8, target: []const u8) -> bool {
+    const prefix: []const u8 = "scripts/tri_loop/";
+    const suffix: []const u8 = ".py";
+    if (target.len != prefix.len + cmd.len + suffix.len) {
+        return false;
+    }
+    var i: usize = 0;
+    while (i < prefix.len) {
+        if (target[i] != prefix[i]) {
+            return false;
+        }
+        i += 1;
+    }
+    var j: usize = 0;
+    while (j < cmd.len) {
+        if (target[prefix.len + j] != cmd_char_to_file_char(cmd[j])) {
+            return false;
+        }
+        j += 1;
+    }
+    var k: usize = 0;
+    while (k < suffix.len) {
+        if (target[prefix.len + cmd.len + k] != suffix[k]) {
+            return false;
+        }
+        k += 1;
+    }
+    return true;
+}
+
+// Decision behind check 4b, per subcommand: the subcommand is routed iff the
+// file the dispatcher resolves it to exists.
+pub fn routing_fail(target_exists: bool) -> i32 {
+    if (target_exists) {
+        return EXIT_OK;
+    }
+    return EXIT_FAIL;
+}
+
+// The script's accumulation, from every loop: fail starts at 0 and the verdict
+// of a check that failed pins it to 1, and it stays pinned.
+pub fn accumulate(fail: i32, verdict: i32) -> i32 {
+    if (verdict != EXIT_OK) {
+        return EXIT_FAIL;
+    }
+    return fail;
+}
+
+// The script's last word before its exit code: PASS iff no check failed, FAIL
+// otherwise.
+pub fn final_word(fail: i32) -> []const u8 {
+    if (fail == EXIT_OK) {
+        return "PASS";
+    }
+    return "FAIL";
+}
+
+// The script's top level. It cd's to the repository root -- exiting 2 if that
+// fails, a different code from a failed check, so a broken invocation is never
+// mistaken for one -- then runs the four checks in order, notes each result,
+// and exits 0 only when every check passed. The caller performs the
+// observations (the cd, `git ls-files`, the grep over scripts/tri, the
+// `[[ -f ]]` tests) and feeds in the five verdicts: check 1's per-tool
+// decisions accumulated over the 16 REQUIRED_TOOLS, check 2's likewise over
+// the tools still present, check 3's listing emptiness, check 4a's exec line,
+// check 4b's routing accumulated over the 16 REQUIRED_SUBCOMMANDS. This
+// function decides on those verdicts exactly what the original decides.
+pub fn main(cd_ok: bool, present: i32, tracked: i32, tri_loop_dir: i32, dispatcher: i32, routing: i32) -> i32 {
+    if (!cd_ok) {
+        return 2;
+    }
+    var fail: i32 = EXIT_OK;
+    fail = accumulate(fail, present);
+    fail = accumulate(fail, tracked);
+    fail = accumulate(fail, tri_loop_dir);
+    fail = accumulate(fail, dispatcher);
+    fail = accumulate(fail, routing);
+    return fail;
+}
+
+test present_check {
+    // Check 1: an absent required tool is MISSING and forces fail.
+    assert(present_note(true) == "ok");
+    assert(present_note(false) == "MISSING");
+    assert(present_fail(true) == 0);
+    assert(present_fail(false) == 1);
+}
+
+test tracked_check {
+    // Check 2: absent files are skipped even here -- check 1 already flagged
+    // them, and the original notes nothing for them -- and a file that exists
+    // but git does not track is the exact state that preceded the loss.
+    assert(tracked_note(true, true) == "tracked");
+    assert(tracked_note(true, false) == "UNTRACKED");
+    assert(tracked_note(false, false) == "");
+    assert(tracked_fail(false, false) == 0);
+    assert(tracked_fail(true, true) == 0);
+    assert(tracked_fail(true, false) == 1);
+}
+
+test tri_loop_dir_check {
+    // Check 3: one untracked path under scripts/tri_loop/ is enough.
+    assert(tri_loop_dir_fail(0) == 0);
+    assert(tri_loop_dir_fail(1) == 1);
+    assert(tri_loop_dir_fail(16) == 1);
+}
+
+test dispatcher_check {
+    // Check 4a: the exec line present is ok; gone is BROKEN and forces fail.
+    assert(dispatcher_fail(true) == 0);
+    assert(dispatcher_fail(false) == 1);
+}
+
+test dispatcher_char_map {
+    // The dispatcher maps a subcommand name to a file name with - as _.
+    assert(cmd_char_to_file_char('-') == '_');
+    assert(cmd_char_to_file_char('_') == '_');
+    assert(cmd_char_to_file_char('a') == 'a');
+    assert(cmd_char_to_file_char('7') == '7');
+}
+
+test resolution_cases {
+    // `tri <cmd>` resolves to scripts/tri_loop/<cmd with - as _>.py: right for
+    // triage, damage-freeze and t27b; wrong when the dash is kept, the
+    // directory differs, the suffix differs, or the length is off.
+    assert(is_resolution("triage", "scripts/tri_loop/triage.py"));
+    assert(is_resolution("damage-freeze", "scripts/tri_loop/damage_freeze.py"));
+    assert(is_resolution("t27b", "scripts/tri_loop/t27b.py"));
+    assert(!is_resolution("damage-freeze", "scripts/tri_loop/damage-freeze.py"));
+    assert(!is_resolution("triage", "scripts/tri_loop/triage.sh"));
+    assert(!is_resolution("triage", "scripts/tri_loop/corpus_parse.py"));
+    assert(!is_resolution("triage", "triage.py"));
+}
+
+test routing_check {
+    // Check 4b: a subcommand is routed iff its resolved file exists.
+    assert(routing_fail(true) == 0);
+    assert(routing_fail(false) == 1);
+}
+
+test accumulate_cases {
+    // fail starts at 0; the verdict of a failed check pins it to 1 and it
+    // stays pinned.
+    assert(accumulate(0, 0) == 0);
+    assert(accumulate(0, 1) == 1);
+    assert(accumulate(1, 0) == 1);
+    assert(accumulate(1, 1) == 1);
+}
+
+test main_verdict {
+    // A failed cd is exit 2, whatever the checks say; otherwise the script
+    // exits 0 only when every one of the five verdicts is 0.
+    assert(main(false, 0, 0, 0, 0, 0) == 2);
+    assert(main(false, 1, 1, 1, 1, 1) == 2);
+    assert(main(true, 0, 0, 0, 0, 0) == 0);
+    assert(main(true, 1, 0, 0, 0, 0) == 1);
+    assert(main(true, 0, 0, 1, 0, 0) == 1);
+    assert(main(true, 0, 0, 0, 1, 0) == 1);
+    assert(main(true, 0, 0, 0, 0, 1) == 1);
+    assert(main(true, 1, 1, 1, 1, 1) == 1);
+}
+
+test final_word_cases {
+    // The script's last word: PASS iff every check passed, FAIL otherwise.
+    assert(final_word(0) == "PASS");
+    assert(final_word(1) == "FAIL");
+}
+
+test subcommands_resolve {
+    // The two lists line up: every REQUIRED_SUBCOMMANDS entry, mapped through
+    // the dispatcher's rule, is exactly its REQUIRED_TOOLS entry.
+    var i: usize = 0;
+    while (i < REQUIRED_SUBCOMMANDS.len) {
+        assert(is_resolution(REQUIRED_SUBCOMMANDS[i], REQUIRED_TOOLS[i]));
+        i += 1;
+    }
+}
+
+test required_lists {
+    // The original carries 16 required tools and 16 subcommands.
+    assert(REQUIRED_TOOLS.len == 16);
+    assert(REQUIRED_SUBCOMMANDS.len == 16);
+}

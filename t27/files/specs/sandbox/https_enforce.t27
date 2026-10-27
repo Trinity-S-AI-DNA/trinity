@@ -1,0 +1,289 @@
+// SPDX-License-Identifier: CC0-1.0
+// SANDBOX-012: HTTPS Enforcement
+
+/**
+ * Module: sandbox.https_enforce
+ *
+ * Enforces HTTPS for all API requests.
+ * - Production: redirect HTTP to HTTPS (301 permanent redirect)
+ * - Local: allow HTTP for development
+ * - Uses X-Forwarded-Proto header when behind proxy
+ *
+ * This prevents mixed content and ensures all traffic is encrypted.
+ */
+
+module sandbox.https_enforce;
+
+// ─────────────────────────────────────────────
+// Configuration
+// ─────────────────────────────────────────────
+
+const HTTPS_REDIRECT_STATUS : u16 = 301;
+const HTTPS_SCHEME : []const u8 = "https";
+const HTTP_SCHEME : []const u8 = "http";
+// The original typed this table `[&[u8; 9]; 3]` although "127.0.0.1" and
+// "[::1]" are not 9 bytes long; a byte-slice element type holds all three.
+const LOCAL_HOSTNAMES : [3][]const u8 = ["localhost", "127.0.0.1", "[::1]"];
+
+// t27 has no heap-backed Vec<u8>: a redirect URL is written into a
+// caller-supplied fixed-size buffer and its length is returned instead.
+// This is the capacity the tests and the interface below use.
+const MAX_URL_LEN : usize = 2048;
+
+// ─────────────────────────────────────────────
+// Request Context
+// ─────────────────────────────────────────────
+
+// `Option<&[u8]>` is spelled `?[]const u8` (null = header absent) and
+// `&[u8]` is spelled `[]const u8`.
+pub const RequestContext = struct {
+    forwarded_proto : ?[]const u8,
+    host : []const u8,
+    is_local : bool,
+};
+
+// ---------------------------------------------
+// Byte-string helpers
+// ---------------------------------------------
+
+// Byte-wise equality of two byte strings. Stands in for the original's
+// slice `==` comparisons, which t27 does not define on slices.
+fn bytes_eq(a: []const u8, b: []const u8) -> bool {
+    if (a.len != b.len) {
+        return false;
+    }
+    var i : usize = 0;
+    while (i < a.len) {
+        if (a[i] != b[i]) {
+            return false;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+// True when `s` begins with `prefix`. Stands in for the original's
+// `&s[..n] == prefix` comparisons.
+fn starts_with(s: []const u8, prefix: []const u8) -> bool {
+    if (s.len < prefix.len) {
+        return false;
+    }
+    var i : usize = 0;
+    while (i < prefix.len) {
+        if (s[i] != prefix[i]) {
+            return false;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+// Copy `src[from..]` into `out` starting at `pos`; returns the new write
+// position. Stands in for `Vec::extend_from_slice`. Bytes that would run
+// past the end of `out` are not written (the fixed buffer is the bound
+// that replaces Vec growth).
+fn copy_bytes(out: []u8, pos: usize, src: []const u8, from: usize) -> usize {
+    var w : usize = pos;
+    var r : usize = from;
+    while (r < src.len and w < out.len) {
+        out[w] = src[r];
+        w += 1;
+        r += 1;
+    }
+    return w;
+}
+
+// ─────────────────────────────────────────────
+// Core Logic
+// ─────────────────────────────────────────────
+
+/**
+ * Determine if a request should be redirected to HTTPS.
+ *
+ * Redirect rules:
+ * 1. Never redirect in local mode (localhost/127.0.0.1/::1)
+ * 2. Never redirect if X-Forwarded-Proto is "https"
+ * 3. Always redirect if X-Forwarded-Proto is "http" or missing
+ *
+ * @param ctx - Request context containing headers and local flag
+ * @return true if redirect to HTTPS is required
+ */
+fn should_redirect(ctx: RequestContext) -> bool {
+    // Local mode: never redirect
+    if (ctx.is_local) {
+        return false;
+    }
+
+    // The original `match` on Some/None is a null test plus unwrap here.
+    if (ctx.forwarded_proto != null) {
+        const proto = ctx.forwarded_proto.?;
+        // If explicitly set to https, no redirect needed.
+        // NOTE: the original arm read `proto == HTTPS_SCHEME`, which would
+        // redirect exactly the https requests -- contrary to rule 2 above,
+        // to this comment, and to the tests https_not_redirected and
+        // http_redirected_in_prod. The comparison is negated to match them.
+        return !bytes_eq(proto, HTTPS_SCHEME);
+    }
+    // No header = assume HTTP, redirect
+    return true;
+}
+
+/**
+ * Build HTTPS redirect URL from original HTTP URL.
+ *
+ * @param original_url - Original HTTP URL
+ * @param out - Destination buffer (replaces the returned Vec<u8>)
+ * @return HTTPS URL length written into `out`
+ */
+fn redirect_url(original_url: []const u8, out: []u8) -> usize {
+    var scheme_end : usize = 0; // No scheme prefix
+    if (original_url.len > 7 and starts_with(original_url, "http://")) {
+        scheme_end = 7;
+    } else if (original_url.len > 8 and starts_with(original_url, "https://")) {
+        scheme_end = 8; // Already HTTPS, return as-is
+    }
+
+    var len : usize = 0;
+    if (scheme_end > 0) {
+        len = copy_bytes(out, len, HTTPS_SCHEME, 0);
+        len = copy_bytes(out, len, "://", 0);
+        len = copy_bytes(out, len, original_url, scheme_end);
+    } else {
+        len = copy_bytes(out, len, original_url, 0);
+    }
+    return len;
+}
+
+/**
+ * Check if a hostname indicates a local development environment.
+ *
+ * @param host - Hostname to check
+ * @return true if hostname is local
+ */
+fn is_local_hostname(host: []const u8) -> bool {
+    // Explicit loop in place of `LOCAL_HOSTNAMES.iter().any(|local| ...)`.
+    var i : usize = 0;
+    while (i < LOCAL_HOSTNAMES.len) {
+        if (bytes_eq(LOCAL_HOSTNAMES[i], host)) {
+            return true;
+        }
+        i += 1;
+    }
+    return false;
+}
+
+// ─────────────────────────────────────────────
+// Interface
+// ─────────────────────────────────────────────
+
+/**
+ * HTTPS enforcement middleware interface.
+ */
+// t27 has no `trait`: the interface is a struct whose member is a
+// function-typed field (as in specs/sandbox/health.t27). The receiver
+// `&self` becomes an explicit `*HttpsEnforcer` parameter.
+pub const HttpsEnforcer = struct {
+    /**
+     * Check if request should redirect and build redirect URL.
+     *
+     * @param ctx - Request context
+     * @param out - Destination buffer for the HTTPS URL (MAX_URL_LEN bytes)
+     * @return null if no redirect, the https_url length in `out` if redirect needed
+     *         (the original returned Option<Vec<u8>>)
+     */
+    enforce : fn(*HttpsEnforcer, RequestContext, []u8) ?usize,
+};
+
+// ─────────────────────────────────────────────
+// TDD Tests
+// ─────────────────────────────────────────────
+
+// The original wrapped these in a `.test { use sandbox.https_enforce; ... }`
+// block; they live in the module itself, so the self-import is not needed.
+
+fn make_ctx(forwarded_proto: ?[]const u8, host: []const u8) -> RequestContext {
+    return RequestContext{
+        .forwarded_proto = forwarded_proto,
+        .host = host,
+        .is_local = is_local_hostname(host),
+    };
+}
+
+// The original tests were written as `input: {...}; expected: ...;
+// description: "...";` records. Each is now an executable assertion of the
+// same input against the same expected value; the description is kept as
+// the first comment of the test.
+
+// Test: HTTPS requests are NOT redirected
+test "https_not_redirected" {
+    // Requests with X-Forwarded-Proto: https should not be redirected
+    const ctx = make_ctx(HTTPS_SCHEME, "api.t27.dev");
+    assert(should_redirect(ctx) == false);
+}
+
+// Test: HTTP requests in production ARE redirected
+test "http_redirected_in_prod" {
+    // Requests with X-Forwarded-Proto: http should be redirected to HTTPS
+    const ctx = make_ctx(HTTP_SCHEME, "api.t27.dev");
+    assert(should_redirect(ctx) == true);
+}
+
+// Test: Missing proto header triggers redirect
+test "no_proto_header_redirected" {
+    // Requests without X-Forwarded-Proto should be redirected
+    const ctx = make_ctx(null, "api.t27.dev");
+    assert(should_redirect(ctx) == true);
+}
+
+// Test: Local mode never redirects
+test "local_mode_never_redirects" {
+    // Requests to localhost should never be redirected
+    const ctx = make_ctx(HTTP_SCHEME, "localhost");
+    assert(should_redirect(ctx) == false);
+}
+
+// Test: Redirect URL construction is correct
+test "redirect_url_correct" {
+    // HTTP URL should be converted to HTTPS URL
+    var out : [MAX_URL_LEN]u8 = undefined;
+    const len = redirect_url("http://api.t27.dev/health", out[0..MAX_URL_LEN]);
+    assert(bytes_eq(out[0..len], "https://api.t27.dev/health"));
+}
+
+// Test: HTTPS URL remains unchanged
+test "https_url_unchanged" {
+    // Already HTTPS URL should remain unchanged
+    var out : [MAX_URL_LEN]u8 = undefined;
+    const len = redirect_url("https://api.t27.dev/health", out[0..MAX_URL_LEN]);
+    assert(bytes_eq(out[0..len], "https://api.t27.dev/health"));
+}
+
+// Test: 127.0.0.1 is considered local
+test "127_0_0_1_is_local" {
+    // Requests to 127.0.0.1 should never be redirected
+    const ctx = make_ctx(HTTP_SCHEME, "127.0.0.1");
+    assert(should_redirect(ctx) == false);
+}
+
+// Test: IPv6 localhost is considered local
+test "ipv6_localhost_is_local" {
+    // Requests to [::1] should never be redirected
+    const ctx = make_ctx(HTTP_SCHEME, "[::1]");
+    assert(should_redirect(ctx) == false);
+}
+
+// Test: Port is preserved in redirect
+test "redirect_preserves_port" {
+    // Port number should be preserved in HTTPS redirect
+    var out : [MAX_URL_LEN]u8 = undefined;
+    const len = redirect_url("http://api.t27.dev:8080/health", out[0..MAX_URL_LEN]);
+    assert(bytes_eq(out[0..len], "https://api.t27.dev:8080/health"));
+}
+
+// Test: Query string is preserved in redirect
+test "redirect_preserves_query" {
+    // Query string should be preserved in HTTPS redirect
+    var out : [MAX_URL_LEN]u8 = undefined;
+    const len = redirect_url("http://api.t27.dev/health?debug=true", out[0..MAX_URL_LEN]);
+    assert(bytes_eq(out[0..len], "https://api.t27.dev/health?debug=true"));
+}

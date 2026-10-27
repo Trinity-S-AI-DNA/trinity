@@ -1,0 +1,2605 @@
+; t27core -- the self-hosted compiler core, MVP (epic #5980, issue #5981).
+
+; This module is a t27 compiler written in t27. It reads one t27 module from
+; `src`, and writes the C translation unit that `t27c gen-c` writes for the same
+; module into `out` -- byte for byte. It is written in exactly the subset it
+; accepts, so it compiles itself:
+
+;   gen-c(t27core.t27)  ==  t27core(t27core.t27)
+
+; is the fixpoint the harness checks (bootstrap/tests/core_selfhost.rs).
+
+; The subset is the part of the language gen-c lowers WITHOUT loss. Where gen-c
+; silently drops or rewrites something, this core refuses the input instead of
+; copying the defect; every refusal has an error code below and a reason in the
+; epic. Inside the subset the two compilers must agree on every byte.
+
+; Accepted:
+;   module NAME ;                                  (first, exactly once)
+;   [pub] const|let NAME : SCALAR = EXPR ;         (gen-c's lossless shapes only)
+;   [pub] var NAME : SCALAR = EXPR ;
+;   [pub] var NAME : [N]SCALAR = [_]SCALAR{0} ** N ;   (N a number or a name)
+;   [pub] var NAME : [N]SCALAR = [_]SCALAR{ EXPR, ... } ;   (N items)
+;   [pub] var NAME : [N][M]SCALAR = [_][M]SCALAR{ ROW, ... } ;   (N ROWs of
+;         M items: [_]SCALAR{ EXPR, ... }; N, M decimals; used as a[i][j])
+;   [pub] fn NAME ( P : SCALAR , ... ) [-> SCALAR|void] { STMT* }
+;   test NAME { STMT* }
+;   STMT: var|const|let NAME : SCALAR = EXPR ;   NAME = EXPR ;   A[I] = EXPR ;
+;         NAME OP= EXPR ;   A[I] OP= EXPR ;       (OP one of + - * / % | & ^)
+;         CALL ;   if ( EXPR ) { } [else if ... | else { }]
+;         while ( EXPR ) { }   break ;   continue ;   return [EXPR] ;
+;   EXPR: or and == != < > <= >= | ^ & << >> + - * / % ; unary - ! ~ ;
+;         X as SCALAR ; f(args) ; a[i] ; a[i][j] ; ( EXPR ) ; number ; 'c' ;
+;         true false                                (no `defer`: #7352)
+;   SCALAR: bool u8 i8 u16 i16 u32 i32 u64 i64 usize
+;   number: 1_000  0x1F_FF  0b1010_0101  (`_` between digits; no leading 0)
+
+; With no string literals, fixed text is packed 64-bit words: w(word, n) emits
+; the n low bytes, first byte lowest; each text function names its text.
+
+; The C driver (stdin to `src`, `compile`, `out` to stdout) is plumbing in the
+; Rust harness; every byte of output is decided here.
+
+; Three compilers build this module, not one (#6508, T732 in
+; specs/compiler/theory/toolchain.t27): gen-c + cc, t27b, and the Zig reference.
+; So every buffer holds 262144 (this file and its output must fit; t27b's
+; old 65536 repeat cap is gone, #7376), every index is `as usize` as in Zig,
+; and `/` `%` are unsigned: Zig refuses them on signed operands.
+
+module t27core;
+
+const SRC_MAX: i64 = 262144;
+const OUT_MAX: i64 = 262144;
+const TOK_MAX: i64 = 262144;
+const NODE_MAX: i64 = 262144;
+
+; Error codes. `err_pos` is the byte offset in `src`.
+const E_LEX: i64 = 1;
+const E_SYNTAX: i64 = 2;
+const E_TYPE: i64 = 3;
+const E_CALL: i64 = 4;
+const E_NAME: i64 = 5;
+const E_TESTASSIGN: i64 = 6;
+const E_CONST: i64 = 7;
+const E_LIMIT: i64 = 8;
+const E_ARRAY: i64 = 9;
+
+; Token kinds. A one-character punctuation token uses its own byte as its kind,
+; so every named kind sits above 255.
+
+; Brace and bracket kinds as numbers: `use` counts braces and brackets, in
+; character literals too, to find a declaration's end, and cut parse_block
+; short for a module importing this one (t27core_ddc.t27).
+const K_LBRACE: i64 = 123;
+const K_RBRACE: i64 = 125;
+const K_LBRACKET: i64 = 91;
+const K_RBRACKET: i64 = 93;
+
+const T_EOF: i64 = 256;
+const T_IDENT: i64 = 257;
+const T_NUM: i64 = 258;
+const T_CHAR: i64 = 259;
+const T_MODULE: i64 = 260;
+const T_CONST: i64 = 261;
+const T_VAR: i64 = 262;
+const T_FN: i64 = 263;
+const T_PUB: i64 = 264;
+const T_TEST: i64 = 265;
+const T_IF: i64 = 266;
+const T_ELSE: i64 = 267;
+const T_WHILE: i64 = 268;
+const T_BREAK: i64 = 269;
+const T_CONTINUE: i64 = 270;
+const T_RETURN: i64 = 271;
+const T_TRUE: i64 = 272;
+const T_FALSE: i64 = 273;
+const T_AND: i64 = 274;
+const T_OR: i64 = 275;
+const T_VOID: i64 = 276;
+const T_AS: i64 = 277;
+const T_ARROW: i64 = 278;
+const T_LE: i64 = 279;
+const T_GE: i64 = 280;
+const T_EQEQ: i64 = 281;
+const T_NE: i64 = 282;
+const T_SHL: i64 = 283;
+const T_SHR: i64 = 284;
+const T_POW: i64 = 285;
+const T_BAD: i64 = 286;
+const T_OPEQ: i64 = 287;
+
+; Node kinds. Node 0 is the null node; a list is a chain through `nd_next`.
+const N_NUM: i64 = 1;
+const N_CHAR: i64 = 2;
+const N_TRUE: i64 = 3;
+const N_FALSE: i64 = 4;
+const N_IDENT: i64 = 5;
+const N_BIN: i64 = 6;
+const N_UN: i64 = 7;
+const N_CAST: i64 = 8;
+const N_INDEX: i64 = 9;
+const N_CALL: i64 = 10;
+const N_NEGLIT: i64 = 11;
+const N_LIST: i64 = 12;
+const S_LOCAL: i64 = 20;
+const S_ASSIGN: i64 = 21;
+const S_EXPR: i64 = 22;
+const S_IF: i64 = 23;
+const S_WHILE: i64 = 24;
+const S_BREAK: i64 = 25;
+const S_CONTINUE: i64 = 26;
+const S_RETURN: i64 = 27;
+const D_CONST: i64 = 40;
+const D_VAR: i64 = 41;
+const D_ARRAY: i64 = 42;
+const D_FN: i64 = 43;
+const D_PARAM: i64 = 44;
+const D_TEST: i64 = 45;
+
+; Packed spellings of the words the lexer and checker recognise.
+const W_MODULE: i64 = 0x656c75646f6d;
+const W_CONST: i64 = 0x74736e6f63;
+const W_LET: i64 = 0x74656c;
+const W_VAR: i64 = 0x726176;
+const W_FN: i64 = 0x6e66;
+const W_PUB: i64 = 0x627570;
+const W_TEST: i64 = 0x74736574;
+const W_IF: i64 = 0x6669;
+const W_ELSE: i64 = 0x65736c65;
+const W_WHILE: i64 = 0x656c696877;
+const W_BREAK: i64 = 0x6b61657262;
+const W_CONTINUE: i64 = 0x65756e69746e6f63;
+const W_RETURN: i64 = 0x6e7275746572;
+const W_TRUE: i64 = 0x65757274;
+const W_FALSE: i64 = 0x65736c6166;
+const W_AND: i64 = 0x646e61;
+const W_OR: i64 = 0x726f;
+const W_VOID: i64 = 0x64696f76;
+const W_AS: i64 = 0x7361;
+const W_ENUM: i64 = 0x6d756e65;
+const W_STRUCT: i64 = 0x746375727473;
+const W_INVARIA: i64 = 0x6e61697261766e69;
+const W_BENCH: i64 = 0x68636e6562;
+const W_FOR: i64 = 0x726f66;
+const W_TRY: i64 = 0x797274;
+const W_SWITCH: i64 = 0x686374697773;
+const W_USING: i64 = 0x676e697375;
+const W_USE: i64 = 0x657375;
+const W_PRAGMA: i64 = 0x616d67617270;
+const W_IN: i64 = 0x6e69;
+const W_BOOL: i64 = 0x6c6f6f62;
+const W_USIZE: i64 = 0x657a697375;
+const W_U8: i64 = 0x3875;
+const W_I8: i64 = 0x3869;
+const W_U16: i64 = 0x363175;
+const W_I16: i64 = 0x363169;
+const W_U32: i64 = 0x323375;
+const W_I32: i64 = 0x323369;
+const W_U64: i64 = 0x343675;
+const W_I64: i64 = 0x343669;
+const W_UNDEFINE: i64 = 0x656e696665646e75;
+const W_ASSERT: i64 = 0x747265737361;
+const W_DEFAULT_: i64 = 0x5f746c7561666564;
+const W_VALID_IN: i64 = 0x6e695f64696c6176;
+const W_ASSERT_E: i64 = 0x655f747265737361;
+const W_T27_ASSE: i64 = 0x657373615f373274;
+const W_ENDMODUL: i64 = 0x6c75646f6d646e65;
+
+var src: [SRC_MAX]u8 = [_]u8{0} ** SRC_MAX;
+var out: [OUT_MAX]u8 = [_]u8{0} ** OUT_MAX;
+var tk_kind: [TOK_MAX]i64 = [_]i64{0} ** TOK_MAX;
+var tk_pos: [TOK_MAX]i64 = [_]i64{0} ** TOK_MAX;
+var tk_len: [TOK_MAX]i64 = [_]i64{0} ** TOK_MAX;
+var nd_kind: [NODE_MAX]i64 = [_]i64{0} ** NODE_MAX;
+var nd_tok: [NODE_MAX]i64 = [_]i64{0} ** NODE_MAX;
+var nd_a: [NODE_MAX]i64 = [_]i64{0} ** NODE_MAX;
+var nd_b: [NODE_MAX]i64 = [_]i64{0} ** NODE_MAX;
+var nd_c: [NODE_MAX]i64 = [_]i64{0} ** NODE_MAX;
+var nd_next: [NODE_MAX]i64 = [_]i64{0} ** NODE_MAX;
+var nd_aux: [NODE_MAX]i64 = [_]i64{0} ** NODE_MAX;
+
+var src_len: i64 = 0;
+var out_len: i64 = 0;
+var tok_count: i64 = 0;
+var node_count: i64 = 1;
+var p: i64 = 0;
+var failed: bool = false;
+var err_code: i64 = 0;
+var err_pos: i64 = 0;
+var has_tests: bool = false;
+var uses_assert: bool = false;
+var mod_tok: i64 = 0;
+var decls: i64 = 0;
+
+; ---------------------------------------------------------------- output
+
+fn fail(code: i64, at_pos: i64) -> void {
+    if (!failed) {
+        failed = true;
+        err_code = code;
+        err_pos = at_pos;
+    }
+}
+
+fn put(c: i64) -> void {
+    if (out_len >= OUT_MAX) {
+        fail(E_LIMIT, 0);
+        return;
+    }
+    out[out_len as usize] = c as u8;
+    out_len = out_len + 1;
+}
+
+fn w(x: i64, n: i64) -> void {
+    var i: i64 = 0;
+    while (i < n) {
+        put((x >> (i * 8)) & 255);
+        i = i + 1;
+    }
+}
+
+fn rep(c: i64, n: i64) -> void {
+    var i: i64 = 0;
+    while (i < n) {
+        put(c);
+        i = i + 1;
+    }
+}
+
+fn indent(lvl: i64) -> void {
+    rep(' ', lvl * 4);
+}
+
+fn put_int(n: i64) -> void {
+    var u: u64 = n as u64;
+    if (u >= 10) {
+        put_int((u / 10) as i64);
+    }
+    put('0' + (u % 10) as i64);
+}
+
+; A number is written without its `_` separators, as gen-c writes it.
+fn put_tok(t: i64) -> void {
+    var i: i64 = tk_pos[t as usize];
+    var e: i64 = i + tk_len[t as usize];
+    var num: bool = tk_kind[t as usize] == T_NUM;
+    while (i < e) {
+        if (!num or src[i as usize] != '_') {
+            put(src[i as usize] as i64);
+        }
+        i = i + 1;
+    }
+}
+
+fn put_upper(t: i64) -> void {
+    var i: i64 = tk_pos[t as usize];
+    var e: i64 = i + tk_len[t as usize];
+    while (i < e) {
+        var c: i64 = src[i as usize] as i64;
+        if (c >= 'a' and c <= 'z') {
+            c = c - 32;
+        }
+        put(c);
+        i = i + 1;
+    }
+}
+
+; ---------------------------------------------------------------- tokens
+
+fn at(i: i64) -> i64 {
+    if (i < 0 or i >= src_len) {
+        return 0;
+    }
+    return src[i as usize] as i64;
+}
+
+fn is_alpha(c: i64) -> bool {
+    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_';
+}
+
+fn is_digit(c: i64) -> bool {
+    return c >= '0' and c <= '9';
+}
+
+fn is_alnum(c: i64) -> bool {
+    return is_alpha(c) or is_digit(c);
+}
+
+fn kind(t: i64) -> i64 {
+    if (t >= tok_count) {
+        return T_EOF;
+    }
+    return tk_kind[t as usize];
+}
+
+fn tpos(t: i64) -> i64 {
+    if (t >= tok_count) {
+        return src_len;
+    }
+    return tk_pos[t as usize];
+}
+
+; Up to eight bytes of token `t`, starting `off` bytes in, first byte lowest.
+fn tok_word(t: i64, off: i64) -> i64 {
+    var n: i64 = tk_len[t as usize] - off;
+    if (n > 8) {
+        n = 8;
+    }
+    var v: i64 = 0;
+    var i: i64 = n - 1;
+    while (i >= 0) {
+        v = (v << 8) | (src[(tk_pos[t as usize] + off + i) as usize] as i64);
+        i = i - 1;
+    }
+    return v;
+}
+
+fn tok_is(t: i64, lo: i64, hi: i64, n: i64) -> bool {
+    return tk_len[t as usize] == n and tok_word(t, 0) == lo and tok_word(t, 8) == hi;
+}
+
+fn tok_eq(a: i64, b: i64) -> bool {
+    if (tk_len[a as usize] != tk_len[b as usize]) {
+        return false;
+    }
+    var i: i64 = 0;
+    while (i < tk_len[a as usize]) {
+        if (src[(tk_pos[a as usize] + i) as usize] != src[(tk_pos[b as usize] + i) as usize]) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn add_tok(k: i64, start: i64, len: i64) -> void {
+    if (tok_count >= TOK_MAX) {
+        fail(E_LIMIT, start);
+        return;
+    }
+    tk_kind[tok_count as usize] = k;
+    tk_pos[tok_count as usize] = start;
+    tk_len[tok_count as usize] = len;
+    tok_count = tok_count + 1;
+}
+
+; The keyword an identifier spells, T_IDENT if none, T_BAD for a word gen-c
+; reserves for a construct outside the subset.
+fn word_kind(t: i64) -> i64 {
+    if (tok_is(t, W_MODULE, 0, 6)) {
+        return T_MODULE;
+    }
+    if (tok_is(t, W_CONST, 0, 5) or tok_is(t, W_LET, 0, 3)) {
+        return T_CONST;
+    }
+    if (tok_is(t, W_VAR, 0, 3)) {
+        return T_VAR;
+    }
+    if (tok_is(t, W_FN, 0, 2)) {
+        return T_FN;
+    }
+    if (tok_is(t, W_PUB, 0, 3)) {
+        return T_PUB;
+    }
+    if (tok_is(t, W_TEST, 0, 4)) {
+        return T_TEST;
+    }
+    if (tok_is(t, W_IF, 0, 2)) {
+        return T_IF;
+    }
+    if (tok_is(t, W_ELSE, 0, 4)) {
+        return T_ELSE;
+    }
+    if (tok_is(t, W_WHILE, 0, 5)) {
+        return T_WHILE;
+    }
+    if (tok_is(t, W_BREAK, 0, 5)) {
+        return T_BREAK;
+    }
+    if (tok_is(t, W_CONTINUE, 0, 8)) {
+        return T_CONTINUE;
+    }
+    if (tok_is(t, W_RETURN, 0, 6)) {
+        return T_RETURN;
+    }
+    if (tok_is(t, W_TRUE, 0, 4)) {
+        return T_TRUE;
+    }
+    if (tok_is(t, W_FALSE, 0, 5)) {
+        return T_FALSE;
+    }
+    if (tok_is(t, W_AND, 0, 3)) {
+        return T_AND;
+    }
+    if (tok_is(t, W_OR, 0, 2)) {
+        return T_OR;
+    }
+    if (tok_is(t, W_VOID, 0, 4)) {
+        return T_VOID;
+    }
+    if (tok_is(t, W_AS, 0, 2)) {
+        return T_AS;
+    }
+    if (tok_is(t, W_ENUM, 0, 4) or tok_is(t, W_STRUCT, 0, 6) or tok_is(t, W_INVARIA, 't', 9)) {
+        return T_BAD;
+    }
+    if (tok_is(t, W_BENCH, 0, 5) or tok_is(t, W_FOR, 0, 3) or tok_is(t, W_TRY, 0, 3)) {
+        return T_BAD;
+    }
+    if (tok_is(t, W_SWITCH, 0, 6) or tok_is(t, W_USING, 0, 5) or tok_is(t, W_USE, 0, 3)) {
+        return T_BAD;
+    }
+    if (tok_is(t, W_PRAGMA, 0, 6) or tok_is(t, W_IN, 0, 2)) {
+        return T_BAD;
+    }
+    return T_IDENT;
+}
+
+; The kind of a two-byte operator at c d, T_BAD for one gen-c reads into a
+; construct outside the subset, 0 if c d is not a two-byte operator.
+fn pair_kind(c: i64, d: i64) -> i64 {
+    if (c == '-' and d == '>') {
+        return T_ARROW;
+    }
+    if (c == '*' and d == '*') {
+        return T_POW;
+    }
+    if (c == '<' and d == '=') {
+        return T_LE;
+    }
+    if (c == '>' and d == '=') {
+        return T_GE;
+    }
+    if (c == '=' and d == '=') {
+        return T_EQEQ;
+    }
+    if (c == '!' and d == '=') {
+        return T_NE;
+    }
+    if (c == '<' and d == '<') {
+        return T_SHL;
+    }
+    if (c == '>' and d == '>') {
+        return T_SHR;
+    }
+    if (c == '&' and d == '&') {
+        return T_AND;
+    }
+    if (c == '|' and d == '|') {
+        return T_OR;
+    }
+    if (c == '=' and d == '>') {
+        return T_BAD;
+    }
+    if (c == '+' and d == '+') {
+        return T_BAD;
+    }
+    if (c == '.' and d == '.') {
+        return T_BAD;
+    }
+    if (d == '=' and (c == '+' or c == '-' or c == '*' or c == '/')) {
+        return T_OPEQ;
+    }
+    if (d == '=' and (c == '|' or c == '%' or c == '&' or c == '^')) {
+        return T_OPEQ;
+    }
+    if (d == '%' and (c == '+' or c == '-' or c == '*')) {
+        return T_BAD;
+    }
+    return 0;
+}
+
+fn is_single(c: i64) -> bool {
+    if (c == ':' or c == ',' or c == '=' or c == '(' or c == ')' or c == ';') {
+        return true;
+    }
+    if (c == K_LBRACE or c == K_RBRACE or c == K_LBRACKET or c == K_RBRACKET or c == '~' or c == '!') {
+        return true;
+    }
+    if (c == '+' or c == '-' or c == '*' or c == '/' or c == '%' or c == '&') {
+        return true;
+    }
+    return c == '|' or c == '^' or c == '<' or c == '>';
+}
+
+fn skip_line(i: i64) -> i64 {
+    var j: i64 = i;
+    while (j < src_len and at(j) != '\n') {
+        j = j + 1;
+    }
+    return j;
+}
+
+; A block comment nests, and one left open runs to the end of the input.
+fn skip_block(i: i64) -> i64 {
+    var j: i64 = i + 2;
+    var depth: i64 = 1;
+    while (depth > 0 and j < src_len) {
+        if (at(j) == '*' and at(j + 1) == '/' and j + 1 < src_len) {
+            j = j + 2;
+            depth = depth - 1;
+        } else if (at(j) == '/' and at(j + 1) == '*' and j + 1 < src_len) {
+            j = j + 2;
+            depth = depth + 1;
+        } else {
+            j = j + 1;
+        }
+    }
+    return j;
+}
+
+fn lex_ident(i: i64) -> i64 {
+    var j: i64 = i;
+    while (is_alnum(at(j))) {
+        j = j + 1;
+    }
+    if (at(j) == '@') {
+        fail(E_LEX, j);
+        return j;
+    }
+    add_tok(T_IDENT, i, j - i);
+    if (failed) {
+        return j;
+    }
+    var k: i64 = word_kind(tok_count - 1);
+    if (k == T_BAD) {
+        fail(E_LEX, i);
+        return j;
+    }
+    tk_kind[(tok_count - 1) as usize] = k;
+    return j;
+}
+
+fn radix_digit(c: i64, radix: i64) -> bool {
+    if (radix == 2) {
+        return c == '0' or c == '1';
+    }
+    if (radix == 16) {
+        return is_digit(c) or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F');
+    }
+    return is_digit(c);
+}
+
+; A decimal, `0x` or `0b` number, `_` only between digits (gen-c drops it,
+; #7321). gen-c breaks the rest (#7319): a leading zero, a bare prefix, a `.`,
+; a letter or digit glued on (exponent, suffix, `0b2`, `0o` (#2645)).
+fn lex_num(i: i64) -> i64 {
+    var j: i64 = i;
+    var radix: i64 = 10;
+    var c1: i64 = at(i + 1);
+    if (at(i) == '0' and (c1 == 'x' or c1 == 'X')) {
+        radix = 16;
+        j = i + 2;
+    } else if (at(i) == '0' and (c1 == 'b' or c1 == 'B')) {
+        radix = 2;
+        j = i + 2;
+    }
+    var start: i64 = j;
+    while (j < src_len) {
+        var c: i64 = at(j);
+        if (radix_digit(c, radix)) {
+            j = j + 1;
+        } else if (c == '_' and j > start and radix_digit(at(j + 1), radix)) {
+            j = j + 1;
+        } else {
+            break;
+        }
+    }
+    var bad: bool = j == start or is_alnum(at(j)) or at(j) == '@';
+    if (radix == 10 and at(i) == '0' and j > i + 1) {
+        bad = true;
+    }
+    if (at(j) == '.' and at(j + 1) != '.') {
+        bad = true;
+    }
+    if (bad) {
+        fail(E_LEX, i);
+        return j;
+    }
+    add_tok(T_NUM, i, j - i);
+    return j;
+}
+
+; True when a number token carries a `_` separator.
+fn has_sep(t: i64) -> bool {
+    var i: i64 = tk_pos[t as usize];
+    var e: i64 = i + tk_len[t as usize];
+    while (i < e) {
+        if (src[i as usize] == '_') {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+; 'c' or '\c' on one line, printable ASCII inside.
+fn lex_char(i: i64) -> i64 {
+    var j: i64 = i + 1;
+    var n: i64 = 0;
+    var esc: bool = false;
+    while (j < src_len and at(j) != '\'') {
+        var c: i64 = at(j);
+        if (c < ' ' or c > '~') {
+            fail(E_LEX, j);
+            return j;
+        }
+        if (c == '\\' and n == 0) {
+            esc = true;
+            n = n + 1;
+            j = j + 1;
+            c = at(j);
+            if (c < ' ' or c > '~') {
+                fail(E_LEX, j);
+                return j;
+            }
+        }
+        n = n + 1;
+        j = j + 1;
+    }
+    if (j >= src_len or n == 0 or n > 2 or (n == 2 and !esc)) {
+        fail(E_LEX, i);
+        return j;
+    }
+    add_tok(T_CHAR, i, j + 1 - i);
+    return j + 1;
+}
+
+fn lex_one(i: i64) -> i64 {
+    var c: i64 = at(i);
+    var d: i64 = at(i + 1);
+    if (c == ' ' or c == '\t' or c == '\n' or c == '\r') {
+        return i + 1;
+    }
+    if (c == '/' and d == '/') {
+        return skip_line(i);
+    }
+    if (c == '#') {
+        return skip_line(i);
+    }
+    if (c == '/' and d == '*' and i + 1 < src_len) {
+        return skip_block(i);
+    }
+    if (c == ';' and (d == ' ' or d == '\t') and (i == 0 or at(i - 1) == '\n')) {
+        return skip_line(i);
+    }
+    if (is_alpha(c)) {
+        return lex_ident(i);
+    }
+    if (is_digit(c)) {
+        return lex_num(i);
+    }
+    if (c == '\'') {
+        return lex_char(i);
+    }
+    var k: i64 = pair_kind(c, d);
+    if (k == T_BAD) {
+        fail(E_LEX, i);
+        return i;
+    }
+    if (k != 0) {
+        add_tok(k, i, 2);
+        return i + 2;
+    }
+    if (is_single(c)) {
+        add_tok(c, i, 1);
+        return i + 1;
+    }
+    fail(E_LEX, i);
+    return i;
+}
+
+fn lex() -> void {
+    var i: i64 = 0;
+    while (!failed and i < src_len) {
+        i = lex_one(i);
+    }
+}
+
+; ---------------------------------------------------------------- tree
+
+; Reads of the node arrays.
+fn nkind(n: i64) -> i64 {
+    return nd_kind[n as usize];
+}
+
+fn ntok(n: i64) -> i64 {
+    return nd_tok[n as usize];
+}
+
+fn na(n: i64) -> i64 {
+    return nd_a[n as usize];
+}
+
+fn nb(n: i64) -> i64 {
+    return nd_b[n as usize];
+}
+
+fn nc(n: i64) -> i64 {
+    return nd_c[n as usize];
+}
+
+fn nnext(n: i64) -> i64 {
+    return nd_next[n as usize];
+}
+
+fn naux(n: i64) -> i64 {
+    return nd_aux[n as usize];
+}
+
+fn mk(k: i64, t: i64, a: i64, b: i64) -> i64 {
+    if (node_count >= NODE_MAX) {
+        fail(E_LIMIT, tpos(t));
+        return 0;
+    }
+    var n: i64 = node_count;
+    node_count = node_count + 1;
+    nd_kind[n as usize] = k;
+    nd_tok[n as usize] = t;
+    nd_a[n as usize] = a;
+    nd_b[n as usize] = b;
+    nd_c[n as usize] = 0;
+    nd_next[n as usize] = 0;
+    nd_aux[n as usize] = 0;
+    return n;
+}
+
+fn cur() -> i64 {
+    return kind(p);
+}
+
+fn expect(k: i64) -> void {
+    if (failed) {
+        return;
+    }
+    if (kind(p) != k) {
+        fail(E_SYNTAX, tpos(p));
+        return;
+    }
+    p = p + 1;
+}
+
+; Steps past one token, instead of a second `p = p + 1` in a function: the
+; reference backend reused a stale hoisted `p + 1` (#6292, #6508).
+fn advance() -> void {
+    p = p + 1;
+}
+
+fn is_scalar(t: i64) -> bool {
+    if (kind(t) != T_IDENT) {
+        return false;
+    }
+    if (tok_is(t, W_BOOL, 0, 4) or tok_is(t, W_USIZE, 0, 5)) {
+        return true;
+    }
+    if (tok_is(t, W_U8, 0, 2) or tok_is(t, W_I8, 0, 2)) {
+        return true;
+    }
+    if (tok_is(t, W_U16, 0, 3) or tok_is(t, W_I16, 0, 3)) {
+        return true;
+    }
+    if (tok_is(t, W_U32, 0, 3) or tok_is(t, W_I32, 0, 3)) {
+        return true;
+    }
+    return tok_is(t, W_U64, 0, 3) or tok_is(t, W_I64, 0, 3);
+}
+
+fn expect_scalar() -> i64 {
+    var t: i64 = p;
+    if (failed) {
+        return 0;
+    }
+    if (!is_scalar(t)) {
+        fail(E_TYPE, tpos(t));
+        return 0;
+    }
+    p = p + 1;
+    return t;
+}
+
+; ---------------------------------------------------------------- expressions
+
+; Binding level of a binary operator, lowest first; -1 if `k` is not one.
+fn op_level(k: i64) -> i64 {
+    if (k == T_OR) {
+        return 0;
+    }
+    if (k == T_AND) {
+        return 1;
+    }
+    if (k == T_EQEQ or k == T_NE or k == '<' or k == '>' or k == T_LE or k == T_GE) {
+        return 2;
+    }
+    if (k == '|') {
+        return 3;
+    }
+    if (k == '^') {
+        return 4;
+    }
+    if (k == '&') {
+        return 5;
+    }
+    if (k == T_SHL or k == T_SHR) {
+        return 6;
+    }
+    if (k == '+' or k == '-') {
+        return 7;
+    }
+    if (k == '*' or k == '/' or k == '%') {
+        return 8;
+    }
+    return -1;
+}
+
+fn parse_args() -> i64 {
+    var head: i64 = 0;
+    var tail: i64 = 0;
+    if (cur() == ')') {
+        p = p + 1;
+        return 0;
+    }
+    while (!failed) {
+        var e: i64 = parse_expr();
+        if (failed) {
+            return 0;
+        }
+        if (head == 0) {
+            head = e;
+        } else {
+            nd_next[tail as usize] = e;
+        }
+        tail = e;
+        if (cur() == ',') {
+            p = p + 1;
+        } else {
+            expect(')');
+            return head;
+        }
+    }
+    return head;
+}
+
+fn parse_primary() -> i64 {
+    var k: i64 = cur();
+    var t: i64 = p;
+    if (k == T_IDENT) {
+        p = p + 1;
+        if (cur() == '(') {
+            p = p + 1;
+            return mk(N_CALL, t, parse_args(), 0);
+        }
+        var e: i64 = mk(N_IDENT, t, 0, 0);
+        while (!failed and cur() == K_LBRACKET) {
+            p = p + 1;
+            var ix: i64 = parse_expr();
+            expect(K_RBRACKET);
+            e = mk(N_INDEX, t, e, ix);
+        }
+        return e;
+    }
+    if (k == T_NUM) {
+        p = p + 1;
+        return mk(N_NUM, t, 0, 0);
+    }
+    if (k == T_CHAR) {
+        p = p + 1;
+        return mk(N_CHAR, t, 0, 0);
+    }
+    if (k == T_TRUE) {
+        p = p + 1;
+        return mk(N_TRUE, t, 0, 0);
+    }
+    if (k == T_FALSE) {
+        p = p + 1;
+        return mk(N_FALSE, t, 0, 0);
+    }
+    if (k == '(') {
+        p = p + 1;
+        var inner: i64 = parse_expr();
+        expect(')');
+        return inner;
+    }
+    fail(E_SYNTAX, tpos(t));
+    return 0;
+}
+
+; Unary binds looser than `as`: `-x as T` is `-(x as T)`, as in gen-c.
+fn parse_unary() -> i64 {
+    var k: i64 = cur();
+    var t: i64 = p;
+    if (k == '-' or k == '!' or k == '~') {
+        p = p + 1;
+        var e: i64 = parse_unary();
+        if (failed) {
+            return 0;
+        }
+        return mk(N_UN, t, e, 0);
+    }
+    var x: i64 = parse_primary();
+    while (!failed and cur() == T_AS) {
+        p = p + 1;
+        var ty: i64 = expect_scalar();
+        x = mk(N_CAST, ty, x, 0);
+    }
+    return x;
+}
+
+fn parse_bin(level: i64) -> i64 {
+    if (level > 8) {
+        return parse_unary();
+    }
+    var l: i64 = parse_bin(level + 1);
+    while (!failed and op_level(cur()) == level) {
+        var op: i64 = p;
+        p = p + 1;
+        var r: i64 = parse_bin(level + 1);
+        l = mk(N_BIN, op, l, r);
+    }
+    return l;
+}
+
+fn parse_expr() -> i64 {
+    return parse_bin(0);
+}
+
+; ---------------------------------------------------------------- statements
+
+fn parse_block() -> i64 {
+    var head: i64 = 0;
+    var tail: i64 = 0;
+    expect(K_LBRACE);
+    while (!failed and cur() != K_RBRACE) {
+        if (cur() == T_EOF) {
+            fail(E_SYNTAX, src_len);
+            return 0;
+        }
+        var s: i64 = parse_stmt();
+        if (failed) {
+            return 0;
+        }
+        if (head == 0) {
+            head = s;
+        } else {
+            nd_next[tail as usize] = s;
+        }
+        tail = s;
+    }
+    expect(K_RBRACE);
+    return head;
+}
+
+fn parse_if() -> i64 {
+    advance();
+    expect('(');
+    var c: i64 = parse_expr();
+    expect(')');
+    var body: i64 = parse_block();
+    var n: i64 = mk(S_IF, 0, c, body);
+    if (!failed and cur() == T_ELSE) {
+        advance();
+        nd_aux[n as usize] = 1;
+        if (cur() == T_IF) {
+            nd_c[n as usize] = parse_if();
+        } else {
+            nd_c[n as usize] = parse_block();
+        }
+    }
+    return n;
+}
+
+fn parse_stmt() -> i64 {
+    var k: i64 = cur();
+    var t: i64 = p;
+    if (k == T_VAR or k == T_CONST) {
+        p = p + 1;
+        var name: i64 = p;
+        expect(T_IDENT);
+        expect(':');
+        var ty: i64 = expect_scalar();
+        expect('=');
+        var init: i64 = parse_expr();
+        expect(';');
+        var n: i64 = mk(S_LOCAL, name, init, 0);
+        nd_aux[n as usize] = ty;
+        return n;
+    }
+    if (k == T_IF) {
+        return parse_if();
+    }
+    if (k == T_WHILE) {
+        p = p + 1;
+        expect('(');
+        var c: i64 = parse_expr();
+        expect(')');
+        return mk(S_WHILE, t, c, parse_block());
+    }
+    if (k == T_BREAK) {
+        p = p + 1;
+        expect(';');
+        return mk(S_BREAK, t, 0, 0);
+    }
+    if (k == T_CONTINUE) {
+        p = p + 1;
+        expect(';');
+        return mk(S_CONTINUE, t, 0, 0);
+    }
+    if (k == T_RETURN) {
+        p = p + 1;
+        if (cur() == ';') {
+            p = p + 1;
+            return mk(S_RETURN, t, 0, 0);
+        }
+        var v: i64 = parse_expr();
+        expect(';');
+        return mk(S_RETURN, t, v, 0);
+    }
+    if (k == T_IDENT) {
+        var lhs: i64 = parse_expr();
+        if (failed) {
+            return 0;
+        }
+        if (cur() == '=' or cur() == T_OPEQ) {
+            if (nkind(lhs) != N_IDENT and nkind(lhs) != N_INDEX) {
+                fail(E_SYNTAX, tpos(p));
+                return 0;
+            }
+            // A compound `op=` keeps its token in nd_c; a plain `=` leaves 0.
+            var op: i64 = 0;
+            if (cur() == T_OPEQ) {
+                op = p;
+            }
+            p = p + 1;
+            var rhs: i64 = parse_expr();
+            expect(';');
+            var asg: i64 = mk(S_ASSIGN, t, lhs, rhs);
+            nd_c[asg as usize] = op;
+            return asg;
+        }
+        if (nkind(lhs) != N_CALL) {
+            fail(E_SYNTAX, tpos(p));
+            return 0;
+        }
+        expect(';');
+        return mk(S_EXPR, t, lhs, 0);
+    }
+    fail(E_SYNTAX, tpos(t));
+    return 0;
+}
+
+; ---------------------------------------------------------------- declarations
+
+; Tokens after which gen-c keeps reading a constant as an expression, the cast
+; `as` included (#6048). Anything else after a leading literal or name is
+; skipped by gen-c, so it is refused.
+fn continues(k: i64) -> bool {
+    return op_level(k) >= 0 or k == T_POW or k == T_AS;
+}
+
+; The value of a top-level `const`, mirroring gen-c's literal shortcuts: only
+; the shapes it renders without loss get through.
+fn parse_const_value() -> i64 {
+    var k: i64 = cur();
+    var k1: i64 = kind(p + 1);
+    var t: i64 = p;
+    if (k == '-' and k1 == T_NUM) {
+        if (kind(p + 2) == ';') {
+            // gen-c's `#define` for `-N` keeps N's `_` separators (#7318).
+            if (has_sep(p + 1)) {
+                fail(E_CONST, tpos(t + 1));
+                return 0;
+            }
+            p = p + 2;
+            return mk(N_NEGLIT, t + 1, 0, 0);
+        }
+        if (continues(kind(p + 2))) {
+            return parse_expr();
+        }
+        fail(E_CONST, tpos(t));
+        return 0;
+    }
+    // `~5`, `!true` and `'a'` are whole expressions in gen-c since #6048
+    // and #6049; before, it skipped them and emitted no constant at all.
+    if (k == '(' or k == '-' or k == '!' or k == '~') {
+        return parse_expr();
+    }
+    if (k == T_NUM and (k1 == ';' or continues(k1))) {
+        return parse_expr();
+    }
+    if (k == T_IDENT and (k1 == ';' or k1 == '(' or continues(k1))) {
+        return parse_expr();
+    }
+    if ((k == T_TRUE or k == T_FALSE or k == T_CHAR) and (k1 == ';' or continues(k1))) {
+        return parse_expr();
+    }
+    fail(E_CONST, tpos(t));
+    return 0;
+}
+
+fn parse_size() -> i64 {
+    var t: i64 = p;
+    if (cur() != T_NUM and cur() != T_IDENT) {
+        fail(E_ARRAY, tpos(t));
+        return 0;
+    }
+    p = p + 1;
+    return t;
+}
+
+; `[_]`, then `[M]` if `inner` is set, then the element type, which is `ty`.
+fn parse_elem(ty: i64, inner: i64) -> void {
+    expect(K_LBRACKET);
+    if (!failed and !(cur() == T_IDENT and tk_len[p as usize] == 1 and src[(tk_pos[p as usize]) as usize] == '_')) {
+        fail(E_ARRAY, tpos(p));
+        return;
+    }
+    advance();
+    expect(K_RBRACKET);
+    if (inner != 0) {
+        expect(K_LBRACKET);
+        if (!failed and !tok_eq(p, inner)) {
+            fail(E_ARRAY, tpos(p));
+            return;
+        }
+        advance();
+        expect(K_RBRACKET);
+    }
+    var ety: i64 = expect_scalar();
+    if (!failed and !tok_eq(ty, ety)) {
+        fail(E_ARRAY, tpos(ety));
+    }
+}
+
+; A plain decimal's value, else -1; past NODE_MAX, more than a list holds.
+fn num_val(t: i64) -> i64 {
+    var i: i64 = tk_pos[t as usize];
+    var v: i64 = 0;
+    while (i < tk_pos[t as usize] + tk_len[t as usize]) {
+        var d: i64 = (src[i as usize] as i64) - '0';
+        if (d < 0 or d > 9 or v > NODE_MAX) {
+            return -1;
+        }
+        v = v * 10 + d;
+        i = i + 1;
+    }
+    return v;
+}
+
+; gen-c pads a short list, drops the excess of a long one and loses a
+; repeated list (#7353). nd_b of an N_LIST is its item count.
+fn bad_count(l: i64, dim: i64) -> bool {
+    return nb(l) != num_val(dim) or nb(l) == 0 or cur() == T_POW;
+}
+
+; `{ ITEM , ... [,] }`, `dim` items if set; an ITEM is an EXPR, or a row
+; `[_]T{ EXPR , ... }` of `row` items if set.
+fn parse_list(dim: i64, row: i64, ty: i64) -> i64 {
+    var t: i64 = p;
+    var head: i64 = 0;
+    var tail: i64 = 0;
+    var n: i64 = 0;
+    expect(K_LBRACE);
+    while (!failed and cur() != K_RBRACE) {
+        var e: i64 = 0;
+        if (row != 0) {
+            parse_elem(ty, 0);
+            e = parse_list(row, 0, ty);
+        } else {
+            e = parse_expr();
+        }
+        if (head == 0) {
+            head = e;
+        } else {
+            nd_next[tail as usize] = e;
+        }
+        tail = e;
+        n = n + 1;
+        if (cur() != K_RBRACE) {
+            expect(',');
+        }
+    }
+    expect(K_RBRACE);
+    var l: i64 = mk(N_LIST, t, head, n);
+    if (!failed and dim != 0 and bad_count(l, dim)) {
+        fail(E_ARRAY, tpos(t));
+    }
+    return l;
+}
+
+; var NAME : [SIZE]T = [_]T{VALUE} ** COUNT ;  -- `name` is already consumed.
+; VALUE is a number; emit_global finds it three tokens before COUNT. A list
+; initializer sets nd_c instead, and nd_b to the inner dimension, if any.
+fn parse_array(name: i64) -> i64 {
+    expect(K_LBRACKET);
+    var size: i64 = parse_size();
+    // gen-c writes a dimension with its `_` separators kept (#7318).
+    if (!failed and kind(size) == T_NUM and has_sep(size)) {
+        fail(E_ARRAY, tpos(size));
+        return 0;
+    }
+    expect(K_RBRACKET);
+    var inner: i64 = 0;
+    if (!failed and cur() == K_LBRACKET) {
+        advance();
+        inner = parse_size();
+        expect(K_RBRACKET);
+    }
+    var ty: i64 = expect_scalar();
+    expect('=');
+    parse_elem(ty, inner);
+    var n: i64 = mk(D_ARRAY, name, size, 0);
+    nd_aux[n as usize] = ty;
+    if (inner != 0) {
+        nd_b[n as usize] = inner;
+        nd_c[n as usize] = parse_list(size, inner, ty);
+    } else {
+        var l: i64 = parse_list(0, 0, ty);
+        var it: i64 = na(l);
+        if (cur() == T_POW) {
+            if (!failed and (nb(l) != 1 or nkind(it) != N_NUM or ntok(it) != p - 2)) {
+                fail(E_ARRAY, tpos(p));
+                return 0;
+            }
+            advance();
+            nd_b[n as usize] = parse_size();
+        } else {
+            if (!failed and bad_count(l, size)) {
+                fail(E_ARRAY, tpos(size));
+            }
+            nd_c[n as usize] = l;
+        }
+    }
+    expect(';');
+    return n;
+}
+
+fn parse_params() -> i64 {
+    var head: i64 = 0;
+    var tail: i64 = 0;
+    expect('(');
+    if (!failed and cur() == ')') {
+        p = p + 1;
+        return 0;
+    }
+    while (!failed) {
+        var name: i64 = p;
+        expect(T_IDENT);
+        expect(':');
+        var ty: i64 = expect_scalar();
+        var n: i64 = mk(D_PARAM, name, 0, 0);
+        nd_aux[n as usize] = ty;
+        if (head == 0) {
+            head = n;
+        } else {
+            nd_next[tail as usize] = n;
+        }
+        tail = n;
+        if (cur() == ',') {
+            p = p + 1;
+        } else {
+            expect(')');
+            return head;
+        }
+    }
+    return head;
+}
+
+fn parse_fn() -> i64 {
+    advance();
+    var name: i64 = p;
+    expect(T_IDENT);
+    var params: i64 = parse_params();
+    var ret: i64 = 0;
+    if (!failed and cur() == T_ARROW) {
+        advance();
+        if (cur() == T_VOID) {
+            advance();
+        } else {
+            ret = expect_scalar();
+        }
+    }
+    var body: i64 = parse_block();
+    var n: i64 = mk(D_FN, name, params, body);
+    nd_aux[n as usize] = ret;
+    return n;
+}
+
+fn parse_decl() -> i64 {
+    var k: i64 = cur();
+    var t: i64 = p;
+    if (k == T_PUB) {
+        p = p + 1;
+        k = cur();
+        t = p;
+        if (k != T_FN and k != T_CONST and k != T_VAR) {
+            fail(E_SYNTAX, tpos(p));
+            return 0;
+        }
+    }
+    if (k == T_FN) {
+        return parse_fn();
+    }
+    if (k == T_TEST) {
+        p = p + 1;
+        var tname: i64 = p;
+        expect(T_IDENT);
+        has_tests = true;
+        return mk(D_TEST, tname, 0, parse_block());
+    }
+    if (k == T_CONST or k == T_VAR) {
+        p = p + 1;
+        var name: i64 = p;
+        expect(T_IDENT);
+        expect(':');
+        if (!failed and k == T_VAR and cur() == K_LBRACKET) {
+            return parse_array(name);
+        }
+        var ty: i64 = expect_scalar();
+        expect('=');
+        var v: i64 = 0;
+        if (k == T_CONST) {
+            v = parse_const_value();
+        } else {
+            v = parse_expr();
+        }
+        expect(';');
+        var n: i64 = mk(D_VAR, name, v, 0);
+        if (k == T_CONST) {
+            nd_kind[n as usize] = D_CONST;
+        }
+        nd_aux[n as usize] = ty;
+        return n;
+    }
+    fail(E_SYNTAX, tpos(t));
+    return 0;
+}
+
+; gen-c stops reading at `endmodule` and drops whatever follows it, so the
+; word is accepted only where nothing follows.
+fn parse_end() -> void {
+    while (cur() == T_IDENT and tok_is(p, W_ENDMODUL, 'e', 9)) {
+        p = p + 1;
+    }
+    if (cur() != T_EOF) {
+        fail(E_SYNTAX, tpos(p));
+    }
+}
+
+fn parse_module() -> void {
+    var tail: i64 = 0;
+    expect(T_MODULE);
+    mod_tok = p;
+    expect(T_IDENT);
+    expect(';');
+    while (!failed and cur() != T_EOF) {
+        if (cur() == T_IDENT and tok_is(p, W_ENDMODUL, 'e', 9)) {
+            parse_end();
+            return;
+        }
+        var d: i64 = parse_decl();
+        if (failed) {
+            return;
+        }
+        if (decls == 0) {
+            decls = d;
+        } else {
+            nd_next[tail as usize] = d;
+        }
+        tail = d;
+    }
+}
+
+; ---------------------------------------------------------------- checks
+
+fn is_fn_name(t: i64) -> bool {
+    var d: i64 = decls;
+    while (d != 0) {
+        if (nkind(d) == D_FN and tok_eq(ntok(d), t)) {
+            return true;
+        }
+        d = nnext(d);
+    }
+    return false;
+}
+
+fn list_len(head: i64) -> i64 {
+    var n: i64 = 0;
+    var e: i64 = head;
+    while (e != 0) {
+        n = n + 1;
+        e = nnext(e);
+    }
+    return n;
+}
+
+; How many indexes a name takes: 2 or 1 for an array global, else 0.
+fn rank(t: i64) -> i64 {
+    var d: i64 = decls;
+    while (d != 0) {
+        if (nkind(d) == D_ARRAY and tok_eq(ntok(d), t)) {
+            if (nc(d) != 0 and nb(d) != 0) {
+                return 2;
+            }
+            return 1;
+        }
+        d = nnext(d);
+    }
+    return 0;
+}
+
+fn check_expr(e: i64) -> void {
+    var k: i64 = nkind(e);
+    if (failed or e == 0) {
+        return;
+    }
+    if (k == N_IDENT and tok_is(ntok(e), W_UNDEFINE, 'd', 9)) {
+        fail(E_NAME, tpos(ntok(e)));
+        return;
+    }
+    if (k == N_CALL) {
+        var t: i64 = ntok(e);
+        var is_assert: bool = tok_is(t, W_ASSERT, 0, 6);
+        var is_eq: bool = tok_is(t, W_ASSERT_E, 'q', 9);
+        if (!is_assert and !is_eq and !is_fn_name(t)) {
+            fail(E_CALL, tpos(t));
+            return;
+        }
+        // Both come from the test header, and take 1 and 2 arguments. The
+        // header follows their use, not the test block (#6051).
+        if (is_assert and list_len(na(e)) != 1) {
+            fail(E_CALL, tpos(t));
+            return;
+        }
+        if (is_eq and list_len(na(e)) != 2) {
+            fail(E_CALL, tpos(t));
+            return;
+        }
+        if (is_assert or is_eq) {
+            uses_assert = true;
+        }
+        var arg: i64 = na(e);
+        while (arg != 0) {
+            check_expr(arg);
+            arg = nnext(arg);
+        }
+        return;
+    }
+    // C reads a row or a whole array where a scalar goes, or will not compile
+    // a store to it; Zig copies it. Either way gen-c loses it.
+    if (k == N_IDENT or k == N_INDEX) {
+        var b: i64 = e;
+        var depth: i64 = 0;
+        while (nkind(b) == N_INDEX) {
+            check_expr(nb(b));
+            b = na(b);
+            depth = depth + 1;
+        }
+        if (!failed and depth != rank(ntok(e))) {
+            fail(E_ARRAY, tpos(ntok(e)));
+        }
+        return;
+    }
+    if (k == N_LIST) {
+        var it: i64 = na(e);
+        while (it != 0) {
+            check_expr(it);
+            it = nnext(it);
+        }
+        return;
+    }
+    if (k == N_BIN) {
+        check_expr(na(e));
+        check_expr(nb(e));
+        return;
+    }
+    if (k == N_UN or k == N_CAST) {
+        check_expr(na(e));
+    }
+}
+
+; gen-c writes a test-level `x = e;` or `x op= e;` as a fresh `uint64_t x = e`
+; unless the test declares x at its top level or x is a scalar module `var`
+; (#6052).
+fn declared_in(head: i64, t: i64) -> bool {
+    var s: i64 = head;
+    while (s != 0) {
+        if (nkind(s) == S_LOCAL and tok_eq(ntok(s), t)) {
+            return true;
+        }
+        s = nnext(s);
+    }
+    s = decls;
+    while (s != 0) {
+        if (nkind(s) == D_VAR and tok_eq(ntok(s), t)) {
+            return true;
+        }
+        s = nnext(s);
+    }
+    return false;
+}
+
+fn check_stmts(head: i64, test_body: i64) -> void {
+    var s: i64 = head;
+    while (!failed and s != 0) {
+        var k: i64 = nkind(s);
+        if (k == S_ASSIGN) {
+            var lhs: i64 = na(s);
+            if (nkind(lhs) == N_IDENT) {
+                var t: i64 = ntok(lhs);
+                if (tk_len[t as usize] == 1 and src[(tk_pos[t as usize]) as usize] == '_') {
+                    fail(E_NAME, tpos(t));
+                    return;
+                }
+                if (test_body != 0 and !declared_in(test_body, t)) {
+                    fail(E_TESTASSIGN, tpos(t));
+                    return;
+                }
+            }
+            check_expr(lhs);
+            check_expr(nb(s));
+        } else if (k == S_IF) {
+            check_expr(na(s));
+            check_stmts(nb(s), 0);
+            check_stmts(nc(s), 0);
+        } else if (k == S_WHILE) {
+            check_expr(na(s));
+            check_stmts(nb(s), 0);
+        } else {
+            check_expr(na(s));
+        }
+        s = nnext(s);
+    }
+}
+
+fn check() -> void {
+    var d: i64 = decls;
+    while (!failed and d != 0) {
+        var k: i64 = nkind(d);
+        var t: i64 = ntok(d);
+        if (k == D_FN) {
+            if (tok_is(t, W_ASSERT, 0, 6) or tok_is(t, W_DEFAULT_, 0x7475706e69, 13) or tok_is(t, W_VALID_IN, 0x747570, 11)) {
+                fail(E_NAME, tpos(t));
+                return;
+            }
+            if (tok_is(t, W_ASSERT_E, 'q', 9) or tok_is(t, W_T27_ASSE, 0x7472, 10)) {
+                fail(E_NAME, tpos(t));
+                return;
+            }
+            check_stmts(nb(d), 0);
+        } else if (k == D_TEST) {
+            check_stmts(nb(d), nb(d));
+        } else if (k == D_CONST or k == D_VAR) {
+            check_expr(na(d));
+        } else if (k == D_ARRAY) {
+            check_expr(nc(d));
+        }
+        d = nnext(d);
+    }
+}
+
+; ---------------------------------------------------------------- C output
+
+fn emit_ctype(t: i64) -> void {
+    var c: i64 = src[(tk_pos[t as usize]) as usize] as i64;
+    if (c == 'b') {
+        t_ty_bool();
+        return;
+    }
+    if (tk_len[t as usize] == 5) {
+        t_ty_size();
+        return;
+    }
+    if (c == 'u') {
+        put('u');
+    }
+    t_ty_int();
+    var i: i64 = 1;
+    while (i < tk_len[t as usize]) {
+        put(src[(tk_pos[t as usize] + i) as usize] as i64);
+        i = i + 1;
+    }
+    t_ty_t();
+}
+
+fn emit_ret(t: i64) -> void {
+    if (t == 0) {
+        t_void_params();
+    } else {
+        emit_ctype(t);
+    }
+}
+
+fn emit_items(head: i64) -> void {
+    var it: i64 = head;
+    while (it != 0) {
+        emit_expr(it);
+        it = nnext(it);
+        if (it != 0) {
+            t_comma();
+        }
+    }
+}
+
+fn emit_expr(e: i64) -> void {
+    var k: i64 = nkind(e);
+    if (k == N_BIN) {
+        var op: i64 = ntok(e);
+        put('(');
+        emit_expr(na(e));
+        put(' ');
+        if (kind(op) == T_AND) {
+            w(0x2626, 2);
+        } else if (kind(op) == T_OR) {
+            w(0x7c7c, 2);
+        } else {
+            put_tok(op);
+        }
+        put(' ');
+        emit_expr(nb(e));
+        put(')');
+    } else if (k == N_UN) {
+        put_tok(ntok(e));
+        // `- -x`, not `--x`: C reads that as a decrement (#6046). Only an
+        // operand that is itself the same unary starts with the same byte.
+        var a: i64 = na(e);
+        if (nkind(a) == N_UN and kind(ntok(a)) == kind(ntok(e))) {
+            put(' ');
+        }
+        emit_expr(a);
+    } else if (k == N_CAST) {
+        t_cast_open();
+        emit_ctype(ntok(e));
+        t_cast_mid();
+        emit_expr(na(e));
+        t_cast_close();
+    } else if (k == N_INDEX) {
+        emit_expr(na(e));
+        put(K_LBRACKET);
+        emit_expr(nb(e));
+        put(K_RBRACKET);
+    } else if (k == N_CALL) {
+        put_tok(ntok(e));
+        put('(');
+        emit_items(na(e));
+        put(')');
+    } else if (k == N_LIST) {
+        put(K_LBRACE);
+        put(' ');
+        emit_items(na(e));
+        put(' ');
+        put(K_RBRACE);
+    } else {
+        put_tok(ntok(e));
+    }
+}
+
+fn emit_stmts(head: i64, lvl: i64) -> void {
+    var s: i64 = head;
+    while (s != 0) {
+        emit_stmt(s, lvl);
+        s = nnext(s);
+    }
+}
+
+; gen-c folds an else branch holding exactly one `if` into `} else if`.
+fn emit_if_tail(s: i64, lvl: i64) -> void {
+    t_kw_if();
+    emit_expr(na(s));
+    t_open_body();
+    emit_stmts(nb(s), lvl + 1);
+    indent(lvl);
+    if (naux(s) == 0) {
+        t_close_brace();
+        return;
+    }
+    var el: i64 = nc(s);
+    if (el != 0 and nnext(el) == 0 and nkind(el) == S_IF) {
+        t_else_inline();
+        emit_if_tail(el, lvl);
+        return;
+    }
+    t_else_block();
+    emit_stmts(el, lvl + 1);
+    indent(lvl);
+    t_close_brace();
+}
+
+fn emit_stmt(s: i64, lvl: i64) -> void {
+    var k: i64 = nkind(s);
+    if (k == S_BREAK) {
+        t_kw_break();
+        return;
+    }
+    if (k == S_CONTINUE) {
+        t_kw_continue();
+        return;
+    }
+    indent(lvl);
+    if (k == S_LOCAL) {
+        emit_ctype(naux(s));
+        put(' ');
+        put_tok(ntok(s));
+        t_assign();
+        emit_expr(na(s));
+        t_semi_nl();
+    } else if (k == S_ASSIGN) {
+        emit_expr(na(s));
+        if (nc(s) == 0) {
+            t_assign();
+        } else {
+            put(' ');
+            put_tok(nc(s));
+            put(' ');
+        }
+        emit_expr(nb(s));
+        t_semi_nl();
+    } else if (k == S_EXPR) {
+        emit_expr(na(s));
+        t_semi_nl();
+    } else if (k == S_RETURN) {
+        t_kw_return();
+        if (na(s) != 0) {
+            emit_expr(na(s));
+        }
+        t_semi_nl();
+    } else if (k == S_WHILE) {
+        t_kw_while();
+        emit_expr(na(s));
+        t_open_body();
+        emit_stmts(nb(s), lvl + 1);
+        indent(lvl);
+        t_close_brace();
+    } else if (k == S_IF) {
+        emit_if_tail(s, lvl);
+    }
+}
+
+; A number token whose value is zero, in any radix the lexer takes.
+fn num_is_zero(t: i64) -> bool {
+    var i: i64 = tk_pos[t as usize];
+    var e: i64 = i + tk_len[t as usize];
+    if (tk_len[t as usize] > 2 and src[i as usize] == '0') {
+        var c: i64 = src[(i + 1) as usize] as i64;
+        if (c == 'x' or c == 'X' or c == 'b' or c == 'B') {
+            i = i + 2;
+        }
+    }
+    while (i < e) {
+        if (src[i as usize] != '0' and src[i as usize] != '_') {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn emit_global(d: i64) -> void {
+    var k: i64 = nkind(d);
+    var v: i64 = na(d);
+    if (k == D_ARRAY) {
+        t_static();
+        emit_ctype(naux(d));
+        put(' ');
+        put_tok(ntok(d));
+        put(K_LBRACKET);
+        put_tok(na(d));
+        put(K_RBRACKET);
+        if (nc(d) != 0) {
+            if (nb(d) != 0) {
+                put(K_LBRACKET);
+                put_tok(nb(d));
+                put(K_RBRACKET);
+            }
+            t_assign();
+            emit_expr(nc(d));
+            t_semi_nl();
+            return;
+        }
+        // gen-c keeps `{0}` for a zero value and writes a GNU range for any
+        // other (#6050): before, every repeat came out `{0}`.
+        var vt: i64 = nb(d) - 3;
+        t_repeat();
+        put_tok(vt);
+        t_repeat_mid();
+        put_tok(nb(d));
+        if (num_is_zero(vt)) {
+            t_repeat_end();
+        } else {
+            t_range_open();
+            put_tok(nb(d));
+            t_range_mid();
+            put_tok(vt);
+            t_range_end();
+        }
+        return;
+    }
+    if (k == D_CONST and nkind(v) == N_NEGLIT) {
+        t_define();
+        put_tok(ntok(d));
+        put(' ');
+        put('-');
+        put_tok(ntok(v));
+        put('\n');
+        return;
+    }
+    var lit: bool = nkind(v) == N_NUM or nkind(v) == N_TRUE or nkind(v) == N_FALSE or nkind(v) == N_CHAR;
+    if (k == D_CONST and lit) {
+        t_define();
+        put_tok(ntok(d));
+        put(' ');
+        put_tok(ntok(v));
+        put('\n');
+        return;
+    }
+    if (k == D_CONST) {
+        t_static_const();
+    } else {
+        t_static();
+    }
+    emit_ctype(naux(d));
+    put(' ');
+    put_tok(ntok(d));
+    t_assign();
+    emit_expr(v);
+    t_semi_nl();
+}
+
+fn emit_sig(d: i64) -> void {
+    emit_ret(naux(d));
+    put(' ');
+    put_tok(ntok(d));
+    put('(');
+    var prm: i64 = na(d);
+    if (prm == 0) {
+        t_void_params();
+    }
+    while (prm != 0) {
+        emit_ctype(naux(prm));
+        put(' ');
+        put_tok(ntok(prm));
+        prm = nnext(prm);
+        if (prm != 0) {
+            t_comma();
+        }
+    }
+}
+
+fn count_kind(k1: i64, k2: i64, k3: i64) -> i64 {
+    var n: i64 = 0;
+    var d: i64 = decls;
+    while (d != 0) {
+        var k: i64 = nkind(d);
+        if (k == k1 or k == k2 or k == k3) {
+            n = n + 1;
+        }
+        d = nnext(d);
+    }
+    return n;
+}
+
+fn emit_module() -> void {
+    var d: i64 = 0;
+    t_hdr_open();
+    put_tok(mod_tok);
+    t_hdr_close();
+    if (has_tests or uses_assert) {
+        t_hdr_tests();
+    }
+    t_ifndef();
+    put_upper(mod_tok);
+    t_define_guard();
+    put_upper(mod_tok);
+    t_guard_end();
+    if (count_kind(D_CONST, D_VAR, D_ARRAY) > 0) {
+        t_banner_open();
+        t_constants();
+        t_banner_close();
+        d = decls;
+        while (d != 0) {
+            var k: i64 = nkind(d);
+            if (k == D_CONST or k == D_VAR or k == D_ARRAY) {
+                emit_global(d);
+            }
+            d = nnext(d);
+        }
+        put('\n');
+    }
+    if (count_kind(D_FN, D_FN, D_FN) > 0) {
+        t_banner_open();
+        t_prototypes();
+        t_banner_close();
+        d = decls;
+        while (d != 0) {
+            if (nkind(d) == D_FN) {
+                emit_sig(d);
+                t_proto_end();
+            }
+            d = nnext(d);
+        }
+        put('\n');
+        t_banner_open();
+        t_implementations();
+        t_banner_close();
+        d = decls;
+        while (d != 0) {
+            if (nkind(d) == D_FN) {
+                emit_sig(d);
+                t_open_body();
+                if (nb(d) == 0) {
+                    indent(1);
+                    t_todo_fn();
+                }
+                emit_stmts(nb(d), 1);
+                t_close_fn();
+            }
+            d = nnext(d);
+        }
+    }
+    if (has_tests) {
+        var checked: i64 = 0;
+        var empty: i64 = 0;
+        t_banner_open();
+        t_tests();
+        t_banner_close();
+        d = decls;
+        while (d != 0) {
+            if (nkind(d) == D_TEST) {
+                t_test_fn();
+                put_tok(ntok(d));
+                t_test_sig();
+                if (nb(d) == 0) {
+                    indent(1);
+                    t_todo_test();
+                    empty = empty + 1;
+                } else {
+                    checked = checked + 1;
+                }
+                emit_stmts(nb(d), 1);
+                t_close_fn();
+            }
+            d = nnext(d);
+        }
+        put('\n');
+        t_banner_open();
+        t_runner();
+        t_banner_close();
+        t_run_open();
+        d = decls;
+        while (d != 0) {
+            if (nkind(d) == D_TEST) {
+                indent(1);
+                t_test_pfx();
+                put_tok(ntok(d));
+                t_run_call();
+            }
+            d = nnext(d);
+        }
+        if (empty > 0) {
+            t_run_checked();
+            put_int(checked);
+            t_comma();
+            put_int(empty);
+        } else {
+            t_run_all();
+            put_int(checked);
+        }
+        t_run_close();
+    }
+    t_endif();
+    put_upper(mod_tok);
+    t_endif_close();
+}
+
+; ---------------------------------------------------------------- entry
+
+; Compile the first `n` bytes of `src` into `out`. Returns the number of bytes
+; written, or -1 with `err_code` and `err_pos` set.
+pub fn compile(n: i64) -> i64 {
+    src_len = n;
+    out_len = 0;
+    tok_count = 0;
+    node_count = 1;
+    p = 0;
+    failed = false;
+    err_code = 0;
+    err_pos = 0;
+    has_tests = false;
+    uses_assert = false;
+    mod_tok = 0;
+    decls = 0;
+    if (n < 0 or n > SRC_MAX) {
+        fail(E_LIMIT, 0);
+        return -1;
+    }
+    lex();
+    if (!failed) {
+        parse_module();
+    }
+    if (!failed) {
+        check();
+    }
+    if (!failed) {
+        emit_module();
+    }
+    if (failed) {
+        return -1;
+    }
+    return out_len;
+}
+
+; ---------------------------------------------------------------- tests
+
+; Writes the n low bytes of x into src at `at_pos`; returns the next offset.
+fn feed(x: i64, n: i64, at_pos: i64) -> i64 {
+    var i: i64 = 0;
+    while (i < n) {
+        src[(at_pos + i) as usize] = ((x >> (i * 8)) & 255) as u8;
+        i = i + 1;
+    }
+    return at_pos + n;
+}
+
+fn reset_out() -> void {
+    out_len = 0;
+}
+
+fn out_at(i: i64) -> i64 {
+    return out[i as usize] as i64;
+}
+
+; Each feed step binds a fresh local (n1, n2, ...): the Zig reference and t27b
+; both read a second assignment to a test-block local as a redeclaration.
+
+; "module m;" is 372 bytes of C under gen-c, header to guard.
+test minimal_module_compiles {
+    var n1: i64 = feed(0x6d20656c75646f6d, 8, 0);
+    var n2: i64 = feed(0x3b, 1, n1);
+    assert(compile(n2) == 372);
+    assert(out_at(0) == '/');
+    assert(out_at(371) == '\n');
+}
+
+; "module m;" then a double quote: strings are outside the subset.
+test string_is_refused {
+    var n1: i64 = feed(0x6d20656c75646f6d, 8, 0);
+    var n2: i64 = feed(0x223b, 2, n1);
+    assert(compile(n2) == -1);
+    assert(err_code == E_LEX);
+}
+
+; "module m;fn f(){g();}": g is declared nowhere.
+test undeclared_call_is_refused {
+    var n1: i64 = feed(0x6d20656c75646f6d, 8, 0);
+    var n2: i64 = feed(0x3b, 1, n1);
+    var n3: i64 = feed(0x677b292866206e66, 8, n2);
+    var n4: i64 = feed(0x7d3b2928, 4, n3);
+    assert(compile(n4) == -1);
+    assert(err_code == E_CALL);
+}
+
+; "module m;const A: u8 = B[0];": gen-c keeps `B` and skips `[0]`.
+test lossy_const_is_refused {
+    var n1: i64 = feed(0x6d20656c75646f6d, 8, 0);
+    var n2: i64 = feed(0x3b, 1, n1);
+    var n3: i64 = feed(0x3a412074736e6f63, 8, n2);
+    var n4: i64 = feed(0x5b42203d20387520, 8, n3);
+    var n5: i64 = feed(0x3b5d30, 3, n4);
+    assert(compile(n5) == -1);
+    assert(err_code == E_CONST);
+}
+
+; "module m;test t{x = 1;}": gen-c would bind a fresh uint64_t x.
+test unbound_test_assignment_is_refused {
+    var n1: i64 = feed(0x6d20656c75646f6d, 8, 0);
+    var n2: i64 = feed(0x3b, 1, n1);
+    var n3: i64 = feed(0x787b742074736574, 8, n2);
+    var n4: i64 = feed(0x7d3b31203d20, 6, n3);
+    assert(compile(n4) == -1);
+    assert(err_code == E_TESTASSIGN);
+}
+
+; "module m;fn f(){var x: i64 = 1;x += 2;}": gen-c writes `x += 2;`, 731
+; bytes in all, the operator at offset 705 (#7306).
+test compound_assignment_keeps_its_operator {
+    var n1: i64 = feed(0x6d20656c75646f6d, 8, 0);
+    var n2: i64 = feed(0x7b292866206e663b, 8, n1);
+    var n3: i64 = feed(0x69203a7820726176, 8, n2);
+    var n4: i64 = feed(0x783b31203d203436, 8, n3);
+    var n5: i64 = feed(0x7d3b32203d2b20, 7, n4);
+    assert(compile(n5) == 731);
+    assert(out_at(704) == ' ');
+    assert(out_at(705) == '+');
+    assert(out_at(706) == '=');
+    assert(out_at(707) == ' ');
+}
+
+; "module m;var g: i64 = 0;test t{g ^= 1;}": a module var is written in place.
+test compound_assignment_to_a_module_var_in_a_test {
+    var n1: i64 = feed(0x6d20656c75646f6d, 8, 0);
+    var n2: i64 = feed(0x203a67207261763b, 8, n1);
+    var n3: i64 = feed(0x3b30203d20343669, 8, n2);
+    var n4: i64 = feed(0x677b742074736574, 8, n3);
+    var n5: i64 = feed(0x7d3b31203d5e20, 7, n4);
+    assert(compile(n5) == 1205);
+    assert(out_at(843) == '^');
+    assert(out_at(844) == '=');
+}
+
+; "module m;test t{x += 1;}": gen-c would bind a fresh `uint64_t x = 1`,
+; dropping the operator.
+test unbound_test_compound_assignment_is_refused {
+    var n1: i64 = feed(0x6d20656c75646f6d, 8, 0);
+    var n2: i64 = feed(0x7b7420747365743b, 8, n1);
+    var n3: i64 = feed(0x7d3b31203d2b2078, 8, n2);
+    assert(compile(n3) == -1);
+    assert(err_code == E_TESTASSIGN);
+}
+
+; "module m;const A: i64 = 0b1_0;": gen-c writes `#define A 0b10`, 523 bytes
+; in all, the separator dropped (#7321).
+test separator_is_dropped_from_a_number {
+    var n1: i64 = feed(0x6d20656c75646f6d, 8, 0);
+    var n2: i64 = feed(0x412074736e6f633b, 8, n1);
+    var n3: i64 = feed(0x203d20343669203a, 8, n2);
+    var n4: i64 = feed(0x3b305f316230, 6, n3);
+    assert(compile(n4) == 523);
+    assert(out_at(500) == '0');
+    assert(out_at(501) == 'b');
+    assert(out_at(502) == '1');
+    assert(out_at(503) == '0');
+    assert(out_at(504) == '\n');
+}
+
+; "module m;const A: i64 = 010;": C would read `010` as 8 (#7319).
+test leading_zero_is_refused {
+    var n1: i64 = feed(0x6d20656c75646f6d, 8, 0);
+    var n2: i64 = feed(0x412074736e6f633b, 8, n1);
+    var n3: i64 = feed(0x203d20343669203a, 8, n2);
+    var n4: i64 = feed(0x3b303130, 4, n3);
+    assert(compile(n4) == -1);
+    assert(err_code == E_LEX);
+}
+
+; "module m;var a: [1_0]u8 = [_]u8{0} ** 2;": gen-c writes `a[1_0]` (#7318).
+test separator_in_a_dimension_is_refused {
+    var n1: i64 = feed(0x6d20656c75646f6d, 8, 0);
+    var n2: i64 = feed(0x203a61207261763b, 8, n1);
+    var n3: i64 = feed(0x2038755d305f315b, 8, n2);
+    var n4: i64 = feed(0x7b38755d5f5b203d, 8, n3);
+    var n5: i64 = feed(0x3b32202a2a207d30, 8, n4);
+    assert(compile(n5) == -1);
+    assert(err_code == E_ARRAY);
+}
+
+; "module m;var a:[1][1]u8=[_][1]u8{[_]u8{7}};": `a[1][1] = { { 7 } };`.
+test nested_list_is_written {
+    var n1: i64 = feed(0x6d20656c75646f6d, 8, 0);
+    var n2: i64 = feed(0x5b3a61207261763b, 8, n1);
+    var n3: i64 = feed(0x3d38755d315b5d31, 8, n2);
+    var n4: i64 = feed(0x38755d315b5d5f5b, 8, n3);
+    var n5: i64 = feed(0x377b38755d5f5b7b, 8, n4);
+    var n6: i64 = feed(0x3b7d7d, 3, n5);
+    assert(compile(n6) == 544);
+    assert(out_at(517) == K_LBRACE);
+    assert(out_at(519) == '7');
+}
+
+; "module m;var a:[2]u8=[_]u8{1};": gen-c pads it with a zero.
+test short_list_is_refused {
+    var n1: i64 = feed(0x6d20656c75646f6d, 8, 0);
+    var n2: i64 = feed(0x5b3a61207261763b, 8, n1);
+    var n3: i64 = feed(0x5d5f5b3d38755d32, 8, n2);
+    var n4: i64 = feed(0x3b7d317b3875, 6, n3);
+    assert(compile(n4) == -1);
+    assert(err_code == E_ARRAY);
+}
+
+; "module m;fn f(){assert(true);}": no test block, yet <assert.h> (#6051).
+test assert_outside_tests_takes_the_header {
+    var n1: i64 = feed(0x6d20656c75646f6d, 8, 0);
+    var n2: i64 = feed(0x3b, 1, n1);
+    var n3: i64 = feed(0x617b292866206e66, 8, n2);
+    var n4: i64 = feed(0x7274287472657373, 8, n3);
+    var n5: i64 = feed(0x7d3b296575, 5, n4);
+    assert(compile(n5) > 372);
+    assert(uses_assert);
+    assert(!has_tests);
+}
+
+test put_int_writes_decimal {
+    reset_out();
+    put_int(907);
+    assert(out_len == 3);
+    assert(out_at(0) == '9');
+    assert(out_at(1) == '0');
+    assert(out_at(2) == '7');
+}
+
+test packed_words_match_their_spelling {
+    reset_out();
+    w(0x656c75646f6d, 6);
+    assert(out_at(0) == 'm');
+    assert(out_at(5) == 'e');
+}
+
+; ---------------------------------------------------------------- fixed text
+
+fn t_test_pfx() -> void {
+    w(0x5f74736574, 5);
+}
+
+; /* <76 x '='>\n   Generated from t27 spec: 
+fn t_hdr_open() -> void {
+    w(0x202a2f, 3);
+    rep('=', 76);
+    w(0x656e65472020200a, 8);
+    w(0x7266206465746172, 8);
+    w(0x7320373274206d6f, 8);
+    w(0x203a636570, 5);
+}
+
+; \n   DO NOT EDIT - generated by t27c gen-c\n   phi^2 + 1/phi^2 = 3 | TRINITY\n   <76 x '='> */\n\n#include <stdint.h>\n#include <stdbool.h>\n#include <stddef.h>\n
+fn t_hdr_close() -> void {
+    w(0x4e204f442020200a, 8);
+    w(0x205449444520544f, 8);
+    w(0x6172656e6567202d, 8);
+    w(0x7420796220646574, 8);
+    w(0x2d6e656720633732, 8);
+    w(0x6968702020200a63, 8);
+    w(0x702f31202b20325e, 8);
+    w(0x33203d20325e6968, 8);
+    w(0x494e495254207c20, 8);
+    w(0x2020200a5954, 6);
+    rep('=', 76);
+    w(0x6e69230a0a2f2a20, 8);
+    w(0x733c206564756c63, 8);
+    w(0x3e682e746e696474, 8);
+    w(0x64756c636e69230a, 8);
+    w(0x6f626474733c2065, 8);
+    w(0x69230a3e682e6c6f, 8);
+    w(0x3c206564756c636e, 8);
+    w(0x682e666564647473, 8);
+    w(0xa3e, 2);
+}
+
+; #include <assert.h>\n#define t27_assert(c, m) do { if (!(c)) { __builtin_trap(); } } while (0)\n#define assert_eq(a, b) do { if ((a) != (b)) { __builtin_trap(); } } while (0)\n
+fn t_hdr_tests() -> void {
+    w(0x6564756c636e6923, 8);
+    w(0x7472657373613c20, 8);
+    w(0x666564230a3e682e, 8);
+    w(0x5f37327420656e69, 8);
+    w(0x6328747265737361, 8);
+    w(0x206f6420296d202c, 8);
+    w(0x282128206669207b, 8);
+    w(0x5f5f207b20292963, 8);
+    w(0x5f6e69746c697562, 8);
+    w(0x203b292870617274, 8);
+    w(0x6c696877207d207d, 8);
+    w(0x64230a2930282065, 8);
+    w(0x736120656e696665, 8);
+    w(0x2871655f74726573, 8);
+    w(0x6f64202962202c61, 8);
+    w(0x2828206669207b20, 8);
+    w(0x6228203d21202961, 8);
+    w(0x625f5f207b202929, 8);
+    w(0x745f6e69746c6975, 8);
+    w(0x7d203b2928706172, 8);
+    w(0x656c696877207d20, 8);
+    w(0xa29302820, 5);
+}
+
+; \n#ifndef 
+fn t_ifndef() -> void {
+    w(0x6665646e6669230a, 8);
+    w(0x20, 1);
+}
+
+; _H\n#define 
+fn t_define_guard() -> void {
+    w(0x69666564230a485f, 8);
+    w(0x20656e, 3);
+}
+
+; _H\n\n
+fn t_guard_end() -> void {
+    w(0xa0a485f, 4);
+}
+
+; /* <55 x '-'>\n   
+fn t_banner_open() -> void {
+    w(0x202a2f, 3);
+    rep('-', 55);
+    w(0x2020200a, 4);
+}
+
+; \n   <55 x '-'> */\n\n
+fn t_banner_close() -> void {
+    w(0x2020200a, 4);
+    rep('-', 55);
+    w(0xa0a2f2a20, 5);
+}
+
+; Constants
+fn t_constants() -> void {
+    w(0x746e6174736e6f43, 8);
+    w(0x73, 1);
+}
+
+; Function prototypes
+fn t_prototypes() -> void {
+    w(0x6e6f6974636e7546, 8);
+    w(0x79746f746f727020, 8);
+    w(0x736570, 3);
+}
+
+; Function implementations
+fn t_implementations() -> void {
+    w(0x6e6f6974636e7546, 8);
+    w(0x656d656c706d6920, 8);
+    w(0x736e6f697461746e, 8);
+}
+
+; Tests
+fn t_tests() -> void {
+    w(0x7374736554, 5);
+}
+
+; Test runner (compile with -DT27_TEST_MAIN to execute)
+fn t_runner() -> void {
+    w(0x6e75722074736554, 8);
+    w(0x6d6f63282072656e, 8);
+    w(0x74697720656c6970, 8);
+    w(0x5f373254442d2068, 8);
+    w(0x49414d5f54534554, 8);
+    w(0x657865206f74204e, 8);
+    w(0x2965747563, 5);
+}
+
+; #define 
+fn t_define() -> void {
+    w(0x20656e6966656423, 8);
+}
+
+; static const 
+fn t_static_const() -> void {
+    w(0x6320636974617473, 8);
+    w(0x2074736e6f, 5);
+}
+
+; static 
+fn t_static() -> void {
+    w(0x20636974617473, 7);
+}
+
+;  = 
+fn t_assign() -> void {
+    w(0x203d20, 3);
+}
+
+; ;\n
+fn t_semi_nl() -> void {
+    w(0xa3b, 2);
+}
+
+;  = /* repeat: { 
+fn t_repeat() -> void {
+    w(0x6572202a2f203d20, 8);
+    w(0x207b203a74616570, 8);
+}
+
+;  } ** 
+fn t_repeat_mid() -> void {
+    w(0x202a2a207d20, 6);
+}
+
+;  */ { [0 ... (
+fn t_range_open() -> void {
+    w(0x305b207b202f2a20, 8);
+    w(0x28202e2e2e20, 6);
+}
+
+; ) - 1] = 
+fn t_range_mid() -> void {
+    w(0x3d205d31202d2029, 8);
+    w(0x20, 1);
+}
+
+;  };\n
+fn t_range_end() -> void {
+    w(0xa3b7d20, 4);
+}
+
+;  */ {0};\n
+fn t_repeat_end() -> void {
+    w(0x3b7d307b202f2a20, 8);
+    w(0xa, 1);
+}
+
+; void
+fn t_void_params() -> void {
+    w(0x64696f76, 4);
+}
+
+; ) {\n
+fn t_open_body() -> void {
+    w(0xa7b2029, 4);
+}
+
+; );\n
+fn t_proto_end() -> void {
+    w(0xa3b29, 3);
+}
+
+; }\n\n
+fn t_close_fn() -> void {
+    w(0xa0a7d, 3);
+}
+
+; /* TODO: implement */\n
+fn t_todo_fn() -> void {
+    w(0x3a4f444f54202a2f, 8);
+    w(0x656d656c706d6920, 8);
+    w(0xa2f2a20746e, 6);
+}
+
+; /* TODO: implement test */\n
+fn t_todo_test() -> void {
+    w(0x3a4f444f54202a2f, 8);
+    w(0x656d656c706d6920, 8);
+    w(0x207473657420746e, 8);
+    w(0xa2f2a, 3);
+}
+
+; void test_
+fn t_test_fn() -> void {
+    w(0x7365742064696f76, 8);
+    w(0x5f74, 2);
+}
+
+; (void) {\n
+fn t_test_sig() -> void {
+    w(0x7b202964696f7628, 8);
+    w(0xa, 1);
+}
+
+; if (
+fn t_kw_if() -> void {
+    w(0x28206669, 4);
+}
+
+; while (
+fn t_kw_while() -> void {
+    w(0x2820656c696877, 7);
+}
+
+; } else 
+fn t_else_inline() -> void {
+    w(0x2065736c65207d, 7);
+}
+
+; } else {\n
+fn t_else_block() -> void {
+    w(0x7b2065736c65207d, 8);
+    w(0xa, 1);
+}
+
+; }\n
+fn t_close_brace() -> void {
+    w(0xa7d, 2);
+}
+
+; break;\n
+fn t_kw_break() -> void {
+    w(0xa3b6b61657262, 7);
+}
+
+; continue;\n
+fn t_kw_continue() -> void {
+    w(0x65756e69746e6f63, 8);
+    w(0xa3b, 2);
+}
+
+; return 
+fn t_kw_return() -> void {
+    w(0x206e7275746572, 7);
+}
+
+; #ifdef T27_TEST_MAIN\n#include <stdio.h>\nint main(void) {\n
+fn t_run_open() -> void {
+    w(0x5420666564666923, 8);
+    w(0x5f545345545f3732, 8);
+    w(0x6e69230a4e49414d, 8);
+    w(0x733c206564756c63, 8);
+    w(0xa3e682e6f696474, 8);
+    w(0x6e69616d20746e69, 8);
+    w(0x7b202964696f7628, 8);
+    w(0xa, 1);
+}
+
+; ();\n
+fn t_run_call() -> void {
+    w(0xa3b2928, 4);
+}
+
+;     printf("All %d tests passed.\\n", 
+fn t_run_all() -> void {
+    w(0x6e69727020202020, 8);
+    w(0x206c6c4122286674, 8);
+    w(0x7374736574206425, 8);
+    w(0x2e64657373617020, 8);
+    w(0x202c226e5c, 5);
+}
+
+;     printf("All %d checked tests passed (%d empty, NOT CHECKED).\\n", 
+fn t_run_checked() -> void {
+    w(0x6e69727020202020, 8);
+    w(0x206c6c4122286674, 8);
+    w(0x6b63656863206425, 8);
+    w(0x7374736574206465, 8);
+    w(0x2064657373617020, 8);
+    w(0x74706d6520642528, 8);
+    w(0x4320544f4e202c79, 8);
+    w(0x2e2944454b434548, 8);
+    w(0x202c226e5c, 5);
+}
+
+; );\n    return 0;\n}\n#endif /* T27_TEST_MAIN */\n\n
+fn t_run_close() -> void {
+    w(0x72202020200a3b29, 8);
+    w(0x3b30206e72757465, 8);
+    w(0x69646e65230a7d0a, 8);
+    w(0x373254202a2f2066, 8);
+    w(0x414d5f545345545f, 8);
+    w(0xa0a2f2a204e49, 7);
+}
+
+; #endif /* 
+fn t_endif() -> void {
+    w(0x2f206669646e6523, 8);
+    w(0x202a, 2);
+}
+
+; _H */\n
+fn t_endif_close() -> void {
+    w(0xa2f2a20485f, 6);
+}
+
+; bool
+fn t_ty_bool() -> void {
+    w(0x6c6f6f62, 4);
+}
+
+; size_t
+fn t_ty_size() -> void {
+    w(0x745f657a6973, 6);
+}
+
+; int
+fn t_ty_int() -> void {
+    w(0x746e69, 3);
+}
+
+; _t
+fn t_ty_t() -> void {
+    w(0x745f, 2);
+}
+
+; ((
+fn t_cast_open() -> void {
+    w(0x2828, 2);
+}
+
+; )(
+fn t_cast_mid() -> void {
+    w(0x2829, 2);
+}
+
+; ))
+fn t_cast_close() -> void {
+    w(0x2929, 2);
+}
+
+; , 
+fn t_comma() -> void {
+    w(0x202c, 2);
+}
+

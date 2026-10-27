@@ -1,0 +1,260 @@
+// SPDX-License-Identifier: Apache-2.0
+// t27/specs/fpga/mtbf.t27
+// Metastability MTBF model for Trinity T27 FPGA HIR
+// Integer-only log2 arithmetic, no floats anywhere
+// phi^2 + 1/phi^2 = 3 | TRINITY
+//
+// THE MODEL. MTBF = e^(T_slack / tau) / (F_clk * F_data * W), the form taught
+// by Xilinx WP323, "Understanding Metastability in FPGAs": T_slack is the time
+// a synchronizer's first flop is given to resolve, tau is its resolve time
+// constant, W is the metastability aperture (window) of that flop, F_clk is
+// the receiving clock and F_data the transition rate of the asynchronous
+// input. Because e^(T/tau) overflows any integer seconds count long before a
+// real synchronizer becomes safe, this file works in log2 of seconds with 10
+// fractional bits (Q10): every MTBF below is log2(MTBF) * 1024.
+//
+// THE CONSTANTS ARE ASSUMPTIONS, NOT DATASHEET NUMBERS. Xilinx publishes flop
+// metastability parameters only partially (WP323 gives the method and some
+// measured taus for older families; DS181 does not list W or tau per device),
+// so tau = 50 ps and W = 10 ps here are labelled teaching assumptions in the
+// WP323 form. A design that needs a real number measures its own, or reads it
+// from the vendor's CDC report. The lesson these numbers teach -- each extra
+// synchronizer stage multiplies MTBF by 2^(T_clk * log2 e / tau) -- does not
+// depend on the exact constants, and the tests below only use differences and
+// the model's own arithmetic.
+
+module Mtbf {
+
+    // === Model constants (assumptions; see header) ===
+
+    fn tau_ps() -> u32 {
+        return 50;   // resolve time constant, ASSUMPTION (WP323 form)
+    }
+
+    fn window_ps() -> u32 {
+        return 10;   // metastability aperture, ASSUMPTION (WP323 form)
+    }
+
+    fn setup_ps() -> u32 {
+        return 200;  // flop setup, same teaching value as timing.t27
+    }
+
+    pub const LOG2_E_Q10 : i64 = 1477;  // 1024 * log2(e) = 1477.33
+    pub const LOG2_1E6_Q10 : i64 = 20410;  // 1024 * log2(1e6) = 20409.97
+    pub const LOG2_1E12_Q10 : i64 = 40820; // 1024 * log2(1e12) = 40819.85
+    pub const MAX_STAGES : u32 = 8;
+
+    // === Crossing model ===
+
+    pub struct MtbfModel {
+        name : &str,
+        clk_mhz : u32,    // the receiving (destination) clock
+        data_mhz : u32,   // transitions per second of the async input, in MHz
+    }
+
+    fn mtbf_model(name: &str, clk_mhz: u32, data_mhz: u32) -> MtbfModel {
+        return MtbfModel{
+            .name = name,
+            .clk_mhz = clk_mhz,
+            .data_mhz = data_mhz,
+        };
+    }
+
+    fn period_ps(clk_mhz: u32) -> u32 {
+        if clk_mhz == 0 {
+            return 0;
+        }
+        return 1000000 / clk_mhz;
+    }
+
+    // Time the first flop is given to resolve: an N-stage synchronizer leaves
+    // (N - 1) full periods minus one setup before its output is sampled again
+    fn resolve_slack_ps(m: MtbfModel, stages: u32) -> i64 {
+        var p : i64 = period_ps(m.clk_mhz) as i64;
+        return (stages as i64 - 1) * p - setup_ps() as i64;
+    }
+
+    // Integer log2 in Q10: bit-normalize to [2^20, 2^21), then one fractional
+    // bit per squaring. Exact for powers of two, +-1 unit otherwise.
+    fn log2_q10(n: u32) -> i64 {
+        if n < 2 {
+            return 0;
+        }
+        var x : i64 = n as i64;
+        var e : i64 = 0;
+        while x < 1048576 {
+            x = x * 2;
+            e = e - 1;
+        }
+        while x >= 2097152 {
+            x = x / 2;
+            e = e + 1;
+        }
+        var frac : i64 = 0;
+        var w : i64 = 512;
+        var i : u32 = 0;
+        while i < 10 {
+            x = (x * x) >> 20;
+            if x >= 2097152 {
+                x = x / 2;
+                frac = frac + w;
+            }
+            w = w / 2;
+            i = i + 1;
+        }
+        return (e + 20) * 1024 + frac;
+    }
+
+    // log2(MTBF in seconds) * 1024 for a given resolve slack, per the header
+    fn mtbf_log2_q10(m: MtbfModel, slack_ps: i64) -> i64 {
+        var acc : i64 = slack_ps * LOG2_E_Q10 / (tau_ps() as i64);
+        acc = acc - (log2_q10(m.clk_mhz) + LOG2_1E6_Q10);
+        acc = acc - (log2_q10(m.data_mhz) + LOG2_1E6_Q10);
+        acc = acc + (LOG2_1E12_Q10 - log2_q10(window_ps()));
+        return acc;
+    }
+
+    // One more stage buys T_clk * log2(e) / tau of log2-MTBF, exactly
+    fn stage_gain_q10(m: MtbfModel) -> i64 {
+        return period_ps(m.clk_mhz) as i64 * LOG2_E_Q10 / (tau_ps() as i64);
+    }
+
+    // MTBF of an N-stage synchronizer on this crossing
+    fn synchronizer_mtbf_q10(m: MtbfModel, stages: u32) -> i64 {
+        return mtbf_log2_q10(m, resolve_slack_ps(m, stages));
+    }
+
+    // Smallest stage count (1..MAX_STAGES) whose MTBF reaches the Q10 target;
+    // returns MAX_STAGES when even that does not reach it
+    fn stages_for_mtbf(m: MtbfModel, target_q10: i64) -> u32 {
+        var stages : u32 = 1;
+        while stages < MAX_STAGES {
+            if synchronizer_mtbf_q10(m, stages) >= target_q10 {
+                return stages;
+            }
+            stages = stages + 1;
+        }
+        return stages;
+    }
+
+    // === Validation ===
+
+    fn validate_model(m: MtbfModel) -> u32 {
+        var errors : u32 = 0;
+
+        if m.name == "" {
+            errors = errors + 1;
+        }
+        if m.clk_mhz == 0 {
+            errors = errors + 1;
+        }
+        if m.data_mhz == 0 {
+            errors = errors + 1;
+        }
+
+        return errors;
+    }
+
+    // === Tests ===
+
+    test log2_q10_is_exact_for_powers_of_two
+        then log2_q10(1) == 0
+        and log2_q10(2) == 1024
+        and log2_q10(1024) == 10240
+        and log2_q10(4096) == 12288
+
+    test log2_q10_tracks_the_true_value
+        then log2_q10(10) == 3401
+        and log2_q10(100) == 6803
+        and log2_q10(1000000) == 20409
+
+    test a_100mhz_clock_has_a_10000ps_period
+        then period_ps(100) == 10000
+        and period_ps(200) == 5000
+
+    test one_flop_gets_negative_slack
+        given m = mtbf_model("cross", 100, 10)
+        then resolve_slack_ps(m, 1) == -200
+
+    test two_flops_get_a_period_minus_setup
+        given m = mtbf_model("cross", 100, 10)
+        then resolve_slack_ps(m, 2) == 9800
+
+    test one_flop_is_not_enough
+        given m = mtbf_model("cross", 100, 10)
+        then synchronizer_mtbf_q10(m, 1) == -19513
+
+    test two_flops_reach_astronomical_mtbf
+        given m = mtbf_model("cross", 100, 10)
+        then synchronizer_mtbf_q10(m, 2) == 275887
+
+    test a_billion_seconds_needs_two_flops_here
+        given m = mtbf_model("cross", 100, 10)
+        and target = 30 * 1024
+        then stages_for_mtbf(m, target) == 2
+
+    test a_higher_bar_needs_a_third_flop
+        given m = mtbf_model("cross", 100, 10)
+        and target = 280000
+        then synchronizer_mtbf_q10(m, 2) < target
+        and stages_for_mtbf(m, target) == 3
+
+    test a_faster_clock_makes_the_same_crossing_worse
+        given slow = mtbf_model("slow", 50, 10)
+        and fast = mtbf_model("fast", 200, 10)
+        then synchronizer_mtbf_q10(slow, 2) > synchronizer_mtbf_q10(fast, 2)
+
+    test busier_data_makes_the_crossing_worse
+        given quiet = mtbf_model("quiet", 100, 1)
+        and busy = mtbf_model("busy", 100, 50)
+        then synchronizer_mtbf_q10(quiet, 2) > synchronizer_mtbf_q10(busy, 2)
+
+    test mtbf_rises_exponentially_with_slack
+        given m = mtbf_model("cross", 100, 10)
+        then mtbf_log2_q10(m, 500) == 1165
+        and mtbf_log2_q10(m, 1000) == 15935
+        and mtbf_log2_q10(m, 1000) - mtbf_log2_q10(m, 500) > 10000
+
+    test one_more_stage_gains_exactly_the_period
+        given m = mtbf_model("cross", 100, 10)
+        then stage_gain_q10(m) == 295400
+        and synchronizer_mtbf_q10(m, 3) - synchronizer_mtbf_q10(m, 2) == stage_gain_q10(m)
+
+    test validate_accepts_a_named_crossing
+        given m = mtbf_model("cross", 100, 10)
+        then validate_model(m) == 0
+
+    test validate_rejects_a_clock_of_zero
+        given m = mtbf_model("bad", 0, 10)
+        then validate_model(m) > 0
+
+    // === Invariants ===
+
+    invariant mtbf_never_falls_as_slack_grows
+        given m = mtbf_model("inv", 100, 10)
+        assert mtbf_log2_q10(m, 1000) > mtbf_log2_q10(m, 500)
+
+    invariant the_stage_gain_is_positive
+        given m = mtbf_model("inv", 100, 10)
+        assert stage_gain_q10(m) > 0
+
+    invariant two_flops_beat_one
+        given m = mtbf_model("inv", 100, 10)
+        assert synchronizer_mtbf_q10(m, 2) > synchronizer_mtbf_q10(m, 1)
+
+    invariant the_window_and_tau_are_stated_assumptions
+        assert tau_ps() == 50
+        and window_ps() == 10
+
+    // === Benchmarks ===
+
+    bench log2_cost
+        measure: nanoseconds for log2_q10(1000000)
+        target: < 100ns
+
+    bench mtbf_cost
+        measure: nanoseconds for synchronizer_mtbf_q10(mtbf_model("b", 100, 10), 2)
+        target: < 200ns
+}
+
+// phi^2 + 1/phi^2 = 3 | TRINITY

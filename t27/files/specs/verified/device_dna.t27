@@ -1,0 +1,318 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/verified/device_dna.t27 -- the die's 57-bit device DNA, read over JTAG with no user
+; bitstream: which instructions shift it, how the raw shift decodes to the DNA, when a read is
+; well formed, how the DNA is written, and when two reads name the same die. Epic gHashTag/t27#6655,
+; Round 3, item R3-2 (device-rooted identity), slice 1 (issue #7439).
+; --
+; Why: the IDCODE (0x03636093 for the XC7A200T, version nibble aside) names the PART, so every die
+; of the part answers it alike; a host key names the host. Neither can tell two dies apart. The
+; DNA is fused per die. This slice reads and defines it only. Binding it into the signed receipt
+; message is slice 2 and does not touch specs/verified/signed_receipt.t27 here.
+; --
+; The oracle (2026-10-07, QMTech Wukong XC7A200T, the only board attached, openFPGALoader
+; --scan-usb bus 000 dev 002, Digilent FTDI 0x0403:0x6014, libftdi index 0):
+; - Two transports read the same raw bits: the libftdi MPSSE layer (tools/jtag/mpsse_jtag.py, 8
+;   reads of each instruction over two sessions) and openocd 0.12.0 (6 reads of each, six
+;   sessions, the last five at 09:42Z with the command below). FUSE_DNA gave 0x2a19bf1841ab0a4f
+;   on all 14 reads and XSC_DNA the same 57 low bits on all 14 (0xfe54337e30835614 with TDI held
+;   high, 0x0054337e30835614 with TDI low), with no power cycle in between. IDCODE through the same path read 0x13636093, so the raw convention (first TDO bit
+;   = bit 0) is the transport's, not a guess.
+; - Register lengths, measured by holding TDI high: FUSE_DNA 64 bits, XSC_DNA 57 bits (ones from
+;   bit 57 on), BYPASS 1 bit. XSC_DNA without ISC_ENABLE read all ones: the register is not on
+;   the chain until ISC_ENABLE, and this spec refuses that read (DNA_ALL_ONES).
+; - The two instructions agree: FUSE_DNA bits 63..7 are XSC_DNA bits 56..0. FUSE_DNA bits 6..0
+;   read 0x4F; whether that tail is the same on every die is PENDING a second board.
+; - An independent decoder, `openFPGALoader -c digilent_hs2 --read-dna`, printed 0x0050d58218fd9854:
+;   the 57 shifted bits with the FIRST shifted bit as the most significant. That is the order
+;   dna_from_xsc()/dna_from_fuse() return, so DNA_OBSERVED below is the value it printed.
+; - Distinct dies giving distinct DNA is PENDING: only one board was attached.
+; --
+; The reader is a command line, not a file (Only-t27: the gate refuses a new or edited .py, and
+; this needs no new code). It prints each 64-bit read as two 32-bit fields, first-shifted first:
+;   openocd -c "adapter driver ftdi; ftdi vid_pid 0x0403 0x6014; ftdi channel 0;
+;     ftdi layout_init 0x00e8 0x60eb; adapter speed 1000; transport select jtag;
+;     jtag newtap xc7 tap -irlen 6 -expected-id 0x13636093; init;
+;     irscan xc7.tap 0x32; echo \"FUSE_DNA [drscan xc7.tap 32 0xffffffff 32 0xffffffff]\";
+;     irscan xc7.tap 0x10; runtest 64; irscan xc7.tap 0x17;
+;     echo \"XSC_DNA [drscan xc7.tap 32 0xffffffff 32 0xffffffff]\";
+;     runtest 64; irscan xc7.tap 0x16; runtest 64; irscan xc7.tap 0x3f; shutdown"
+; Its opcodes are the OP_* constants below; raw_from_fields() assembles the two fields.
+; --
+; Mutation check (2026-10-07, Railway lab, zig, `t27c test-report` per mutant): 20 of 20 hand
+; mutants killed, every one by a failing runtime assert, none by a compile error. Mutated: field
+; order, the bit reversal and its width, the XSC mask, the FUSE shift, the fill and tail widths,
+; each well-formedness check dropped, the tail constant, the agreement test inverted or skipped,
+; hex case, hex nibble position, the hex length check, framing in reads_agree, pow2, the all-ones
+; width, and the XSC_DNA opcode.
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module VerifiedDeviceDna;
+
+/// 7-series JTAG: a 6-bit instruction register, and the instructions this rule shifts.
+pub const IR_LEN : u8 = 6;
+pub const OP_FUSE_DNA : u8 = 50;
+pub const OP_XSC_DNA : u8 = 23;
+pub const OP_ISC_ENABLE : u8 = 16;
+pub const OP_ISC_DISABLE : u8 = 22;
+pub const OP_BYPASS : u8 = 63;
+
+/// The DNA is 57 bits. Every read shifts 64 bits with TDI held high.
+pub const DNA_BITS : u8 = 57;
+pub const SHIFT_BITS : u8 = 64;
+/// FUSE_DNA carries 7 bits below the DNA; this die read them as 0x4F.
+pub const FUSE_TAIL_BITS : u8 = 7;
+pub const FUSE_TAIL_OBSERVED : u64 = 79;
+/// XSC_DNA is 57 bits long, so with TDI high bits 57..63 come back as the 7 fill ones.
+pub const XSC_FILL_ONES : u64 = 127;
+
+/// The live reads (the oracle above), as the reader prints them: first field, second field.
+pub const FUSE_LO_OBSERVED : u64 = 0x41ab0a4f;
+pub const FUSE_HI_OBSERVED : u64 = 0x2a19bf18;
+pub const XSC_LO_OBSERVED : u64 = 0x30835614;
+pub const XSC_HI_OBSERVED : u64 = 0xfe54337e;
+pub const DNA_OBSERVED : u64 = 0x50d58218fd9854;
+/// The IDCODE read through the same path: bit 0 is 1 (IEEE 1149.1), so the convention holds.
+pub const IDCODE_OBSERVED : u64 = 0x13636093;
+
+/// Well-formedness codes, in judgment order.
+pub const DNA_OK : u8 = 0;
+pub const DNA_ALL_ZERO : u8 = 1;
+pub const DNA_ALL_ONES : u8 = 2;
+pub const DNA_BAD_FILL : u8 = 3;
+pub const DNA_BAD_TAIL : u8 = 4;
+
+/// Agreement codes for one FUSE_DNA read against one XSC_DNA read.
+pub const AGREE_SAME_DIE : u8 = 0;
+pub const AGREE_FUSE_BAD : u8 = 1;
+pub const AGREE_XSC_BAD : u8 = 2;
+pub const AGREE_DIFFER : u8 = 3;
+
+/// The DNA is written as DNA_HEX_LEN lowercase hex digits, most significant first, zero padded.
+pub const DNA_HEX_LEN : u32 = 15;
+/// What dna_hex_char answers past the end.
+pub const HEX_END : u32 = 256;
+
+/// 2 to the n, for n below 64.
+pub fn pow2(n: u64) -> u64 {
+    var p : u64 = 1;
+    var i : u64 = 0;
+    while (i < n) {
+        p = p * 2;
+        i = i + 1;
+    }
+    return p;
+}
+
+/// The 64-bit raw word from the reader's two 32-bit fields: the first field holds the first 32
+/// shifted bits, and the first shifted bit is bit 0.
+pub fn raw_from_fields(first: u64, second: u64) -> u64 {
+    return second * pow2(32) + first;
+}
+
+/// The value of all 57 DNA bits set.
+pub fn dna_all_ones() -> u64 {
+    return pow2(57) - 1;
+}
+
+/// Reverse the low 57 bits: bit k goes to bit 56 - k.
+pub fn reverse57(x: u64) -> u64 {
+    var out : u64 = 0;
+    var k : u64 = 0;
+    while (k < 57) {
+        if ((x / pow2(k)) % 2 == 1) { out = out + pow2(56 - k); }
+        k = k + 1;
+    }
+    return out;
+}
+
+/// XSC_DNA: the DNA is the first 57 shifted bits, the first shifted bit most significant.
+pub fn dna_from_xsc(raw: u64) -> u64 {
+    return reverse57(raw % pow2(57));
+}
+
+/// FUSE_DNA: the DNA is the 57 bits after the 7-bit tail, in the same order.
+pub fn dna_from_fuse(raw: u64) -> u64 {
+    return reverse57(raw / pow2(7));
+}
+
+pub fn xsc_fill(raw: u64) -> u64 {
+    return raw / pow2(57);
+}
+
+pub fn fuse_tail(raw: u64) -> u64 {
+    return raw % pow2(7);
+}
+
+/// The first fact that keeps an XSC_DNA read from naming a die, or DNA_OK. A dead chain reads all
+/// zero or all one; a chain that is not shifting a 57-bit register loses the fill.
+pub fn xsc_first_wrong(raw: u64) -> u8 {
+    var dna : u64 = dna_from_xsc(raw);
+    if (dna == 0) { return DNA_ALL_ZERO; }
+    if (dna == dna_all_ones()) { return DNA_ALL_ONES; }
+    if (xsc_fill(raw) != XSC_FILL_ONES) { return DNA_BAD_FILL; }
+    return DNA_OK;
+}
+
+/// The same for a FUSE_DNA read; its framing is the tail as observed.
+pub fn fuse_first_wrong(raw: u64) -> u8 {
+    var dna : u64 = dna_from_fuse(raw);
+    if (dna == 0) { return DNA_ALL_ZERO; }
+    if (dna == dna_all_ones()) { return DNA_ALL_ONES; }
+    if (fuse_tail(raw) != FUSE_TAIL_OBSERVED) { return DNA_BAD_TAIL; }
+    return DNA_OK;
+}
+
+/// Two reads of one instruction agree when their raw words are equal bit for bit, framing too.
+pub fn reads_agree(raw_a: u64, raw_b: u64) -> bool {
+    return raw_a == raw_b;
+}
+
+/// Whether a FUSE_DNA read and an XSC_DNA read name one die: both well formed, same DNA.
+pub fn dna_agreement(fuse_raw: u64, xsc_raw: u64) -> u8 {
+    if (fuse_first_wrong(fuse_raw) != DNA_OK) { return AGREE_FUSE_BAD; }
+    if (xsc_first_wrong(xsc_raw) != DNA_OK) { return AGREE_XSC_BAD; }
+    if (dna_from_fuse(fuse_raw) != dna_from_xsc(xsc_raw)) { return AGREE_DIFFER; }
+    return AGREE_SAME_DIE;
+}
+
+/// Character k of the DNA's hex text, or HEX_END past the end.
+pub fn dna_hex_char(dna: u64, k: u32) -> u32 {
+    if (k >= DNA_HEX_LEN) { return HEX_END; }
+    var nibble : u64 = (dna / pow2(4 * ((DNA_HEX_LEN - 1 - k) as u64))) % 16;
+    if (nibble < 10) { return 48 + (nibble as u32); }
+    return 87 + (nibble as u32);
+}
+
+/// Whether text is exactly the hex rendering of dna.
+pub fn dna_hex_matches(dna: u64, text: string) -> bool {
+    if ((text.len as u32) != DNA_HEX_LEN) { return false; }
+    var k : u32 = 0;
+    while (k < DNA_HEX_LEN) {
+        if ((text[k] as u32) != dna_hex_char(dna, k)) { return false; }
+        k = k + 1;
+    }
+    return true;
+}
+
+test "the live reads decode to the DNA openFPGALoader printed" {
+    var fuse : u64 = raw_from_fields(FUSE_LO_OBSERVED, FUSE_HI_OBSERVED);
+    var xsc : u64 = raw_from_fields(XSC_LO_OBSERVED, XSC_HI_OBSERVED);
+    assert fuse == 0x2a19bf1841ab0a4f;
+    assert dna_from_fuse(fuse) == 0x50d58218fd9854;
+    assert dna_from_xsc(xsc) == 0x50d58218fd9854;
+    assert dna_from_xsc(xsc) == DNA_OBSERVED;
+}
+
+test "the live reads are well formed and name one die" {
+    var fuse : u64 = raw_from_fields(FUSE_LO_OBSERVED, FUSE_HI_OBSERVED);
+    var xsc : u64 = raw_from_fields(XSC_LO_OBSERVED, XSC_HI_OBSERVED);
+    assert fuse_first_wrong(fuse) == DNA_OK;
+    assert xsc_first_wrong(xsc) == DNA_OK;
+    assert fuse_tail(fuse) == 79;
+    assert xsc_fill(xsc) == 127;
+    assert dna_agreement(fuse, xsc) == AGREE_SAME_DIE;
+}
+
+test "the first shifted bit is the most significant DNA bit" {
+    // XSC bits 0, 1, 2 (the first three TDO bits) read 0, 0, 1; DNA bits 56, 55, 54 are 0, 0, 1
+    assert (DNA_OBSERVED / pow2(54)) % 8 == 1;
+    assert reverse57(1) == pow2(56);
+    assert reverse57(pow2(56)) == 1;
+    assert reverse57(4) == pow2(54);
+    assert reverse57(reverse57(DNA_OBSERVED)) == DNA_OBSERVED;
+    // the unreversed shift is a different number, so a reader that skips the reversal fails here
+    assert (raw_from_fields(XSC_LO_OBSERVED, XSC_HI_OBSERVED) % pow2(57)) == 0x54337e30835614;
+    assert dna_from_xsc(pow2(57) * 127 + 1) == pow2(56);
+}
+
+test "the FUSE read is the XSC read shifted past a seven-bit tail" {
+    var xsc57 : u64 = raw_from_fields(XSC_LO_OBSERVED, XSC_HI_OBSERVED) % pow2(57);
+    assert raw_from_fields(FUSE_LO_OBSERVED, FUSE_HI_OBSERVED) == xsc57 * pow2(7) + FUSE_TAIL_OBSERVED;
+    assert dna_from_fuse(xsc57 * 128 + 79) == dna_from_xsc(pow2(57) * 127 + xsc57);
+}
+
+test "a dead chain is refused: all zero and all one" {
+    assert xsc_first_wrong(0) == DNA_ALL_ZERO;
+    assert fuse_first_wrong(0) == DNA_ALL_ZERO;
+    assert xsc_first_wrong(raw_from_fields(0xffffffff, 0xffffffff)) == DNA_ALL_ONES;
+    assert fuse_first_wrong(raw_from_fields(0xffffffff, 0xffffffff)) == DNA_ALL_ONES;
+    assert xsc_first_wrong(0) == 1;
+    assert xsc_first_wrong(raw_from_fields(0xffffffff, 0xffffffff)) == 2;
+}
+
+test "XSC_DNA without ISC_ENABLE read all ones live, and is refused" {
+    assert dna_from_xsc(raw_from_fields(0xffffffff, 0xffffffff)) == dna_all_ones();
+    assert dna_agreement(raw_from_fields(FUSE_LO_OBSERVED, FUSE_HI_OBSERVED), raw_from_fields(0xffffffff, 0xffffffff)) == AGREE_XSC_BAD;
+}
+
+test "an XSC read without the fill ones is not a 57-bit register" {
+    var xsc57 : u64 = raw_from_fields(XSC_LO_OBSERVED, XSC_HI_OBSERVED) % pow2(57);
+    // the same DNA bits shifted with TDI low: the fill is gone
+    assert xsc_first_wrong(xsc57) == DNA_BAD_FILL;
+    // one fill bit lost
+    assert xsc_first_wrong(pow2(57) * 63 + xsc57) == DNA_BAD_FILL;
+    assert xsc_first_wrong(pow2(57) * 126 + xsc57) == 3;
+    assert xsc_first_wrong(pow2(57) * 127 + xsc57) == DNA_OK;
+}
+
+test "a FUSE read with another tail is refused" {
+    var fuse : u64 = raw_from_fields(FUSE_LO_OBSERVED, FUSE_HI_OBSERVED);
+    assert fuse_first_wrong(fuse - 79 + 78) == DNA_BAD_TAIL;
+    assert fuse_first_wrong(fuse - 79 + 15) == 4;
+    assert fuse_first_wrong(fuse - 79) == DNA_BAD_TAIL;
+    assert dna_agreement(fuse - 79, raw_from_fields(XSC_LO_OBSERVED, XSC_HI_OBSERVED)) == AGREE_FUSE_BAD;
+}
+
+test "reads that differ in one DNA bit name different dies" {
+    var fuse : u64 = raw_from_fields(FUSE_LO_OBSERVED, FUSE_HI_OBSERVED);
+    var xsc : u64 = raw_from_fields(XSC_LO_OBSERVED, XSC_HI_OBSERVED);
+    // flip XSC bit 1 (0 -> 1) and FUSE bit 7 + 56 (0 -> 1): each is still well formed
+    assert xsc_first_wrong(xsc + 2) == DNA_OK;
+    assert dna_agreement(fuse, xsc + 2) == AGREE_DIFFER;
+    assert dna_agreement(fuse + pow2(63), xsc) == AGREE_DIFFER;
+    assert dna_agreement(fuse, xsc) == 0;
+    assert dna_agreement(fuse, xsc + 2) == 3;
+}
+
+test "two reads agree only bit for bit" {
+    var xsc : u64 = raw_from_fields(XSC_LO_OBSERVED, XSC_HI_OBSERVED);
+    assert reads_agree(xsc, raw_from_fields(0x30835614, 0xfe54337e)) == true;
+    assert reads_agree(xsc, xsc + 2) == false;
+    // same DNA, lost fill: still a disagreement, framing is part of the read
+    assert reads_agree(xsc, xsc % pow2(57)) == false;
+}
+
+test "the DNA is written as fifteen lowercase hex digits, zero padded" {
+    assert dna_hex_matches(DNA_OBSERVED, "050d58218fd9854") == true;
+    assert dna_hex_matches(DNA_OBSERVED, "50d58218fd9854") == false;
+    assert dna_hex_matches(DNA_OBSERVED, "0050d58218fd9854") == false;
+    // the right fifteen digits with one more after them are not the rendering
+    assert dna_hex_matches(DNA_OBSERVED, "050d58218fd98540") == false;
+    assert dna_hex_matches(DNA_OBSERVED, "050D58218FD9854") == false;
+    assert dna_hex_matches(DNA_OBSERVED, "050d58218fd9855") == false;
+    assert dna_hex_char(DNA_OBSERVED, 0) == 48;
+    assert dna_hex_char(DNA_OBSERVED, 1) == 53;
+    assert dna_hex_char(DNA_OBSERVED, 3) == 100;
+    assert dna_hex_char(DNA_OBSERVED, 14) == 52;
+    assert dna_hex_char(DNA_OBSERVED, 15) == HEX_END;
+    assert dna_hex_matches(dna_all_ones(), "1ffffffffffffff") == true;
+    assert dna_hex_matches(0, "000000000000000") == true;
+}
+
+test "the instructions and lengths are the 7-series ones" {
+    assert IR_LEN == 6;
+    assert OP_FUSE_DNA == 0x32;
+    assert OP_XSC_DNA == 0x17;
+    assert OP_ISC_ENABLE == 0x10;
+    assert OP_ISC_DISABLE == 0x16;
+    assert OP_BYPASS == 0x3f;
+    assert DNA_BITS == 57;
+    assert SHIFT_BITS == DNA_BITS + FUSE_TAIL_BITS;
+    assert dna_all_ones() == 0x1ffffffffffffff;
+    assert XSC_FILL_ONES == pow2(64 - 57) - 1;
+}
+
+test "the IDCODE read through the same path names the part" {
+    assert IDCODE_OBSERVED % 2 == 1;
+    assert IDCODE_OBSERVED % pow2(28) == 0x3636093;
+}

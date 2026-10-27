@@ -1,0 +1,181 @@
+// OLSR-style routing -- ultra-simplified for T27.
+// Neighbor entries are u32-packed [id:8][quality:8][last_seen:16]; the
+// 4-slot neighbor table travels as a [u32; 4] array parameter (read paths)
+// while write paths return the UPDATED ENTRY plus a slot decision, so every
+// function stays scalar-valued and lowers to all backends. (The original
+// wave-era file packed four entries into one u32 with 256-bit masks and
+// shifted the id by 56 bits inside a u32 -- no backend could ever have run
+// it; rewritten 2026-08-08.)
+
+module OlsrRouting {
+    use base::types;
+
+    const MAX_NEIGHBORS: u32 = 4;
+    const VALID_TIMEOUT: u32 = 6000;
+    const NO_NEIGHBOR: u32 = 0xFF;
+    const NO_SLOT: u32 = 0xFF;
+
+    // ---- Single neighbor entry: [id:8][quality:8][last_seen:16] ----
+
+    fn create_neighbor(id: u32, quality: u32, last_seen: u32) -> u32 {
+        return (((id & 0xFF) << 24) |
+                ((quality & 0xFF) << 16) |
+                (last_seen & 0xFFFF));
+    }
+
+    fn get_id(entry: u32) -> u32 {
+        return ((entry >> 24) & 0xFF);
+    }
+
+    fn get_quality(entry: u32) -> u32 {
+        return ((entry >> 16) & 0xFF);
+    }
+
+    fn get_last_seen(entry: u32) -> u32 {
+        return (entry & 0xFFFF);
+    }
+
+    fn is_valid(entry: u32, time: u32) -> bool {
+        return ((time - get_last_seen(entry)) < VALID_TIMEOUT);
+    }
+
+    // ---- 4-slot table, read paths over a [u32; 4] parameter ----
+
+    fn get_id_at(table: [u32; 4], index: u32) -> u32 {
+        return get_id(table[index as usize]);
+    }
+
+    fn find_index(table: [u32; 4], target_id: u32) -> u32 {
+        if (get_id_at(table, 0) == target_id) { return 0; }
+        if (get_id_at(table, 1) == target_id) { return 1; }
+        if (get_id_at(table, 2) == target_id) { return 2; }
+        if (get_id_at(table, 3) == target_id) { return 3; }
+        return NO_SLOT;
+    }
+
+    // Write path: the caller stores updated_entry into the slot this returns
+    // (NO_SLOT when the table is full and the id is unknown).
+    fn slot_for_update(table: [u32; 4], id: u32) -> u32 {
+        if (find_index(table, id) != NO_SLOT) {
+            return find_index(table, id);
+        }
+        if (get_id_at(table, 0) == NO_NEIGHBOR) { return 0; }
+        if (get_id_at(table, 1) == NO_NEIGHBOR) { return 1; }
+        if (get_id_at(table, 2) == NO_NEIGHBOR) { return 2; }
+        if (get_id_at(table, 3) == NO_NEIGHBOR) { return 3; }
+        return NO_SLOT;
+    }
+
+    // ---- Neighbor selection ----
+
+    fn best_of_two(a: u32, b: u32) -> u32 {
+        if (get_quality(a) >= get_quality(b)) {
+            return a;
+        } else {
+            return b;
+        }
+    }
+
+    fn get_best_neighbor(table: [u32; 4]) -> u32 {
+        return get_id(best_of_two(best_of_two(table[0], table[1]),
+                                  best_of_two(table[2], table[3])));
+    }
+
+    // Zero out the entry that carries best_id so the second pass skips it.
+    fn mask_if_id(entry: u32, best_id: u32) -> u32 {
+        if (get_id(entry) == best_id) {
+            return 0;
+        } else {
+            return entry;
+        }
+    }
+
+    fn get_second_best(table: [u32; 4], best_id: u32) -> u32 {
+        return get_id(best_of_two(
+            best_of_two(mask_if_id(table[0], best_id), mask_if_id(table[1], best_id)),
+            best_of_two(mask_if_id(table[2], best_id), mask_if_id(table[3], best_id))));
+    }
+
+    // Select top-2 MPRs, packed [best:8][second:8].
+    fn select_mprs(table: [u32; 4]) -> u32 {
+        let best: u32 = get_best_neighbor(table);
+        let second: u32 = get_second_best(table, best);
+        return ((best & 0xFF) << 8) | (second & 0xFF);
+    }
+
+    fn one_if_present(entry: u32) -> u32 {
+        if (get_id(entry) != NO_NEIGHBOR) {
+            return 1;
+        } else {
+            return 0;
+        }
+    }
+
+    fn count_neighbors(table: [u32; 4]) -> u32 {
+        return one_if_present(table[0]) + one_if_present(table[1])
+             + one_if_present(table[2]) + one_if_present(table[3]);
+    }
+
+    // ---- Tests ----
+
+    test create_neighbor_basic {
+        n = create_neighbor(1, 100, 5000);
+        assert(get_id(n) == 1, "id");
+        assert(get_quality(n) == 100, "quality");
+        assert(get_last_seen(n) == 5000, "timestamp");
+    }
+
+    test is_valid_within_timeout {
+        n = create_neighbor(5, 200, 1000);
+        assert(is_valid(n, 5000) == true, "within timeout");
+    }
+
+    test is_valid_timeout {
+        n = create_neighbor(5, 200, 1000);
+        assert(is_valid(n, 8000) == false, "timeout");
+    }
+
+    test table_reads_and_find {
+        let table: [u32; 4] = [
+            create_neighbor(1, 100, 1000),
+            create_neighbor(2, 200, 2000),
+            create_neighbor(3, 150, 3000),
+            create_neighbor(4, 50, 4000)
+        ];
+        assert(get_id_at(table, 0) == 1, "entry 0");
+        assert(get_id_at(table, 3) == 4, "entry 3");
+        assert(find_index(table, 3) == 2, "find id 3");
+        assert(find_index(table, 9) == NO_SLOT, "unknown id");
+        assert(count_neighbors(table) == 4, "all four present");
+    }
+
+    test slot_decisions {
+        let table: [u32; 4] = [
+            create_neighbor(1, 100, 1000),
+            create_neighbor(NO_NEIGHBOR, 0, 0),
+            create_neighbor(3, 150, 3000),
+            create_neighbor(4, 50, 4000)
+        ];
+        assert(slot_for_update(table, 3) == 2, "known id updates in place");
+        assert(slot_for_update(table, 9) == 1, "unknown id takes the first empty slot");
+        let full: [u32; 4] = [
+            create_neighbor(1, 100, 1000),
+            create_neighbor(2, 200, 2000),
+            create_neighbor(3, 150, 3000),
+            create_neighbor(4, 50, 4000)
+        ];
+        assert(slot_for_update(full, 9) == NO_SLOT, "full table admits nothing new");
+    }
+
+    test mpr_selection {
+        let table: [u32; 4] = [
+            create_neighbor(1, 100, 1000),
+            create_neighbor(2, 200, 2000),
+            create_neighbor(3, 150, 3000),
+            create_neighbor(4, 50, 4000)
+        ];
+        assert(get_best_neighbor(table) == 2, "best by quality");
+        assert(get_second_best(table, 2) == 3, "second best excludes the best");
+        assert(select_mprs(table) == ((2 << 8) | 3), "mpr pack [best][second]");
+    }
+}

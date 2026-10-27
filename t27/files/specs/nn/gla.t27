@@ -1,0 +1,588 @@
+// SPDX-License-Identifier: Apache-2.0
+// t27/specs/nn/gla.t27
+// Gated Linear Attention (GLA) Block Specification
+// Reference: Yang et al. 2023 "Gated Linear Attention Transformers with
+//   Hardware-Efficient Training" arXiv:2312.06635
+//
+// CLAIM-STATUS: all performance claims below are [Open conjecture].
+// The ONLY [Verified] phi-fact in this codebase is phi^2 + phi^-2 = 3 (Law L5).
+// phi anchors in this file (if any) are [Open conjecture] with falsification paths.
+//
+// phi^2 + phi^-2 = 3 | TRINITY
+// ASCII-only identifiers. English comments. (L3)
+
+module GatedLinearAttention {
+    use base::types;
+    use base::ops;
+    use math::constants;
+    use numeric::gf16;
+
+    // =========================================================
+    // 1. Constants
+    // =========================================================
+
+    // Model dimensions (small defaults; match RACE arch sizing).
+    // These defaults mirror specs/nn/attention.t27 for apples-to-apples ablation.
+    const NUM_HEADS  : usize = 4;    // Number of GLA heads (tunable via RACE config)
+    const HEAD_DIM   : usize = 64;   // Key/Value dimension per head
+    const EMBED_DIM  : usize = 256;  // Total d_model = NUM_HEADS * HEAD_DIM
+    const STATE_DIM  : usize = 64;   // Hidden state dim per head (2D RNN state: HEAD_DIM x HEAD_DIM)
+    const EXPAND     : usize = 1;    // State expansion factor (1 = no expansion)
+
+    // [Open conjecture] phi-anchored QK gain from Phase B2 cross-ref.
+    // phi^2 = phi + 1 ~ 2.618 is [Verified] (L5), but that phi^2 is the
+    // *correct* QK gain is [Open conjecture] pending ablation vs. gain=1 and
+    // gain=sqrt(HEAD_DIM) controls. Cross-ref: specs/nn/attention.t27 INV-9.
+    const PHI_SQ_GAIN : f64 = 2.618033988749895; // [Open conjecture] as QK gain
+
+    // Standard 1/sqrt(d_k) scaling for GLA output gate (control anchor).
+    const STD_SCALE   : f64 = 1.0 / sqrt(HEAD_DIM as f64); // control baseline
+
+    // Arch-selection tag for RACE config; read by the trainer's ATTN_MODE env var.
+    // Valid values: "full" | "gla" | "hybrid_gla_full"
+    const ARCH_TAG : str = "gla";
+
+    // Complexity reference (informational, not enforced at compile time).
+    // Full attention: O(N^2 * d_model). GLA parallel: O(N^2 * d_model / chunk_size).
+    // GLA recurrent inference: O(N * HEAD_DIM^2) -- linear in N.
+    // [Open conjecture]: whether this linear complexity translates to wall-clock
+    // win on the RACE CPU target depends on sequence length vs HEAD_DIM^2 crossover.
+
+    // =========================================================
+    // 2. Types
+    // =========================================================
+
+    // Configuration struct for one GLA block.
+    pub const GlaConfig = struct {
+        embed_dim  : usize,   // Total model width
+        num_heads  : usize,   // Number of parallel GLA heads
+        head_dim   : usize,   // Per-head key/value dimension
+        use_rope   : bool,    // Apply RoPE to Q/K (cross-ref: specs/nn/phi_rope.t27)
+        qk_gain    : f64,     // QK scaling scalar; [Open conjecture] if set to PHI_SQ_GAIN
+        gate_act   : GateAct, // Activation for data-dependent gates
+        chunk_size : usize,   // Chunk size for hardware-efficient parallel training
+    };
+
+    // Gate activation variants.
+    pub enum GateAct {
+        Sigmoid,   // Standard sigmoid gate: g = sigma(x)  [default / control]
+        Swish,     // Swish / SiLU gate: g = x * sigma(x)
+        SoftPlus,  // Softplus: log(1 + exp(x))
+    }
+
+    // Per-head 2D hidden state (matrix-valued, size head_dim x head_dim).
+    // This is what makes GLA O(N) at inference: state S[t] is updated
+    // rather than re-materialising the full key-value history.
+    pub const GlaHeadState = struct {
+        S : [HEAD_DIM * HEAD_DIM]f64,   // Matrix state h_t in R^{d x d}
+        normalizer : [HEAD_DIM]f64,     // Running normalizer z_t in R^d
+    };
+
+    // Full block state across all heads.
+    pub const GlaBlockState = struct {
+        heads : [NUM_HEADS]GlaHeadState,
+    };
+
+    // Input projection weights for one GLA block.
+    pub const GlaWeights = struct {
+        w_q : [EMBED_DIM * EMBED_DIM]f64,  // Query projection
+        w_k : [EMBED_DIM * EMBED_DIM]f64,  // Key projection
+        w_v : [EMBED_DIM * EMBED_DIM]f64,  // Value projection
+        w_g : [EMBED_DIM * EMBED_DIM]f64,  // Data-dependent gate projection (GLA-specific)
+        w_o : [EMBED_DIM * EMBED_DIM]f64,  // Output projection
+        b_g : [EMBED_DIM]f64,              // Gate bias
+    };
+
+    // =========================================================
+    // 3. Core Algorithm - Parallel (Chunk) Mode
+    // =========================================================
+
+    // gla_parallel_forward(
+    //   x: input token embeddings [seq_len, EMBED_DIM],
+    //   w: GlaWeights,
+    //   cfg: GlaConfig,
+    //   output: [seq_len, EMBED_DIM],
+    // ) -> void
+    //
+    // Parallel (training) mode following Yang 2023 Algorithm 1.
+    // Complexity: O(N * d^2 / chunk_size) compute, O(chunk_size * d) working memory.
+    //
+    // Algorithm sketch (per chunk of size C, position range [l, l+C)):
+    //   Q[t] = x[t] @ W_q          -- [seq, head_dim] per head
+    //   K[t] = x[t] @ W_k
+    //   V[t] = x[t] @ W_v
+    //   G[t] = gate_act(x[t] @ W_g + b_g)   -- data-dependent forget gate
+    //   Apply causal mask within chunk
+    //   Inter-chunk: propagate state S across chunk boundaries
+    //   output[t] = (attn_output[t] + state_output[t]) * O_gate
+    fn gla_parallel_forward(
+        x       : []f64,
+        w       : *GlaWeights,
+        cfg     : GlaConfig,
+        output  : []f64,
+    ) -> void {
+        const seq_len = x.len() / cfg.embed_dim;
+        const C = cfg.chunk_size;
+        const n_chunks = (seq_len + C - 1) / C;
+
+        var state = GlaBlockState{ .heads = [GlaHeadState{
+            .S = [0.0; HEAD_DIM * HEAD_DIM],
+            .normalizer = [0.0; HEAD_DIM],
+        }; NUM_HEADS] };
+
+        var chunk_idx : usize = 0;
+        while (chunk_idx < n_chunks) {
+            const chunk_start = chunk_idx * C;
+            const chunk_end = min(chunk_start + C, seq_len);
+
+            // Project Q, K, V, G for this chunk
+            gla_project_chunk(x, w, cfg, chunk_start, chunk_end, &state, output);
+
+            chunk_idx = chunk_idx + 1;
+        }
+    }
+
+    // gla_project_chunk(x, w, cfg, l, r, state, output) -> void
+    // Processes one chunk [l, r) of tokens through the GLA layer.
+    fn gla_project_chunk(
+        x       : []f64,
+        w       : *GlaWeights,
+        cfg     : GlaConfig,
+        l       : usize,
+        r       : usize,
+        state   : *GlaBlockState,
+        output  : []f64,
+    ) -> void {
+        var h : usize = 0;
+        while (h < cfg.num_heads) {
+            const head_off = h * cfg.head_dim;
+            var t : usize = l;
+
+            while (t < r) {
+                const x_t_off = t * cfg.embed_dim;
+
+                // Q, K, V projections for token t, head h
+                var q_t = [0.0; HEAD_DIM];
+                var k_t = [0.0; HEAD_DIM];
+                var v_t = [0.0; HEAD_DIM];
+                var g_t = [0.0; HEAD_DIM];
+
+                matmul_slice(x, x_t_off, w.w_q, head_off, cfg.embed_dim, cfg.head_dim, &q_t);
+                matmul_slice(x, x_t_off, w.w_k, head_off, cfg.embed_dim, cfg.head_dim, &k_t);
+                matmul_slice(x, x_t_off, w.w_v, head_off, cfg.embed_dim, cfg.head_dim, &v_t);
+                matmul_slice(x, x_t_off, w.w_g, head_off, cfg.embed_dim, cfg.head_dim, &g_t);
+
+                // Apply configured gate activation
+                apply_gate_act(&g_t, cfg.gate_act);
+
+                // Apply qk_gain scaling (identity if gain=1.0; [Open conjecture] if PHI_SQ_GAIN)
+                scale_vec(&q_t, cfg.qk_gain);
+                scale_vec(&k_t, cfg.qk_gain);
+
+                // GLA recurrent state update:
+                //   S[t] = diag(g_t) * S[t-1] + k_t outer v_t
+                //   z[t] = diag(g_t) * z[t-1] + k_t
+                gla_state_update(&state.heads[h], &g_t, &k_t, &v_t);
+
+                // Read output from state:
+                //   o_t = (S[t] @ q_t) / max(|z[t] . q_t|, 1)
+                var o_t = [0.0; HEAD_DIM];
+                gla_state_read(&state.heads[h], &q_t, &o_t);
+
+                // Write to output buffer
+                const out_off = t * cfg.embed_dim + head_off;
+                var d : usize = 0;
+                while (d < cfg.head_dim) {
+                    output[out_off + d] = o_t[d];
+                    d = d + 1;
+                }
+
+                t = t + 1;
+            }
+
+            h = h + 1;
+        }
+
+        // Output projection: output = output @ W_o + residual handled by caller
+        matmul_full(output, w.w_o, cfg.embed_dim, cfg.embed_dim);
+    }
+
+    // =========================================================
+    // 4. State Update and Read
+    // =========================================================
+
+    // gla_state_update(head_state, g, k, v) -> void
+    // GLA recurrent transition:
+    //   S_t = diag(g) * S_{t-1} + k outer v
+    //   z_t = diag(g) * z_{t-1} + k
+    // Cost: O(HEAD_DIM^2) per token.
+    fn gla_state_update(
+        hs : *GlaHeadState,
+        g  : []f64,   // gate vector [HEAD_DIM]
+        k  : []f64,   // key vector  [HEAD_DIM]
+        v  : []f64,   // value vector[HEAD_DIM]
+    ) -> void {
+        var i : usize = 0;
+        while (i < HEAD_DIM) {
+            // Row i of S: gated decay + rank-1 update
+            hs.normalizer[i] = g[i] * hs.normalizer[i] + k[i];
+            var j : usize = 0;
+            while (j < HEAD_DIM) {
+                hs.S[i * HEAD_DIM + j] = g[i] * hs.S[i * HEAD_DIM + j] + k[i] * v[j];
+                j = j + 1;
+            }
+            i = i + 1;
+        }
+    }
+
+    // gla_state_read(head_state, q, out) -> void
+    // GLA output retrieval with normalisation:
+    //   raw   = S_t @ q
+    //   denom = max(|z_t . q|, 1)
+    //   out   = raw / denom
+    fn gla_state_read(
+        hs  : *GlaHeadState,
+        q   : []f64,     // query vector [HEAD_DIM]
+        out : []f64,     // output buffer [HEAD_DIM]
+    ) -> void {
+        // Compute z . q (dot product of normalizer and query)
+        var z_dot_q : f64 = 0.0;
+        var i : usize = 0;
+        while (i < HEAD_DIM) {
+            z_dot_q = z_dot_q + hs.normalizer[i] * q[i];
+            i = i + 1;
+        }
+        const denom : f64 = max(abs(z_dot_q), 1.0);
+
+        // Compute S @ q and normalise
+        i = 0;
+        while (i < HEAD_DIM) {
+            var dot : f64 = 0.0;
+            var j : usize = 0;
+            while (j < HEAD_DIM) {
+                dot = dot + hs.S[i * HEAD_DIM + j] * q[j];
+                j = j + 1;
+            }
+            out[i] = dot / denom;
+            i = i + 1;
+        }
+    }
+
+    // =========================================================
+    // 5. Gate Activation
+    // =========================================================
+
+    fn apply_gate_act(g : []f64, act : GateAct) -> void {
+        var i : usize = 0;
+        while (i < g.len()) {
+            if (act == GateAct::Sigmoid) {
+                g[i] = 1.0 / (1.0 + exp(-g[i]));
+            } else if (act == GateAct::Swish) {
+                g[i] = g[i] * (1.0 / (1.0 + exp(-g[i])));
+            } else if (act == GateAct::SoftPlus) {
+                g[i] = log(1.0 + exp(g[i]));
+            }
+            i = i + 1;
+        }
+    }
+
+    // =========================================================
+    // 6. Utility Helpers (local; not exported)
+    // =========================================================
+
+    fn scale_vec(v : []f64, s : f64) -> void {
+        var i : usize = 0;
+        while (i < v.len()) {
+            v[i] = v[i] * s;
+            i = i + 1;
+        }
+    }
+
+    fn matmul_slice(
+        x        : []f64, x_off : usize,
+        w        : []f64, w_off : usize,
+        in_dim   : usize, out_dim : usize,
+        result   : []f64,
+    ) -> void {
+        var j : usize = 0;
+        while (j < out_dim) {
+            var acc : f64 = 0.0;
+            var k : usize = 0;
+            while (k < in_dim) {
+                acc = acc + x[x_off + k] * w[w_off + j * in_dim + k];
+                k = k + 1;
+            }
+            result[j] = acc;
+            j = j + 1;
+        }
+    }
+
+    fn matmul_full(
+        x       : []f64,
+        w       : []f64,
+        in_dim  : usize,
+        out_dim : usize,
+    ) -> void {
+        var tmp = [0.0; EMBED_DIM];
+        var i : usize = 0;
+        while (i < out_dim) {
+            var acc : f64 = 0.0;
+            var j : usize = 0;
+            while (j < in_dim) {
+                acc = acc + x[j] * w[i * in_dim + j];
+                j = j + 1;
+            }
+            tmp[i] = acc;
+            i = i + 1;
+        }
+        var i2 : usize = 0;
+        while (i2 < out_dim) {
+            x[i2] = tmp[i2];
+            i2 = i2 + 1;
+        }
+    }
+
+    // =========================================================
+    // 7. RACE Arch-Selection Interface
+    // =========================================================
+
+    // gla_config_from_race(hidden_dim, num_heads, chunk_size) -> GlaConfig
+    // Constructs a GlaConfig from the RACE trainer's arch_config.rs knobs
+    // (HIDDEN_DIM, NUM_ATTN_LAYERS, etc.).
+    // Called when ATTN_MODE="gla" is set in the trainer environment.
+    //
+    // NOTE: qk_gain defaults to 1.0 (standard). Setting it to PHI_SQ_GAIN
+    // is an [Open conjecture] ablation that must be run against gain=1.0
+    // and gain=sqrt(head_dim) controls before any claim can be made.
+    fn gla_config_from_race(
+        hidden_dim  : usize,
+        num_heads   : usize,
+        chunk_size  : usize,
+    ) -> GlaConfig {
+        return GlaConfig {
+            embed_dim  : hidden_dim,
+            num_heads  : num_heads,
+            head_dim   : hidden_dim / num_heads,
+            use_rope   : true,
+            qk_gain    : 1.0,       // control default; ablate PHI_SQ_GAIN separately
+            gate_act   : GateAct::Sigmoid,
+            chunk_size : chunk_size,
+        };
+    }
+
+    // =========================================================
+    // 8. TDD - Tests
+    // =========================================================
+
+    // --- 8a. State update correctness ---
+
+    test gla_state_update_zero_gate_erases_state
+        // If gate g = 0, previous state should be erased (decay to zero).
+        given hs = GlaHeadState{
+            .S = [1.0; HEAD_DIM * HEAD_DIM],
+            .normalizer = [1.0; HEAD_DIM],
+        }
+        and g = [0.0; HEAD_DIM]
+        and k = [1.0; HEAD_DIM]
+        and v = [1.0; HEAD_DIM]
+        when gla_state_update(&hs, g, k, v)
+        // After g=0: S[i,j] = 0 * old + k[i]*v[j] = 1.0 for all i,j
+        then hs.S[0] == 1.0 and hs.S[HEAD_DIM - 1] == 1.0
+
+    test gla_state_update_unit_gate_accumulates
+        // If gate g = 1, state should accumulate (no forgetting).
+        given hs = GlaHeadState{
+            .S = [0.0; HEAD_DIM * HEAD_DIM],
+            .normalizer = [0.0; HEAD_DIM],
+        }
+        and g = [1.0; HEAD_DIM]
+        and k = [1.0; HEAD_DIM]
+        and v = [0.5; HEAD_DIM]
+        when gla_state_update(&hs, g, k, v)
+        // After step 1: S[i,j] = 0.5 for all i,j
+        then abs(hs.S[0] - 0.5) < 1e-9
+
+    test gla_state_read_normalisation_floor
+        // When z . q is small, denom should be 1.0 (floor), preventing div-by-zero.
+        given hs = GlaHeadState{
+            .S = [0.0; HEAD_DIM * HEAD_DIM],
+            .normalizer = [0.0; HEAD_DIM],
+        }
+        and q = [0.0; HEAD_DIM]
+        and out = [0.0; HEAD_DIM]
+        when gla_state_read(&hs, q, &out)
+        // All-zero state, zero query: out should be 0.0, no NaN or Inf
+        then out[0] == 0.0 and out[HEAD_DIM - 1] == 0.0
+
+    test gla_state_update_then_read_identity
+        // After one step with k=q=[1,0,...,0], v=[1,0,...,0]:
+        // out[0] should equal v[0] / denom.
+        given hs = GlaHeadState{
+            .S = [0.0; HEAD_DIM * HEAD_DIM],
+            .normalizer = [0.0; HEAD_DIM],
+        }
+        and k = [1.0, 0.0; rest 0.0]   // unit basis e0
+        and v = [1.0, 0.0; rest 0.0]
+        and g = [1.0; HEAD_DIM]
+        and q = [1.0, 0.0; rest 0.0]
+        and out = [0.0; HEAD_DIM]
+        when gla_state_update(&hs, g, k, v)
+        and gla_state_read(&hs, q, &out)
+        then abs(out[0] - 1.0) < 1e-9   // z.q = 1.0, so denom = 1.0; S@q = 1.0
+
+    // --- 8b. Gate activation tests ---
+
+    test gate_act_sigmoid_range
+        given g = [0.0; 1]
+        when apply_gate_act(&g, GateAct::Sigmoid)
+        then abs(g[0] - 0.5) < 1e-9
+
+    test gate_act_sigmoid_large_positive_saturates
+        given g = [100.0; 1]
+        when apply_gate_act(&g, GateAct::Sigmoid)
+        then abs(g[0] - 1.0) < 1e-6
+
+    test gate_act_sigmoid_large_negative_saturates
+        given g = [-100.0; 1]
+        when apply_gate_act(&g, GateAct::Sigmoid)
+        then g[0] < 0.001 and g[0] >= 0.0
+
+    test gate_act_swish_zero_is_zero
+        given g = [0.0; 1]
+        when apply_gate_act(&g, GateAct::Swish)
+        then g[0] == 0.0
+
+    // --- 8c. Scale and dimension tests ---
+
+    test scale_vec_multiplies_correctly
+        given v = [2.0, 4.0, 6.0]
+        when scale_vec(&v, 0.5)
+        then abs(v[0] - 1.0) < 1e-12 and abs(v[1] - 2.0) < 1e-12 and abs(v[2] - 3.0) < 1e-12
+
+    test gla_config_from_race_head_dim
+        given cfg = gla_config_from_race(256, 4, 64)
+        then cfg.head_dim == 64   // 256 / 4
+
+    test gla_config_from_race_default_gain
+        given cfg = gla_config_from_race(256, 4, 64)
+        then abs(cfg.qk_gain - 1.0) < 1e-12   // control default
+
+    // --- 8d. Phi conjecture falsification witness ---
+
+    test phi_sq_gain_differs_from_control
+        // Witness: PHI_SQ_GAIN != 1.0. This is intentional.
+        // Result: [Open conjecture] whether PHI_SQ_GAIN improves BPB.
+        // Falsification: run ablation; if BPB(qk_gain=1.0) matches
+        // BPB(qk_gain=PHI_SQ_GAIN) within Monte-Carlo error, phi-specificity
+        // of the gain is FALSIFIED.
+        given phi_gain = PHI_SQ_GAIN
+        then abs(phi_gain - 2.618033988749895) < 1e-9
+        and phi_gain != 1.0   // they differ; which is better is an empirical question
+
+    test std_scale_value
+        // Verify standard 1/sqrt(d_k) scale is in expected range for HEAD_DIM=64.
+        given s = STD_SCALE
+        then abs(s - 0.125) < 1e-9   // 1/sqrt(64) = 1/8 = 0.125
+
+    // =========================================================
+    // 9. Invariants
+    // =========================================================
+
+    invariant gla_embed_dim_divisible_by_heads
+        // Required: EMBED_DIM must be evenly divisible by NUM_HEADS.
+        assert EMBED_DIM % NUM_HEADS == 0
+
+    invariant gla_head_dim_consistent
+        assert EMBED_DIM / NUM_HEADS == HEAD_DIM
+
+    invariant gla_state_dim_positive
+        assert STATE_DIM > 0
+
+    invariant gla_phi_sq_is_phi_plus_one
+        // [Verified] L5: phi^2 = phi + 1. This is the ONLY verified phi fact.
+        // PHI_SQ_GAIN uses this, but its *use as a QK gain* is [Open conjecture].
+        assert abs(PHI_SQ_GAIN - (1.618033988749895 + 1.0)) < 1e-9
+
+    invariant gla_std_scale_positive
+        assert STD_SCALE > 0.0
+
+    invariant gla_sigmoid_gate_in_unit_interval
+        // For any finite x, sigmoid(x) in (0,1).
+        given x = 0.0
+        and g = [x; 1]
+        and apply_gate_act(&g, GateAct::Sigmoid)
+        assert g[0] > 0.0 and g[0] < 1.0
+
+    invariant gla_state_update_preserves_finiteness
+        // After one state update with finite inputs, state remains finite.
+        given hs = GlaHeadState{
+            .S = [0.5; HEAD_DIM * HEAD_DIM],
+            .normalizer = [0.5; HEAD_DIM],
+        }
+        and g = [0.9; HEAD_DIM]
+        and k = [0.1; HEAD_DIM]
+        and v = [0.2; HEAD_DIM]
+        and gla_state_update(&hs, g, k, v)
+        assert is_finite(hs.S[0]) and is_finite(hs.normalizer[0])
+
+    invariant gla_read_denom_floor_prevents_div_zero
+        // The max(|z.q|, 1.0) floor ensures denominator >= 1.0 always.
+        given hs = GlaHeadState{
+            .S = [0.0; HEAD_DIM * HEAD_DIM],
+            .normalizer = [0.0; HEAD_DIM],
+        }
+        and q = [0.0; HEAD_DIM]
+        and out = [0.0; HEAD_DIM]
+        and gla_state_read(&hs, q, &out)
+        assert is_finite(out[0])
+
+    invariant gla_arch_tag_is_ascii
+        // Arch tag must be pure ASCII (Law L3).
+        assert ARCH_TAG == "gla"
+
+    // =========================================================
+    // 10. Benchmarks
+    // =========================================================
+
+    bench gla_state_update_latency_cpu
+        // Measure wall-clock for one GLA head state update on CPU.
+        // Target: LINEAR in HEAD_DIM^2 work; should be < 5 us for HEAD_DIM=64.
+        // Compare against bench attn_compute_scores_latency in attention.t27
+        // (O(N^2) reference) at seq_len=64 to verify crossover.
+        measure: nanoseconds to gla_state_update(
+            &GlaHeadState{.S=[0.5; HEAD_DIM*HEAD_DIM], .normalizer=[0.5; HEAD_DIM]},
+            [0.9; HEAD_DIM], [0.1; HEAD_DIM], [0.2; HEAD_DIM])
+        target: < 5000ns      // 5 us; revisit at HEAD_DIM=128
+
+    bench gla_state_read_latency_cpu
+        measure: nanoseconds to gla_state_read(
+            &GlaHeadState{.S=[0.5; HEAD_DIM*HEAD_DIM], .normalizer=[0.5; HEAD_DIM]},
+            [0.1; HEAD_DIM], &[0.0; HEAD_DIM])
+        target: < 5000ns
+
+    bench gla_gate_sigmoid_latency
+        measure: nanoseconds to apply_gate_act(&[0.0; 64], GateAct::Sigmoid)
+        target: < 500ns
+
+    bench gla_full_pass_seq64
+        // Full GLA block forward pass on 64-token sequence.
+        // This is the primary throughput comparison vs. attention.t27's
+        // bench attn_sacred_attention_kernel_latency (single-position reference).
+        // [Open conjecture]: GLA should win at seq >= 128 on CPU vector units.
+        measure: milliseconds to gla_parallel_forward(
+            [0.0; 64 * EMBED_DIM],
+            &GlaWeights{...},
+            gla_config_from_race(EMBED_DIM, NUM_HEADS, 16),
+            &[0.0; 64 * EMBED_DIM])
+        target: < 50ms        // soft target; compare vs full-attn reference
+
+    bench gla_full_pass_seq512
+        // Scale test: 512 tokens. Full attention is 8x more expensive; GLA
+        // should be ~8x cheaper at same dims (linear vs quadratic).
+        // [Open conjecture]: this is a necessary condition for the IGLA regime claim.
+        measure: milliseconds to gla_parallel_forward(
+            [0.0; 512 * EMBED_DIM], &GlaWeights{...},
+            gla_config_from_race(EMBED_DIM, NUM_HEADS, 16),
+            &[0.0; 512 * EMBED_DIM])
+        target: < 400ms       // should be ~8 * (seq64 target)
+}

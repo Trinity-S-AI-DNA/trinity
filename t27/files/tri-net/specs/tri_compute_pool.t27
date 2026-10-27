@@ -1,0 +1,236 @@
+// TRI-NET multi-executor pool split: share one reward pool across several GF
+// executors in proportion to their VERIFIED work, so a mesh of nodes -- not one
+// -- earns from a round. Mirrors tri_settle's discipline: floor division, so the
+// sum of shares never EXCEEDS the pool (no over-issuance; the floor remainder is
+// simply not minted). A node with zero verified work earns zero. "Work" is the
+// summed GoldenFloat width of a node's verified receipts (wider GF op = more work).
+
+module TriComputePool {
+    use base::types;
+
+    // Total verified work across three executors (extend as needed).
+    // Sum of three nodes' work, SATURATING: three large work totals (summed GF
+    // widths, untrusted) overflow a u32 sum and would wrap `total` below a single
+    // node's work, so pool_share(pool, my_work, total) would then divide by a value
+    // smaller than my_work and OVER-issue (my share > pool). Widen to u64 and cap
+    // at u32 max -- the last unsaturated weight-sum of the class fixed in
+    // tri_compute_payout.total_weighted3 / weighted / pool_share.
+    fn total_work3(w0: u32, w1: u32, w2: u32) -> u32 {
+        let sum: u64 = (w0 as u64) + (w1 as u64) + (w2 as u64);
+        if (sum > 4294967295) {
+            return 4294967295;
+        } else {
+            return sum as u32;
+        }
+    }
+
+    // One executor's proportional floor-div share of the pool. Guarded against a
+    // zero total (an empty round pays nobody).
+    fn pool_share(total_pool: u32, my_work: u32, total: u32) -> u32 {
+        if (total == 0) {
+            return 0;
+        } else {
+            // u64 intermediate: total_pool * my_work overflows u32 at realistic
+            // scale (e.g. 1e6 pool * 16000 reputation-weighted work = 1.6e10 >
+            // 2^32), silently WRAPPING the product and breaking the no-over-
+            // issuance invariant this spec claims. Widen the product so the floor-
+            // div stays exact -- the same fix tri_compute_payout.payout already
+            // carries (OpenZeppelin mulDiv / Uniswap FullMath discipline).
+            let num: u64 = (total_pool as u64) * (my_work as u64);
+            let den: u64 = total as u64;
+            return (num / den) as u32;
+        }
+    }
+
+    // ---- Funding-side conservation: the pool is prepaid, not minted ----
+    //
+    // pool_share splits a pool, but nothing said where the pool comes from: settle
+    // credited rewards with no funding source, so the token supply inflated (reward
+    // minted from nothing). Model the pool as a FUNDED balance a requester deposits
+    // into and payouts draw down, and pin the invariant the split assumed: total
+    // payouts NEVER exceed total deposits (Akash/Golem/Gensyn prepaid escrow --
+    // the protocol pays only what was funded). An over-draw is capped at the pool
+    // balance, never going negative.
+
+    // A requester funds the pool (saturating, like a ledger balance).
+    fn pool_after_deposit(pool: u32, amount: u32) -> u32 {
+        let sum: u32 = pool +% amount;
+        if (sum < pool) {
+            return 0xFFFFFFFF;
+        } else {
+            return sum;
+        }
+    }
+
+    // The actual payable amount: the request, capped at what the pool holds -- a
+    // payout can never exceed the funded balance.
+    fn payout_capped(pool: u32, requested: u32) -> u32 {
+        if (requested <= pool) {
+            return requested;
+        } else {
+            return pool;
+        }
+    }
+
+    // The pool after a payout: drawn down by the capped amount, never negative.
+    fn pool_after_payout(pool: u32, requested: u32) -> u32 {
+        if (requested <= pool) {
+            return pool - requested;
+        } else {
+            return 0;
+        }
+    }
+
+    // Pool-funded settlement: move an already-gated reward FROM the pool TO the
+    // executor -- settle_canonical decides the magnitude, this MOVES it, it does
+    // not mint. The executor's balance rises by exactly payout_capped(pool, reward)
+    // and the pool falls by exactly the same (pool_after_payout uses the identical
+    // cap), so total(balance, pool) is invariant across the settle: value is
+    // conserved, never created (Akash/Golem: the provider is paid out of the
+    // requester's escrow, atomically). An underfunded pool caps the credit to what
+    // was funded and drains the pool to zero.
+    // SATURATING credit: prev_balance is a full u32 (balances cap at 0xFFFFFFFF), so a
+    // bare prev_balance + credit WRAPS a large balance to near-zero on payout -- the
+    // executor would LOSE its holdings while the pool still drained, destroying value
+    // instead of conserving it (the very invariant this function's doc claims). Cap at
+    // u32 max, exactly as tri_compute_settle.balance_add / account.bal_add_sat do for
+    // the minting path. Conservation holds for every value whose total fits u32; only
+    // at the representable ceiling does it degrade gracefully (cap) rather than wrap.
+    fn balance_after_pool_settle(prev_balance: u32, pool: u32, reward: u32) -> u32 {
+        let credit: u32 = payout_capped(pool, reward);
+        let sum: u32 = prev_balance +% credit;
+        if (sum < prev_balance) {
+            return 0xFFFFFFFF;
+        } else {
+            return sum;
+        }
+    }
+
+    // ---- Tests / invariants ----
+
+    // Proportional split with floor division; a zero-work node earns nothing.
+    test proportional_and_zero_work {
+        assert(pool_share(1000, 16, 96) == 166, "16/96 of 1000 (floor)");
+        assert(pool_share(1000, 32, 96) == 333, "32/96 of 1000 (floor)");
+        assert(pool_share(1000, 48, 96) == 500, "48/96 of 1000 (floor)");
+        assert(pool_share(1000, 0, 96) == 0, "a node with no work earns nothing");
+    }
+
+    // The pool split is ALREADY rung-proportional: `work` is the summed GF WIDTH of a
+    // node's receipts, and width encodes the rung (GF-T64 width 64 vs GF-T16 width 16).
+    // So for one op each, a GF-T64 node earns 4x a GF-T16 node's share -- exactly the
+    // width (rung) ratio -- with NO extra rung premium. A separate rung multiplier here
+    // (like the window/bond/reputation premiums) would DOUBLE-COUNT the width that already
+    // carries the rung; the rung must enter the pool exactly once, via width. This test
+    // pins that so no one later adds a redundant premium.
+    test pool_split_is_already_rung_proportional {
+        // one GF-T64 op (work 64) and one GF-T16 op (work 16); pool 1000, total 80
+        assert(pool_share(1000, 64, 80) == 800, "GF-T64 node earns 64/80 of the pool");
+        assert(pool_share(1000, 16, 80) == 200, "GF-T16 node earns 16/80");
+        assert(pool_share(1000, 64, 80) == 4 * pool_share(1000, 16, 80), "GF-T64 : GF-T16 = 4 : 1 = the width/rung ratio");
+        // GF-T8 (width 8) vs GF-T32 (width 32): 1 : 4, again the width ratio, no premium.
+        assert(pool_share(1000, 32, 40) == 800, "GF-T32 node earns 32/40");
+        assert(pool_share(1000, 8, 40) == 200, "GF-T8 node earns 8/40");
+    }
+
+    // No over-issuance: the shares SUM to at most the pool (floor loses the dust).
+    test no_over_issuance {
+        s0 = pool_share(1000, 16, 96);
+        s1 = pool_share(1000, 32, 96);
+        s2 = pool_share(1000, 48, 96);
+        assert((s0 + s1 + s2) == 999, "sum <= pool; floor under-issues by the remainder");
+    }
+
+    // An empty round (no verified work anywhere) pays zero, no divide-by-zero.
+    test empty_round_pays_zero {
+        assert(pool_share(1000, 0, 0) == 0, "empty round is safe and pays nothing");
+        assert(total_work3(0, 0, 0) == 0, "no work summed");
+    }
+
+    // total_work3 is saturating: three large work totals cap instead of wrapping
+    // below a single node's work (which would let pool_share over-issue).
+    test total_work3_saturates {
+        assert(total_work3(16, 32, 48) == 96, "normal sum is exact");
+        assert(total_work3(4000000000, 400000000, 0) == 4294967295, "sum 4.4e9 > 2^32 saturates, no wrap");
+        assert(total_work3(4294967295, 4294967295, 4294967295) == 4294967295, "three max totals saturate");
+        // Over-issuance guard: with a saturated total, a node's share never exceeds
+        // the pool. Bare-u32 wrap would put total below my_work and over-issue.
+        assert(pool_share(1000, 3000000000, total_work3(3000000000, 3000000000, 3000000000)) <= 1000, "saturated total keeps the share within the pool");
+    }
+
+    // More verified work strictly earns more (monotonic in work).
+    test more_work_earns_more {
+        assert(pool_share(1000, 48, 96) > pool_share(1000, 16, 96), "more work, bigger share");
+    }
+
+    // Overflow guard: a realistic pool and reputation-weighted work whose product
+    // exceeds u32 must still floor-div EXACTLY. 1_000_000 * 16_000 = 1.6e10 > 2^32;
+    // in bare u32 the product wraps to 3_115_098_112 and yields a garbage 129_795
+    // share -- the u64 widening keeps it exact, and the no-over-issuance invariant
+    // survives at scale (not just the toy 1000-pool rounds above).
+    test large_pool_no_overflow {
+        assert(pool_share(1000000, 16000, 24000) == 666666, "large pool*work floor-divides exactly (no u32 overflow)");
+        assert(pool_share(1000000, 8000, 24000) == 333333, "second node's share is exact too");
+        s0 = pool_share(1000000, 16000, 24000);
+        s1 = pool_share(1000000, 8000, 24000);
+        assert((s0 + s1) == 999999, "sum 999999 <= pool 1e6 at scale; floor loses one dust unit");
+    }
+
+    // A requester funds the pool; deposits accumulate (saturating at the ceiling).
+    test deposit_funds_the_pool {
+        assert(pool_after_deposit(0, 1000) == 1000, "first deposit funds an empty pool");
+        assert(pool_after_deposit(1000, 500) == 1500, "deposits accumulate");
+        assert(pool_after_deposit(0xFFFFFFF0, 32) == 0xFFFFFFFF, "deposit saturates, no wrap");
+    }
+
+    // A payout draws the pool down and can never exceed the funded balance; an
+    // over-draw is capped and drains to zero, never negative.
+    test payout_never_exceeds_the_pool {
+        assert(payout_capped(1000, 300) == 300, "a payout within the pool is paid in full");
+        assert(pool_after_payout(1000, 300) == 700, "the pool is drawn down by the payout");
+        assert(payout_capped(100, 300) == 100, "an over-draw is capped at the pool balance");
+        assert(pool_after_payout(100, 300) == 0, "an over-draw drains the pool to zero, never negative");
+    }
+
+    // THE funding invariant: total payouts never exceed total deposits. Fund 1000,
+    // pay the three proportional shares (166+333+500 = 999) via pool_after_payout;
+    // the pool ends at 1 (the floor dust), so paid 999 <= deposited 1000 -- no
+    // reward is minted beyond what the requester funded.
+    test payouts_never_exceed_deposits {
+        p0 = pool_after_deposit(0, 1000);
+        p1 = pool_after_payout(p0, pool_share(1000, 16, 96));
+        p2 = pool_after_payout(p1, pool_share(1000, 32, 96));
+        p3 = pool_after_payout(p2, pool_share(1000, 48, 96));
+        assert(p1 == 834, "after 166 -> 834 remains");
+        assert(p2 == 501, "after 333 -> 501 remains");
+        assert(p3 == 1, "after 500 -> 1 remains (the floor dust stays funded)");
+        assert(p3 == 1000 - (166 + 333 + 500), "pool end == deposit minus total payouts, exactly conserved");
+    }
+
+    // Pool-funded settle MOVES value, never mints: the executor gains exactly what
+    // the pool loses, so balance + pool is invariant across the settle.
+    test pool_settle_conserves_total {
+        // reward 300 <= pool 1000: balance 500 -> 800, pool 1000 -> 700, total 1500 both sides.
+        assert(balance_after_pool_settle(500, 1000, 300) == 800, "executor credited the reward");
+        assert(pool_after_payout(1000, 300) == 700, "pool drawn down by the same reward");
+        assert(balance_after_pool_settle(500, 1000, 300) + pool_after_payout(1000, 300) == 500 + 1000, "balance + pool conserved across settle");
+    }
+
+    // An underfunded pool caps the credit to what was funded and drains to zero --
+    // still conserved, the executor simply cannot be paid more than the pool holds.
+    test pool_settle_caps_underfunded {
+        // reward 300 > pool 100: executor gains only 100, pool -> 0, total conserved.
+        assert(balance_after_pool_settle(500, 100, 300) == 600, "credit capped at the funded 100");
+        assert(pool_after_payout(100, 300) == 0, "underfunded pool drains to zero, not negative");
+        assert(balance_after_pool_settle(500, 100, 300) + pool_after_payout(100, 300) == 500 + 100, "capped settle still conserves balance + pool");
+    }
+
+    // The credit saturates instead of wrapping at the u32 ceiling. A near-max balance
+    // receiving a payout would overflow: bare `+` wraps to a tiny value (funds lost);
+    // saturation caps at u32 max. Regression: the normal path stays exact.
+    test pool_settle_credit_saturates {
+        assert(balance_after_pool_settle(500, 1000, 300) == 800, "normal credit exact (regression)");
+        assert(balance_after_pool_settle(0xFFFFFFF0, 1000, 300) == 0xFFFFFFFF, "credit that would overflow saturates to u32 max, not a wrap to 284");
+        assert(balance_after_pool_settle(0xFFFFFFFF, 1000, 300) == 0xFFFFFFFF, "already-max balance stays at max, never wraps to a small value");
+    }
+}

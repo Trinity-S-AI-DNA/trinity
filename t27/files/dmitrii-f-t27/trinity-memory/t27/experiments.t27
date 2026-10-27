@@ -1,0 +1,681 @@
+// Executable native experiments. Domain behavior is here; the runtime supplies
+// bounded allocation, loopback sockets, monotonic time and platform primitives.
+// JSON output is scratch until a nonnegative return. No physical-device claim.
+module TrinityMemoryExperiments {
+    const TM_EXP_ERR_CHECK: i32 = -90;
+    const TM_EXP_ERR_RESOURCE: i32 = -91;
+    const TM_EXP_ERR_RTL: i32 = -82;
+    struct TMExperimentWork {
+        rpc: *TMRPCWorkspace, tensors: *TMTPJSONWorkspace,
+        params: []u8, request: []u8, response: []u8,
+        blob: []u8, fetched: []u8, metadata: []u8,
+    }
+    fn tm_exp_open(work: *TMExperimentWork) -> i32 {
+        work.rpc = tm_runtime_rpc_new(131072);
+        work.tensors = tm_runtime_tensor_new(32768, 16384);
+        work.params = tm_runtime_alloc(65536, 1);
+        work.request = tm_runtime_alloc(131072, 1);
+        work.response = tm_runtime_alloc(131072, 1);
+        work.blob = tm_runtime_alloc(32768, 1);
+        work.fetched = tm_runtime_alloc(32768, 1);
+        work.metadata = tm_runtime_alloc(16384, 1);
+        if (work.rpc == 0 || work.tensors == 0 || work.params == 0 || work.request == 0 ||
+            work.response == 0 || work.blob == 0 || work.fetched == 0 || work.metadata == 0) { return TM_EXP_ERR_RESOURCE; }
+        return 0;
+    }
+    fn tm_exp_close(work: *TMExperimentWork) -> void {
+        tm_runtime_rpc_free(work.rpc); tm_runtime_tensor_free(work.tensors);
+        tm_runtime_free(work.params); tm_runtime_free(work.request); tm_runtime_free(work.response);
+        tm_runtime_free(work.blob); tm_runtime_free(work.fetched); tm_runtime_free(work.metadata);
+    }
+    fn tm_exp_rpc(work: *TMExperimentWork, port: i32, method: str,
+                   params_size: usize, reply: *TMRPCReply) -> i32 {
+        var id: [32]u8 = [0]; var method_bytes: [64]u8 = [0]; var length: usize = 0;
+        while (method[length] != 0) {
+            if (length >= 63) { return TM_EXP_ERR_CHECK; }
+            method_bytes[length] = method[length] as u8; length = length + 1;
+        }
+        if (tm_rpc_random_id(id) != 0) { return TM_RPC_ERR_TRANSPORT; }
+        var request_size: i64 = tm_rpc_prepare(method_bytes, length, work.params, params_size,
+                                              id, work.request, 131072, work.rpc);
+        if (request_size < 0) { return request_size as i32; }
+        var size: i64 = tm_runtime_http(port, 10.0, work.request, request_size as usize, work.response, 131072);
+        if (size < 0) { return size as i32; }
+        var status: i32 = tm_rpc_validate(work.response, size as usize, id, work.rpc, reply);
+        if (status == 1) {
+            var code: i64 = tm_rpc_field(work.rpc, reply.error_index, "code", 4);
+            if (code < 0) { return TM_RPC_ERR_TRANSPORT; }
+            var token: *TMJsonToken = &work.rpc[0].tokens[code];
+            if (!token[0].integer_fits_i64 || token[0].integer < -2147483648 || token[0].integer > 2147483647) {
+                return TM_RPC_ERR_TRANSPORT;
+            }
+            return token[0].integer as i32;
+        }
+        return status;
+    }
+    fn tm_exp_upload(work: *TMExperimentWork, port: i32, blob: []u8, size: usize, handle: []u8) -> i32 {
+        var params: TMJsonWriter = TMJsonWriter{ .data = work.params, .capacity = 65536, .used = 0, .error = 0 };
+        tm_bridge_text(&params, "{\"data\":\""); tm_bridge_b64_encode(&params, blob, size); tm_bridge_text(&params, "\"}");
+        if (params.error != 0) { return params.error; }
+        var reply: TMRPCReply = TMRPCReply{ .result_index = -1, .error_index = -1, .remote_error = false };
+        var status: i32 = tm_exp_rpc(work, port, "memory.upload", params.used, &reply);
+        if (status != 0) { return status; }
+        var index: i64 = tm_rpc_field(work.rpc, reply.result_index, "handle", 6);
+        if (index < 0) { return TM_EXP_ERR_CHECK; }
+        var token: *TMJsonToken = &work.rpc[0].tokens[index];
+        if (token[0].kind != TM_JSON_STRING || token[0].text_size != 32) { return TM_EXP_ERR_CHECK; }
+        var i: usize = 0; while (i < 32) { handle[i] = token[0].text[i]; i = i + 1; }
+        return 0;
+    }
+    fn tm_exp_handle_params(work: *TMExperimentWork, handle: []u8) -> usize {
+        var params: TMJsonWriter = TMJsonWriter{ .data = work.params, .capacity = 65536, .used = 0, .error = 0 };
+        tm_bridge_text(&params, "{\"handle\":"); tm_json_write_quoted(&params, handle, 32); tm_bridge_put(&params, 125);
+        return params.used;
+    }
+    fn tm_exp_read(work: *TMExperimentWork, port: i32, handle: []u8) -> i64 {
+        var reply: TMRPCReply = TMRPCReply{ .result_index = -1, .error_index = -1, .remote_error = false };
+        var status: i32 = tm_exp_rpc(work, port, "memory.read", tm_exp_handle_params(work, handle), &reply);
+        if (status != 0) { return status as i64; }
+        var index: i64 = tm_rpc_field(work.rpc, reply.result_index, "data", 4);
+        if (index < 0) { return TM_EXP_ERR_CHECK as i64; }
+        var token: *TMJsonToken = &work.rpc[0].tokens[index];
+        if (token[0].kind != TM_JSON_STRING) { return TM_EXP_ERR_CHECK as i64; }
+        return tm_bridge_b64_decode(token[0].text, token[0].text_size, work.fetched, 32768);
+    }
+    fn tm_exp_delete(work: *TMExperimentWork, port: i32, handle: []u8) -> i32 {
+        var reply: TMRPCReply = TMRPCReply{ .result_index = -1, .error_index = -1, .remote_error = false };
+        var status: i32 = tm_exp_rpc(work, port, "memory.delete", tm_exp_handle_params(work, handle), &reply);
+        if (status != 0) { return status; }
+        var index: i64 = tm_rpc_field(work.rpc, reply.result_index, "deleted", 7);
+        if (index < 0 || work.rpc[0].tokens[index].kind != TM_JSON_TRUE) { return TM_EXP_ERR_CHECK; }
+        return 0;
+    }
+    fn tm_exp_dot(work: *TMExperimentWork, port: i32, handle: []u8, tensor: str,
+                  samples: []i64, count: usize, reply: *TMRPCReply) -> i32 {
+        var params: TMJsonWriter = TMJsonWriter{ .data = work.params, .capacity = 65536, .used = 0, .error = 0 };
+        tm_bridge_text(&params, "{\"handle\":"); tm_json_write_quoted(&params, handle, 32);
+        tm_bridge_text(&params, ",\"tensor_name\":"); tm_bridge_literal_string(&params, tensor);
+        tm_bridge_text(&params, ",\"activations\":["); var i: usize = 0;
+        while (i < count) {
+            if (i > 0) { tm_bridge_put(&params, 44); }
+            tm_json_write_i64(&params, samples[i]); i = i + 1;
+        }
+        tm_bridge_text(&params, "]}");
+        if (params.error != 0) { return params.error; }
+        return tm_exp_rpc(work, port, "compute.dot", params.used, reply);
+    }
+    fn tm_exp_label(index: usize) -> str {
+        if (index == 0) { return "rising"; } if (index == 1) { return "falling"; } return "alternating";
+    }
+    fn tm_exp_fixture_name(index: usize) -> str {
+        if (index == 0) { return "step_up"; } if (index == 1) { return "step_down"; }
+        if (index == 2) { return "alternating"; } if (index == 3) { return "offset_step_up"; }
+        if (index == 4) { return "offset_step_down"; } return "noisy_alternating";
+    }
+    fn tm_exp_weight(row: usize, column: usize) -> i32 {
+        if (row == 2) { if (column % 2 == 0) { return -1; } return 1; }
+        if (row == 0) { if (column < 6) { return -1; } return 1; }
+        if (column < 6) { return 1; } return -1;
+    }
+    fn tm_exp_fixture(index: usize, samples: []i64) -> i32 {
+        if (index >= 6) { return TM_EXP_ERR_CHECK; }
+        var up: [12]i64 = [-8, -7, -9, -8, -6, -8, 33, 34, 35, 34, 32, 35];
+        var down: [12]i64 = [36, 35, 33, 35, 34, 36, -8, -9, -7, -8, -8, -6];
+        var alternating: [12]i64 = [-25, 29, -27, 31, -28, 30, -26, 28, -29, 32, -25, 31];
+        var i: usize = 0;
+        while (i < 12) {
+            if (index == 0) { samples[i] = 40 * (tm_exp_weight(0, i) as i64); }
+            if (index == 1) { samples[i] = 40 * (tm_exp_weight(1, i) as i64); }
+            if (index == 2) { samples[i] = 30 * (tm_exp_weight(2, i) as i64); }
+            if (index == 3) { samples[i] = up[i]; }
+            if (index == 4) { samples[i] = down[i]; }
+            if (index == 5) { samples[i] = alternating[i]; }
+            i = i + 1;
+        }
+        return 0;
+    }
+    fn tm_exp_signal_model(codec: i32, out: []u8, capacity: usize) -> i64 {
+        var weights: [36]i32 = [0]; var shape: [2]u64 = [3, 12]; var scale: [1]f64 = [1.0];
+        var name: [16]u8 = [0]; var class_axis: [5]u8 = [0]; var sample_axis: [6]u8 = [0];
+        tm_exp_copy_text("signal_templates", name, 16);
+        tm_exp_copy_text("class", class_axis, 5); tm_exp_copy_text("sample", sample_axis, 6);
+        var axes: [2]TMTPText;
+        axes[0].data = class_axis; axes[0].size = 5;
+        axes[1].data = sample_axis; axes[1].size = 6;
+        var row: usize = 0;
+        while (row < 3) { var col: usize = 0; while (col < 12) { weights[row * 12 + col] = tm_exp_weight(row, col); col = col + 1; } row = row + 1; }
+        var d: TMTensorDescriptor = TMTensorDescriptor{ .name = name, .name_size = 16,
+            .shape = shape, .rank = 2, .scales = scale, .scale_count = 1, .scale_axis = -1,
+            .axes = axes, .axes_count = 2, .codec = codec, .offset = 0, .length = 0 };
+        var metadata: [1024]u8 = [0];
+        return tm_tp_encode_json(&d, 1, weights, 36, metadata, 1024, out, capacity);
+    }
+    fn tm_exp_model(work: *TMExperimentWork, codec: i32) -> i64 {
+        return tm_exp_signal_model(codec, work.blob, 32768);
+    }
+    fn tm_exp_copy_text(text: str, out: []u8, capacity: usize) -> i64 {
+        var i: usize = 0;
+        while (text[i] != 0) {
+            if (i >= capacity) { return TM_ERR_CAPACITY as i64; }
+            out[i] = text[i] as u8; i = i + 1;
+        }
+        return i as i64;
+    }
+    fn tm_exp_classify(work: *TMRPCWorkspace, reply: *TMRPCReply,
+                       raw: []i64, scores: []f64, best: *i64, tied: *i64) -> i32 {
+        var accum: i64 = tm_rpc_field(work, reply.result_index, "accumulators", 12);
+        var scale: i64 = tm_rpc_field(work, reply.result_index, "scales", 6);
+        var backend: i64 = tm_rpc_field(work, reply.result_index, "backend", 7);
+        if (accum < 0 || scale < 0 || backend < 0 || !tm_rpc_text(&work.tokens[backend], "emulator", 8) ||
+            work.tokens[accum].kind != TM_JSON_ARRAY || work.tokens[scale].kind != TM_JSON_ARRAY ||
+            tm_tpj_members(work.tokens, accum) != 3) { return TM_EXP_ERR_CHECK; }
+        var scales: [3]f64 = [0.0]; var scale_count: usize = tm_tpj_members(work.tokens, scale);
+        if (scale_count != 1 && scale_count != 3) { return TM_EXP_ERR_CHECK; }
+        var child: i64 = work.tokens[accum].first; var i: usize = 0;
+        while (child >= 0) {
+            if (work.tokens[child].kind != TM_JSON_INTEGER || !work.tokens[child].integer_fits_i64) { return TM_EXP_ERR_CHECK; }
+            raw[i] = work.tokens[child].integer; i = i + 1; child = work.tokens[child].next;
+        }
+        child = work.tokens[scale].first; i = 0;
+        while (child >= 0) {
+            if (work.tokens[child].kind != TM_JSON_REAL) { return TM_EXP_ERR_CHECK; }
+            scales[i] = work.tokens[child].real; i = i + 1; child = work.tokens[child].next;
+        }
+        if (tm_scale_scores(raw, 3, scales, scale_count as u64, scores, 3) != 0) { return TM_EXP_ERR_CHECK; }
+        return tm_argmax_scores(scores, 3, best, tied);
+    }
+    fn tm_exp_i64_array(writer: *TMJsonWriter, values: []i64, count: usize) -> void {
+        tm_bridge_put(writer, 91); var i: usize = 0;
+        while (i < count) { if (i > 0) { tm_bridge_put(writer, 44); } tm_json_write_i64(writer, values[i]); i = i + 1; }
+        tm_bridge_put(writer, 93);
+    }
+    fn tm_exp_edge_mode(work: *TMExperimentWork, port: i32, codec: i32, rtl: bool, seed: i64, writer: *TMJsonWriter) -> i32 {
+        var size: i64 = tm_exp_model(work, codec);
+        if (size < 0) { return size as i32; }
+        var reply: TMRPCReply = TMRPCReply{ .result_index = -1, .error_index = -1, .remote_error = false };
+        var status: i32 = tm_exp_rpc(work, port, "trinity.capabilities", 0, &reply);
+        if (status != 0) { return status; }
+        tm_bridge_text(writer, "{\"codec\":"); tm_bridge_literal_string(writer, tm_bridge_codec_name(codec));
+        tm_bridge_text(writer, ",\"capabilities\":"); tm_json_write_tree(writer, work.rpc[0].tokens, work.rpc[0].token_count, reply.result_index);
+        var handle: [32]u8 = [0]; var before: u64 = tm_runtime_monotonic_ns();
+        status = tm_exp_upload(work, port, work.blob, size as usize, handle);
+        if (status != 0) { return status; }
+        var fetched: i64 = tm_exp_read(work, port, handle);
+        var transfer_ns: u64 = tm_runtime_monotonic_ns() - before;
+        if (fetched != size || !tm_tp_text_equal(work.blob, size as usize, work.fetched, fetched as usize)) { return TM_EXP_ERR_CHECK; }
+        var decoded: [36]i32 = [0];
+        var validation: TMTPValidation = TMTPValidation{ .tensor_count = 0, .total_trits = 0, .payload_bytes = 0,
+            .framing_valid = false, .descriptors_valid = false, .json_binding_valid = false };
+        if (tm_tp_decode_json(work.fetched, fetched as usize, work.tensors, decoded, 36, 36, &validation) != 0 || validation.total_trits != 36) { return TM_EXP_ERR_CHECK; }
+        var digest: [32]u8 = [0]; if (tm_os_sha256(work.blob, size as usize, digest) != 0) { return TM_EXP_ERR_RESOURCE; }
+        tm_bridge_text(writer, ",\"container_bytes\":"); tm_json_write_i64(writer, size);
+        tm_bridge_text(writer, ",\"raw_weight_payload_bytes\":"); tm_json_write_i64(writer, tm_payload_size(codec, 36));
+        tm_bridge_text(writer, ",\"container_sha256\":\""); tm_bridge_hex(writer, digest, 32);
+        tm_bridge_text(writer, "\",\"roundtrip_exact\":true,\"upload_read_wall_ns\":"); tm_json_write_u64(writer, transfer_ns);
+        tm_bridge_text(writer, ",\"cases\":["); var index: usize = 0;
+        while (index < 6) {
+            var samples: [12]i64 = [0]; tm_exp_fixture(index, samples);
+            before = tm_runtime_monotonic_ns(); status = tm_exp_dot(work, port, handle, "signal_templates", samples, 12, &reply);
+            if (status != 0) { return status; }
+            var raw: [3]i64 = [0]; var scores: [3]f64 = [0.0]; var best: [1]i64 = [0]; var tied: [1]i64 = [0];
+            status = tm_exp_classify(work.rpc, &reply, raw, scores, best, tied);
+            var rpc_ns: u64 = tm_runtime_monotonic_ns() - before;
+            if (status != 0 || tied[0] != 0 || best[0] != ((index % 3) as i64)) { return TM_EXP_ERR_CHECK; }
+            var reference: [3]i64 = [0]; var row: usize = 0;
+            // Reference is direct fixture/template arithmetic, independent of
+            // the network service and its decoded weights or dot implementation.
+            while (row < 3) {
+                var col: usize = 0;
+                while (col < 12) { reference[row] = reference[row] + (tm_exp_weight(row, col) as i64) * samples[col]; col = col + 1; }
+                if (reference[row] != raw[row]) { return TM_EXP_ERR_CHECK; } row = row + 1;
+            }
+            var witnesses: [3]TMRtlWitness;
+            if (rtl) {
+                var hardware_samples: [12]i32 = [0]; var sample: usize = 0;
+                while (sample < 12) { hardware_samples[sample] = samples[sample] as i32; sample = sample + 1; }
+                row = 0;
+                while (row < 3) {
+                    status = tm_rtl_run_dot(&decoded[row * 12], hardware_samples, 12, codec, seed + (row as i64), &witnesses[row]);
+                    if (status != 0 || witnesses[row].error || witnesses[row].result != reference[row]) { return TM_EXP_ERR_RTL; }
+                    row = row + 1;
+                }
+            }
+            if (index > 0) { tm_bridge_put(writer, 44); }
+            tm_bridge_text(writer, "{\"name\":"); tm_bridge_literal_string(writer, tm_exp_fixture_name(index));
+            tm_bridge_text(writer, ",\"samples\":"); tm_exp_i64_array(writer, samples, 12);
+            tm_bridge_text(writer, ",\"expected\":"); tm_bridge_literal_string(writer, tm_exp_label(index % 3));
+            tm_bridge_text(writer, ",\"label\":"); tm_bridge_literal_string(writer, tm_exp_label(best[0] as usize));
+            tm_bridge_text(writer, ",\"ambiguous\":false,\"accumulators\":"); tm_exp_i64_array(writer, raw, 3);
+            tm_bridge_text(writer, ",\"scores\":["); row = 0;
+            while (row < 3) { if (row > 0) { tm_bridge_put(writer, 44); } tm_bridge_float(writer, scores[row]); row = row + 1; }
+            tm_bridge_text(writer, "],\"backend\":\"emulator\",\"reference\":"); tm_exp_i64_array(writer, reference, 3);
+            tm_bridge_text(writer, ",\"rpc_wall_ns\":"); tm_json_write_u64(writer, rpc_ns);
+            tm_bridge_text(writer, ",\"rtl\":["); row = 0;
+            if (rtl) { while (row < 3) { if (row > 0) { tm_bridge_put(writer, 44); } tm_exp_rtl_json(writer, &witnesses[row], codec, seed + (row as i64)); row = row + 1; } }
+            tm_bridge_text(writer, "],\"passed\":true}"); index = index + 1;
+        }
+        tm_bridge_text(writer, "]}");
+        status = tm_exp_delete(work, port, handle);
+        if (status != 0) { return status; }
+        return writer.error;
+    }
+    fn tm_exp_edge(rtl: bool, seed: i64, out: []u8, capacity: usize) -> i64 {
+        if (rtl && (seed < 0 || seed > 4294967293)) { return TM_EXP_ERR_RTL as i64; }
+        var work: TMExperimentWork;
+        var status: i32 = tm_exp_open(&work);
+        if (status != 0) { tm_exp_close(&work); return status as i64; }
+        var writer: TMJsonWriter = TMJsonWriter{ .data = out, .capacity = capacity, .used = 0, .error = 0 };
+        tm_bridge_text(&writer, "{\"schema\":\"trinity.edge-report.v1\",\"passed\":true,\"evidence\":[\"software-loopback-http\"");
+        if (rtl) { tm_bridge_text(&writer, ",\"rtl-simulation\""); }
+        tm_bridge_text(&writer, "],\"physical_device_tested\":false,\"runtime\":\"native-t27\",\"python\":null,\"seed\":");
+        tm_json_write_i64(&writer, seed);
+        tm_bridge_text(&writer, ",\"model\":\"hand-authored ternary template classifier, shape [3,12]\",\"labels\":[\"rising\",\"falling\",\"alternating\"],\"fixture_count\":6,\"modes\":[");
+        var mode: usize = 0;
+        while (mode < 2 && status == 0 && writer.error == 0) {
+            var server: *u8 = tm_host_server_new(0, 131072, 32768, 131072, 4, 16384, 10.0);
+            if (server == 0) { status = TM_EXP_ERR_RESOURCE; }
+            else {
+                status = tm_host_server_start(server);
+                if (status == 0) {
+                    if (mode > 0) { tm_bridge_put(&writer, 44); }
+                    var codec: i32 = 1; if (mode == 1) { codec = 0; }
+                    status = tm_exp_edge_mode(&work, tm_host_server_port(server), codec, rtl, seed, &writer);
+                }
+                tm_host_server_close(server);
+            }
+            mode = mode + 1;
+        }
+        tm_bridge_text(&writer, "],\"limitations\":[\"Illustrative synthetic fixtures; no measured generalization accuracy.\",\"HTTP wall times include native C, JSON and scheduling overhead.\",\"RTL cycles are simulation evidence, not FPGA throughput or power.\",\"No physical board, DDR controller, trained checkpoint or ZK proof.\"]}\n");
+        tm_exp_close(&work);
+        if (status != 0) { return status as i64; }
+        if (writer.error != 0) { return writer.error as i64; }
+        return writer.used as i64;
+    }
+    fn tm_exp_case_fields(doc: *TMRPCWorkspace, item: i64) -> bool {
+        if (doc.tokens[item].kind != TM_JSON_OBJECT) { return false; }
+        var key: i64 = doc.tokens[item].first; var fields: u32 = 0;
+        while (key >= 0) {
+            var t: *TMJsonToken = &doc.tokens[key]; var flag: u32 = 0;
+            if (tm_rpc_text(t, "name", 4)) { flag = 1; }
+            if (tm_rpc_text(t, "weights", 7)) { flag = 2; }
+            if (tm_rpc_text(t, "activations", 11)) { flag = 4; }
+            if (tm_rpc_text(t, "dot", 3)) { flag = 8; }
+            if (tm_rpc_text(t, "dense5_hex", 10)) { flag = 16; }
+            if (tm_rpc_text(t, "baseline2_hex", 13)) { flag = 32; }
+            if (tm_rpc_text(t, "dense17_hex", 11)) { flag = 64; }
+            if (tm_rpc_text(t, "dense22_hex", 11)) { flag = 128; }
+            if (flag == 0) { return false; } fields = fields | flag; key = doc.tokens[key].next;
+        }
+        return (fields & 15) == 15;
+    }
+    fn tm_exp_case_values(doc: *TMRPCWorkspace, item: i64, weights: []i32,
+                          samples: []i64, expected: *i64) -> i64 {
+        if (!tm_exp_case_fields(doc, item)) { return TM_EXP_ERR_CHECK as i64; }
+        var name: i64 = tm_rpc_field(doc, item, "name", 4);
+        var w: i64 = tm_rpc_field(doc, item, "weights", 7);
+        var x: i64 = tm_rpc_field(doc, item, "activations", 11);
+        var dot: i64 = tm_rpc_field(doc, item, "dot", 3);
+        if (name < 0 || w < 0 || x < 0 || dot < 0 || doc.tokens[name].kind != TM_JSON_STRING || doc.tokens[name].text_size == 0 ||
+            doc.tokens[w].kind != TM_JSON_ARRAY || doc.tokens[x].kind != TM_JSON_ARRAY || doc.tokens[dot].kind != TM_JSON_INTEGER || !doc.tokens[dot].integer_fits_i64) { return TM_EXP_ERR_CHECK as i64; }
+        var count: usize = tm_tpj_members(doc.tokens, w);
+        if (count == 0 || count > 4096 || count != tm_tpj_members(doc.tokens, x)) { return TM_EXP_ERR_CHECK as i64; }
+        var wi: i64 = doc.tokens[w].first; var xi: i64 = doc.tokens[x].first; var i: usize = 0; var sum: i64 = 0;
+        while (i < count) {
+            if (doc.tokens[wi].kind != TM_JSON_INTEGER || !doc.tokens[wi].integer_fits_i64 || doc.tokens[wi].integer < -1 || doc.tokens[wi].integer > 1 ||
+                doc.tokens[xi].kind != TM_JSON_INTEGER || !doc.tokens[xi].integer_fits_i64 || doc.tokens[xi].integer < -128 || doc.tokens[xi].integer > 127) { return TM_EXP_ERR_CHECK as i64; }
+            weights[i] = doc.tokens[wi].integer as i32; samples[i] = doc.tokens[xi].integer;
+            sum = sum + (weights[i] as i64) * samples[i]; i = i + 1; wi = doc.tokens[wi].next; xi = doc.tokens[xi].next;
+        }
+        if (doc.tokens[dot].integer != sum) { return TM_EXP_ERR_CHECK as i64; }
+        expected[0] = sum; return count as i64;
+    }
+    fn tm_exp_golden_field(doc: *TMRPCWorkspace, item: i64, codec: i32) -> i64 {
+        if (codec == 1) { return tm_rpc_field(doc, item, "dense5_hex", 10); }
+        if (codec == 0) { return tm_rpc_field(doc, item, "baseline2_hex", 13); }
+        if (codec == 2) { return tm_rpc_field(doc, item, "dense17_hex", 11); }
+        return tm_rpc_field(doc, item, "dense22_hex", 11);
+    }
+    fn tm_exp_validate_cases(doc: *TMRPCWorkspace, vectors: i64) -> i32 {
+        var item: i64 = doc.tokens[vectors].first;
+        var weights: [4096]i32 = [0]; var samples: [4096]i64 = [0]; var expected: [1]i64 = [0];
+        while (item >= 0) {
+            if (tm_exp_case_values(doc, item, weights, samples, expected) < 0) { return TM_EXP_ERR_CHECK; }
+            var name: i64 = tm_rpc_field(doc, item, "name", 4); var previous: i64 = doc.tokens[vectors].first;
+            while (previous != item) {
+                var other: i64 = tm_rpc_field(doc, previous, "name", 4);
+                if (tm_tp_text_equal(doc.tokens[name].text, doc.tokens[name].text_size, doc.tokens[other].text, doc.tokens[other].text_size)) { return TM_EXP_ERR_CHECK; }
+                previous = doc.tokens[previous].next;
+            }
+            var codec: i32 = 0;
+            while (codec < 4) {
+                var golden: i64 = tm_exp_golden_field(doc, item, codec);
+                if (golden >= 0 && doc.tokens[golden].kind != TM_JSON_STRING) { return TM_EXP_ERR_CHECK; }
+                codec = codec + 1;
+            }
+            item = doc.tokens[item].next;
+        }
+        return 0;
+    }
+    fn tm_exp_vector_blob(work: *TMExperimentWork, weights: []i32, count: usize, codec: i32, short_name: bool) -> i64 {
+        var name: [7]u8 = [0]; var size: usize = 7;
+        if (short_name) { name[0] = 119; size = 1; } else { tm_exp_copy_text("weights", name, 7); }
+        var shape: [1]u64 = [0]; shape[0] = count as u64; var scale: [1]f64 = [1.0];
+        var d: TMTensorDescriptor = TMTensorDescriptor{ .name = name, .name_size = size, .shape = shape, .rank = 1,
+            .scales = scale, .scale_count = 1, .scale_axis = -1, .axes = 0, .axes_count = 0, .codec = codec, .offset = 0, .length = 0 };
+        return tm_tp_encode_json(&d, 1, weights, count, work.metadata, 16384, work.blob, 32768);
+    }
+    fn tm_exp_golden_match(work: *TMExperimentWork, weights: []i32, count: usize, codec: i32,
+                           text: []u8, size: usize) -> i32 {
+        var bytes: i64 = tm_encode(codec, weights, count, work.fetched, 32768);
+        if (bytes < 0 || size != (bytes as usize) * 2) { return TM_EXP_ERR_CHECK; }
+        var i: usize = 0;
+        while (i < (bytes as usize)) {
+            if (text[i * 2] != tm_bridge_hex_digit(work.fetched[i] / 16) || text[i * 2 + 1] != tm_bridge_hex_digit(work.fetched[i] % 16)) { return TM_EXP_ERR_CHECK; }
+            i = i + 1;
+        }
+        return 0;
+    }
+    fn tm_exp_conformance_case(work: *TMExperimentWork, port: i32, name: []u8, name_size: usize,
+                               weights: []i32, samples: []i64, count: usize, expected: i64,
+                               codec: i32, rtl: bool, seed: i64, writer: *TMJsonWriter) -> i32 {
+        var size: i64 = tm_exp_vector_blob(work, weights, count, codec, false);
+        if (size < 0) { return size as i32; }
+        var handle: [32]u8 = [0]; var status: i32 = tm_exp_upload(work, port, work.blob, size as usize, handle);
+        if (status != 0) { return status; }
+        var fetched: i64 = tm_exp_read(work, port, handle);
+        if (fetched != size || !tm_tp_text_equal(work.blob, size as usize, work.fetched, fetched as usize)) { return TM_EXP_ERR_CHECK; }
+        var decoded: [4096]i32 = [0];
+        var v: TMTPValidation = TMTPValidation{ .tensor_count = 0, .total_trits = 0, .payload_bytes = 0,
+            .framing_valid = false, .descriptors_valid = false, .json_binding_valid = false };
+        if (tm_tp_decode_json(work.fetched, fetched as usize, work.tensors, decoded, 4096, 4096, &v) != 0 || v.total_trits != (count as u64)) { return TM_EXP_ERR_CHECK; }
+        var i: usize = 0; while (i < count) { if (decoded[i] != weights[i]) { return TM_EXP_ERR_CHECK; } i = i + 1; }
+        var reply: TMRPCReply = TMRPCReply{ .result_index = -1, .error_index = -1, .remote_error = false };
+        status = tm_exp_dot(work, port, handle, "weights", samples, count, &reply);
+        if (status != 0) { return status; }
+        var accum: i64 = tm_rpc_field(work.rpc, reply.result_index, "accumulators", 12);
+        if (accum < 0 || work.rpc[0].tokens[accum].kind != TM_JSON_ARRAY || tm_tpj_members(work.rpc[0].tokens, accum) != 1) { return TM_EXP_ERR_CHECK; }
+        var value: i64 = work.rpc[0].tokens[accum].first;
+        if (work.rpc[0].tokens[value].kind != TM_JSON_INTEGER || !work.rpc[0].tokens[value].integer_fits_i64 || work.rpc[0].tokens[value].integer != expected) { return TM_EXP_ERR_CHECK; }
+        var witness: TMRtlWitness;
+        var run_rtl: bool = rtl && (codec == 0 || codec == 1);
+        if (run_rtl) {
+            var hardware_samples: [4096]i32 = [0]; i = 0;
+            while (i < count) { hardware_samples[i] = samples[i] as i32; i = i + 1; }
+            status = tm_rtl_run_dot(decoded, hardware_samples, count, codec, seed, &witness);
+            if (status != 0 || witness.error || witness.result != expected) { return TM_EXP_ERR_RTL; }
+        }
+        tm_bridge_text(writer, "{\"name\":"); tm_json_write_quoted(writer, name, name_size);
+        tm_bridge_text(writer, ",\"codec\":"); tm_bridge_literal_string(writer, tm_bridge_codec_name(codec));
+        tm_bridge_text(writer, ",\"passed\":true,\"expected_dot\":"); tm_json_write_i64(writer, expected);
+        tm_bridge_text(writer, ",\"rtl\":");
+        if (run_rtl) { tm_exp_rtl_json(writer, &witness, codec, seed); } else { tm_json_write_null(writer); }
+        tm_bridge_put(writer, 125);
+        status = tm_exp_delete(work, port, handle);
+        if (status != 0) { return status; } return writer.error;
+    }
+    fn tm_exp_conformance_checks(work: *TMExperimentWork, doc: *TMRPCWorkspace, vectors: i64,
+                                 port: i32, seed: i64, rtl: bool, writer: *TMJsonWriter, positive: *u64, rtl_checks: *u64) -> i32 {
+        var weights: [4096]i32 = [0]; var samples: [4096]i64 = [0]; var expected: [1]i64 = [0];
+        var item: i64 = doc.tokens[vectors].first; var seen: u64 = 0;
+        var order: [4]i32 = [1, 0, 2, 3];
+        while (item >= 0) {
+            var count: i64 = tm_exp_case_values(doc, item, weights, samples, expected);
+            if (count < 0) { return count as i32; }
+            var name: i64 = tm_rpc_field(doc, item, "name", 4); var mode: usize = 0;
+            while (mode < 4) {
+                var codec: i32 = order[mode]; var golden: i64 = tm_exp_golden_field(doc, item, codec);
+                if (golden >= 0 && tm_exp_golden_match(work, weights, count as usize, codec, doc.tokens[golden].text, doc.tokens[golden].text_size) != 0) { return TM_EXP_ERR_CHECK; }
+                if (seen > 0) { tm_bridge_put(writer, 44); }
+                var status: i32 = tm_exp_conformance_case(work, port, doc.tokens[name].text, doc.tokens[name].text_size,
+                    weights, samples, count as usize, expected[0], codec, rtl, seed, writer);
+                if (status != 0) { return status; }
+                if (rtl && (codec == 0 || codec == 1)) { rtl_checks[0] = rtl_checks[0] + 1; }
+                seen = seen + 1; mode = mode + 1;
+            }
+            item = doc.tokens[item].next;
+        }
+        var random: TMRandom; tm_random_init_i64(&random, seed);
+        var counts: [7]usize = [1, 4, 5, 6, 12, 31, 65]; var random_case: usize = 0;
+        while (random_case < 7) {
+            var count: usize = counts[random_case]; var i: usize = 0;
+            while (i < count) { weights[i] = (tm_random_below(&random, 3) as i32) - 1; i = i + 1; }
+            i = 0; expected[0] = 0;
+            while (i < count) { samples[i] = (tm_random_below(&random, 256) as i64) - 128; expected[0] = expected[0] + (weights[i] as i64) * samples[i]; i = i + 1; }
+            var name: [32]u8 = [0]; var nw: TMJsonWriter = TMJsonWriter{ .data = name, .capacity = 32, .used = 0, .error = 0 };
+            tm_bridge_text(&nw, "random-"); tm_json_write_u64(&nw, count as u64); var mode: usize = 0;
+            while (mode < 4) {
+                tm_bridge_put(writer, 44);
+                var status: i32 = tm_exp_conformance_case(work, port, name, nw.used, weights, samples, count, expected[0], order[mode], rtl, seed, writer);
+                if (status != 0) { return status; }
+                if (rtl && (order[mode] == 0 || order[mode] == 1)) { rtl_checks[0] = rtl_checks[0] + 1; }
+                seen = seen + 1; mode = mode + 1;
+            }
+            random_case = random_case + 1;
+        }
+        var sparse: [8]i32 = [1, 0, 0, 0, 0, -1, 0, 0]; var codec: i32 = 4;
+        while (codec <= 5) {
+            var size: i64 = tm_pack(codec, sparse, 8, work.blob, 32768); var handle: [32]u8 = [0];
+            if (size < 0) { return size as i32; }
+            var status: i32 = tm_exp_upload(work, port, work.blob, size as usize, handle);
+            if (status != 0) { return status; }
+            var fetched: i64 = tm_exp_read(work, port, handle);
+            if (fetched != size || !tm_tp_text_equal(work.blob, size as usize, work.fetched, fetched as usize)) { return TM_EXP_ERR_CHECK; }
+            status = tm_exp_delete(work, port, handle); if (status != 0) { return status; }
+            tm_bridge_text(writer, ",{\"name\":\"sparse-transfer\",\"codec\":"); tm_bridge_literal_string(writer, tm_bridge_codec_name(codec));
+            tm_bridge_text(writer, ",\"passed\":true,\"rtl\":null}"); seen = seen + 1; codec = codec + 1;
+        }
+        var corruption: [5]i32 = [1, 0, -1, 0, 1]; var size: i64 = tm_exp_vector_blob(work, corruption, 5, 1, true);
+        if (size < 0) { return size as i32; }
+        var positions: [6]usize = [0, 4, 12, 31, 0, 0]; positions[4] = (size as usize) / 2; positions[5] = (size as usize) - 1;
+        var index: usize = 0;
+        while (index < 6) {
+            var position: usize = positions[index]; work.blob[position] = work.blob[position] ^ 1;
+            var handle: [32]u8 = [0]; var status: i32 = tm_exp_upload(work, port, work.blob, size as usize, handle);
+            work.blob[position] = work.blob[position] ^ 1;
+            if (status != -32602) { return TM_EXP_ERR_CHECK; } index = index + 1;
+        }
+        positive[0] = seen; return writer.error;
+    }
+    fn tm_exp_conformance(source: []u8, source_size: usize, rtl: bool, seed: i64,
+                          out: []u8, capacity: usize) -> i64 {
+        if (rtl && (seed < 0 || seed > 4294967295)) { return TM_EXP_ERR_RTL as i64; }
+        if (source_size > 16777216) { return TM_RPC_ERR_LIMIT as i64; }
+        var doc: *TMRPCWorkspace = tm_runtime_rpc_new(source_size);
+        if (doc == 0) { return TM_EXP_ERR_RESOURCE as i64; }
+        var status: i32 = tm_rpc_parse(source, source_size, doc);
+        var vectors: i64 = -1;
+        if (status == 0) {
+            var schema: i64 = tm_rpc_field(doc, doc[0].root, "schema", 6); vectors = tm_rpc_field(doc, doc[0].root, "vectors", 7);
+            if (schema < 0 || vectors < 0 || !tm_rpc_text(&doc[0].tokens[schema], "trinity.conformance.v1", 22) ||
+                doc[0].tokens[vectors].kind != TM_JSON_ARRAY || tm_tpj_members(doc[0].tokens, doc[0].root) != 2 ||
+                tm_tpj_members(doc[0].tokens, vectors) == 0 || tm_tpj_members(doc[0].tokens, vectors) > 256) { status = TM_EXP_ERR_CHECK; }
+        }
+        if (status == 0) { status = tm_exp_validate_cases(doc, vectors); }
+        if (status != 0) { tm_runtime_rpc_free(doc); return status as i64; }
+        var work: TMExperimentWork; status = tm_exp_open(&work);
+        if (status != 0) { tm_exp_close(&work); tm_runtime_rpc_free(doc); return status as i64; }
+        var writer: TMJsonWriter = TMJsonWriter{ .data = out, .capacity = capacity, .used = 0, .error = 0 };
+        var digest: [32]u8 = [0]; status = tm_os_sha256(source, source_size, digest);
+        tm_bridge_text(&writer, "{\"schema\":\"trinity.conformance-report.v1\",\"passed\":true,\"seed\":"); tm_json_write_i64(&writer, seed);
+        tm_bridge_text(&writer, ",\"fixture_sha256\":\""); tm_bridge_hex(&writer, digest, 32);
+        tm_bridge_text(&writer, "\",\"checks\":["); var positive: [1]u64 = [0]; var rtl_checks: [1]u64 = [0];
+        var server: *u8 = tm_host_server_new(0, 131072, 32768, 131072, 4, 16384, 10.0);
+        if (server == 0) { status = TM_EXP_ERR_RESOURCE; }
+        if (status == 0) { status = tm_host_server_start(server); }
+        if (status == 0) { status = tm_exp_conformance_checks(&work, doc, vectors, tm_host_server_port(server), seed, rtl, &writer, positive, rtl_checks); }
+        if (server != 0) { tm_host_server_close(server); }
+        tm_bridge_text(&writer, "],\"positive_checks\":"); tm_json_write_u64(&writer, positive[0]);
+        tm_bridge_text(&writer, ",\"corrupt_rejections\":6,\"rtl_checks\":"); tm_json_write_u64(&writer, rtl_checks[0]);
+        tm_bridge_text(&writer, ",\"physical_device_tested\":false,\"runtime\":\"native-t27\",\"evidence\":[\"software-loopback-http\"");
+        if (rtl) { tm_bridge_text(&writer, ",\"rtl-simulation\""); }
+        tm_bridge_text(&writer, "]}\n");
+        tm_exp_close(&work); tm_runtime_rpc_free(doc);
+        if (status != 0) { return status as i64; }
+        if (writer.error != 0) { return writer.error as i64; } return writer.used as i64;
+    }
+    fn tm_exp_sift(values: []u64, count: usize, root: usize) -> void {
+        var index: usize = root;
+        while (index < count / 2) {
+            var child: usize = index * 2 + 1;
+            if (child + 1 < count && values[child + 1] > values[child]) { child = child + 1; }
+            if (values[index] >= values[child]) { return; }
+            var swap: u64 = values[index]; values[index] = values[child]; values[child] = swap; index = child;
+        }
+    }
+    fn tm_exp_median_ns(values: []u64, count: usize) -> u64 {
+        var root: usize = count / 2;
+        while (root > 0) { root = root - 1; tm_exp_sift(values, count, root); }
+        var end: usize = count;
+        while (end > 1) { end = end - 1; var swap: u64 = values[0]; values[0] = values[end]; values[end] = swap; tm_exp_sift(values, end, 0); }
+        if (count % 2 == 1) { return values[count / 2]; }
+        var lower: u64 = values[count / 2 - 1]; var difference: u64 = values[count / 2] - lower;
+        var middle: u64 = lower + difference / 2;
+        if (difference % 2 == 1 && middle % 2 == 1) { middle = middle + 1; }
+        return middle;
+    }
+    fn tm_exp_string_z(writer: *TMJsonWriter, text: str) -> void {
+        var bytes: [2048]u8 = [0]; var count: i64 = tm_exp_copy_text(text, bytes, 2048);
+        if (count < 0) { writer.error = TM_EXP_ERR_RESOURCE; return; }
+        tm_json_write_quoted(writer, bytes, count as usize);
+    }
+    fn tm_exp_dataset(random: *TMRandom, values: []i32, count: usize, dataset: usize) -> i32 {
+        var i: usize = 0;
+        if (dataset == 0) {
+            while (i < count) { values[i] = (tm_random_below(random, 3) as i32) - 1; i = i + 1; } return 0;
+        }
+        var group: usize = 4; var k: u32 = 1; if (dataset == 2) { group = 8; k = 2; }
+        var selected: [8]u32 = [0]; var scratch: [8]u32 = [0];
+        while (i < count) {
+            var length: usize = group; if (count - i < group) { length = count - i; }
+            var j: usize = 0; while (j < length) { values[i + j] = 0; j = j + 1; }
+            var chosen: u32 = k; if (length < (chosen as usize)) { chosen = length as u32; }
+            var status: i32 = tm_random_sample(random, length as u32, chosen, selected, 8, scratch, 8);
+            if (status != 0) { return status; }
+            j = 0;
+            while (j < (chosen as usize)) { values[i + (selected[j] as usize)] = (tm_random_below(random, 2) as i32) * 2 - 1; j = j + 1; }
+            i = i + length;
+        }
+        return 0;
+    }
+    fn tm_exp_benchmark_run(count: usize, repeats: usize, seed: i64, values: []i32, recovered: []i32,
+                            payload: []u8, container: []u8, buffer_capacity: usize, timings: []u64,
+                            writer: *TMJsonWriter) -> i32 {
+        var random: TMRandom; tm_random_init_i64(&random, seed);
+        tm_bridge_text(writer, "{\"schema_version\":1,\"generated_at\":"); tm_exp_string_z(writer, tm_runtime_utc());
+        tm_bridge_text(writer, ",\"environment\":{\"python\":null,\"runtime\":\"native-t27\",\"platform\":"); tm_exp_string_z(writer, tm_runtime_platform());
+        tm_bridge_text(writer, "},\"seed\":"); tm_json_write_i64(writer, seed);
+        tm_bridge_text(writer, ",\"repeats\":"); tm_json_write_u64(writer, repeats as u64);
+        tm_bridge_text(writer, ",\"weights_per_dataset\":"); tm_json_write_u64(writer, count as u64);
+        tm_bridge_text(writer, ",\"measurement_scope\":\"Synthetic integer trits. Exact bytes and verified round trips. Median native C payload encode/decode wall time after one warm-up; container creation/CRC/file I/O excluded from timing. No FPGA, DDR, model quality, power, or tokens/s measurements.\",\"datasets\":[");
+        var dataset: usize = 0; var order: [6]i32 = [0, 1, 2, 3, 4, 5];
+        while (dataset < 3 && writer.error == 0) {
+            if (tm_exp_dataset(&random, values, count, dataset) != 0) { return TM_EXP_ERR_CHECK; }
+            var negative: u64 = 0; var zero: u64 = 0; var positive: u64 = 0; var i: usize = 0;
+            while (i < count) {
+                if (values[i] == 0) { zero = zero + 1; } else { if (values[i] < 0) { negative = negative + 1; } else { positive = positive + 1; } }
+                i = i + 1;
+            }
+            var entropy: f64 = tm_entropy_term(negative, count as u64) + tm_entropy_term(zero, count as u64) + tm_entropy_term(positive, count as u64);
+            if (dataset > 0) { tm_bridge_put(writer, 44); }
+            tm_bridge_text(writer, "{\"name\":");
+            if (dataset == 0) { tm_bridge_literal_string(writer, "uniform"); }
+            if (dataset == 1) { tm_bridge_literal_string(writer, "sparse_4_1"); }
+            if (dataset == 2) { tm_bridge_literal_string(writer, "sparse_8_2"); }
+            tm_bridge_text(writer, ",\"count\":"); tm_json_write_u64(writer, count as u64);
+            tm_bridge_text(writer, ",\"zero_fraction\":"); tm_bridge_float(writer, (zero as f64) / (count as f64));
+            tm_bridge_text(writer, ",\"entropy_bpw\":"); tm_bridge_float(writer, entropy);
+            tm_bridge_text(writer, ",\"results\":[");
+            var modes: usize = 4; if (dataset == 1) { modes = 6; } if (dataset == 2) { modes = 5; }
+            var mode: usize = 0;
+            while (mode < modes) {
+                var codec: i32 = order[mode]; if (dataset == 2 && mode == 4) { codec = 5; }
+                var size: i64 = tm_encode(codec, values, count, payload, buffer_capacity);
+                if (size < 0) { return size as i32; }
+                var repeat: usize = 0;
+                while (repeat < repeats) {
+                    var before: u64 = tm_runtime_monotonic_ns();
+                    var written: i64 = tm_encode(codec, values, count, payload, buffer_capacity);
+                    timings[repeat] = tm_runtime_monotonic_ns() - before;
+                    if (written != size) { return TM_EXP_ERR_CHECK; } repeat = repeat + 1;
+                }
+                var encode_ns: u64 = tm_exp_median_ns(timings, repeats);
+                if (tm_decode(codec, payload, size as usize, count, recovered, count) != 0) { return TM_EXP_ERR_CHECK; }
+                repeat = 0;
+                while (repeat < repeats) {
+                    var before: u64 = tm_runtime_monotonic_ns();
+                    var status: i64 = tm_decode(codec, payload, size as usize, count, recovered, count);
+                    timings[repeat] = tm_runtime_monotonic_ns() - before;
+                    if (status != 0) { return TM_EXP_ERR_CHECK; } repeat = repeat + 1;
+                }
+                var decode_ns: u64 = tm_exp_median_ns(timings, repeats);
+                i = 0; while (i < count) { if (values[i] != recovered[i]) { return TM_EXP_ERR_CHECK; } i = i + 1; }
+                var container_size: i64 = tm_pack(codec, values, count, container, buffer_capacity);
+                if (container_size < 0 || tm_unpack(container, container_size as usize, recovered, count) != (count as i64)) { return TM_EXP_ERR_CHECK; }
+                i = 0; while (i < count) { if (values[i] != recovered[i]) { return TM_EXP_ERR_CHECK; } i = i + 1; }
+                if (mode > 0) { tm_bridge_put(writer, 44); }
+                tm_bridge_text(writer, "{\"codec\":"); tm_bridge_literal_string(writer, tm_bridge_codec_name(codec));
+                tm_bridge_text(writer, ",\"group_size\":"); tm_json_write_u64(writer, tm_group_size(codec) as u64);
+                tm_bridge_text(writer, ",\"group_bits\":"); tm_json_write_u64(writer, tm_group_bits(codec) as u64);
+                tm_bridge_text(writer, ",\"payload_bytes\":"); tm_json_write_i64(writer, size);
+                tm_bridge_text(writer, ",\"container_bytes\":"); tm_json_write_i64(writer, container_size);
+                tm_bridge_text(writer, ",\"payload_bpw\":"); tm_bridge_float(writer, (size as f64) * 8.0 / (count as f64));
+                tm_bridge_text(writer, ",\"container_bpw\":"); tm_bridge_float(writer, (container_size as f64) * 8.0 / (count as f64));
+                tm_bridge_text(writer, ",\"encode_ms\":"); tm_bridge_float(writer, (encode_ns as f64) / 1000000.0);
+                tm_bridge_text(writer, ",\"decode_ms\":"); tm_bridge_float(writer, (decode_ns as f64) / 1000000.0);
+                tm_bridge_text(writer, ",\"roundtrip\":true,\"ideal_payload_ratio_vs_baseline\":");
+                tm_bridge_float(writer, (tm_payload_size(0, count as u64) as f64) / (size as f64));
+                tm_bridge_put(writer, 125); mode = mode + 1;
+            }
+            tm_bridge_text(writer, "]}"); dataset = dataset + 1;
+        }
+        tm_bridge_text(writer, "]}\n"); return writer.error;
+    }
+    fn tm_exp_benchmark(count: usize, repeats: usize, seed: i64, out: []u8, capacity: usize) -> i64 {
+        if (count == 0 || repeats == 0 || count > 4194304 || repeats > 1000000) { return TM_RPC_ERR_LIMIT as i64; }
+        var maximum: usize = 0; var codec: i32 = 0;
+        while (codec < 6) {
+            var needed: usize = tm_payload_size(codec, count as u64) as usize;
+            if (needed > maximum) { maximum = needed; } codec = codec + 1;
+        }
+        var buffer_capacity: usize = maximum + 24;
+        var values: *i32 = tm_runtime_alloc(count, 4); var recovered: *i32 = tm_runtime_alloc(count, 4);
+        var payload: *u8 = tm_runtime_alloc(buffer_capacity, 1); var container: *u8 = tm_runtime_alloc(buffer_capacity, 1);
+        var timings: *u64 = tm_runtime_alloc(repeats, 8);
+        var status: i32 = 0;
+        var writer: TMJsonWriter = TMJsonWriter{ .data = out, .capacity = capacity, .used = 0, .error = 0 };
+        if (values == 0 || recovered == 0 || payload == 0 || container == 0 || timings == 0) { status = TM_EXP_ERR_RESOURCE; }
+        else { status = tm_exp_benchmark_run(count, repeats, seed, values, recovered, payload, container, buffer_capacity, timings, &writer); }
+        tm_runtime_free(values); tm_runtime_free(recovered); tm_runtime_free(payload); tm_runtime_free(container); tm_runtime_free(timings);
+        if (status != 0) { return status as i64; } return writer.used as i64;
+    }
+    fn tm_exp_rtl_json(writer: *TMJsonWriter, witness: *TMRtlWitness, codec: i32, seed: i64) -> void {
+        tm_bridge_text(writer, "{\"codec\":"); tm_bridge_literal_string(writer, tm_bridge_codec_name(codec));
+        tm_bridge_text(writer, ",\"evidence\":\"rtl-simulation\",\"simulator\":\"Icarus Verilog\",\"accumulator_bits\":32,\"seed\":"); tm_json_write_i64(writer, seed);
+        tm_bridge_text(writer, ",\"result\":"); tm_json_write_i64(writer, witness.result);
+        tm_bridge_text(writer, ",\"error\":"); tm_json_write_bool(writer, witness.error);
+        tm_bridge_text(writer, ",\"cycles\":"); tm_json_write_u64(writer, witness.cycles);
+        tm_bridge_text(writer, ",\"groups\":"); tm_json_write_u64(writer, witness.groups);
+        tm_bridge_text(writer, ",\"input_stalls\":"); tm_json_write_u64(writer, witness.input_stalls);
+        tm_bridge_text(writer, ",\"output_stalls\":"); tm_json_write_u64(writer, witness.output_stalls);
+        tm_bridge_text(writer, ",\"source_bubbles\":"); tm_json_write_u64(writer, witness.source_bubbles);
+        tm_bridge_text(writer, ",\"resets\":"); tm_json_write_u64(writer, witness.resets);
+        tm_bridge_text(writer, ",\"stalls\":"); tm_json_write_u64(writer, witness.input_stalls + witness.output_stalls);
+        tm_bridge_text(writer, ",\"weight_count\":"); tm_json_write_u64(writer, witness.weight_count as u64);
+        tm_bridge_text(writer, ",\"result_cycle\":"); tm_json_write_u64(writer, witness.result_cycle);
+        tm_bridge_text(writer, ",\"encoded_weight_bits\":"); tm_json_write_u64(writer, witness.encoded_weight_bits);
+        tm_bridge_put(writer, 125);
+    }
+    fn tm_exp_fixtures_json(out: []u8, capacity: usize) -> i64 {
+        var writer: TMJsonWriter = TMJsonWriter{ .data = out, .capacity = capacity, .used = 0, .error = 0 };
+        tm_bridge_put(&writer, 91); var index: usize = 0;
+        while (index < 6) {
+            var samples: [12]i64 = [0]; tm_exp_fixture(index, samples);
+            if (index > 0) { tm_bridge_put(&writer, 44); }
+            tm_bridge_text(&writer, "{\"name\":"); tm_bridge_literal_string(&writer, tm_exp_fixture_name(index));
+            tm_bridge_text(&writer, ",\"samples\":"); tm_exp_i64_array(&writer, samples, 12);
+            tm_bridge_text(&writer, ",\"expected\":"); tm_bridge_literal_string(&writer, tm_exp_label(index % 3));
+            tm_bridge_put(&writer, 125); index = index + 1;
+        }
+        tm_bridge_text(&writer, "]\n"); if (writer.error != 0) { return writer.error as i64; } return writer.used as i64;
+    }
+}

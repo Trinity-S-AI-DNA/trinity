@@ -1,0 +1,634 @@
+module TrinityFpgaDdr3PatternT27;
+
+// Pattern test of the AX7203 DDR3 (issue #61): a Wishbone master on UberDDR3's
+// user port (ddr3_top at the commit in fpga/ax7203/ddr3/uberddr3.lock), wired by
+// fpga/ax7203/ddr3/tms_ddr3_ax7203.v when PATTERN_TEST is 1. It also owns the
+// report line: the calibration status lines of fpga_ddr3_status.t27 pass through
+// it to the line emitter.
+//
+// After o_calib_complete it runs rounds (`rounds` of them, 0 = until reset). A
+// round is two passes, true data then its complement, each pass
+//   1. writes every burst address 0 .. bursts-1 in order (one Wishbone write per
+//      BL8 burst, all byte selects on), until every write is acknowledged;
+//   2. waits `hold` controller clocks;
+//   3. reads every burst back in the same order and compares each acknowledged
+//      read with the data written, counting the bursts and 64-bit words that
+//      differ, the wrong bits, the DQ bits that were ever wrong and the first
+//      failing burst address;
+//   4. reports the pass on the UART.
+// No burst is read before every burst of the pass has been written and
+// acknowledged, so every burst sits at least hold + bursts - 1 controller clocks
+// between the acceptance of its write and of its read (a request is accepted at
+// most once per clock).
+//
+// Data: the burst's 64 * lanes bits as `lanes` 64-bit words, word w of burst a is
+// kdata ^ lin((w << 32) | a), where lin is nine xorshift steps (a bijection of
+// 64 bits, linear over GF(2)) and kdata the round key (true pass) or its complement. Every
+// (address, word) pair of a pass therefore has its own data, so a burst read back
+// from another address's storage (a stuck or aliased address line) differs in
+// every word; every stored bit is written as 0 and as 1 in a round, so a stuck
+// DQ bit or a dropped write shows. The round key comes from the seed, the clock
+// count at which calibration completed and the round number (tools/ddr3_pattern_model.py
+// states the same rules in Python).
+//
+// Wishbone (UberDDR3 79d8fd3e, docs/hardware.md "What the #61 pattern test
+// needs"): a request is taken on a clock with stb and not stall; stb, we, addr
+// and data stay unchanged until then. Writes and reads are acknowledged in
+// order, one pipeline, so the n-th ack belongs to the n-th request; acks cannot
+// be held off and o_wb_data is valid with a read's ack only. cyc stays high from
+// reset (as the calibrated build had it) and falls only when the watchdog gives
+// up (no request taken and no ack for `watchdog` clocks while a phase is open),
+// which aborts the requests in flight. The address unit is one burst; sel is
+// all ones (every byte written; it drives DM).
+//
+// Report lines (tag, a, b; b is 40 bits), after the H and S lines of the status
+// reporter:
+//   G a=bursts   b=(PATTERN_FORMAT << 32) | (byte lanes << 24) | rounds (low 24 bits)
+//   K a=seed     b=controller clocks since reset when calib_complete was seen (low 40 bits)
+//   L a=hold     b=watchdog clocks
+// then per pass, rp = (round << 1) | pass (pass 0 true data, 1 complement):
+//   W a=rp  b=write phase: controller clocks from the first request presented to the last ack
+//   R a=rp  b=read phase: the same for the reads
+//   E a=bursts with a wrong bit   b=wrong bits
+//   M a=64-bit words with a wrong bit   b=DQ bits ever wrong in this pass (bit j = DQ j)
+//   F a=first failing burst address (ffffffff: none)
+//     b=(index of its first wrong 64-bit word << 32) | low 32 bits of (read xor expected) of that word
+// and at the end
+//   T a=acks of the open phase   b=(read phase << 36) | (pass << 32) | round    (watchdog; the test stops)
+//   Z a=rounds done   b=bursts with a wrong bit, all passes                     (after `rounds` rounds)
+// Every statement of on_clock reads a variable before the same tick writes it,
+// so the C and the Verilog backends agree. As in bram_trit_engine.t27, the
+// module-level assignments are not lowered by the pinned gen-c: the functions are
+// checked in C against tools/ddr3_pattern_model.py and the module in Icarus
+// against a behavioural Wishbone memory (tests/test_ddr3_pattern.py).
+const T_CALIB: u32 = 0;
+const T_KEY0: u32 = 1;
+const T_KEY1: u32 = 2;
+const T_KEY2: u32 = 3;
+const T_KEY3: u32 = 4;
+const T_PRIME_A: u32 = 5;
+const T_PRIME_B: u32 = 6;
+const T_PRIME_C: u32 = 7;
+const T_WRITE: u32 = 8;
+const T_HOLD: u32 = 9;
+const T_READ: u32 = 10;
+const T_DRAIN: u32 = 11;
+const T_REPORT: u32 = 12;
+const T_STOP: u32 = 13;
+
+const K_HEAD: u32 = 0;
+const K_PASS: u32 = 1;
+const K_TIME: u32 = 2;
+const K_DONE: u32 = 3;
+
+const A_IDLE: u32 = 0;
+const A_START: u32 = 1;
+const A_WAIT: u32 = 2;
+
+const PATTERN_FORMAT: u64 = 1;
+const B40: u64 = 1099511627775;
+const M32: u64 = 4294967295;
+const NONE32: u32 = 4294967295;
+const KADD: u64 = 6364136223846793005;
+const TAG_G: u32 = 71;
+const TAG_K: u32 = 75;
+const TAG_L: u32 = 76;
+const TAG_W: u32 = 87;
+const TAG_R: u32 = 82;
+const TAG_E: u32 = 69;
+const TAG_M: u32 = 77;
+const TAG_F: u32 = 70;
+const TAG_T: u32 = 84;
+const TAG_Z: u32 = 90;
+
+// Test sequencer.
+var tstate: u32 = 0;
+var rd: bool = false;
+var pass: u32 = 0;
+var round: u32 = 0;
+var cycles: u64 = 0;
+var calib_clocks: u64 = 0;
+var base_key: u64 = 0;
+var key: u64 = 0;
+var kdata: u64 = 0;
+var phase_clocks: u64 = 0;
+var wr_clocks: u64 = 0;
+var rd_clocks: u64 = 0;
+var hold_count: u32 = 0;
+var quiet: u32 = 0;
+var drain: u32 = 0;
+var acks: u32 = 0;
+var rkind: u32 = 0;
+var rline: u32 = 0;
+var total_bad: u64 = 0;
+
+// Wishbone master (outputs to ddr3_top) and the data pipeline: cur is the data
+// of the burst presented (write) or of the next ack (read), nxt the one after it,
+// and the generator computes the burst after that from gaddr.
+var wb_cyc: bool = true;
+var wb_stb: bool = false;
+var wb_we: bool = false;
+var wb_addr: u32 = 0;
+var wb_sel: u32 = 4294967295;
+var gaddr: u32 = 0;
+var cur0: u64 = 0;
+var cur1: u64 = 0;
+var cur2: u64 = 0;
+var cur3: u64 = 0;
+var nxt0: u64 = 0;
+var nxt1: u64 = 0;
+var nxt2: u64 = 0;
+var nxt3: u64 = 0;
+
+// Compare pipeline: read xor expected (stage 1), per-word counts (2), per-burst
+// sums (3), pass accumulators (4).
+var dv: bool = false;
+var daddr: u32 = 0;
+var d0: u64 = 0;
+var d1: u64 = 0;
+var d2: u64 = 0;
+var d3: u64 = 0;
+var ev: bool = false;
+var eaddr: u32 = 0;
+var epc0: u32 = 0;
+var epc1: u32 = 0;
+var epc2: u32 = 0;
+var epc3: u32 = 0;
+var enz: u32 = 0;
+var emask: u32 = 0;
+var einfo: u64 = 0;
+var fv: bool = false;
+var faddr: u32 = 0;
+var fbits: u32 = 0;
+var fwords: u32 = 0;
+var fmask: u32 = 0;
+var finfo: u64 = 0;
+var bad_bursts: u32 = 0;
+var bad_words: u32 = 0;
+var bit_errors: u64 = 0;
+var dq_mask: u32 = 0;
+var has_fail: bool = false;
+var first_addr: u32 = 0;
+var first_info: u64 = 0;
+
+// Report line arbiter: the status reporter's line is held in sbuf until the
+// emitter is free; pattern lines go out when no status line waits.
+var arb: u32 = 0;
+var sbuf_full: bool = false;
+var sb_tag: u32 = 0;
+var sb_a: u32 = 0;
+var sb_b: u64 = 0;
+var line_go: bool = false;
+var line_tag: u32 = 0;
+var line_a: u32 = 0;
+var line_b: u64 = 0;
+
+fn ones() -> u64 {
+    var z: u64 = 0;
+    return z - 1;
+}
+
+// Nine xorshift steps (three triples); each x ^= x << s or x ^= x >> s is invertible.
+fn lin(x: u64) -> u64 {
+    var y: u64 = x;
+    y = y ^ (y << 13);
+    y = y ^ (y >> 7);
+    y = y ^ (y << 17);
+    y = y ^ (y << 21);
+    y = y ^ (y >> 35);
+    y = y ^ (y << 4);
+    y = y ^ (y << 9);
+    y = y ^ (y >> 29);
+    y = y ^ (y << 25);
+    return y;
+}
+
+fn gen(kd: u64, addr: u32, w: u32) -> u64 {
+    return kd ^ lin(((w as u64) << 32) | (addr as u64));
+}
+
+fn base_of(seed: u32, clocks: u64) -> u64 {
+    return ((seed as u64) << 32) | (clocks & M32);
+}
+
+fn round_offset(r: u32) -> u64 {
+    return ((r as u64) << 32) | (r as u64);
+}
+
+fn word_mask(i: u32, lanes: u32) -> u64 {
+    var m: u64 = 0;
+    if (i < lanes) { m = ones(); }
+    return m;
+}
+
+fn bit_of(x: u64, i: u32) -> u32 {
+    return ((x >> i) & 1) as u32;
+}
+
+fn pc8(x: u64) -> u32 {
+    return ((bit_of(x, 0) + bit_of(x, 1)) + (bit_of(x, 2) + bit_of(x, 3)))
+         + ((bit_of(x, 4) + bit_of(x, 5)) + (bit_of(x, 6) + bit_of(x, 7)));
+}
+
+fn pc64(x: u64) -> u32 {
+    return ((pc8(x) + pc8(x >> 8)) + (pc8(x >> 16) + pc8(x >> 24)))
+         + ((pc8(x >> 32) + pc8(x >> 40)) + (pc8(x >> 48) + pc8(x >> 56)));
+}
+
+// DQ bits that differ in a 64-bit word of the Wishbone data: byte b of the word
+// is byte lane b % lanes (beat k, lane l sit at bits 8 * (lanes * k + l)).
+fn fold(d: u64, lanes: u32) -> u32 {
+    var h: u64 = d | (d >> 32);
+    var q: u64 = h | (h >> 16);
+    var r: u32 = (q & 65535) as u32;
+    if (lanes >= 4) { r = (h & M32) as u32; }
+    return r;
+}
+
+fn nz(d: u64) -> u32 {
+    var n: u32 = 0;
+    if (d != 0) { n = 1; }
+    return n;
+}
+
+// (index of the first nonzero word << 32) | its low 32 bits; 0 when all are zero.
+fn first_of(x0: u64, x1: u64, x2: u64, x3: u64) -> u64 {
+    var r: u64 = 0;
+    var three: u64 = 3;
+    var two: u64 = 2;
+    var one: u64 = 1;
+    if (x3 != 0) { r = (three << 32) | (x3 & M32); }
+    if (x2 != 0) { r = (two << 32) | (x2 & M32); }
+    if (x1 != 0) { r = (one << 32) | (x1 & M32); }
+    if (x0 != 0) { r = x0 & M32; }
+    return r;
+}
+
+fn rep_last(kind: u32) -> u32 {
+    var n: u32 = 0;
+    if (kind == K_HEAD) { n = 2; }
+    if (kind == K_PASS) { n = 4; }
+    return n;
+}
+
+fn rep_tag(kind: u32, n: u32) -> u32 {
+    var t: u32 = TAG_Z;
+    if (kind == K_HEAD) {
+        t = TAG_G;
+        if (n == 1) { t = TAG_K; }
+        if (n == 2) { t = TAG_L; }
+    }
+    if (kind == K_PASS) {
+        t = TAG_W;
+        if (n == 1) { t = TAG_R; }
+        if (n == 2) { t = TAG_E; }
+        if (n == 3) { t = TAG_M; }
+        if (n == 4) { t = TAG_F; }
+    }
+    if (kind == K_TIME) { t = TAG_T; }
+    return t;
+}
+
+fn rep_a(kind: u32, n: u32, bursts: u32, seed: u32, hold: u32, rp: u32, nbad: u32, nwords: u32,
+         failed: bool, faddr0: u32, nacks: u32, rdone: u32) -> u32 {
+    var a: u32 = rdone;
+    if (kind == K_HEAD) {
+        a = bursts;
+        if (n == 1) { a = seed; }
+        if (n == 2) { a = hold; }
+    }
+    if (kind == K_PASS) {
+        a = rp;
+        if (n == 2) { a = nbad; }
+        if (n == 3) { a = nwords; }
+        if (n == 4) {
+            a = NONE32;
+            if (failed) { a = faddr0; }
+        }
+    }
+    if (kind == K_TIME) { a = nacks; }
+    return a;
+}
+
+fn head_b(lanes: u32, rounds: u32) -> u64 {
+    var fmt: u64 = PATTERN_FORMAT;
+    return (fmt << 32) | (((lanes & 255) as u64) << 24) | ((rounds & 16777215) as u64);
+}
+
+fn time_b(rdph: bool, p: u32, r: u32) -> u64 {
+    var x: u64 = 0;
+    var one: u64 = 1;
+    if (rdph) { x = one << 36; }
+    return x | (((p & 1) as u64) << 32) | (r as u64);
+}
+
+fn rep_b(kind: u32, n: u32, lanes: u32, rounds: u32, cal: u64, wd: u32, wr: u64, rdc: u64, bits: u64,
+         mask: u32, info: u64, tb: u64, tbad: u64) -> u64 {
+    var b: u64 = tbad & B40;
+    if (kind == K_HEAD) {
+        b = head_b(lanes, rounds);
+        if (n == 1) { b = cal & B40; }
+        if (n == 2) { b = wd as u64; }
+    }
+    if (kind == K_PASS) {
+        b = wr & B40;
+        if (n == 1) { b = rdc & B40; }
+        if (n == 2) { b = bits & B40; }
+        if (n == 3) { b = mask as u64; }
+        if (n == 4) { b = info & B40; }
+    }
+    if (kind == K_TIME) { b = tb; }
+    return b;
+}
+
+// Module-level (combinational) rather than locals of on_clock: gen-verilog
+// declares an on_clock local where it appears, which plain Verilog rejects.
+var g0: u64;
+var g1: u64;
+var g2: u64;
+var g3: u64;
+var last: u32;
+var accept: bool;
+var progress: bool;
+var advance: bool;
+var rd_ack: bool;
+var final_ack: bool;
+var timeout: bool;
+var pc_d0: u32;
+var pc_d1: u32;
+var pc_d2: u32;
+var pc_d3: u32;
+var nz_d: u32;
+var mask_d: u32;
+var info_d: u64;
+var wm0: u64;
+var wm1: u64;
+var wm2: u64;
+var wm3: u64;
+var rp: u32;
+var pfire: bool;
+var sfire: bool;
+var rep_t: u32;
+var rep_av: u32;
+var rep_bv: u64;
+var status_idle: bool;
+var running: bool;
+g0 = gen(kdata, gaddr, 0);
+g1 = gen(kdata, gaddr, 1);
+g2 = gen(kdata, gaddr, 2);
+g3 = gen(kdata, gaddr, 3);
+last = bursts - 1;
+accept = wb_stb && !stall;
+progress = accept || ack;
+advance = (tstate == T_WRITE && accept) || (tstate == T_READ && ack);
+rd_ack = tstate == T_READ && ack;
+final_ack = ack && acks == last;
+timeout = !progress && quiet >= watchdog;
+pc_d0 = pc64(d0);
+pc_d1 = pc64(d1);
+pc_d2 = pc64(d2);
+pc_d3 = pc64(d3);
+nz_d = (nz(d0) + nz(d1)) + (nz(d2) + nz(d3));
+mask_d = ((fold(d0, lanes) | fold(d1, lanes)) | (fold(d2, lanes) | fold(d3, lanes)));
+info_d = first_of(d0, d1, d2, d3);
+wm0 = word_mask(0, lanes);
+wm1 = word_mask(1, lanes);
+wm2 = word_mask(2, lanes);
+wm3 = word_mask(3, lanes);
+rp = (round << 1) | (pass & 1);
+sfire = arb == A_IDLE && sbuf_full && line_idle;
+pfire = arb == A_IDLE && !sbuf_full && line_idle && tstate == T_REPORT;
+rep_t = rep_tag(rkind, rline);
+rep_av = rep_a(rkind, rline, bursts, seed, hold, rp, bad_bursts, bad_words, has_fail, first_addr, acks, round);
+rep_bv = rep_b(rkind, rline, lanes, rounds, calib_clocks, watchdog, wr_clocks, rd_clocks, bit_errors, dq_mask, first_info,
+               time_b(rd, pass, round), total_bad);
+status_idle = !sbuf_full;
+running = tstate != T_CALIB && tstate != T_STOP;
+
+// calib: ddr3_top o_calib_complete. stall, ack, rdata0..3: o_wb_stall, o_wb_ack and
+// the 64-bit words of o_wb_data (words at or above `lanes` are ignored).
+// s_go, s_tag, s_a, s_b: the status reporter's line request; line_idle: the emitter's.
+// bursts >= 1: burst addresses tested (2^25 = all of them). seed, hold, rounds: see above;
+// watchdog >= 1: clocks without a request taken or an ack after which a phase gives up.
+fn on_clock(calib: bool, stall: bool, ack: bool, rdata0: u64, rdata1: u64, rdata2: u64, rdata3: u64,
+            lanes: u32, bursts: u32, seed: u32, hold: u32, rounds: u32, watchdog: u32,
+            s_go: bool, s_tag: u32, s_a: u32, s_b: u64, line_idle: bool) {
+    // Stage 4: pass accumulators.
+    if (fv) {
+        if (fwords != 0) {
+            bad_bursts = bad_bursts + 1;
+            bad_words = bad_words + fwords;
+            bit_errors = bit_errors + (fbits as u64);
+            dq_mask = dq_mask | fmask;
+            if (!has_fail) {
+                has_fail = true;
+                first_addr = faddr;
+                first_info = finfo;
+            }
+        }
+    }
+    // Stage 3: per-burst sums.
+    fv = ev;
+    faddr = eaddr;
+    fbits = (epc0 + epc1) + (epc2 + epc3);
+    fwords = enz;
+    fmask = emask;
+    finfo = einfo;
+    // Stage 2: per-word counts of read xor expected.
+    ev = dv;
+    eaddr = daddr;
+    epc0 = pc_d0;
+    epc1 = pc_d1;
+    epc2 = pc_d2;
+    epc3 = pc_d3;
+    enz = nz_d;
+    emask = mask_d;
+    einfo = info_d;
+    dv = false;
+
+    if (tstate == T_CALIB) {
+        if (calib) {
+            calib_clocks = cycles;
+            base_key = base_of(seed, cycles);
+            round = 0;
+            total_bad = 0;
+            rkind = K_HEAD;
+            rline = 0;
+            tstate = T_REPORT;
+        }
+    } else if (tstate == T_KEY0) {
+        key = base_key + round_offset(round);
+        tstate = T_KEY1;
+    } else if (tstate == T_KEY1) {
+        key = lin(key);
+        tstate = T_KEY2;
+    } else if (tstate == T_KEY2) {
+        key = key + KADD;
+        tstate = T_KEY3;
+    } else if (tstate == T_KEY3) {
+        kdata = lin(key);
+        pass = 0;
+        rd = false;
+        tstate = T_PRIME_A;
+    } else if (tstate == T_PRIME_A) {
+        gaddr = 0;
+        if (!rd) {
+            bad_bursts = 0;
+            bad_words = 0;
+            bit_errors = 0;
+            dq_mask = 0;
+            has_fail = false;
+            first_addr = 0;
+            first_info = 0;
+        }
+        tstate = T_PRIME_B;
+    } else if (tstate == T_PRIME_B) {
+        cur0 = g0;
+        cur1 = g1;
+        cur2 = g2;
+        cur3 = g3;
+        gaddr = 1;
+        tstate = T_PRIME_C;
+    } else if (tstate == T_PRIME_C) {
+        nxt0 = g0;
+        nxt1 = g1;
+        nxt2 = g2;
+        nxt3 = g3;
+        gaddr = 2;
+        wb_addr = 0;
+        wb_stb = true;
+        wb_we = !rd;
+        phase_clocks = 0;
+        acks = 0;
+        quiet = 0;
+        if (rd) { tstate = T_READ; } else { tstate = T_WRITE; }
+    } else if (tstate == T_WRITE || tstate == T_READ) {
+        // In this order, so that every value read is the one from before this tick.
+        if (rd_ack) {
+            d0 = (rdata0 ^ cur0) & wm0;
+            d1 = (rdata1 ^ cur1) & wm1;
+            d2 = (rdata2 ^ cur2) & wm2;
+            d3 = (rdata3 ^ cur3) & wm3;
+            daddr = acks;
+            dv = true;
+        }
+        if (final_ack) {
+            if (tstate == T_WRITE) {
+                wr_clocks = phase_clocks + 1;
+                hold_count = 0;
+                tstate = T_HOLD;
+            } else {
+                rd_clocks = phase_clocks + 1;
+                drain = 0;
+                tstate = T_DRAIN;
+            }
+        } else if (timeout) {
+            wb_stb = false;
+            wb_cyc = false;
+            rkind = K_TIME;
+            rline = 0;
+            tstate = T_REPORT;
+        }
+        // The generator pipeline advances with each write taken and each read acknowledged.
+        if (advance) {
+            cur0 = nxt0;
+            cur1 = nxt1;
+            cur2 = nxt2;
+            cur3 = nxt3;
+            nxt0 = g0;
+            nxt1 = g1;
+            nxt2 = g2;
+            nxt3 = g3;
+            gaddr = gaddr + 1;
+        }
+        if (accept) {
+            if (wb_addr == last) { wb_stb = false; } else { wb_addr = wb_addr + 1; }
+        }
+        if (ack) { acks = acks + 1; }
+        if (progress) { quiet = 0; } else { quiet = quiet + 1; }
+        phase_clocks = phase_clocks + 1;
+    } else if (tstate == T_HOLD) {
+        if (hold_count >= hold) {
+            rd = true;
+            tstate = T_PRIME_A;
+        } else {
+            hold_count = hold_count + 1;
+        }
+    } else if (tstate == T_DRAIN) {
+        if (drain == 4) {
+            rkind = K_PASS;
+            rline = 0;
+            tstate = T_REPORT;
+        } else {
+            drain = drain + 1;
+        }
+    } else if (tstate == T_REPORT) {
+        if (pfire) {
+            if (rline == rep_last(rkind)) {
+                rline = 0;
+                if (rkind == K_HEAD) {
+                    tstate = T_KEY0;
+                } else if (rkind == K_PASS) {
+                    total_bad = total_bad + (bad_bursts as u64);
+                    if (pass == 0) {
+                        pass = 1;
+                        kdata = kdata ^ ones();
+                        rd = false;
+                        tstate = T_PRIME_A;
+                    } else if (rounds != 0 && round + 1 >= rounds) {
+                        round = round + 1;
+                        rkind = K_DONE;
+                    } else {
+                        round = round + 1;
+                        tstate = T_KEY0;
+                    }
+                } else {
+                    tstate = T_STOP;
+                }
+            } else {
+                rline = rline + 1;
+            }
+        }
+    }
+
+    // Report line arbiter.
+    line_go = false;
+    if (arb == A_IDLE) {
+        if (sfire) {
+            line_go = true;
+            line_tag = sb_tag;
+            line_a = sb_a;
+            line_b = sb_b;
+            sbuf_full = false;
+            arb = A_START;
+        } else if (pfire) {
+            line_go = true;
+            line_tag = rep_t;
+            line_a = rep_av;
+            line_b = rep_bv;
+            arb = A_START;
+        }
+    } else if (arb == A_START) {
+        arb = A_WAIT;
+    } else {
+        if (line_idle) { arb = A_IDLE; }
+    }
+    if (s_go) {
+        sbuf_full = true;
+        sb_tag = s_tag;
+        sb_a = s_a;
+        sb_b = s_b;
+    }
+    cycles = cycles + 1;
+}
+
+test xorshift_steps_are_the_model { assert_eq(lin(0), 0); assert_eq(lin(1), 1750279251066886390); assert_eq(lin(4294967296), 5079629637630073896); }
+test data_word_of_the_model { assert_eq(gen(7, 5, 1), 4547707432737481507); }
+test base_key_holds_seed_and_clocks { assert_eq(base_of(1, 4294967297), 4294967297); assert_eq(round_offset(1), 4294967297); }
+test popcount_of_words { assert_eq(pc64(0), 0); assert_eq(pc64(255), 8); assert_eq(pc64(1085102592571150095), 32); assert_eq(pc8(1024), 0); }
+test dq_fold_x16_and_x32 { assert_eq(fold(72057594037927936, 2), 256); assert_eq(fold(72057594037927936, 4), 16777216); assert_eq(fold(128, 2), 128); }
+test word_masks_follow_the_lanes { assert_eq(word_mask(1, 2), ones()); assert_eq(word_mask(2, 2), 0); }
+test first_wrong_word { assert_eq(first_of(0, 0, 5, 9), 8589934597); assert_eq(first_of(0, 0, 0, 0), 0); assert_eq(first_of(7, 1, 0, 0), 7); }
+test report_tags { assert_eq(rep_tag(0, 0), 71); assert_eq(rep_tag(1, 4), 70); assert_eq(rep_tag(2, 0), 84); assert_eq(rep_tag(3, 0), 90); assert_eq(rep_last(1), 4); }
+test report_fields { assert_eq(head_b(2, 3), 4328521731); assert_eq(time_b(true, 1, 2), 73014444034); assert_eq(rep_a(1, 4, 8, 0, 0, 0, 0, 0, false, 5, 0, 0), 4294967295); }
+endmodule

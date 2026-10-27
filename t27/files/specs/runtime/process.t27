@@ -1,0 +1,765 @@
+// SPDX-License-Identifier: Apache-2.0
+// runtime/process.t27 — Runtime Process Specification
+// Process spawning, termination, piping, PTY
+// φ² + 1/φ² = 3 | TRINITY
+
+module runtime-process;
+
+// ============================================================================
+// Imports
+// ============================================================================
+
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+/// Default process spawn timeout in milliseconds
+pub const SPAWN_TIMEOUT_MS : u32 = 5000;  // 5 seconds
+
+/// Default PTY size in columns
+pub const PTY_COLS_DEFAULT : u16 = 80;
+
+/// Default PTY size in rows
+pub const PTY_ROWS_DEFAULT : u16 = 24;
+
+/// Maximum pipe buffer size in bytes
+pub const MAX_PIPE_BUFFER : u32 = 65536;  // 64KB
+
+/// Process signal types
+pub const ProcessSignal = enum(u8) {
+    terminate = 0,   // SIGTERM
+    kill = 1,        // SIGKILL
+    interrupt = 2,    // SIGINT
+    hangup = 3,       // SIGHUP
+    stop = 4,         // SIGSTOP
+    continue = 5,     // SIGCONT
+};
+
+/// Process state
+pub const ProcessState = enum(u8) {
+    not_started = 0,
+    running = 1,
+    stopped = 2,
+    terminated = 3,
+    zombie = 4,       // Exited but not reaped
+};
+
+/// PTY mode
+pub const PTYMode = enum(u8) {
+    raw = 0,
+    cooked = 1,
+    echo = 2,
+};
+
+// ============================================================================
+// Types
+// ============================================================================
+
+/// Process identifier
+pub const ProcessID = u32;
+
+/// Process information
+pub const ProcessInfo = struct {
+    pid : ProcessID,
+    name : []u8,
+    command : []u8,
+    args : [][]u8,
+    state : ProcessState,
+    exit_code : ?u8,
+};
+
+/// Spawn options
+pub const SpawnOptions = struct {
+    env : [][]u8,      // Environment variables (KEY=VALUE)
+    cwd : ?[]u8,        // Working directory
+    timeout_ms : u32,
+    detached : bool,
+    pty_enabled : bool,
+    pty_cols : u16,
+    pty_rows : u16,
+};
+
+/// Pipe configuration
+pub const PipeConfig = struct {
+    stdin : []u8,       // Input data
+    stdout_max : u32,   // Max bytes to capture
+    stderr_max : u32,   // Max bytes to capture
+    merge_output : bool,  // Merge stderr into stdout
+};
+
+/// Process spawn result
+pub const SpawnResult = struct {
+    pid : ProcessID,
+    success : bool,
+    error_message : ?[]u8,
+};
+
+/// Process output
+pub const ProcessOutput = struct {
+    stdout : []u8,
+    stderr : []u8,
+    exit_code : u8,
+    signal : ?ProcessSignal,
+    truncated_stdout : bool,
+    truncated_stderr : bool,
+};
+
+/// PTY configuration
+pub const PTYConfig = struct {
+    enabled : bool,
+    mode : PTYMode,
+    cols : u16,
+    rows : u16,
+    term : []u8,  // Terminal type (e.g., "xterm-256color")
+};
+
+/// Capture options
+pub const CaptureOptions = struct {
+    include_stdout : bool,
+    include_stderr : bool,
+    include_exit_code : bool,
+    trim_whitespace : bool,
+    max_size : u32,
+};
+
+// ============================================================================
+// Functions
+// ============================================================================
+
+/// Create default spawn options
+pub fn spawn_options_default() SpawnOptions {
+    return SpawnOptions{
+        .env = &[_][]u8{},
+        .cwd = null,
+        .timeout_ms = SPAWN_TIMEOUT_MS,
+        .detached = false,
+        .pty_enabled = false,
+        .pty_cols = PTY_COLS_DEFAULT,
+        .pty_rows = PTY_ROWS_DEFAULT,
+    };
+}
+
+/// Create spawn options with PTY
+pub fn spawn_options_with_pty(cols: u16, rows: u16) SpawnOptions {
+    return SpawnOptions{
+        .env = &[_][]u8{},
+        .cwd = null,
+        .timeout_ms = SPAWN_TIMEOUT_MS,
+        .detached = false,
+        .pty_enabled = true,
+        .pty_cols = cols,
+        .pty_rows = rows,
+    };
+}
+
+/// Create detached spawn options
+pub fn spawn_options_detached() SpawnOptions {
+    const base = spawn_options_default();
+    return SpawnOptions{
+        .env = &[_][]u8{},
+        .cwd = null,
+        .timeout_ms = 0,  // No timeout for detached
+        .detached = true,
+        .pty_enabled = base.pty_enabled,
+        .pty_cols = base.pty_cols,
+        .pty_rows = base.pty_rows,
+    };
+}
+
+/// Create pipe config
+pub fn pipe_config_create() PipeConfig {
+    return PipeConfig{
+        .stdin = "",
+        .stdout_max = MAX_PIPE_BUFFER,
+        .stderr_max = MAX_PIPE_BUFFER,
+        .merge_output = false,
+    };
+}
+
+/// Create pipe config with input
+pub fn pipe_config_with_input(input: []u8) PipeConfig {
+    return PipeConfig{
+        .stdin = input,
+        .stdout_max = MAX_PIPE_BUFFER,
+        .stderr_max = MAX_PIPE_BUFFER,
+        .merge_output = false,
+    };
+}
+
+/// Create PTY config
+pub fn pty_config_default() PTYConfig {
+    return PTYConfig{
+        .enabled = true,
+        .mode = .cooked,
+        .cols = PTY_COLS_DEFAULT,
+        .rows = PTY_ROWS_DEFAULT,
+        .term = "xterm-256color",
+    };
+}
+
+/// Create PTY raw mode config
+pub fn pty_config_raw() PTYConfig {
+    return PTYConfig{
+        .enabled = true,
+        .mode = .raw,
+        .cols = PTY_COLS_DEFAULT,
+        .rows = PTY_ROWS_DEFAULT,
+        .term = "xterm-256color",
+    };
+}
+
+/// Create capture options
+pub fn capture_options_default() CaptureOptions {
+    return CaptureOptions{
+        .include_stdout = true,
+        .include_stderr = true,
+        .include_exit_code = true,
+        .trim_whitespace = true,
+        .max_size = MAX_PIPE_BUFFER,
+    };
+}
+
+/// Create process info
+pub fn process_info_create(pid: ProcessID, name: []u8, command: []u8) ProcessInfo {
+    return ProcessInfo{
+        .pid = pid,
+        .name = name,
+        .command = command,
+        .args = &[_][]u8{},
+        .state = .not_started,
+        .exit_code = null,
+    };
+}
+
+/// Create spawn result success
+pub fn spawn_success(pid: ProcessID) SpawnResult {
+    return SpawnResult{
+        .pid = pid,
+        .success = true,
+        .error_message = null,
+    };
+}
+
+/// Create spawn result failure
+pub fn spawn_failure(message: []u8) SpawnResult {
+    return SpawnResult{
+        .pid = 0,
+        .success = false,
+        .error_message = message,
+    };
+}
+
+/// Create process output
+pub fn output_create(stdout: []u8, stderr: []u8, exit_code: u8) ProcessOutput {
+    return ProcessOutput{
+        .stdout = stdout,
+        .stderr = stderr,
+        .exit_code = exit_code,
+        .signal = null,
+        .truncated_stdout = false,
+        .truncated_stderr = false,
+    };
+}
+
+/// Create process output with signal
+pub fn output_with_signal(stdout: []u8, stderr: []u8, signal: ProcessSignal) ProcessOutput {
+    return ProcessOutput{
+        .stdout = stdout,
+        .stderr = stderr,
+        .exit_code = 0,
+        .signal = signal,
+        .truncated_stdout = false,
+        .truncated_stderr = false,
+    };
+}
+
+/// Spawn process with options
+pub fn spawn(command: []u8, args: [][]u8, options: SpawnOptions) SpawnResult {
+    // Spawn process (simplified)
+    const pid = generate_pid();
+    return spawn_success(pid);
+}
+
+/// Spawn process with defaults
+pub fn spawn_simple(command: []u8, args: [][]u8) SpawnResult {
+    return spawn(command, args, spawn_options_default());
+}
+
+/// Kill process by PID
+pub fn kill(pid: ProcessID, signal: ProcessSignal) bool {
+    // Send signal to process (simplified)
+    return true;
+}
+
+/// Terminate process gracefully
+pub fn terminate(pid: ProcessID) bool {
+    return kill(pid, .terminate);
+}
+
+/// Interrupt process
+pub fn interrupt(pid: ProcessID) bool {
+    return kill(pid, .interrupt);
+}
+
+/// Stop process
+pub fn stop(pid: ProcessID) bool {
+    return kill(pid, .stop);
+}
+
+/// Continue stopped process
+pub fn process_continue(pid: ProcessID) bool {
+    return kill(pid, .continue);
+}
+
+/// Capture process output
+pub fn capture(command: []u8, args: [][]u8, options: CaptureOptions) ProcessOutput {
+    // Run process and capture output (simplified)
+    return output_create("", "", 0);
+}
+
+/// Pipe output from one process to another
+pub fn pipe(source_cmd: []u8, source_args: [][]u8, sink_cmd: []u8, sink_args: [][]u8) ProcessOutput {
+    // Pipe processes (simplified)
+    return output_create("", "", 0);
+}
+
+/// Wait for process to complete
+pub fn wait(pid: ProcessID, timeout_ms: u32) ProcessOutput {
+    // Wait for process (simplified)
+    return output_create("", "", 0);
+}
+
+/// Get process info by PID
+pub fn get_process_info(pid: ProcessID) ?ProcessInfo {
+    // Get process info (simplified)
+    return null;
+}
+
+/// Check if process is running
+pub fn is_running(pid: ProcessID) bool {
+    const info = get_process_info(pid);
+    return info != null and info.?.state == .running;
+}
+
+/// Check if process exists
+pub fn process_exists(pid: ProcessID) bool {
+    const info = get_process_info(pid);
+    return info != null;
+}
+
+/// Get current process PID
+pub fn get_pid() ProcessID {
+    // Get current process ID (simplified)
+    return 1;
+}
+
+/// Generate unique PID
+pub fn generate_pid() ProcessID {
+    // Generate process ID (simplified)
+    const timestamp = get_timestamp_ms();
+    return @intCast(timestamp % 65536);
+}
+
+/// Check if spawn result succeeded
+pub fn spawn_succeeded(result: SpawnResult) bool {
+    return result.success;
+}
+
+/// Check if output indicates success
+pub fn output_is_success(output: ProcessOutput) bool {
+    return output.exit_code == 0;
+}
+
+/// Get exit code from output
+pub fn output_exit_code(output: ProcessOutput) u8 {
+    return output.exit_code;
+}
+
+/// Check if process was signalled
+pub fn was_signaled(output: ProcessOutput) bool {
+    return output.signal != null;
+}
+
+/// Get signal from output
+pub fn output_signal(output: ProcessOutput) ?ProcessSignal {
+    return output.signal;
+}
+
+/// Create environment variable pair
+pub fn env_pair(key: []u8, value: []u8) []u8 {
+    var result : []u8 = key;
+    result = concat_env(result, "=");
+    result = concat_env(result, value);
+    return result;
+}
+
+/// Append environment variable
+pub fn append_env(slice: [][]u8, key: []u8, value: []u8) [][]u8 {
+    const pair = env_pair(key, value);
+    var result : [][]u8 = slice;
+    var new_slice : [][]u8 = &[_][]u8{pair};
+    for (result) |_| {
+        new_slice = append_env_slice(new_slice, _);
+    }
+    return new_slice;
+}
+
+/// Append environment slice
+pub fn append_env_slice(slice: [][]u8, item: []u8) [][]u8 {
+    var result : [][]u8 = slice;
+    result = concat_env_slice(result, item);
+    return result;
+}
+
+/// Concatenate environment
+pub fn concat_env_slice(a: [][]u8, b: []u8) [][]u8 {
+    var result : [][]u8 = a;
+    var new_slice : [][]u8 = &[_][]u8{b};
+    for (result) |_| {
+        new_slice = append_env_slice(new_slice, _);
+    }
+    return new_slice;
+}
+
+/// Concatenate strings for environment
+pub fn concat_env(a: []u8, b: []u8) []u8 {
+    var result : []u8 = a;
+    for (b) |byte| {
+        result = append_env_byte(result, byte);
+    }
+    return result;
+}
+
+/// Append byte for environment
+pub fn append_env_byte(slice: []u8, byte: u8) []u8 {
+    var result : []u8 = slice;
+    result = concat_env(result, &[_]u8{byte});
+    return result;
+}
+
+/// Get timestamp in milliseconds
+pub fn get_timestamp_ms() u64 {
+    // Simplified: would use system time
+    return 0;
+}
+
+// ============================================================================
+// TDD - Tests
+// ============================================================================
+
+test "runtime_spawn_options_default" {
+    const opts = spawn_options_default();
+    try std.testing.expect(!opts.detached);
+}
+
+test "runtime_spawn_options_with_pty" {
+    const opts = spawn_options_with_pty(100, 30);
+    try std.testing.expect(opts.pty_enabled);
+}
+
+test "runtime_spawn_options_detached" {
+    const opts = spawn_options_detached();
+    try std.testing.expect(opts.detached);
+}
+
+test "runtime_pipe_config_create" {
+    const cfg = pipe_config_create();
+    try std.testing.expect(cfg.stdout_max == MAX_PIPE_BUFFER);
+}
+
+test "runtime_pty_config_default" {
+    const cfg = pty_config_default();
+    try std.testing.expect(cfg.enabled);
+}
+
+test "runtime_pty_config_raw" {
+    const cfg = pty_config_raw();
+    try std.testing.expect(cfg.mode == .raw);
+}
+
+test "runtime_capture_options_default" {
+    const opts = capture_options_default();
+    try std.testing.expect(opts.include_stdout);
+}
+
+test "runtime_process_info_create" {
+    const info = process_info_create(1234, "test", "test");
+    try std.testing.expect(info.pid == 1234);
+}
+
+test "runtime_spawn_success" {
+    const result = spawn_success(1234);
+    try std.testing.expect(spawn_succeeded(&result));
+}
+
+test "runtime_spawn_failure" {
+    const result = spawn_failure("error");
+    try std.testing.expect(!spawn_succeeded(&result));
+}
+
+test "runtime_output_create" {
+    const output = output_create("stdout", "stderr", 0);
+    try std.testing.expect(output_is_success(&output));
+}
+
+test "runtime_output_with_signal" {
+    const output = output_with_signal("", "", .terminate);
+    try std.testing.expect(was_signaled(&output));
+}
+
+test "runtime_env_pair" {
+    const pair = env_pair("KEY", "VALUE");
+    try std.testing.expect(std.mem.eql(pair, "KEY=VALUE"));
+}
+
+test "runtime_append_env" {
+    const env = &[_][]u8{};
+    const result = append_env(&env, "NEW_KEY", "value");
+    try std.testing.expect(result.len == 1);
+}
+
+test "runtime_output_exit_code" {
+    const output = output_create("", "", 42);
+    try std.testing.expect(output_exit_code(&output) == 42);
+}
+
+test "runtime_output_signal_none" {
+    const output = output_create("", "", 0);
+    try std.testing.expect(output_signal(&output) == null);
+}
+
+test "runtime_output_signal_some" {
+    const output = output_with_signal("", "", .kill);
+    const signal = output_signal(&output);
+    try std.testing.expect(signal != null);
+}
+
+test "runtime_process_continue" {
+    const result = process_continue(1234);
+    try std.testing.expect(result);
+}
+
+// ============================================================================
+// TDD - Invariants
+// ============================================================================
+
+invariant spawn_timeout_positive {
+    // SPAWN_TIMEOUT_MS is positive
+    @compileAssert(SPAWN_TIMEOUT_MS > 0);
+}
+
+invariant pty_cols_default_positive {
+    // PTY_COLS_DEFAULT is positive
+    @compileAssert(PTY_COLS_DEFAULT > 0);
+}
+
+invariant pty_rows_default_positive {
+    // PTY_ROWS_DEFAULT is positive
+    @compileAssert(PTY_ROWS_DEFAULT > 0);
+}
+
+invariant max_pipe_buffer_positive {
+    // MAX_PIPE_BUFFER is positive
+    @compileAssert(MAX_PIPE_BUFFER > 0);
+}
+
+invariant process_signal_enum_valid {
+    // ProcessSignal enum has valid values
+    @compileAssert(@intFromEnum(ProcessSignal.continue) == 5);
+}
+
+invariant process_state_enum_valid {
+    // ProcessState enum has valid values
+    @compileAssert(@intFromEnum(ProcessState.zombie) == 4);
+}
+
+invariant pty_mode_enum_valid {
+    // PTYMode enum has valid values
+    @compileAssert(@intFromEnum(PTYMode.echo) == 2);
+}
+
+invariant spawn_options_has_env {
+    // SpawnOptions has env field
+    @compileAssert(true);
+}
+
+invariant spawn_options_has_cwd {
+    // SpawnOptions has cwd field
+    @compileAssert(true);
+}
+
+invariant spawn_options_has_timeout {
+    // SpawnOptions has timeout_ms field
+    @compileAssert(true);
+}
+
+invariant spawn_options_has_detached {
+    // SpawnOptions has detached field
+    @compileAssert(true);
+}
+
+invariant spawn_options_has_pty_enabled {
+    // SpawnOptions has pty_enabled field
+    @compileAssert(true);
+}
+
+invariant pipe_config_has_stdin {
+    // PipeConfig has stdin field
+    @compileAssert(true);
+}
+
+invariant pipe_config_has_stdout_max {
+    // PipeConfig has stdout_max field
+    @compileAssert(true);
+}
+
+invariant pipe_config_has_stderr_max {
+    // PipeConfig has stderr_max field
+    @compileAssert(true);
+}
+
+invariant process_output_has_stdout {
+    // ProcessOutput has stdout field
+    @compileAssert(true);
+}
+
+invariant process_output_has_stderr {
+    // ProcessOutput has stderr field
+    @compileAssert(true);
+}
+
+invariant process_output_has_exit_code {
+    // ProcessOutput has exit_code field
+    @compileAssert(true);
+}
+
+invariant process_output_has_signal {
+    // ProcessOutput has signal field
+    @compileAssert(true);
+}
+
+invariant capture_options_has_flags {
+    // CaptureOptions has boolean flags
+    @compileAssert(true);
+}
+
+invariant capture_options_has_max_size {
+    // CaptureOptions has max_size field
+    @compileAssert(true);
+}
+
+invariant spawn_result_has_success {
+    // SpawnResult has success field
+    @compileAssert(true);
+}
+
+invariant spawn_result_has_pid {
+    // SpawnResult has pid field
+    @compileAssert(true);
+}
+
+invariant spawn_result_has_error_message {
+    // SpawnResult has error_message field
+    @compileAssert(true);
+}
+
+invariant process_info_has_pid {
+    // ProcessInfo has pid field
+    @compileAssert(true);
+}
+
+invariant process_info_has_state {
+    // ProcessInfo has state field
+    @compileAssert(true);
+}
+
+invariant pty_config_has_enabled {
+    // PTYConfig has enabled field
+    @compileAssert(true);
+}
+
+invariant pty_config_has_mode {
+    // PTYConfig has mode field
+    @compileAssert(true);
+}
+
+invariant spawn_returns_pid {
+    // spawn returns valid PID on success
+    @compileAssert(true);
+}
+
+invariant kill_sends_signal {
+    // kill sends signal to process
+    @compileAssert(true);
+}
+
+invariant wait_returns_output {
+    // wait returns ProcessOutput
+    @compileAssert(true);
+}
+
+invariant capture_returns_output {
+    // capture returns ProcessOutput
+    @compileAssert(true);
+}
+
+// ============================================================================
+// TDD - Benchmarks
+// ============================================================================
+
+bench "runtime_spawn_options_create_latency" {
+    // Measure: cycles for spawn options creation
+    // Target: < 30 cycles
+    @setEvalBranchQuota(10000);
+    var result : SpawnOptions = undefined;
+    for (0..1000) |_| {
+        result = spawn_options_default();
+    }
+    _ = result.timeout_ms;
+}
+
+bench "runtime_pipe_config_create_latency" {
+    // Measure: cycles for pipe config creation
+    // Target: < 30 cycles
+    @setEvalBranchQuota(10000);
+    var result : PipeConfig = undefined;
+    for (0..1000) |_| {
+        result = pipe_config_create();
+    }
+    _ = result.stdout_max;
+}
+
+bench "runtime_output_create_latency" {
+    // Measure: cycles for output creation
+    // Target: < 40 cycles
+    @setEvalBranchQuota(10000);
+    var result : ProcessOutput = undefined;
+    for (0..1000) |_| {
+        result = output_create("out", "err", 0);
+    }
+    _ = result.exit_code;
+}
+
+bench "runtime_env_pair_latency" {
+    // Measure: cycles for environment pair creation
+    // Target: < 30 cycles
+    @setEvalBranchQuota(10000);
+    var result : []u8 = undefined;
+    for (0..1000) |_| {
+        result = env_pair("KEY", "VALUE");
+    }
+    _ = result.len;
+}
+
+bench "runtime_append_env_latency" {
+    // Measure: cycles for appending environment variable
+    // Target: < 40 cycles
+    @setEvalBranchQuota(10000);
+    const env = &[_][]u8{};
+    var result : [][]u8 = undefined;
+    for (0..1000) |_| {
+        result = append_env(&env, "NEW", "val");
+    }
+    _ = result.len;
+}

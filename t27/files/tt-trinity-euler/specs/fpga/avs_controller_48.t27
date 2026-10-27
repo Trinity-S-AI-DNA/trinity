@@ -1,0 +1,614 @@
+// SPDX-License-Identifier: Apache-2.0
+; avs_controller_48.t27 — 48-pin AVS Controller
+; Adaptive voltage scaling controller for 48-pin configuration
+; φ² + 1/φ² = 3 | TRINITY
+
+module avs-controller-48;
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+pub const PINS_48 : u8 = 48;
+pub const VOLTAGE_MIN_MV : u16 = 800;   // 0.8V minimum
+pub const VOLTAGE_MAX_MV : u16 = 1200;  // 1.2V maximum
+pub const VOLTAGE_STEP_MV : u16 = 10;    // 10mV step size
+pub const VOLTAGE_LEVELS : u8 = 41;      // (1200-800)/10 + 1
+
+pub const TARGET_MV : u16 = 1000;       // 1.0V target
+pub const HYSTERESIS_MV : u16 = 20;     // 20mV hysteresis
+pub const SETTLING_US : u16 = 100;      // 100us settling time
+
+pub const CONTROL_PIN_OFFSET : u8 = 16;  // AVS control pins start at 16
+pub const CONTROL_PIN_COUNT : u8 = 6;    // 6 control pins for 48-pin config
+
+pub const FREQ_MIN_KHZ : u32 = 10000;   // 10 MHz minimum
+pub const FREQ_MAX_KHZ : u32 = 100000;  // 100 MHz maximum
+
+// ============================================================================
+// Types
+// ============================================================================
+
+pub const AvsState = enum(u8) {
+    disabled = 0,
+    enabled = 1,
+    adjusting = 2,
+    settled = 3,
+    fault = 4,
+}
+
+pub const AvsMode = enum(u8) {
+    manual = 0,
+    automatic = 1,
+    adaptive = 2,
+}
+
+pub const AvsPinConfig = struct {
+    pin_index : u8,
+    is_output : bool,
+    function : u8,  // 0=control, 1=feedback, 2=enable
+}
+
+pub const AvsVoltageLevel = struct {
+    level : u8,          // 0 to 40
+    voltage_mv : u16,
+    control_code : u8,   // 6-bit code for control pins
+}
+
+pub const AvsStatus = struct {
+    state : AvsState,
+    mode : AvsMode,
+    current_mv : u16,
+    target_mv : u16,
+    level : u8,
+    fault_code : u8,
+}
+
+// Named form of the anonymous `struct { opcode, level, reserved }` that
+// decode_avs_48_cmd returns (same fields, same types).
+pub const Avs48Cmd = struct {
+    opcode : u8,
+    level : u8,
+    reserved : u8,
+}
+
+pub const AvsConfig = struct {
+    mode : AvsMode,
+    min_mv : u16,
+    max_mv : u16,
+    target_mv : u16,
+    hysteresis_mv : u16,
+    settling_us : u16,
+}
+
+// ============================================================================
+// Voltage Level Functions
+// ============================================================================
+
+// avs_voltage_from_level(level: u8) -> u16
+// Convert voltage level to millivolts
+pub fn avs_voltage_from_level(level: u8) -> u16 {
+    return VOLTAGE_MIN_MV + @as(u16, level) * VOLTAGE_STEP_MV;
+}
+
+// avs_level_from_voltage(voltage_mv: u16) -> u8
+// Convert voltage to level
+pub fn avs_level_from_voltage(voltage_mv: u16) -> u8 {
+    var mv = voltage_mv;
+    if (mv < VOLTAGE_MIN_MV) {
+        mv = VOLTAGE_MIN_MV;
+    } else if (mv > VOLTAGE_MAX_MV) {
+        mv = VOLTAGE_MAX_MV;
+    }
+    return @as(u8, (mv - VOLTAGE_MIN_MV) / VOLTAGE_STEP_MV);
+}
+
+// avs_control_code_from_level(level: u8) -> u8
+// Generate 6-bit control code for voltage level
+pub fn avs_control_code_from_level(level: u8) -> u8 {
+    // Simple binary encoding for 6 pins
+    return level & 0x3F;
+}
+
+// avs_level_from_control_code(code: u8) -> u8
+// Decode level from 6-bit control code
+pub fn avs_level_from_control_code(code: u8) -> u8 {
+    return code & 0x3F;
+}
+
+// ============================================================================
+// Voltage Validation
+// ============================================================================
+
+// avs_voltage_valid(voltage_mv: u16) -> bool
+// Check if voltage is within valid range
+pub fn avs_voltage_valid(voltage_mv: u16) -> bool {
+    return voltage_mv >= VOLTAGE_MIN_MV and voltage_mv <= VOLTAGE_MAX_MV;
+}
+
+// avs_voltage_in_hysteresis(current_mv: u16, target_mv: u16, hysteresis_mv: u16) -> bool
+// Check if current voltage is within hysteresis band of target
+pub fn avs_voltage_in_hysteresis(current_mv: u16, target_mv: u16, hysteresis_mv: u16) -> bool {
+    if (current_mv > target_mv) {
+        return (current_mv - target_mv) <= hysteresis_mv;
+    } else {
+        return (target_mv - current_mv) <= hysteresis_mv;
+    }
+}
+
+// avs_should_adjust(current_mv: u16, target_mv: u16, hysteresis_mv: u16) -> bool
+// Check if voltage should be adjusted
+pub fn avs_should_adjust(current_mv: u16, target_mv: u16, hysteresis_mv: u16) -> bool {
+    return !avs_voltage_in_hysteresis(current_mv, target_mv, hysteresis_mv);
+}
+
+// ============================================================================
+// Config Functions
+// ============================================================================
+
+// avs_config_init() -> AvsConfig
+// Initialize AVS configuration
+pub fn avs_config_init() -> AvsConfig {
+    return AvsConfig {
+        .mode = AvsMode.automatic,
+        .min_mv = VOLTAGE_MIN_MV,
+        .max_mv = VOLTAGE_MAX_MV,
+        .target_mv = TARGET_MV,
+        .hysteresis_mv = HYSTERESIS_MV,
+        .settling_us = SETTLING_US,
+    };
+}
+
+// avs_config_manual(target_mv: u16) -> AvsConfig
+// Create manual AVS configuration
+pub fn avs_config_manual(target_mv: u16) -> AvsConfig {
+    return AvsConfig {
+        .mode = AvsMode.manual,
+        .min_mv = VOLTAGE_MIN_MV,
+        .max_mv = VOLTAGE_MAX_MV,
+        .target_mv = target_mv,
+        .hysteresis_mv = HYSTERESIS_MV,
+        .settling_us = SETTLING_US,
+    };
+}
+
+// avs_config_adaptive(min_mv: u16, max_mv: u16) -> AvsConfig
+// Create adaptive AVS configuration
+pub fn avs_config_adaptive(min_mv: u16, max_mv: u16) -> AvsConfig {
+    return AvsConfig {
+        .mode = AvsMode.adaptive,
+        .min_mv = min_mv,
+        .max_mv = max_mv,
+        .target_mv = (min_mv + max_mv) / 2,
+        .hysteresis_mv = HYSTERESIS_MV,
+        .settling_us = SETTLING_US,
+    };
+}
+
+// ============================================================================
+// Status Functions
+// ============================================================================
+
+// avs_status_init() -> AvsStatus
+// Initialize AVS status
+pub fn avs_status_init() -> AvsStatus {
+    return AvsStatus {
+        .state = AvsState.disabled,
+        .mode = AvsMode.manual,
+        .current_mv = VOLTAGE_MIN_MV,
+        .target_mv = TARGET_MV,
+        .level = 0,
+        .fault_code = 0,
+    };
+}
+
+// avs_status_enable(status: AvsStatus, config: AvsConfig) -> AvsStatus
+// Enable AVS controller
+pub fn avs_status_enable(status: AvsStatus, config: AvsConfig) -> AvsStatus {
+    return AvsStatus {
+        .state = AvsState.enabled,
+        .mode = config.mode,
+        .current_mv = status.current_mv,
+        .target_mv = config.target_mv,
+        .level = status.level,
+        .fault_code = 0,
+    };
+}
+
+// avs_status_adjust(status: AvsStatus, new_level: u8) -> AvsStatus
+// Adjust to new voltage level
+pub fn avs_status_adjust(status: AvsStatus, new_level: u8) -> AvsStatus {
+    const new_mv = avs_voltage_from_level(new_level);
+    return AvsStatus {
+        .state = AvsState.adjusting,
+        .mode = status.mode,
+        .current_mv = status.current_mv,
+        .target_mv = new_mv,
+        .level = new_level,
+        .fault_code = status.fault_code,
+    };
+}
+
+// avs_status_settled(status: AvsStatus, measured_mv: u16) -> AvsStatus
+// Mark voltage as settled
+pub fn avs_status_settled(status: AvsStatus, measured_mv: u16) -> AvsStatus {
+    return AvsStatus {
+        .state = AvsState.settled,
+        .mode = status.mode,
+        .current_mv = measured_mv,
+        .target_mv = status.target_mv,
+        .level = avs_level_from_voltage(measured_mv),
+        .fault_code = status.fault_code,
+    };
+}
+
+// avs_status_fault(status: AvsStatus, fault_code: u8) -> AvsStatus
+// Mark fault condition
+pub fn avs_status_fault(status: AvsStatus, fault_code: u8) -> AvsStatus {
+    return AvsStatus {
+        .state = AvsState.fault,
+        .mode = status.mode,
+        .current_mv = status.current_mv,
+        .target_mv = status.target_mv,
+        .level = status.level,
+        .fault_code = fault_code,
+    };
+}
+
+// ============================================================================
+// Pin Functions
+// ============================================================================
+
+// avs_control_pins_start() -> u8
+// Get starting pin index for control pins
+pub fn avs_control_pins_start() -> u8 {
+    return CONTROL_PIN_OFFSET;
+}
+
+// avs_control_pins_end() -> u8
+// Get ending pin index for control pins
+pub fn avs_control_pins_end() -> u8 {
+    return CONTROL_PIN_OFFSET + CONTROL_PIN_COUNT - 1;
+}
+
+// avs_is_control_pin(pin_index: u8) -> bool
+// Check if pin is a control pin
+pub fn avs_is_control_pin(pin_index: u8) -> bool {
+    return pin_index >= avs_control_pins_start() and pin_index <= avs_control_pins_end();
+}
+
+// avs_control_pin_for_bit(bit_index: u8) -> u8
+// Get control pin for a bit index (0-5)
+pub fn avs_control_pin_for_bit(bit_index: u8) -> u8 {
+    if (bit_index >= CONTROL_PIN_COUNT) {
+        return CONTROL_PIN_OFFSET;
+    }
+    return CONTROL_PIN_OFFSET + bit_index;
+}
+
+// ============================================================================
+// Opcode Encoding/Decoding
+// ============================================================================
+
+// encode_avs_48_cmd(opcode: u8, level: u8, reserved: u8) -> u16
+// Encode AVS 48-pin command
+pub fn encode_avs_48_cmd(opcode: u8, level: u8, reserved: u8) -> u16 {
+    // Format: [OP:8][LEVEL:6][RES:2]
+    const op_field : u16 = @as(u16, opcode) << 8;
+    const level_field : u16 = @as(u16, level & 0x3F) << 2;
+    const res_field : u16 = @as(u16, reserved & 0x03);
+    return op_field | level_field | res_field;
+}
+
+// decode_avs_48_cmd(encoded: u16) -> struct { opcode: u8, level: u8, reserved: u8 }
+// Decode AVS 48-pin command
+pub fn decode_avs_48_cmd(encoded: u16) -> Avs48Cmd {
+    const opcode : u8 = @as(u8, @truncate((encoded >> 8) & 0xFF));
+    const level : u8 = @as(u8, @truncate((encoded >> 2) & 0x3F));
+    const reserved : u8 = @as(u8, @truncate(encoded & 0x03));
+    return Avs48Cmd{ .opcode = opcode, .level = level, .reserved = reserved };
+}
+
+// ============================================================================
+// TDD Tests
+// ============================================================================
+
+test "pins_48_constant" {
+    assert(PINS_48 == 48);
+}
+
+test "voltage_constants" {
+    assert(VOLTAGE_MIN_MV == 800);
+    assert(VOLTAGE_MAX_MV == 1200);
+    assert(VOLTAGE_STEP_MV == 10);
+    assert(VOLTAGE_LEVELS == 41);
+}
+
+test "target_voltage_constant" {
+    assert(TARGET_MV == 1000);
+}
+
+test "control_pin_constants" {
+    assert(CONTROL_PIN_OFFSET == 16);
+    assert(CONTROL_PIN_COUNT == 6);
+}
+
+test "avs_voltage_from_level_zero" {
+    assert(avs_voltage_from_level(0) == VOLTAGE_MIN_MV);
+}
+
+test "avs_voltage_from_level_max" {
+    const max_level = VOLTAGE_LEVELS - 1;
+    assert(avs_voltage_from_level(max_level) == VOLTAGE_MAX_MV);
+}
+
+test "avs_voltage_from_level_target" {
+    const level = avs_level_from_voltage(TARGET_MV);
+    assert(avs_voltage_from_level(level) == TARGET_MV);
+}
+
+test "avs_level_from_voltage_min" {
+    assert(avs_level_from_voltage(VOLTAGE_MIN_MV) == 0);
+}
+
+test "avs_level_from_voltage_max" {
+    assert(avs_level_from_voltage(VOLTAGE_MAX_MV) == VOLTAGE_LEVELS - 1);
+}
+
+test "avs_level_from_voltage_clamp_low" {
+    assert(avs_level_from_voltage(700) == 0);
+}
+
+test "avs_level_from_voltage_clamp_high" {
+    assert(avs_level_from_voltage(1500) == VOLTAGE_LEVELS - 1);
+}
+
+test "avs_control_code_from_level_zero" {
+    assert(avs_control_code_from_level(0) == 0);
+}
+
+test "avs_control_code_from_level_max" {
+    const code = avs_control_code_from_level(63);
+    assert(code == 63);
+}
+
+test "avs_control_code_from_level_clamp" {
+    const code = avs_control_code_from_level(100);
+    assert(code == 36); // 100 & 0x3F
+}
+
+test "avs_level_from_control_code_roundtrip" {
+    const level = 20;
+    const code = avs_control_code_from_level(level);
+    const decoded = avs_level_from_control_code(code);
+    assert(decoded == level);
+}
+
+test "avs_voltage_valid_in_range" {
+    assert(avs_voltage_valid(900) == true);
+    assert(avs_voltage_valid(1000) == true);
+    assert(avs_voltage_valid(1100) == true);
+}
+
+test "avs_voltage_valid_out_of_range" {
+    assert(avs_voltage_valid(700) == false);
+    assert(avs_voltage_valid(1300) == false);
+}
+
+test "avs_voltage_in_hysteresis_true" {
+    assert(avs_voltage_in_hysteresis(1000, 1000, 20) == true);
+    assert(avs_voltage_in_hysteresis(1015, 1000, 20) == true);
+    assert(avs_voltage_in_hysteresis(985, 1000, 20) == true);
+}
+
+test "avs_voltage_in_hysteresis_false" {
+    assert(avs_voltage_in_hysteresis(1050, 1000, 20) == false);
+    assert(avs_voltage_in_hysteresis(950, 1000, 20) == false);
+}
+
+test "avs_should_adjust_false_in_hysteresis" {
+    assert(avs_should_adjust(1010, 1000, 20) == false);
+}
+
+test "avs_should_adjust_true_out_of_hysteresis" {
+    assert(avs_should_adjust(1050, 1000, 20) == true);
+}
+
+test "avs_config_init_structure" {
+    const config = avs_config_init();
+    assert(config.mode == AvsMode.automatic);
+    assert(config.target_mv == TARGET_MV);
+    assert(config.hysteresis_mv == HYSTERESIS_MV);
+}
+
+test "avs_config_manual_structure" {
+    const config = avs_config_manual(900);
+    assert(config.mode == AvsMode.manual);
+    assert(config.target_mv == 900);
+}
+
+test "avs_config_adaptive_structure" {
+    const config = avs_config_adaptive(850, 1150);
+    assert(config.mode == AvsMode.adaptive);
+    assert(config.min_mv == 850);
+    assert(config.max_mv == 1150);
+}
+
+test "avs_status_init_structure" {
+    const status = avs_status_init();
+    assert(status.state == AvsState.disabled);
+    assert(status.current_mv == VOLTAGE_MIN_MV);
+}
+
+test "avs_status_enable" {
+    const status = avs_status_init();
+    const config = avs_config_init();
+    const result = avs_status_enable(status, config);
+    assert(result.state == AvsState.enabled);
+    assert(result.mode == AvsMode.automatic);
+}
+
+test "avs_status_adjust" {
+    const status = avs_status_init();
+    const result = avs_status_adjust(status, 10);
+    assert(result.state == AvsState.adjusting);
+    assert(result.level == 10);
+}
+
+test "avs_status_settled" {
+    const status = avs_status_init();
+    const result = avs_status_settled(status, 1000);
+    assert(result.state == AvsState.settled);
+    assert(result.current_mv == 1000);
+}
+
+test "avs_status_fault" {
+    const status = avs_status_init();
+    const result = avs_status_fault(status, 1);
+    assert(result.state == AvsState.fault);
+    assert(result.fault_code == 1);
+}
+
+test "avs_control_pins_start" {
+    assert(avs_control_pins_start() == CONTROL_PIN_OFFSET);
+}
+
+test "avs_control_pins_end" {
+    assert(avs_control_pins_end() == CONTROL_PIN_OFFSET + CONTROL_PIN_COUNT - 1);
+}
+
+test "avs_is_control_pin_true" {
+    assert(avs_is_control_pin(16) == true);
+    assert(avs_is_control_pin(21) == true);
+}
+
+test "avs_is_control_pin_false" {
+    assert(avs_is_control_pin(15) == false);
+    assert(avs_is_control_pin(22) == false);
+}
+
+test "avs_control_pin_for_bit" {
+    assert(avs_control_pin_for_bit(0) == CONTROL_PIN_OFFSET);
+    assert(avs_control_pin_for_bit(5) == CONTROL_PIN_OFFSET + 5);
+}
+
+test "avs_control_pin_for_bit_clamp" {
+    assert(avs_control_pin_for_bit(10) == CONTROL_PIN_OFFSET);
+}
+
+test "encode_avs_48_cmd" {
+    const encoded = encode_avs_48_cmd(0x10, 20, 0);
+    assert((encoded >> 8) == 0x10);
+}
+
+test "decode_avs_48_cmd" {
+    const decoded = decode_avs_48_cmd(0x1050);
+    assert(decoded.opcode == 0x10);
+    assert(decoded.level == 20);
+}
+
+// ============================================================================
+// Invariants
+// ============================================================================
+
+invariant voltage_range_positive
+    assert VOLTAGE_MIN_MV > 0 and VOLTAGE_MAX_MV > VOLTAGE_MIN_MV
+
+invariant voltage_step_positive
+    assert VOLTAGE_STEP_MV > 0
+
+invariant voltage_levels_calculated
+    assert VOLTAGE_LEVELS == ((VOLTAGE_MAX_MV - VOLTAGE_MIN_MV) / VOLTAGE_STEP_MV) + 1
+
+invariant target_voltage_in_range
+    assert avs_voltage_valid(TARGET_MV)
+
+invariant hysteresis_less_than_step
+    assert HYSTERESIS_MV < VOLTAGE_STEP_MV * 3
+
+invariant control_pins_valid_range
+    assert CONTROL_PIN_OFFSET + CONTROL_PIN_COUNT <= PINS_48
+
+invariant control_pin_count_six
+    assert CONTROL_PIN_COUNT == 6
+
+invariant avs_voltage_from_level_roundtrip
+    given level = 15
+    and   voltage = avs_voltage_from_level(level)
+    and   result_level = avs_level_from_voltage(voltage)
+    then result_level == level
+
+invariant avs_voltage_in_hysteresis_exact
+    assert avs_voltage_in_hysteresis(TARGET_MV, TARGET_MV, 0) == true
+
+invariant avs_should_adjust_false_at_exact_target
+    assert avs_should_adjust(TARGET_MV, TARGET_MV, HYSTERESIS_MV) == false
+
+invariant avs_status_init_disabled
+    given status = avs_status_init()
+    then status.state == AvsState.disabled
+
+invariant avs_status_enable_sets_mode
+    given status = avs_status_init()
+    and   config = avs_config_manual(950)
+    and   result = avs_status_enable(status, config)
+    then result.mode == AvsMode.manual
+
+invariant avs_status_adjust_changes_level
+    given status = avs_status_init()
+    and   result = avs_status_adjust(status, 25)
+    then result.level == 25
+
+invariant avs_is_control_pin_monotonic
+    assert avs_control_pin_for_bit(3) > avs_control_pin_for_bit(2)
+
+invariant avs_control_pin_for_bit_start_at_offset
+    assert avs_control_pin_for_bit(0) == CONTROL_PIN_OFFSET
+
+// ============================================================================
+// Benchmarks
+// ============================================================================
+
+bench avs_voltage_from_level_latency
+    measure: nanoseconds to avs_voltage_from_level(20)
+    target: < 20ns
+
+bench avs_level_from_voltage_latency
+    measure: nanoseconds to avs_level_from_voltage(1000)
+    target: < 20ns
+
+bench avs_control_code_from_level_latency
+    measure: nanoseconds to avs_control_code_from_level(20)
+    target: < 15ns
+
+bench avs_voltage_valid_latency
+    measure: nanoseconds to avs_voltage_valid(1000)
+    target: < 15ns
+
+bench avs_voltage_in_hysteresis_latency
+    measure: nanoseconds to avs_voltage_in_hysteresis(1000, 1000, 20)
+    target: < 25ns
+
+bench avs_config_init_latency
+    measure: nanoseconds to avs_config_init()
+    target: < 30ns
+
+bench avs_status_init_latency
+    measure: nanoseconds to avs_status_init()
+    target: < 30ns
+
+bench avs_status_adjust_latency
+    measure: nanoseconds to avs_status_adjust(avs_status_init(), 20)
+    target: < 30ns
+
+bench avs_is_control_pin_latency
+    measure: nanoseconds to avs_is_control_pin(18)
+    target: < 15ns
+
+bench encode_avs_48_cmd_latency
+    measure: nanoseconds to encode_avs_48_cmd(0x10, 20, 0)
+    target: < 20ns
+
+bench decode_avs_48_cmd_latency
+    measure: nanoseconds to decode_avs_48_cmd(0x1050)
+    target: < 20ns

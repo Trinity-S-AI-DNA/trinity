@@ -1,0 +1,388 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/tri/t27b/builtin_plan.t27 -- how t27b lowers `@abs`, `@max`, `@min` and `std.math.pi` / `std.math.e`
+; (issue #7394, t27b lane 4 of epic #6063; written in t27 under the port epic #6198).
+; gen-zig prints these four as written, and so does a bare `abs(x)` when no `fn abs` is declared, so t27b
+; must give each of them the meaning Zig 0.16 gives it in a Debug build. Everything t27b decides about them
+; is in this file and reaches cli/t27b through `t27c gen-rust` (gen/rust/tri/t27b/builtin_plan.rs):
+; which operands a call takes, where the result type comes from, the select chain each call lowers to,
+; the operator of each step, the names a refusal reports, and the digits of the two constants. The Rust
+; glue in cli/t27b/src/lower.rs and lower_float.rs only classifies the operands it lowered, evaluates
+; each one once, and turns the rows of a plan into IR select nodes.
+; --
+; The semantics (measured on the t27b Railway lab with Zig 0.16 Debug, issue #7394):
+;   `@abs(x)` of an f64 / f32 is the magnitude: -0.0 gives +0.0, -inf gives +inf, a NaN stays a NaN.
+;   A comptime operand folds. A typed integer is refused: Zig's `@abs` of an `iN` is a `uN`.
+;   `@max(a, b)` / `@min(a, b)` of two floats of one type: a NaN operand gives the other operand, and when
+;   the two compare equal (-0.0 and +0.0) the FIRST operand is the result. That sign is t27b's choice: Zig
+;   0.16 leaves it to the target (x86_64 gives the first operand, as the t27b lab's reference does; aarch64
+;   gives +0.0 for @max and -0.0 for @min; measured for #7394), so no conformance test pins it. A literal
+;   beside a typed float takes that float's type. Of two integers of one type: the larger / smaller. Each
+;   operand runs once.
+;   Refused: an integer beside a literal (Zig narrows the result type to the literal's range), mixed
+;   types, two literals, and any other number of operands.
+;   `std.math.pi` and `std.math.e` are the comptime_float literals of Zig's lib/std/math.zig, held as
+;   binary128 and rounded once where a typed float is needed.
+; --
+; A plan is a list of rows over numbered slots. Slot 0 is the literal 0, slots 1 and 2 are the operands
+; (each evaluated once, in order), and row i writes slot 1 + arity + i. A row is
+;   OP_SUB  l r       slot[l] - slot[r]
+;   OP_xx   l r t e   (slot[l] xx slot[r]) ? slot[t] : slot[e]      xx: <, <=, !=
+; and the last row is the value of the call. `run_plan` below is the same walk over f64 values, so the
+; tests check the semantics above on the plan itself, not on a second copy of it.
+; --
+; The oracle is the hand-written Rust of draft PR #7411 (branch claude/t27b-lane4-abs-max-pi, 079cc1800),
+; which passed the conformance spec specs/tri/t27b/conformance/builtin_abs_max_min_pi.t27 and the t27b
+; lab corpus with mismatch 0. Its `abs_of`, `max_min` and `std_math_const` are rows, tables and constants
+; here; the refusal names are the ones its blockers reported.
+; ASCII only (L3)
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module T27bBuiltinPlan;
+
+// Which call: a bare `abs(x)` with no `fn abs` declared, `@abs(x)`, `@max(a, b)`, `@min(a, b)`.
+pub const BARE_ABS : u8 = 0;
+pub const ABS : u8 = 1;
+pub const MAX : u8 = 2;
+pub const MIN : u8 = 3;
+
+// What one lowered operand is, as the glue sees it.
+pub const K_FLOAT : u8 = 0;
+pub const K_INT : u8 = 1;
+pub const K_CF : u8 = 2;
+pub const K_CT : u8 = 3;
+pub const K_OTHER : u8 = 4;
+
+// Where the result type comes from (type_from): refuse the call, the first or the second operand's
+// type, or fold the call at compile time. FROM_FIRST and FROM_SECOND are that operand's slot
+// (S_FIRST, S_SECOND): the glue reads the type of operand `from - 1`.
+pub const REFUSE : u8 = 0;
+pub const FROM_FIRST : u8 = 1;
+pub const FROM_SECOND : u8 = 2;
+pub const FOLD : u8 = 3;
+
+// The operator of a row, and the fields of a row.
+pub const OP_SUB : u8 = 0;
+pub const OP_LT : u8 = 1;
+pub const OP_LE : u8 = 2;
+pub const OP_NE : u8 = 3;
+pub const F_OP : u8 = 0;
+pub const F_L : u8 = 1;
+pub const F_R : u8 = 2;
+pub const F_THEN : u8 = 3;
+pub const F_ELSE : u8 = 4;
+
+// The slots every plan starts with.
+pub const S_ZERO : u8 = 0;
+pub const S_FIRST : u8 = 1;
+pub const S_SECOND : u8 = 2;
+
+/// Zig's comptime_float digits of `std.math.pi` and `std.math.e` (lib/std/math.zig, Zig 0.16).
+pub const PI_DIGITS : str = "3.14159265358979323846264338327950288419716939937510";
+pub const E_DIGITS : str = "2.71828182845904523536028747135266249775724709369995";
+
+/// How many operands the call takes.
+pub fn arity(b: u8) -> usize {
+    if (b == MAX or b == MIN) { return 2; }
+    return 1;
+}
+
+/// The construct a refusal names when the call has another number of operands. A bare `abs` with
+/// another arity is no builtin at all: an undeclared fn.
+pub fn what_arity(b: u8) -> str {
+    if (b == BARE_ABS) { return "ExprCall(undeclared fn)"; }
+    if (b == ABS) { return "ExprCall(@abs)"; }
+    if (b == MAX) { return "ExprCall(@max)"; }
+    return "ExprCall(@min)";
+}
+
+/// The construct a refusal names when the operands cannot be lowered.
+pub fn what_operands(b: u8) -> str {
+    if (b == BARE_ABS) { return "ExprCall(abs of an integer)"; }
+    if (b == ABS) { return "ExprCall(@abs of an integer)"; }
+    return what_arity(b);
+}
+
+/// A comptime_float or a comptime_int.
+pub fn is_literal(k: u8) -> bool {
+    return k == K_CF or k == K_CT;
+}
+
+/// The decision table. k1, k2: the operands' kinds (k2 is K_OTHER for a one-operand call); same: both
+/// operands are typed and of one type. Returns REFUSE, FROM_FIRST, FROM_SECOND or FOLD.
+pub fn type_from(b: u8, k1: u8, k2: u8, same: bool) -> u8 {
+    if (b == BARE_ABS or b == ABS) {
+        if (k1 == K_FLOAT) { return FROM_FIRST; }
+        if (is_literal(k1)) { return FOLD; }
+        return REFUSE;
+    }
+    if (same and k1 == k2 and (k1 == K_FLOAT or k1 == K_INT)) { return FROM_FIRST; }
+    if (k1 == K_FLOAT and is_literal(k2)) { return FROM_FIRST; }
+    if (is_literal(k1) and k2 == K_FLOAT) { return FROM_SECOND; }
+    return REFUSE;
+}
+
+/// How many rows the plan has: the two NaN rows of `@max` / `@min` exist only for floats.
+pub fn rows(b: u8, float: bool) -> usize {
+    if (b == BARE_ABS or b == ABS) { return 2; }
+    if (float) { return 3; }
+    return 1;
+}
+
+/// A row as five 4-bit fields, F_OP lowest.
+pub fn pack(op: u8, l: u8, r: u8, t: u8, e: u8) -> u32 {
+    return (op as u32) | ((l as u32) << 4) | ((r as u32) << 8) | ((t as u32) << 12) | ((e as u32) << 16);
+}
+
+/// Row i of the plan of b.
+pub fn plan_row(b: u8, i: usize) -> u32 {
+    if (b == BARE_ABS or b == ABS) {
+        // slot 2 = 0 - x; slot 3 = x <= 0 ? slot 2 : x. NaN <= 0 is false: a NaN comes back as is.
+        if (i == 0) { return pack(OP_SUB, S_ZERO, S_FIRST, 0, 0); }
+        return pack(OP_LE, S_FIRST, S_ZERO, 2, S_FIRST);
+    }
+    // slot 3 = a < b ? b : a for @max, b < a ? b : a for @min: equal operands give a.
+    if (i == 0 and b == MAX) { return pack(OP_LT, S_FIRST, S_SECOND, S_SECOND, S_FIRST); }
+    if (i == 0) { return pack(OP_LT, S_SECOND, S_FIRST, S_SECOND, S_FIRST); }
+    // slot 4 = b != b ? a : slot 3; slot 5 = a != a ? b : slot 4.
+    if (i == 1) { return pack(OP_NE, S_SECOND, S_SECOND, S_FIRST, 3); }
+    return pack(OP_NE, S_FIRST, S_FIRST, S_SECOND, 4);
+}
+
+/// Field f of row i of the plan of b, as a slot index.
+pub fn row_field(b: u8, i: usize, f: u8) -> usize {
+    return ((plan_row(b, i) >> (4 * (f as u32))) & 15) as usize;
+}
+
+/// The operator of row i of the plan of b.
+pub fn row_op(b: u8, i: usize) -> u8 {
+    return (plan_row(b, i) & 15) as u8;
+}
+
+/// Does a row of this operator select between two slots (true), or compute a value (OP_SUB)?
+pub fn op_selects(op: u8) -> bool {
+    return op != OP_SUB;
+}
+
+/// The operator as t27b's binary() takes it.
+pub fn op_text(op: u8) -> str {
+    if (op == OP_SUB) { return "-"; }
+    if (op == OP_LT) { return "<"; }
+    if (op == OP_LE) { return "<="; }
+    return "!=";
+}
+
+/// The plan of b run over f64 values, slot by slot, the way the glue builds it in IR. For the tests; a
+/// one-operand call ignores y.
+pub fn run_plan(b: u8, float: bool, x: f64, y: f64) -> f64 {
+    var s : [6]f64 = [0.0, x, y, 0.0, 0.0, 0.0];
+    const first : usize = 1 + arity(b);
+    const n : usize = rows(b, float);
+    var i : usize = 0;
+    while (i < n) {
+        const op : u8 = row_op(b, i);
+        const l : f64 = s[row_field(b, i, F_L)];
+        const r : f64 = s[row_field(b, i, F_R)];
+        var v : f64 = l - r;
+        if (op_selects(op)) {
+            var take : bool = l != r;
+            if (op == OP_LT) { take = l < r; }
+            if (op == OP_LE) { take = l <= r; }
+            v = s[row_field(b, i, F_ELSE)];
+            if (take) { v = s[row_field(b, i, F_THEN)]; }
+        }
+        s[first + i] = v;
+        i = i + 1;
+    }
+    return s[first + n - 1];
+}
+
+/// Is the byte an ASCII decimal digit ('0' is 48, '9' is 57)? Written as numbers: gen-rust emits a
+/// character literal as a Rust char, which a u8 cannot be compared with (#7604).
+pub fn is_digit(c: u8) -> bool {
+    return c >= 48 and c <= 57;
+}
+
+/// How many decimal digits the string holds. For the tests.
+pub fn digit_count(s: str) -> usize {
+    var n : usize = 0;
+    var i : usize = 0;
+    while (i < s.len) {
+        if (is_digit(s[i])) { n = n + 1; }
+        i = i + 1;
+    }
+    return n;
+}
+
+/// The digits from the (from+1)-th to the (from+count)-th of the string as one integer, the point
+/// skipped; count at most 19. For the tests.
+pub fn digits_at(s: str, from: usize, count: usize) -> u64 {
+    var m : u64 = 0;
+    var n : usize = 0;
+    var i : usize = 0;
+    while (i < s.len and n < from + count) {
+        if (is_digit(s[i])) {
+            if (n >= from) { m = m * 10 + ((s[i] - 48) as u64); }
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    return m;
+}
+
+fn bp_div(a: f64, b: f64) -> f64 {
+    return a / b;
+}
+
+fn bp_neg(x: f64) -> f64 {
+    return -x;
+}
+
+fn bp_is_nan(x: f64) -> bool {
+    return x != x;
+}
+
+test the_call_names_its_operands_and_its_refusals {
+    assert arity(BARE_ABS) == 1;
+    assert arity(ABS) == 1;
+    assert arity(MAX) == 2;
+    assert arity(MIN) == 2;
+    assert std.mem.eql(u8, what_arity(BARE_ABS), "ExprCall(undeclared fn)");
+    assert std.mem.eql(u8, what_arity(ABS), "ExprCall(@abs)");
+    assert std.mem.eql(u8, what_arity(MAX), "ExprCall(@max)");
+    assert std.mem.eql(u8, what_arity(MIN), "ExprCall(@min)");
+    assert std.mem.eql(u8, what_operands(BARE_ABS), "ExprCall(abs of an integer)");
+    assert std.mem.eql(u8, what_operands(ABS), "ExprCall(@abs of an integer)");
+    assert std.mem.eql(u8, what_operands(MAX), "ExprCall(@max)");
+    assert std.mem.eql(u8, what_operands(MIN), "ExprCall(@min)");
+    assert !std.mem.eql(u8, what_arity(MAX), what_arity(MIN));
+}
+
+test abs_lowers_a_typed_float_folds_a_literal_and_refuses_the_rest {
+    assert type_from(ABS, K_FLOAT, K_OTHER, false) == FROM_FIRST;
+    assert type_from(BARE_ABS, K_FLOAT, K_OTHER, false) == FROM_FIRST;
+    assert type_from(ABS, K_CF, K_OTHER, false) == FOLD;
+    assert type_from(ABS, K_CT, K_OTHER, false) == FOLD;
+    assert type_from(BARE_ABS, K_CT, K_OTHER, false) == FOLD;
+    assert type_from(ABS, K_INT, K_OTHER, false) == REFUSE;
+    assert type_from(BARE_ABS, K_INT, K_OTHER, false) == REFUSE;
+    assert type_from(ABS, K_OTHER, K_OTHER, false) == REFUSE;
+}
+
+test max_and_min_take_one_type_or_a_float_beside_a_literal {
+    assert FROM_FIRST == S_FIRST and FROM_SECOND == S_SECOND;
+    assert type_from(MAX, K_FLOAT, K_FLOAT, true) == FROM_FIRST;
+    assert type_from(MIN, K_INT, K_INT, true) == FROM_FIRST;
+    assert type_from(MAX, K_FLOAT, K_CF, false) == FROM_FIRST;
+    assert type_from(MIN, K_FLOAT, K_CT, false) == FROM_FIRST;
+    assert type_from(MAX, K_CF, K_FLOAT, false) == FROM_SECOND;
+    assert type_from(MIN, K_CT, K_FLOAT, false) == FROM_SECOND;
+}
+
+test max_and_min_refuse_mixed_types_and_an_integer_beside_a_literal {
+    assert type_from(MAX, K_FLOAT, K_FLOAT, false) == REFUSE;
+    assert type_from(MIN, K_INT, K_INT, false) == REFUSE;
+    assert type_from(MAX, K_INT, K_CT, false) == REFUSE;
+    assert type_from(MIN, K_CT, K_INT, false) == REFUSE;
+    assert type_from(MAX, K_CF, K_CT, true) == REFUSE;
+    assert type_from(MAX, K_CF, K_CF, true) == REFUSE;
+    assert type_from(MIN, K_FLOAT, K_INT, false) == REFUSE;
+    assert type_from(MAX, K_OTHER, K_OTHER, true) == REFUSE;
+    assert type_from(MAX, K_FLOAT, K_OTHER, false) == REFUSE;
+}
+
+test the_rows_are_the_oracle_s_select_chains {
+    assert rows(ABS, true) == 2;
+    assert rows(BARE_ABS, true) == 2;
+    assert rows(MAX, true) == 3;
+    assert rows(MIN, true) == 3;
+    assert rows(MAX, false) == 1;
+    assert rows(MIN, false) == 1;
+    assert plan_row(ABS, 0) == 0x00100;
+    assert plan_row(ABS, 1) == 0x12012;
+    assert plan_row(BARE_ABS, 1) == plan_row(ABS, 1);
+    assert plan_row(MAX, 0) == 0x12211;
+    assert plan_row(MIN, 0) == 0x12121;
+    assert plan_row(MAX, 1) == 0x31223;
+    assert plan_row(MAX, 2) == 0x42113;
+    assert plan_row(MIN, 2) == plan_row(MAX, 2);
+    assert row_op(ABS, 0) == OP_SUB;
+    assert row_field(ABS, 1, F_THEN) == 2;
+    assert row_field(MAX, 2, F_ELSE) == 4;
+    assert !op_selects(OP_SUB);
+    assert op_selects(OP_NE);
+    assert std.mem.eql(u8, op_text(OP_SUB), "-");
+    assert std.mem.eql(u8, op_text(OP_LT), "<");
+    assert std.mem.eql(u8, op_text(OP_LE), "<=");
+    assert std.mem.eql(u8, op_text(OP_NE), "!=");
+}
+
+test abs_plan_is_the_magnitude {
+    assert run_plan(ABS, true, -1.5, 0.0) == 1.5;
+    assert run_plan(ABS, true, 2.25, 0.0) == 2.25;
+    assert run_plan(BARE_ABS, true, -0.75, 0.0) == 0.75;
+    assert 1.0 / run_plan(ABS, true, bp_neg(0.0), 0.0) > 0.0;
+    assert 1.0 / run_plan(ABS, true, 0.0, 0.0) > 0.0;
+    assert run_plan(ABS, true, bp_div(-1.0, 0.0), 0.0) == bp_div(1.0, 0.0);
+    assert bp_is_nan(run_plan(ABS, true, bp_div(0.0, 0.0), 0.0));
+}
+
+test max_and_min_plans_of_floats {
+    assert run_plan(MAX, true, 1.0, 2.0) == 2.0;
+    assert run_plan(MAX, true, 2.0, 1.0) == 2.0;
+    assert run_plan(MIN, true, 1.0, 2.0) == 1.0;
+    assert run_plan(MIN, true, 2.0, 1.0) == 1.0;
+    assert run_plan(MAX, true, -3.0, -7.5) == -3.0;
+    assert run_plan(MIN, true, -3.0, -7.5) == -7.5;
+    assert run_plan(MAX, true, bp_div(-1.0, 0.0), 5.0) == 5.0;
+    assert run_plan(MIN, true, bp_div(1.0, 0.0), 5.0) == 5.0;
+}
+
+test a_nan_operand_gives_the_other_operand {
+    const nan : f64 = bp_div(0.0, 0.0);
+    assert run_plan(MAX, true, nan, 1.0) == 1.0;
+    assert run_plan(MAX, true, 1.0, nan) == 1.0;
+    assert run_plan(MIN, true, nan, -1.0) == -1.0;
+    assert run_plan(MIN, true, -1.0, nan) == -1.0;
+    assert bp_is_nan(run_plan(MAX, true, nan, nan));
+    assert bp_is_nan(run_plan(MIN, true, nan, nan));
+}
+
+// t27b's choice where Zig leaves the sign to the target (see the header).
+test equal_operands_give_the_first {
+    const nz : f64 = bp_neg(0.0);
+    assert 1.0 / run_plan(MAX, true, nz, 0.0) < 0.0;
+    assert 1.0 / run_plan(MAX, true, 0.0, nz) > 0.0;
+    assert 1.0 / run_plan(MIN, true, nz, 0.0) < 0.0;
+    assert 1.0 / run_plan(MIN, true, 0.0, nz) > 0.0;
+}
+
+test integer_plans_are_one_compare {
+    assert run_plan(MAX, false, -4.0, 3.0) == 3.0;
+    assert run_plan(MAX, false, 3.0, -4.0) == 3.0;
+    assert run_plan(MIN, false, -4.0, 3.0) == -4.0;
+    assert run_plan(MIN, false, 3.0, -4.0) == -4.0;
+    assert run_plan(MAX, false, 200.0, 17.0) == 200.0;
+    assert run_plan(MIN, false, 17.0, 200.0) == 17.0;
+}
+
+test pi_and_e_are_zig_s_digits {
+    assert digit_count(PI_DIGITS) == 51;
+    assert digit_count(E_DIGITS) == 51;
+    assert PI_DIGITS[1] == '.';
+    assert E_DIGITS[1] == '.';
+    assert digits_at(PI_DIGITS, 0, 17) == 31415926535897932;
+    assert digits_at(PI_DIGITS, 17, 17) == 38462643383279502;
+    assert digits_at(PI_DIGITS, 34, 17) == 88419716939937510;
+    assert digits_at(E_DIGITS, 0, 17) == 27182818284590452;
+    assert digits_at(E_DIGITS, 17, 17) == 35360287471352662;
+    assert digits_at(E_DIGITS, 34, 17) == 49775724709369995;
+}
+
+test the_digits_round_to_zig_s_f64_pi_and_e {
+    const p : f64 = std.math.pi;
+    const e : f64 = std.math.e;
+    const dp : f64 = bp_div(digits_at(PI_DIGITS, 0, 17) as f64, 10000000000000000.0) - p;
+    const de : f64 = bp_div(digits_at(E_DIGITS, 0, 17) as f64, 10000000000000000.0) - e;
+    assert dp < 0.000000000000001 and dp > -0.000000000000001;
+    assert de < 0.000000000000001 and de > -0.000000000000001;
+}

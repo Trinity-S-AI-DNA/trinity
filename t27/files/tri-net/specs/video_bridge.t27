@@ -1,0 +1,712 @@
+// Video bridge protocol: phone <-> mesh node video transport.
+// Defines frame format for H.264 NAL units split into mesh-sized fragments.
+// Phone sends raw H.264 Annex-B NAL units via UDP to mesh node.
+// Node fragments into VSTREAM packets for mesh transport.
+// Receiver reassembles and sends back to phone via UDP.
+// phi^2 + phi^-2 = 3
+
+module VideoBridge {
+    use base::types;
+
+    // ---- Fragment format ----
+    const VSTREAM_TYPE: u8 = 8;
+    const FRAG_HEADER_LEN: u8 = 5;
+    const MAX_FRAG_DATA: u8 = 70;
+
+    // ---- Packet type byte positions ----
+    const TYPE_OFFSET: u8 = 0;
+    const SEQ_LOW_OFFSET: u8 = 1;
+    const SEQ_HIGH_OFFSET: u8 = 2;
+    const FRAG_INDEX_OFFSET: u8 = 3;
+    const FRAG_COUNT_OFFSET: u8 = 4;
+
+    // ---- Network ports ----
+    // The device's payload and a peer node's fragments MUST arrive on different
+    // ports. Telling them apart by a magic first byte cannot work: the payload
+    // is sealed end-to-end and its first byte is a random nonce, so one
+    // datagram in 256 collides with VSTREAM_TYPE.
+    const VIDEO_IN_PORT: u16 = 7000;
+    const VIDEO_OUT_PORT: u16 = 7001;
+    const MESH_PORT: u16 = 5000;
+
+    // Latency-sensitive ingress. A node CANNOT tell audio from video: both are
+    // sealed end-to-end and it must never try to read them. But audio behind a
+    // 138-fragment keyframe waits for all 138 to pace out. Measured on hardware,
+    // 20fps video + 50 Opus frames/s through one FIFO bridge:
+    //   audio, no keyframe in flight: p50 =  84ms
+    //   audio, KEYFRAME in flight   : p50 = 182ms
+    // Audio tolerates ~30ms of jitter, so that is an audible dropout every time
+    // a keyframe goes by. The app declares the class by CHOOSING A PORT -- the
+    // same principle that replaced the magic byte: the sender says what it is,
+    // the node never inspects the ciphertext to guess.
+    const AUDIO_IN_PORT: u16 = 7002;
+
+    // ---- Link feedback ----
+    // The node knows its load exactly. The app does not, and adapts by watching
+    // PLI -- decoder feedback from the FAR end, which only arrives after frames
+    // are already broken, and which climbs back up whenever it sees none. So the
+    // encoder discovers the link's capacity by overrunning it, forever.
+    // Measured on a live call: the Mac offered ~2700 frags/s into a 700 frags/s
+    // budget and 44% of its packets were dropped with NOTHING telling it.
+    //
+    // The node reports its own state once a second to its attached device:
+    //   [FEEDBACK_TYPE][util_pct][drop_pct][rate_lo][rate_hi]
+    //
+    // This is PLAINTEXT and that is deliberate: it is local telemetry between a
+    // device and its own node, carries no payload bytes, and says nothing about
+    // content. It is not end-to-end data and must never carry any.
+    // The node sends its ADVICE, not just its numbers. t27c cannot generate
+    // Swift, so any threshold the app re-derived would be a second copy of this
+    // spec that silently drifts -- and the node and the encoder would disagree
+    // about what "full" means. The numbers ride along for the log and the UI;
+    // the advice is what the app obeys.
+    const FEEDBACK_PORT: u16 = 7003;
+    const FEEDBACK_TYPE: u8 = 10;
+    const FEEDBACK_LEN: u8 = 6;
+
+    const ADVICE_HOLD: u8 = 0;
+    const ADVICE_BACK_OFF: u8 = 1;
+    const ADVICE_CLIMB: u8 = 2;
+
+    // ---- Feedback byte positions ----
+    const FB_UTIL_OFFSET: u8 = 1;
+    const FB_DROP_OFFSET: u8 = 2;
+    const FB_RATE_LO_OFFSET: u8 = 3;
+    const FB_RATE_HI_OFFSET: u8 = 4;
+    const FB_ADVICE_OFFSET: u8 = 5;
+
+    // Budget used, as a percentage. Saturates at 100: the count runs into debt
+    // by design (a NAL is admitted whole once it starts), so raw spent/rate can
+    // exceed 1 and a percentage above 100 would only confuse the reader.
+    fn fb_util_pct(spent: u16, rate: u16) -> u8 {
+        if (rate == 0) {
+            return 100;
+        }
+        let scaled: u32 = spent as u32;
+        let pct: u32 = (scaled * 100) / rate;
+        if (pct > 100) {
+            return 100;
+        }
+        return pct as u8;
+    }
+
+    // Share of offered payloads the node had to drop, as a percentage.
+    //
+    // Widen both source operands explicitly before arithmetic. A typed local
+    // declaration alone does not convert an existing u16 value in generated
+    // Rust; multiplication must happen in u32, not overflow in u16 first.
+    fn fb_drop_pct(dropped: u16, offered: u16) -> u8 {
+        if (offered == 0) {
+            return 0;
+        }
+        let scaled: u32 = dropped as u32;
+        let total: u32 = offered as u32;
+        let pct: u32 = (scaled * 100) / total;
+        return pct as u8;
+    }
+
+    // NO DEAD ZONE. Back off at >=85% or any drop; otherwise CLIMB. An earlier
+    // design held between 60/75 and 85 to damp oscillation -- but a sweep proved
+    // that only made the loop freeze at an arbitrary point and waste ~25% of the
+    // link (it does not seek the ceiling, it just stops when it lands in the
+    // band). Damping belongs in the STEP LAW, not a dead zone: the app climbs
+    // ADDITIVELY (+15 frags/s) and backs off MULTIPLICATIVELY (x0.9). That is
+    // AIMD, and it seeks.
+    //
+    // Swept on hardware, 60s each, from 2000 frags/s into a 700 budget, showing
+    // the step law is the real lever and the dead zone was a red herring:
+    //   dead zone 75/85, x1.2 up, x0.7 down -> 493 (70%), swing 36% (today's app!)
+    //   no zone,  +25 up, x0.7 down         -> 481 (69%), swing 21%
+    //   no zone,  +25 up, x0.9 down         -> 602 (86%), swing 28%
+    //   no zone,  +15 up, x0.9 down         -> 543 (78%), swing 14%, ZERO steady drops
+    // The gentle multiplicative DECREASE (x0.9 not x0.7) is what recovered the
+    // wasted headroom; the additive increase is what stopped the oscillation.
+    // +15/x0.9 chosen: highest utilisation with swing a video call tolerates.
+    const CLIMB_BELOW_PCT: u8 = 85;
+    const BACK_OFF_AT_PCT: u8 = 85;
+
+    // Is the link asking the encoder to back off? Drops mean it is ALREADY too
+    // late; high utilisation means it is about to be. React to either.
+    fn fb_should_back_off(util_pct: u8, drop_pct: u8, back_off_at: u8) -> bool {
+        if (drop_pct > 0) {
+            return true;
+        }
+        return util_pct >= back_off_at;
+    }
+
+    // Is there room to climb? Must sit BELOW the back-off threshold: with a
+    // single margin the encoder oscillates across it forever.
+    fn fb_may_climb(util_pct: u8, drop_pct: u8, climb_below: u8) -> bool {
+        if (drop_pct > 0) {
+            return false;
+        }
+        return util_pct < climb_below;
+    }
+
+    // What the node tells the encoder to do. The ONLY place this is decided.
+    fn fb_advice(util_pct: u8, drop_pct: u8, climb_below: u8, back_off_at: u8) -> u8 {
+        if (fb_should_back_off(util_pct, drop_pct, back_off_at)) {
+            return ADVICE_BACK_OFF;
+        }
+        if (fb_may_climb(util_pct, drop_pct, climb_below)) {
+            return ADVICE_CLIMB;
+        }
+        return ADVICE_HOLD;
+    }
+
+    // ---- Sequence space partition ----
+    // The video uplink and the express (audio) path each keep their own seq
+    // counter, but the peer reassembles BOTH from one map keyed by seq alone.
+    // On a real call they advance at nearly the same rate (~44 video NALs/s,
+    // ~50 audio frames/s), so equal seqs coexist within the reassembly GC
+    // window and splice fragments of different payloads together. Partition
+    // the u16 space instead: video owns 0..32767, express owns 32768..65535.
+    const SEQ_EXPRESS_BASE: u16 = 32768;
+
+    fn video_seq(counter: u16) -> u16 {
+        return counter % 32768;
+    }
+
+    fn express_seq(counter: u16) -> u16 {
+        return (counter % 32768) + 32768;
+    }
+
+    // ---- Link-delivery feedback (node to node) ----
+    // FRAG_RATE_PER_SEC is a CONFIGURED ceiling; a radio's real capacity moves
+    // with range and fading. Capacity below saturation is unmeasurable, but a
+    // saturated link states its own capacity: it is what actually ARRIVES. The
+    // receiving node reports once a second, on the mesh port, how many VSTREAM
+    // fragments it received:
+    //   [RX_REPORT_TYPE][cnt_lo][cnt_hi]
+    // Plaintext counters only -- no payload bytes, nothing about content, and
+    // it must never carry any.
+    const RX_REPORT_TYPE: u8 = 11;
+    const RX_REPORT_LEN: u8 = 3;
+
+    // The rate the encoder should be steered against. Delivered >= 90% of sent
+    // means the link is keeping up -- no capacity signal, trust the configured
+    // ceiling (measuring capacity below saturation is impossible). Real loss
+    // means the link has stated its throughput: what got through.
+    //
+    // Cast the source operands explicitly before the wide threshold product.
+    fn fb_effective_rate(sent: u16, delivered: u16, configured: u16) -> u16 {
+        if (sent == 0) {
+            return configured;
+        }
+        let s: u32 = sent as u32;
+        let d: u32 = delivered as u32;
+        let threshold: u32 = (s * 9) / 10;
+        if (d >= threshold) {
+            return configured;
+        }
+        return delivered;
+    }
+
+    // ---- Multi-hop chain report ----
+    // A relay hop reports UPSTREAM the minimum of what reached it and what its
+    // own downstream reported back. The bottleneck hop thereby propagates all
+    // the way to the origin encoder, hop by hop, without any hop knowing the
+    // chain's length.
+    fn fb_chain_report(received_here: u16, downstream_delivered: u16) -> u16 {
+        if (downstream_delivered < received_here) {
+            return downstream_delivered;
+        }
+        return received_here;
+    }
+
+    // ---- Fragment-layer FEC ----
+    // Reassembly is all-or-nothing: ONE lost 70-byte fragment destroys the
+    // whole NAL, and an I-frame is 129 fragments. One XOR parity per group of
+    // ~FEC_GROUP fragments recovers any single loss within that group, at
+    // 1/FEC_GROUP overhead.
+    //
+    // GROUPS ARE INTERLEAVED, NOT CONTIGUOUS. Group g holds fragments
+    // g, g+stride, g+2*stride, ... where stride = the number of groups.
+    // Contiguous groups (g = idx/16) only survive ISOLATED loss, and neither
+    // loss source this system has is isolated: a full socket buffer drops
+    // consecutive arrivals, and a fading radio drops consecutive symbols.
+    // Measured on hardware with contiguous groups, 9000B NAL, same loss count:
+    //   2 scattered -> DELIVERED   2 consecutive -> LOST
+    //   8 scattered -> DELIVERED   8 consecutive -> LOST
+    // Interleaving spreads a burst of up to `stride` consecutive losses across
+    // `stride` different groups: one each, every one repairable. Same overhead,
+    // same packet count, only the index mapping changes.
+    //
+    // Parity wire format (6-byte header, then XOR over the group's cells each
+    // padded to MAX_FRAG_DATA):
+    //   [VSTREAM_FEC_TYPE][seq_lo][seq_hi][group_idx][frag_count][last_len][xor:70]
+    //
+    // last_len travels in the PARITY because it is the byte length of the NAL's
+    // final fragment: without it a receiver that lost exactly that fragment
+    // could recover its bytes but not know how many of them are real.
+    const VSTREAM_FEC_TYPE: u8 = 9;
+    const FEC_HEADER_LEN: u8 = 6;
+    const FEC_GROUP: u8 = 16;
+
+    // ---- Parity byte positions ----
+    const FEC_GROUP_OFFSET: u8 = 3;
+    const FEC_COUNT_OFFSET: u8 = 4;
+    const FEC_LAST_LEN_OFFSET: u8 = 5;
+
+    // How many parity packets a NAL of frag_count fragments needs. This is also
+    // the interleave stride and therefore the longest burst FEC can absorb.
+    fn fec_group_count(frag_count: u8) -> u8 {
+        if (frag_count == 0) {
+            return 0;
+        }
+        let full: u8 = frag_count / 16;
+        let remainder: u8 = frag_count % 16;
+        if (remainder > 0) {
+            return (full + 1);
+        }
+        return full;
+    }
+
+    // Distance between consecutive fragments of the same group.
+    fn fec_stride(frag_count: u8) -> u8 {
+        return fec_group_count(frag_count);
+    }
+
+    // Which parity group a fragment belongs to
+    fn fec_group_of(frag_idx: u8, frag_count: u8) -> u8 {
+        let stride: u8 = fec_group_count(frag_count);
+        return frag_idx % stride;
+    }
+
+    // First fragment index covered by a group. Interleaved, so the group index
+    // IS its first fragment.
+    fn fec_group_first(group_idx: u8) -> u8 {
+        return group_idx;
+    }
+
+    // How many fragments a group covers: the count of indices below frag_count
+    // that are congruent to group_idx modulo the stride.
+    fn fec_group_len(group_idx: u8, frag_count: u8) -> u8 {
+        if (group_idx >= frag_count) {
+            return 0;
+        }
+        let stride: u8 = fec_group_count(frag_count);
+        let span: u8 = frag_count - group_idx - 1;
+        return ((span / stride) + 1);
+    }
+
+    // A group is recoverable iff EXACTLY one of its fragments is missing:
+    // zero needs no repair, two or more cannot be told apart by one XOR.
+    fn fec_can_recover(missing_in_group: u8) -> bool {
+        return missing_in_group == 1;
+    }
+
+    // Total size of a parity packet on the wire
+    fn fec_packet_size() -> u8 {
+        return FEC_HEADER_LEN + MAX_FRAG_DATA;
+    }
+
+    // Extract sequence number from fragment header (little-endian u16)
+    // Param names must not shadow the seq_lo/seq_hi module fns below.
+    fn frag_seq(s_lo: u8, s_hi: u8) -> u16 {
+        let lo: u16 = s_lo as u16;
+        let hi: u16 = s_hi as u16;
+        return lo + (hi * 256);
+    }
+
+    // Split sequence into bytes
+    fn seq_lo(seq: u16) -> u8 {
+        let low: u16 = seq % 256;
+        return low as u8;
+    }
+
+    fn seq_hi(seq: u16) -> u8 {
+        let high: u16 = seq / 256;
+        return high as u8;
+    }
+
+    // Calculate number of fragments needed for a NAL unit of given size
+    fn fragment_count(nal_size: u16) -> u8 {
+        if (nal_size == 0) {
+            return 1;
+        }
+        let full_frags: u16 = nal_size / 70;
+        let remainder: u16 = nal_size % 70;
+        if (remainder > 0) {
+            return (full_frags + 1) as u8;
+        }
+        return full_frags as u8;
+    }
+
+    // Total packet size for a fragment with given data length
+    fn packet_size(data_len: u8) -> u8 {
+        return FRAG_HEADER_LEN + data_len;
+    }
+
+    // Is this the last fragment?
+    fn is_last_fragment(frag_idx: u8, frag_count: u8) -> bool {
+        return (frag_idx + 1) == frag_count;
+    }
+
+    // Is this the first fragment?
+    fn is_first_fragment(frag_idx: u8) -> bool {
+        return frag_idx == 0;
+    }
+
+    // Data offset in a fragment packet (where payload starts)
+    fn data_offset() -> u8 {
+        return FRAG_HEADER_LEN;
+    }
+
+    // Maximum NAL unit size that fits in 255 fragments
+    fn max_nal_size() -> u16 {
+        return 17850;
+    }
+
+    // Check if a NAL unit size is within limits
+    fn nal_fits(nal_size: u16) -> bool {
+        return nal_size <= 17850;
+    }
+
+    // ---- TDD (L4) ----
+
+    test frag_seq_roundtrip {
+        assert(frag_seq(0xAB, 0xCD) == 52651, "0xAB + 0xCD*256 = 52651");
+    }
+
+    test frag_seq_zero {
+        assert(frag_seq(0, 0) == 0, "zero seq");
+    }
+
+    test frag_seq_max {
+        assert(frag_seq(255, 255) == 65535, "max u16");
+    }
+
+    test seq_lo_basic {
+        assert(seq_lo(256) == 0, "256 mod 256 = 0");
+    }
+
+    test seq_hi_basic {
+        assert(seq_hi(256) == 1, "256 / 256 = 1");
+    }
+
+    test seq_lo_hi_roundtrip {
+        let lo: u8 = seq_lo(12345);
+        let hi: u8 = seq_hi(12345);
+        assert(frag_seq(lo, hi) == 12345, "roundtrip preserves value");
+    }
+
+    test fragment_count_exact {
+        assert(fragment_count(70) == 1, "70 bytes = 1 fragment");
+    }
+
+    test fragment_count_remainder {
+        assert(fragment_count(100) == 2, "100 bytes = 2 fragments");
+    }
+
+    test fragment_count_zero {
+        assert(fragment_count(0) == 1, "0 bytes = 1 fragment");
+    }
+
+    test fragment_count_large {
+        assert(fragment_count(210) == 3, "210 bytes = 3 fragments");
+    }
+
+    test packet_size_basic {
+        assert(packet_size(70) == 75, "5 header + 70 data = 75");
+    }
+
+    test packet_size_empty {
+        assert(packet_size(0) == 5, "5 header + 0 data = 5");
+    }
+
+    test is_last_basic {
+        assert(is_last_fragment(2, 3) == true, "frag 2 of 3 is last");
+    }
+
+    test is_last_not_last {
+        assert(is_last_fragment(0, 3) == false, "frag 0 of 3 is not last");
+    }
+
+    test is_first_basic {
+        assert(is_first_fragment(0) == true, "frag 0 is first");
+    }
+
+    test is_first_not_first {
+        assert(is_first_fragment(1) == false, "frag 1 is not first");
+    }
+
+    test data_offset_value {
+        assert(data_offset() == 5, "payload starts at byte 5");
+    }
+
+    test max_nal_size_value {
+        assert(max_nal_size() == 17850, "255 * 70 = 17850");
+    }
+
+    test nal_fits_small {
+        assert(nal_fits(100) == true, "100 <= 17850");
+    }
+
+    test nal_fits_exact {
+        assert(nal_fits(17850) == true, "17850 <= 17850");
+    }
+
+    test nal_fits_too_large {
+        assert(nal_fits(17851) == false, "17851 > 17850");
+    }
+
+    // ---- FEC tests ----
+
+    test fec_group_of_first {
+        assert(fec_group_of(0, 129) == 0, "fragment 0 is in group 0");
+    }
+
+    test fec_group_of_interleaved {
+        assert(fec_group_of(1, 129) == 1, "the NEXT fragment is in the NEXT group");
+    }
+
+    test fec_group_of_wraps_by_stride {
+        assert(fec_group_of(9, 129) == 0, "129 frags = 9 groups, so 9 rejoins group 0");
+    }
+
+    test fec_group_of_burst_spreads {
+        assert(fec_group_of(20, 129) == 2, "20 mod 9 = 2");
+        assert(fec_group_of(21, 129) == 3, "consecutive fragments land in DIFFERENT groups");
+    }
+
+    test fec_group_count_exact {
+        assert(fec_group_count(32) == 2, "32 fragments = 2 full groups");
+    }
+
+    test fec_group_count_remainder {
+        assert(fec_group_count(33) == 3, "33 fragments needs a third group");
+    }
+
+    test fec_group_count_single {
+        assert(fec_group_count(1) == 1, "1 fragment still needs a parity");
+    }
+
+    test fec_group_count_empty {
+        assert(fec_group_count(0) == 0, "no fragments, no parity");
+    }
+
+    test fec_group_count_keyframe {
+        assert(fec_group_count(129) == 9, "a 9000B I-frame needs 9 parities");
+    }
+
+    test fec_group_first_is_the_index {
+        assert(fec_group_first(2) == 2, "interleaved: group 2 starts at fragment 2");
+    }
+
+    test fec_group_len_interleaved {
+        assert(fec_group_len(0, 129) == 15, "frags 0,9,...,126 = 15 of them");
+    }
+
+    test fec_group_len_short_group {
+        assert(fec_group_len(8, 129) == 14, "frags 8,17,...,125 = 14 of them");
+    }
+
+    test fec_stride_is_the_burst_we_survive {
+        assert(fec_stride(129) == 9, "9 groups = 9 consecutive losses absorbed");
+    }
+
+    test fec_group_len_single {
+        assert(fec_group_len(0, 1) == 1, "a lone fragment is a group of one");
+    }
+
+    test fec_can_recover_one {
+        assert(fec_can_recover(1) == true, "exactly one loss is repairable");
+    }
+
+    test fec_can_recover_none {
+        assert(fec_can_recover(0) == false, "nothing missing, nothing to repair");
+    }
+
+    test fec_can_recover_two {
+        assert(fec_can_recover(2) == false, "one XOR cannot separate two losses");
+    }
+
+    test fb_util_half {
+        assert(fb_util_pct(400, 800) == 50, "400 of 800 is half the budget");
+    }
+
+    test fb_util_saturates {
+        assert(fb_util_pct(900, 800) == 100, "debt must not report over 100%");
+    }
+
+    test fb_util_zero_rate {
+        assert(fb_util_pct(10, 0) == 100, "a zero-rate link is by definition full");
+    }
+
+    test fb_drop_none {
+        assert(fb_drop_pct(0, 300) == 0, "nothing dropped");
+    }
+
+    test fb_drop_the_measured_44 {
+        assert(fb_drop_pct(1055, 2392) == 44, "the live call's real numbers");
+    }
+
+    test fb_drop_nothing_offered {
+        assert(fb_drop_pct(0, 0) == 0, "an idle link is not a dropping link");
+    }
+
+    test fb_back_off_on_any_drop {
+        assert(fb_should_back_off(10, 1, 85) == true, "a drop means it is already too late");
+    }
+
+    test fb_back_off_when_nearly_full {
+        assert(fb_should_back_off(85, 0, 85) == true, "85% is about to be too late");
+    }
+
+    test fb_hold_when_comfortable {
+        assert(fb_should_back_off(70, 0, 85) == false, "70% needs no action");
+    }
+
+    test fb_climb_only_when_clear {
+        assert(fb_may_climb(50, 0, 60) == true, "half empty, climb");
+    }
+
+    test fb_no_climb_after_a_drop {
+        assert(fb_may_climb(10, 5, 60) == false, "never climb into a link that just dropped");
+    }
+
+    test fb_advice_backs_off_on_drops {
+        assert(fb_advice(10, 3, 75, 85) == ADVICE_BACK_OFF, "any drop overrides everything");
+    }
+
+    test fb_advice_climbs_when_empty {
+        assert(fb_advice(20, 0, 75, 85) == ADVICE_CLIMB, "quiet link, climb");
+    }
+
+    test fb_advice_holds_in_the_band {
+        // HOLD zone is [climb_below, back_off_at) = [75, 85): 80 sits inside it.
+        // (70 < climb_below legitimately CLIMBS -- the old vector contradicted
+        // the thresholds it passed.)
+        assert(fb_advice(80, 0, 75, 85) == ADVICE_HOLD, "75..85 is the hysteresis band");
+    }
+
+    test fb_advice_backs_off_when_full {
+        assert(fb_advice(95, 0, 75, 85) == ADVICE_BACK_OFF, "95% is full enough");
+    }
+
+    test fb_hysteresis_gap_exists {
+        // 60..85 is neither climb nor back off. Without that band the encoder
+        // oscillates across a single threshold forever.
+        assert(fb_may_climb(70, 0, 60) == false, "70% must not climb");
+        assert(fb_should_back_off(70, 0, 85) == false, "...nor back off: it holds");
+    }
+
+    test video_seq_stays_low {
+        assert(video_seq(40000) == 7232, "video wraps inside 0..32767");
+    }
+
+    test express_seq_stays_high {
+        assert(express_seq(0) == 32768, "express lives in the high half");
+    }
+
+    test seq_halves_never_collide {
+        assert(video_seq(100) != express_seq(100), "same counter, disjoint keys");
+    }
+
+    test effective_rate_idle_is_configured {
+        assert(fb_effective_rate(0, 0, 700) == 700, "an idle link says nothing");
+    }
+
+    test effective_rate_lossless_is_configured {
+        assert(fb_effective_rate(500, 495, 700) == 700, "keeping up: no signal");
+    }
+
+    test effective_rate_saturated_is_delivered {
+        assert(fb_effective_rate(700, 300, 700) == 300, "a lossy link states its capacity");
+    }
+
+    test effective_rate_boundary {
+        assert(fb_effective_rate(700, 630, 700) == 700, "exactly 90% still counts as keeping up");
+        assert(fb_effective_rate(700, 629, 700) == 629, "below 90% is loss");
+    }
+
+    test chain_report_takes_the_bottleneck {
+        assert(fb_chain_report(500, 200) == 200, "downstream is the bottleneck");
+    }
+
+    test chain_report_takes_local_when_downstream_keeps_up {
+        assert(fb_chain_report(300, 500) == 300, "this hop is the bottleneck");
+    }
+
+    test chain_report_equal {
+        assert(fb_chain_report(400, 400) == 400, "no bottleneck, same figure");
+    }
+
+    test fec_packet_size_value {
+        assert(fec_packet_size() == 76, "6 header + 70 data = 76");
+    }
+
+    // ---- Full-width arithmetic regression tests ----
+
+    test util_pct_wide_product {
+        assert(fb_util_pct(32768, 65535) == 50, "u16 spent needs a wide product");
+    }
+
+    test drop_pct_u16_boundary {
+        assert(fb_drop_pct(65535, 65535) == 100, "full-width drop counts do not overflow");
+    }
+
+    test effective_rate_wide_threshold {
+        assert(fb_effective_rate(65535, 58980, 65535) == 58980, "full-width 90 percent threshold");
+    }
+
+    // ---- invariants ----
+
+    invariant frag_header_is_5_bytes {
+        assert(FRAG_HEADER_LEN == 5, "frag_header_is_5_bytes");
+    }
+
+    invariant max_data_is_70 {
+        assert(MAX_FRAG_DATA == 70, "max_data_is_70");
+    }
+
+    invariant vstream_type_is_8 {
+        assert(VSTREAM_TYPE == 8, "vstream_type_is_8");
+    }
+
+    // A parity packet must be distinguishable from a data fragment on the wire.
+    invariant fec_type_differs_from_data_type {
+        assert(VSTREAM_FEC_TYPE != VSTREAM_TYPE, "fec_type_differs_from_data_type");
+    }
+
+    // The parity header carries one extra byte (last_len) over a data header.
+    invariant fec_header_is_one_longer {
+        assert(FEC_HEADER_LEN == 6, "fec_header_is_one_longer");
+    }
+
+    // Class is declared by port, so the ports must not collide.
+    invariant audio_port_differs_from_video {
+        assert(AUDIO_IN_PORT != VIDEO_IN_PORT, "audio_port_differs_from_video");
+    }
+
+    invariant feedback_port_is_its_own {
+        assert(FEEDBACK_PORT != AUDIO_IN_PORT, "feedback_port_is_its_own");
+    }
+
+    // The hysteresis gap is the whole point: one threshold oscillates.
+    invariant feedback_carries_advice {
+        assert(FEEDBACK_LEN == 6, "feedback_carries_advice");
+    }
+
+    // The three verdicts must stay distinct or the app cannot tell them apart.
+    invariant advice_values_are_distinct {
+        assert(ADVICE_BACK_OFF != ADVICE_CLIMB, "advice_values_are_distinct");
+    }
+
+    // No dead zone: climb up to the same point we back off at. Damping is in the
+    // AIMD step law, not a band. If these ever diverge again, a HOLD region
+    // reopens and the loop will freeze in it (measured: ~25% link wasted).
+    invariant no_dead_zone {
+        assert(CLIMB_BELOW_PCT == BACK_OFF_AT_PCT, "no_dead_zone");
+    }
+
+    // The rx-report must not be mistaken for a fragment or a parity.
+    invariant rx_report_type_is_distinct {
+        assert(RX_REPORT_TYPE != VSTREAM_TYPE, "rx_report_type_is_distinct");
+    }
+
+    invariant rx_report_differs_from_fec {
+        assert(RX_REPORT_TYPE != VSTREAM_FEC_TYPE, "rx_report_differs_from_fec");
+    }
+}

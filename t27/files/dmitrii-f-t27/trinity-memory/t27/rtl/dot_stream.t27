@@ -1,0 +1,169 @@
+module TrinityDotStreamT27;
+
+// Native two-stage framed ternary/int8 dot pipeline. Configuration inputs
+// dense_mode, min_value and max_value must remain constant throughout a run.
+// The thin RTL adapter binds them from DENSE5 and ACC_WIDTH parameters.
+// Synchronous reset is an ordinary input. Tie compiler rst_n/en ports high.
+
+fn dense_digit(code: u16, divisor: u16) -> u16 {
+    var digit: u16 = (code / divisor) % 3;
+    if (digit == 0) { return 2; }
+    if (digit == 1) { return 0; }
+    return 1;
+}
+
+fn decode(code: u16, dense_mode: bool) -> u16 {
+    if (dense_mode) {
+        if (code < 243) {
+            return 1024 | dense_digit(code, 1) | (dense_digit(code, 3) << 2)
+                | (dense_digit(code, 9) << 4) | (dense_digit(code, 27) << 6)
+                | (dense_digit(code, 81) << 8);
+        }
+        return 0;
+    }
+    if (code < 1024 && (code & 3) < 3 && ((code >> 2) & 3) < 3
+        && ((code >> 4) & 3) < 3 && ((code >> 6) & 3) < 3
+        && ((code >> 8) & 3) < 3) {
+        return 1024 | code;
+    }
+    return 0;
+}
+
+fn activation(acts: u64, shift: u32) -> i16 {
+    var byte_value: i16 = ((acts >> shift) & 255) as i16;
+    if (byte_value >= 128) { return byte_value - 256; }
+    return byte_value;
+}
+
+fn product(lanes: u16, acts: u64, mask: u8, lane: u32) -> i16 {
+    if (((mask >> lane) & 1) == 1) {
+        var trit: u16 = (lanes >> (lane << 1)) & 3;
+        var value: i16 = activation(acts, lane << 3);
+        if (trit == 1) { return value; }
+        if (trit == 2) { return -value; }
+    }
+    return 0;
+}
+
+fn sum_group(lanes: u16, acts: u64, mask: u8) -> i16 {
+    return product(lanes, acts, mask, 0) + product(lanes, acts, mask, 1)
+        + product(lanes, acts, mask, 2) + product(lanes, acts, mask, 3)
+        + product(lanes, acts, mask, 4);
+}
+
+fn valid_mask(mask: u8, last: bool) -> bool {
+    if (last == true) {
+        if (mask == 0 || mask == 1 || mask == 3 || mask == 7 || mask == 15 || mask == 31) {
+            return true;
+        }
+        return false;
+    }
+    if (last == false && mask == 31) { return true; }
+    return false;
+}
+
+fn valid_lane(lanes: u16, acts: u64, mask: u8, lane: u32) -> bool {
+    if (((mask >> lane) & 1) == 1) { return true; }
+    if (((mask >> lane) & 1) == 0 && ((lanes >> (lane << 1)) & 3) == 0
+        && ((acts >> (lane << 3)) & 255) == 0) {
+        return true;
+    }
+    return false;
+}
+
+fn valid_group(lanes: u16, acts: u64, mask: u8, last: bool) -> bool {
+    if ((lanes & 1024) == 1024 && valid_mask(mask, last)
+        && valid_lane(lanes, acts, mask, 0) && valid_lane(lanes, acts, mask, 1)
+        && valid_lane(lanes, acts, mask, 2) && valid_lane(lanes, acts, mask, 3)
+        && valid_lane(lanes, acts, mask, 4)) {
+        return true;
+    }
+    return false;
+}
+
+var stage_valid: bool = false;
+var stage_sum: i16 = 0;
+var stage_error: bool = false;
+var stage_last: bool = false;
+var stage_empty: bool = false;
+var accumulator: i32 = 0;
+var frame_error: bool = false;
+var frame_active: bool = false;
+var out_valid: bool = false;
+var out_result: i32 = 0;
+var out_error: bool = false;
+
+// No initializer: these are combinational outputs, not reset-driven state.
+var in_ready: bool;
+var accumulate_ready: bool;
+var decoded: u16;
+var group_sum: i16;
+var group_ok: bool;
+var next_total: i64;
+var next_error: bool;
+accumulate_ready = !out_valid || out_ready;
+in_ready = !reset && (!stage_valid || accumulate_ready);
+decoded = decode(in_code, dense_mode);
+group_sum = sum_group(decoded, in_activations, in_mask);
+group_ok = valid_group(decoded, in_activations, in_mask, in_last);
+next_total = (accumulator as i64) + (stage_sum as i64);
+next_error = frame_error || stage_error || next_total < min_value
+    || next_total > max_value || (stage_empty && frame_active);
+
+fn on_clock(reset: bool, in_valid: bool, in_code: u16, in_activations: u64,
+            in_mask: u8, in_last: bool, out_ready: bool, dense_mode: bool,
+            min_value: i64, max_value: i64) {
+    if (reset) {
+        stage_valid = false;
+        stage_sum = 0;
+        stage_error = false;
+        stage_last = false;
+        stage_empty = false;
+        accumulator = 0;
+        frame_error = false;
+        frame_active = false;
+        out_valid = false;
+        out_result = 0;
+        out_error = false;
+    } else {
+        if (out_valid && out_ready) { out_valid = false; }
+        if (stage_valid && accumulate_ready) {
+            stage_valid = false;
+            if (stage_last) {
+                out_valid = true;
+                out_error = next_error;
+                if (next_error) { out_result = 0; }
+                else { out_result = next_total as i32; }
+                accumulator = 0;
+                frame_error = false;
+                frame_active = false;
+            } else {
+                if (next_error) { accumulator = 0; }
+                else { accumulator = next_total as i32; }
+                frame_error = next_error;
+                frame_active = true;
+            }
+        }
+        if (in_valid && in_ready) {
+            stage_valid = true;
+            stage_sum = group_sum;
+            stage_error = !group_ok;
+            stage_last = in_last;
+            stage_empty = in_mask == 0;
+        }
+    }
+}
+
+test decode_zero { assert_eq(decode(121, true), 1024); }
+test decode_reserved { assert_eq(decode(243, true), 0); }
+test decode_high_bits { assert_eq(decode(377, true), 0); }
+test baseline_reserved { assert_eq(decode(3, false), 0); }
+test int8_minimum { assert_eq(activation(128, 0), -128); }
+test int8_maximum { assert_eq(activation(127, 0), 127); }
+test widened_negation { assert_eq(product(2, 128, 1, 0), 128); }
+test padded_weights_rejected { assert_eq(valid_group(1281, 0, 1, true), false); }
+test padded_activation_rejected { assert_eq(valid_group(1024, 256, 1, true), false); }
+test hole_rejected { assert_eq(valid_mask(11, true), false); }
+test nonlast_tail_rejected { assert_eq(valid_mask(3, false), false); }
+test empty_frame { assert_eq(valid_group(1024, 0, 0, true), true); }
+endmodule

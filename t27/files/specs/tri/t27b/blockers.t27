@@ -1,0 +1,410 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/tri/t27b/blockers.t27 -- the greedy order of `t27b corpus --blockers`, its replay, and FNV-1a 64
+; (port epic #6198, issue #7673). Until this file, all three were hand-written Rust in
+; cli/t27b/src/blockers.rs. Now they reach cli/t27b through `t27c gen-rust` (gen/rust/tri/t27b/blockers.rs).
+; The rest of blockers.rs is I/O and stays glue: it spawns and times out processes, runs the reference
+; (`t27c test-report`) and reads and appends its cache file. The glue around this file only names the
+; constructs and lays the files out as rows of 0/1, as described below.
+; --
+; A file is unlocked only when every construct it uses is supported, so the count of first rejections says
+; little about what to build next: a construct that is the first rejection in 300 files may be the last one
+; in none. `t27b corpus --blockers` works from the full set of constructs each file needs and orders the
+; constructs greedily by the number of whole files each one unlocks, given the ones already chosen.
+; --
+; The layout. The constructs are numbered in name order (byte order, as Rust's BTreeSet keeps them), and
+; the files are the rows of a matrix m of nf rows by nc columns: m[f * nc + c] is 1 when file f needs
+; construct c, else 0. A row of zeros is a file that needs nothing; it is already unlocked and is never
+; counted. Supporting construct c clears column c.
+; --
+; The order. Each step picks the construct that unlocks the most files outright. When no single construct
+; unlocks any file, it picks the one that moves the most files closest to done: the score of a construct is
+; the sum, over the files that need it, of 1 / (constructs the file still needs), added in file order. Ties
+; go to the construct needed by more files, then to the name (the lower number), so the order is
+; deterministic. It stops when every file is unlocked.
+; --
+; The oracle. Every order, count and hash in the tests below was printed by the hand-written Rust this file
+; replaces (cli/t27b/src/blockers.rs `greedy`, `replay` and `fnv64` on master 0fbb0a033, run on the t27c
+; Railway lab). The fixtures G1 and G2 are the ones of cli/t27b/tests/blockers.rs.
+; ASCII only (L3)
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module T27bBlockers;
+
+/// FNV-1a, 64 bits: the offset basis and the prime.
+pub const FNV_OFFSET : u64 = 0xcbf29ce484222325;
+pub const FNV_PRIME : u64 = 0x100000001b3;
+
+/// FNV-1a, 64 bits, over bytes: the key of a spec's source and of the toolchain in the reference cache.
+pub fn fnv64(bytes: []const u8) -> u64 {
+    var h : u64 = FNV_OFFSET;
+    var i : usize = 0;
+    while (i < bytes.len) {
+        h = (h ^ (bytes[i] as u64)) *% FNV_PRIME;
+        i = i + 1;
+    }
+    return h;
+}
+
+/// The constructs file f still needs: the 1s of row f.
+pub fn need(m: []const u8, nc: usize, f: usize) -> usize {
+    var k : usize = 0;
+    var c : usize = 0;
+    while (c < nc) {
+        if (m[f * nc + c] != 0) {
+            k = k + 1;
+        }
+        c = c + 1;
+    }
+    return k;
+}
+
+/// The construct to support next, or nc when no file needs anything. A construct no file needs scores
+/// (0, 0.0, 0) and never beats the start, so it is never picked.
+pub fn pick(m: []const u8, nf: usize, nc: usize) -> usize {
+    var best : usize = nc;
+    var best_unlocks : usize = 0;
+    var best_score : f64 = 0.0;
+    var best_files : usize = 0;
+    var c : usize = 0;
+    while (c < nc) {
+        var unlocks : usize = 0;
+        var score : f64 = 0.0;
+        var files : usize = 0;
+        var f : usize = 0;
+        while (f < nf) {
+            if (m[f * nc + c] != 0) {
+                const k : usize = need(m, nc, f);
+                if (k == 1) {
+                    unlocks = unlocks + 1;
+                }
+                score = score + 1.0 / (k as f64);
+                files = files + 1;
+            }
+            f = f + 1;
+        }
+        if (unlocks > best_unlocks or (unlocks == best_unlocks and (score > best_score or (score == best_score and files > best_files)))) {
+            best = c;
+            best_unlocks = unlocks;
+            best_score = score;
+            best_files = files;
+        }
+        c = c + 1;
+    }
+    return best;
+}
+
+/// Support construct c: clear column c. Returns the files that needed c and now need nothing.
+pub fn take(m: []u8, nf: usize, nc: usize, c: usize) -> usize {
+    var unlocked : usize = 0;
+    var f : usize = 0;
+    while (f < nf) {
+        if (m[f * nc + c] != 0) {
+            m[f * nc + c] = 0;
+            if (need(m, nc, f) == 0) {
+                unlocked = unlocked + 1;
+            }
+        }
+        f = f + 1;
+    }
+    return unlocked;
+}
+
+/// The greedy order over m, which it consumes. Step i supports construct at[i], which unlocks got[i] more
+/// files, cum[i] in all. at, got and cum have room for nc steps; returns the number of steps.
+pub fn greedy(m: []u8, nf: usize, nc: usize, at: []usize, got: []usize, cum: []usize) -> usize {
+    var steps : usize = 0;
+    var total : usize = 0;
+    var c : usize = pick(m, nf, nc);
+    while (c < nc) {
+        const unlocked : usize = take(m, nf, nc, c);
+        total = total + unlocked;
+        at[steps] = c;
+        got[steps] = unlocked;
+        cum[steps] = total;
+        steps = steps + 1;
+        c = pick(m, nf, nc);
+    }
+    return steps;
+}
+
+/// The files of m unlocked after each step of an order (at, one construct per step), which m is consumed
+/// by: cum[i] counts the files whose every construct is among at[0..i+1]. A construct the order never names
+/// keeps its files locked; one no file needs unlocks nothing.
+pub fn replay(m: []u8, nf: usize, nc: usize, at: []const usize, cum: []usize) -> void {
+    var total : usize = 0;
+    var i : usize = 0;
+    while (i < at.len) {
+        total = total + take(m, nf, nc, at[i]);
+        cum[i] = total;
+        i = i + 1;
+    }
+}
+
+// ------------------------------------------------------------------ tests
+
+test fnv64_is_fnv1a_64 {
+    assert fnv64("") == 0xcbf29ce484222325;
+    assert fnv64("a") == 0xaf63dc4c8601ec8c;
+    assert fnv64("foobar") == 0x85944171f73967e8;
+    // a byte with the top bit set is xored in as is, not sign-extended
+    const high : [3]u8 = [255, 0, 128];
+    assert fnv64(high[0..3]) == 0xf920891be415651e;
+    // the prefixes of the t27c binary's key and of the toolchain key
+    const content : [13]u8 = [116, 50, 55, 99, 45, 99, 111, 110, 116, 101, 110, 116, 0];
+    assert fnv64(content[0..13]) == 0xe6cd9d7d70e030df;
+    const zig : [9]u8 = [116, 50, 55, 99, 43, 122, 105, 103, 0];
+    assert fnv64(zig[0..9]) == 0x7f29379d936a5084;
+    assert fnv64(zig[0..8]) != fnv64(zig[0..9]);
+}
+
+test fnv64_of_256_bytes {
+    var bytes : [256]u8 = [0] ** 256;
+    var i : usize = 0;
+    while (i < 256) {
+        bytes[i] = ((i * 7 + 3) % 256) as u8;
+        i = i + 1;
+    }
+    assert fnv64(bytes[0..256]) == 0x63b790cc20dc7525;
+}
+
+test need_counts_the_ones_of_a_row {
+    // G1: files {a,b} {a,c} {a,d} {b} {b} {}, constructs a b c d
+    const m : [24]u8 = [1, 1, 0, 0, 1, 0, 1, 0, 1, 0, 0, 1, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0];
+    assert need(m[0..24], 4, 0) == 2;
+    assert need(m[0..24], 4, 2) == 2;
+    assert need(m[0..24], 4, 3) == 1;
+    assert need(m[0..24], 4, 5) == 0;
+}
+
+test pick_prefers_whole_files {
+    // "a" is needed by the most files but unlocks none alone; "b" unlocks two.
+    const m : [24]u8 = [1, 1, 0, 0, 1, 0, 1, 0, 1, 0, 0, 1, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0];
+    assert pick(m[0..24], 6, 4) == 1;
+    // no file at all, or files that need nothing: nothing to pick
+    assert pick(m[0..0], 0, 0) == 0;
+    const empty : [6]u8 = [0, 0, 0, 0, 0, 0];
+    assert pick(empty[0..6], 2, 3) == 3;
+}
+
+test take_counts_only_files_it_unlocks {
+    var m : [24]u8 = [1, 1, 0, 0, 1, 0, 1, 0, 1, 0, 0, 1, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0];
+    assert take(m[0..24], 6, 4, 1) == 2;
+    assert m[1] == 0;
+    assert m[13] == 0;
+    assert m[0] == 1;
+    assert need(m[0..24], 4, 0) == 1;
+    // supporting it again unlocks nothing, and the file that needed nothing is never counted
+    assert take(m[0..24], 6, 4, 1) == 0;
+    assert take(m[0..24], 6, 4, 0) == 1;
+    assert take(m[0..24], 6, 4, 2) == 1;
+    assert take(m[0..24], 6, 4, 3) == 1;
+    assert pick(m[0..24], 6, 4) == 4;
+}
+
+test greedy_prefers_whole_files_g1 {
+    var m : [24]u8 = [1, 1, 0, 0, 1, 0, 1, 0, 1, 0, 0, 1, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0];
+    var at : [4]usize = [9] ** 4;
+    var got : [4]usize = [9] ** 4;
+    var cum : [4]usize = [9] ** 4;
+    assert greedy(m[0..24], 6, 4, at[0..4], got[0..4], cum[0..4]) == 4;
+    // b unlocks two, then a one, then c and d one each: 5 files, the empty one not counted
+    assert at[0] == 1 and got[0] == 2 and cum[0] == 2;
+    assert at[1] == 0 and got[1] == 1 and cum[1] == 3;
+    assert at[2] == 2 and got[2] == 1 and cum[2] == 4;
+    assert at[3] == 3 and got[3] == 1 and cum[3] == 5;
+}
+
+test greedy_breaks_a_zero_unlock_step_by_progress_g2 {
+    // files {x,p} {x,q} {r,s}, constructs p q r s x: no construct unlocks a file alone; x sits in both
+    // files that need two.
+    var m : [15]u8 = [1, 0, 0, 0, 1, 0, 1, 0, 0, 1, 0, 0, 1, 1, 0];
+    var at : [5]usize = [9] ** 5;
+    var got : [5]usize = [9] ** 5;
+    var cum : [5]usize = [9] ** 5;
+    assert greedy(m[0..15], 3, 5, at[0..5], got[0..5], cum[0..5]) == 5;
+    assert at[0] == 4 and got[0] == 0 and cum[0] == 0;
+    assert at[1] == 0 and got[1] == 1 and cum[1] == 1;
+    assert at[2] == 1 and got[2] == 1 and cum[2] == 2;
+    assert at[3] == 2 and got[3] == 0 and cum[3] == 2;
+    assert at[4] == 3 and got[4] == 1 and cum[4] == 3;
+}
+
+test a_score_tie_goes_to_the_construct_more_files_need_g3 {
+    // files {p,x1} {p,x2} {q,y1,z1} {q,y2,z2} {q,y3,z3}, constructs p q x1 x2 y1 y2 y3 z1 z2 z3:
+    // p scores 1/2 + 1/2 and q 1/3 + 1/3 + 1/3, both exactly 1.0; q is needed by three files, p by two.
+    var m : [50]u8 = [
+        1, 0, 1, 0, 0, 0, 0, 0, 0, 0,
+        1, 0, 0, 1, 0, 0, 0, 0, 0, 0,
+        0, 1, 0, 0, 1, 0, 0, 1, 0, 0,
+        0, 1, 0, 0, 0, 1, 0, 0, 1, 0,
+        0, 1, 0, 0, 0, 0, 1, 0, 0, 1];
+    var at : [10]usize = [99] ** 10;
+    var got : [10]usize = [99] ** 10;
+    var cum : [10]usize = [99] ** 10;
+    assert greedy(m[0..50], 5, 10, at[0..10], got[0..10], cum[0..10]) == 10;
+    assert at[0] == 1 and got[0] == 0 and cum[0] == 0;
+    assert at[1] == 0 and got[1] == 0 and cum[1] == 0;
+    assert at[2] == 2 and got[2] == 1 and cum[2] == 1;
+    assert at[3] == 3 and got[3] == 1 and cum[3] == 2;
+    assert at[4] == 4 and got[4] == 0 and cum[4] == 2;
+    assert at[5] == 7 and got[5] == 1 and cum[5] == 3;
+    assert at[6] == 5 and got[6] == 0 and cum[6] == 3;
+    assert at[7] == 8 and got[7] == 1 and cum[7] == 4;
+    assert at[8] == 6 and got[8] == 0 and cum[8] == 4;
+    assert at[9] == 9 and got[9] == 1 and cum[9] == 5;
+}
+
+test a_full_tie_goes_to_the_first_name_g4 {
+    // files {b} {a}: both unlock one file
+    var m : [4]u8 = [0, 1, 1, 0];
+    var at : [2]usize = [9] ** 2;
+    var got : [2]usize = [9] ** 2;
+    var cum : [2]usize = [9] ** 2;
+    assert greedy(m[0..4], 2, 2, at[0..2], got[0..2], cum[0..2]) == 2;
+    assert at[0] == 0 and got[0] == 1 and cum[0] == 1;
+    assert at[1] == 1 and got[1] == 1 and cum[1] == 2;
+}
+
+test unlocking_beats_progress_g5 {
+    // files {a} {b,c} {b,d} {b,e} {b,f}: a unlocks one file; b scores 2.0 but unlocks none
+    var m : [30]u8 = [
+        1, 0, 0, 0, 0, 0,
+        0, 1, 1, 0, 0, 0,
+        0, 1, 0, 1, 0, 0,
+        0, 1, 0, 0, 1, 0,
+        0, 1, 0, 0, 0, 1];
+    var at : [6]usize = [9] ** 6;
+    var got : [6]usize = [9] ** 6;
+    var cum : [6]usize = [9] ** 6;
+    assert greedy(m[0..30], 5, 6, at[0..6], got[0..6], cum[0..6]) == 6;
+    assert at[0] == 0 and got[0] == 1 and cum[0] == 1;
+    assert at[1] == 1 and got[1] == 0 and cum[1] == 1;
+    assert at[2] == 2 and got[2] == 1 and cum[2] == 2;
+    assert at[3] == 3 and got[3] == 1 and cum[3] == 3;
+    assert at[4] == 4 and got[4] == 1 and cum[4] == 4;
+    assert at[5] == 5 and got[5] == 1 and cum[5] == 5;
+}
+
+test progress_beats_the_count_of_files_g6 {
+    // files {p,x} {p,y} {q,r1,r2,r3} {q,s1,s2,s3} {q,t1,t2,t3}, constructs p q r1 r2 r3 s1 s2 s3 t1 t2 t3 x y:
+    // p scores 1.0 in two files, q 0.75 in three
+    var m : [65]u8 = [
+        1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0,
+        1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+        0, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 1, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0,
+        0, 1, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0];
+    var at : [13]usize = [99] ** 13;
+    var got : [13]usize = [99] ** 13;
+    var cum : [13]usize = [99] ** 13;
+    assert greedy(m[0..65], 5, 13, at[0..13], got[0..13], cum[0..13]) == 13;
+    assert at[0] == 0 and got[0] == 0 and cum[0] == 0;
+    assert at[1] == 11 and got[1] == 1 and cum[1] == 1;
+    assert at[2] == 12 and got[2] == 1 and cum[2] == 2;
+    assert at[3] == 1 and got[3] == 0 and cum[3] == 2;
+    assert at[4] == 2 and got[4] == 0 and cum[4] == 2;
+    assert at[5] == 3 and got[5] == 0 and cum[5] == 2;
+    assert at[6] == 4 and got[6] == 1 and cum[6] == 3;
+    assert at[7] == 5 and got[7] == 0 and cum[7] == 3;
+    assert at[8] == 6 and got[8] == 0 and cum[8] == 3;
+    assert at[9] == 7 and got[9] == 1 and cum[9] == 4;
+    assert at[10] == 8 and got[10] == 0 and cum[10] == 4;
+    assert at[11] == 9 and got[11] == 0 and cum[11] == 4;
+    assert at[12] == 10 and got[12] == 1 and cum[12] == 5;
+}
+
+test no_files_no_steps {
+    var m : [2]u8 = [0, 0];
+    var at : [1]usize = [9] ** 1;
+    var got : [1]usize = [9] ** 1;
+    var cum : [1]usize = [9] ** 1;
+    assert greedy(m[0..0], 0, 0, at[0..0], got[0..0], cum[0..0]) == 0;
+    // two files that need nothing: still no step
+    assert greedy(m[0..0], 2, 0, at[0..0], got[0..0], cum[0..0]) == 0;
+    assert at[0] == 9;
+}
+
+test twelve_files_six_constructs_g7 {
+    // files {c0,c1} {c2} {c0,c3,c4} {c1,c5} {c2,c5} {c3} {c0,c1,c2} {c4,c5} {} {c0} {c3,c4} {c1}: four
+    // constructs unlock one file alone; c1 has the best score.
+    var m : [72]u8 = [
+        1, 1, 0, 0, 0, 0,
+        0, 0, 1, 0, 0, 0,
+        1, 0, 0, 1, 1, 0,
+        0, 1, 0, 0, 0, 1,
+        0, 0, 1, 0, 0, 1,
+        0, 0, 0, 1, 0, 0,
+        1, 1, 1, 0, 0, 0,
+        0, 0, 0, 0, 1, 1,
+        0, 0, 0, 0, 0, 0,
+        1, 0, 0, 0, 0, 0,
+        0, 0, 0, 1, 1, 0,
+        0, 1, 0, 0, 0, 0];
+    var at : [6]usize = [9] ** 6;
+    var got : [6]usize = [9] ** 6;
+    var cum : [6]usize = [9] ** 6;
+    assert greedy(m[0..72], 12, 6, at[0..6], got[0..6], cum[0..6]) == 6;
+    assert at[0] == 1 and got[0] == 1 and cum[0] == 1;
+    assert at[1] == 0 and got[1] == 2 and cum[1] == 3;
+    assert at[2] == 2 and got[2] == 2 and cum[2] == 5;
+    assert at[3] == 5 and got[3] == 2 and cum[3] == 7;
+    assert at[4] == 3 and got[4] == 1 and cum[4] == 8;
+    assert at[5] == 4 and got[5] == 3 and cum[5] == 11;
+}
+
+test replay_an_order_over_other_files_g7 {
+    var m : [72]u8 = [
+        1, 1, 0, 0, 0, 0,
+        0, 0, 1, 0, 0, 0,
+        1, 0, 0, 1, 1, 0,
+        0, 1, 0, 0, 0, 1,
+        0, 0, 1, 0, 0, 1,
+        0, 0, 0, 1, 0, 0,
+        1, 1, 1, 0, 0, 0,
+        0, 0, 0, 0, 1, 1,
+        0, 0, 0, 0, 0, 0,
+        1, 0, 0, 0, 0, 0,
+        0, 0, 0, 1, 1, 0,
+        0, 1, 0, 0, 0, 0];
+    // the greedy order of the first six files only ...
+    var first : [36]u8 = [0] ** 36;
+    var i : usize = 0;
+    while (i < 36) {
+        first[i] = m[i];
+        i = i + 1;
+    }
+    var at : [6]usize = [9] ** 6;
+    var got : [6]usize = [9] ** 6;
+    var cum : [6]usize = [9] ** 6;
+    assert greedy(first[0..36], 6, 6, at[0..6], got[0..6], cum[0..6]) == 6;
+    assert at[0] == 2 and at[1] == 5 and at[2] == 1 and at[3] == 0 and at[4] == 3 and at[5] == 4;
+    // ... replayed over all twelve
+    var all : [6]usize = [9] ** 6;
+    replay(m[0..72], 12, 6, at[0..6], all[0..6]);
+    assert all[0] == 1 and all[1] == 2 and all[2] == 4 and all[3] == 7 and all[4] == 8 and all[5] == 11;
+}
+
+test replay_keeps_files_locked_by_constructs_the_order_never_names {
+    // G1 with a fifth construct z that no file needs: constructs a b c d z
+    var m : [30]u8 = [
+        1, 1, 0, 0, 0,
+        1, 0, 1, 0, 0,
+        1, 0, 0, 1, 0,
+        0, 1, 0, 0, 0,
+        0, 1, 0, 0, 0,
+        0, 0, 0, 0, 0];
+    var cum : [3]usize = [9] ** 3;
+    const only_a : [1]usize = [0];
+    replay(m[0..30], 6, 5, only_a[0..1], cum[0..1]);
+    assert cum[0] == 0;
+    var m2 : [30]u8 = [
+        1, 1, 0, 0, 0,
+        1, 0, 1, 0, 0,
+        1, 0, 0, 1, 0,
+        0, 1, 0, 0, 0,
+        0, 1, 0, 0, 0,
+        0, 0, 0, 0, 0];
+    const b_z_a : [3]usize = [1, 4, 0];
+    replay(m2[0..30], 6, 5, b_z_a[0..3], cum[0..3]);
+    assert cum[0] == 2 and cum[1] == 2 and cum[2] == 3;
+}

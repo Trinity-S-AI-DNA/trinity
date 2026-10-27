@@ -1,0 +1,445 @@
+; gf16.t27 — GoldenFloat16 Encode/Decode
+; GF16: 16-bit floating point with 1 sign + 6 exponent + 9 mantissa
+; Bit layout: [S(1) E(6) M(9)] = [15:15][14:9][8:0]
+; φ² + 1/φ² = 3 | TRINITY
+
+.const SIGN_SHIFT 15
+.const EXP_SHIFT 9
+.const MANT_SHIFT 0
+
+.const SIGN_MASK 0x8000  ; 1 << 15
+.const EXP_MASK 0x7E00    ; 0b111111 << 9
+.const MANT_MASK 0x01FF    ; 0b111111111
+
+.const EXP_MAX 0x3F     ; 63 (all ones in 6 bits)
+.const EXP_MIN 0x00
+
+.const BIAS 31          ; Exponent bias for GF16
+
+.const SPECIAL_EXP 0x3F  ; All ones = special (Inf/NaN)
+
+.data
+    ; Constants for zero detection
+    .const GF16_ZERO_POS 0x0000
+    .const GF16_ZERO_NEG 0x8000
+
+    ; Special values
+    .const GF16_INF_POS 0x7E00
+    .const GF16_INF_NEG 0xFE00
+    .const GF16_NAN 0xFE01  ; Sign + all exp + mantissa != 0
+
+    ; Powers of 2 for mantissa division (2^9 = 512)
+    .const MANT_DIVISOR 512
+    .const MANT_DIVISOR_SHIFT 9  ; log2(512)
+
+    ; Lookup: 2^exp for exponents 0-63
+pow2_table:
+    .half 0x3C00   ; 2^0 = 1.0
+    .half 0x3D00   ; 2^1 = 2.0
+    .half 0x3D80   ; 2^2 = 4.0
+    .half 0x3E00   ; 2^3 = 8.0
+    .half 0x3E40   ; 2^4 = 16.0
+    .half 0x3E80   ; 2^5 = 32.0
+    .half 0x3EC0   ; 2^6 = 64.0
+    .half 0x3F00   ; 2^7 = 128.0
+    .half 0x3F40   ; 2^8 = 256.0
+    .half 0x3F80   ; 2^9 = 512.0
+    .half 0x3FC0   ; 2^10 = 1024.0
+    .half 0x3FE0   ; 2^11 = 2048.0
+    .half 0x3FF0   ; 2^12 = 4096.0
+    .half 0x4000   ; 2^13 = 8192.0
+    .half 0x4040   ; 2^14 = 16384.0
+    .half 0x4080   ; 2^15 = 32768.0
+    .half 0x40C0   ; 2^16 = 65536.0
+    .half 0x4100   ; 2^17 = 131072.0
+    .half 0x4140   ; 2^18 = 262144.0
+    .half 0x4180   ; 2^19 = 524288.0
+    .half 0x41C0   ; 2^20 = 1048576.0
+    .half 0x4200   ; 2^21 = 2097152.0
+    .half 0x4240   ; 2^22 = 4194304.0
+    .half 0x4280   ; 2^23 = 8388608.0
+    .half 0x42C0   ; 2^24 = 16777216.0
+    .half 0x4300   ; 2^25 = 33554432.0
+    .half 0x4340   ; 2^26 = 67108864.0
+    .half 0x4380   ; 2^27 = 134217728.0
+    .half 0x43C0   ; 2^28 = 268435456.0
+    .half 0x4400   ; 2^29 = 536870912.0
+    .half 0x4440   ; 2^30 = 1073741824.0
+    .half 0x4480   ; 2^31 = 2147483648.0
+
+.code
+    ; ═════════════════════════════════════════════════════════════════════
+    ; gf16_extract_sign(gf16: u16) → sign: i8
+    ; Extract sign bit (bit 15)
+    ; Returns: 0 for positive, -1 for negative
+    ; ═════════════════════════════════════════════════════════════════════════
+gf16_extract_sign:
+    ; Input: r0 = gf16
+    ; Output: r0 = sign (-1 or 0)
+
+    ; Shift right to get sign bit
+    MOV r1, SIGN_SHIFT
+    SHR r0, r0, r1       ; r0 = gf16 >> 15
+    AND r0, r0, #1       ; r0 = gf16 & 1
+    ; Map: 1 → -1, 0 → 0
+    CMP r0, #1
+    JEQ sign_neg
+    MOV r0, #0
+    RET
+
+sign_neg:
+    MOV r0, #255  ; -1 as trit (using -1 value)
+    RET
+
+    ; ═════════════════════════════════════════════════════════════════════════
+    ; gf16_extract_exponent(gf16: u16) → exp: i8
+    ; Extract exponent bits (bits 14-9)
+    ; Returns: 0-63
+    ; ═══════════════════════════════════════════════════════════════════════
+gf16_extract_exponent:
+    ; Input: r0 = gf16
+    ; Output: r0 = exponent
+
+    ; Shift and mask
+    MOV r1, EXP_SHIFT
+    SHR r0, r0, r1       ; r0 = gf16 >> 9
+    AND r0, r0, EXP_MASK ; r0 = (gf16 >> 9) & 0x3F
+    RET
+
+    ; ═════════════════════════════════════════════════════════════════════════════
+    ; gf16_extract_mantissa(gf16: u16) → mant: i16
+    ; Extract mantissa bits (bits 8-0)
+    ; Returns: 0-511
+    ; ═════════════════════════════════════════════════════════════════════════
+gf16_extract_mantissa:
+    ; Input: r0 = gf16
+    ; Output: r0 = mantissa
+
+    MOV r1, MANT_SHIFT
+    SHR r0, r0, r1       ; r0 = gf16 >> 0
+    AND r0, r0, MANT_MASK ; r0 = gf16 & 0x01FF
+    RET
+
+    ; ═══════════════════════════════════════════════════════════════════════════════
+    ; gf16_from_components(sign: i8, exp: i8, mant: i16) → gf16: u16
+    ; Assemble GF16 from sign, exponent, mantissa
+    ; ═══════════════════════════════════════════════════════════════════════════════════
+gf16_from_components:
+    ; Input: r0 = sign, r1 = exp, r2 = mant
+    ; Output: r0 = gf16
+
+    ; Validate exponent range
+    CMP r1, #0
+    JLT exp_invalid
+    CMP r1, EXP_MAX
+    JGT exp_invalid
+
+    ; Validate mantissa range
+    CMP r2, #0
+    JLT mant_invalid
+    CMP r2, #511
+    JGT mant_invalid
+
+    ; Assemble: sign | (exp << 9) | mant
+    MOV r3, EXP_SHIFT
+    SHL r1, r1, r3       ; r1 = exp << 9
+    MOV r3, MANT_SHIFT
+    SHL r2, r2, r3       ; r2 = mant << 0 (just mant)
+    MOV r3, SIGN_SHIFT
+    SHL r0, r0, r3       ; r0 = sign << 15
+
+    ; OR together
+    OR r0, r0, r1       ; r0 = (sign << 15) | (exp << 9)
+    OR r0, r0, r2       ; r0 |= mant
+    RET
+
+exp_invalid:
+    ; Invalid exponent
+    MOV r0, #0xFFFF  ; Error sentinel
+    HALT
+
+mant_invalid:
+    ; Invalid mantissa
+    MOV r0, #0xFFFF  ; Error sentinel
+    HALT
+
+    ; ═════════════════════════════════════════════════════════════════════════════
+    ; gf16_is_zero(gf16: u16) → bool
+    ; Check if GF16 is zero (positive or negative)
+    ; ═════════════════════════════════════════════════════════════════════════════════
+gf16_is_zero:
+    ; Input: r0 = gf16
+    ; Output: r0 = 1 if zero, 0 otherwise
+
+    ; Check exp == 0 and mant == 0
+    MOV r1, r0
+    MOV r2, MANT_SHIFT
+    SHR r1, r1, r2       ; r1 = mant
+    MOV r2, r0
+    MOV r3, EXP_SHIFT
+    SHR r2, r2, r3       ; r2 = exp
+
+    ; Check if both zero
+    AND r1, r1, r1       ; r1 = mant & mant (for non-zero check)
+    OR r1, r1, r2       ; r1 = mant | exp
+    CMP r1, #0
+    JEQ is_zero
+    MOV r0, #0
+    RET
+
+is_zero:
+    MOV r0, #1
+    RET
+
+    ; ═══════════════════════════════════════════════════════════════════════════════════
+    ; gf16_is_special(gf16: u16) → bool
+    ; Check if GF16 is Inf or NaN (exp == 63)
+    ; ═══════════════════════════════════════════════════════════════════════════════════════════
+gf16_is_special:
+    ; Input: r0 = gf16
+    ; Output: r0 = 1 if special, 0 otherwise
+
+    ; Check exp == 63 (all ones)
+    MOV r1, r0
+    MOV r2, EXP_SHIFT
+    SHR r1, r1, r2       ; r1 = exp
+    AND r1, r1, EXP_MASK ; r1 = exp & 0x3F
+    CMP r1, EXP_MAX
+    JEQ is_special
+    MOV r0, #0
+    RET
+
+is_special:
+    MOV r0, #1
+    RET
+
+    ; ═══════════════════════════════════════════════════════════════════════════════════════════
+    ; gf16_encode_f32(f32: float) → gf16: u16
+    ; Encode IEEE 754 single precision to GF16
+    ; Round-to-nearest, ties to even
+    ; Range: 2^-31 to 2^32 (normal), subnormals flushed to zero
+    ; ═════════════════════════════════════════════════════════════════════════════════════════
+gf16_encode_f32:
+    ; Input: r0 = f32 (passed as u32 representation)
+    ; Output: r0 = gf16
+
+    ; Note: f32 representation in IEEE 754:
+    ;   bits 31: sign, bits 30-23: exp, bits 22-0: mant
+    ;   exp bias: 127
+    ;   Special values: exp=0 (subnormal), exp=255 (Inf/NaN)
+
+    ; Check if f32 is zero
+    MOV r1, r0
+    MOV r2, #0x7F800000  ; -0.0 pattern
+    CMP r1, r2
+    JEQ encode_neg_zero
+    MOV r2, #0x00000000  ; +0.0 pattern
+    CMP r0, r2
+    JEQ encode_pos_zero
+
+    ; Extract f32 components
+    ; f32_sign = (r0 >> 31) & 1
+    ; f32_exp = ((r0 >> 23) & 0xFF) - 127
+    ; f32_mant = r0 & 0x7FFFFF (with implied 1)
+
+    ; Convert exp from f32 bias (127) to GF16 bias (31)
+    ; gf16_exp = f32_exp + 31 - 127 = f32_exp - 96
+    ; Clamp to [0, 63]
+    ; If gf16_exp < 0, underflow to zero
+    ; If gf16_exp > 63, overflow to Inf
+
+    ; Extract sign
+    MOV r3, r0
+    MOV r4, #31
+    SHR r3, r3, r4       ; r3 = sign (0 or 1)
+
+    ; Extract and adjust exponent
+    MOV r4, r0
+    MOV r5, #23
+    SHR r4, r4, r5       ; r4 = f32_exp (biased by 127)
+    MOV r5, #96          ; Adjustment: 31 - 127 = -96
+    ADD r4, r4, r5       ; r4 = f32_exp - 96
+
+    ; Clamp exponent
+    CMP r4, #0
+    JGE exp_ok
+    MOV r4, #0          ; Underflow to zero
+    JMP exp_clamped
+
+exp_ok:
+    CMP r4, EXP_MAX
+    JLE exp_clamped
+    MOV r4, EXP_MAX     ; Overflow to Inf
+
+exp_clamped:
+    ; Extract mantissa and scale to 9 bits
+    ; f32 mantissa is 23 bits, GF16 needs 9 bits
+    ; Strategy: take top 9 bits, adjust based on remaining bits for rounding
+
+    ; Extract f32 mantissa
+    MOV r5, r0
+    AND r5, r5, #0x007FFFFF ; r5 = mantissa bits
+
+    ; Scale: shift right by 14 bits to get 9 bits
+    ; (23 - 9 = 14)
+    MOV r6, #14
+    SHR r5, r5, r6       ; r5 = mantissa >> 14 (9 bits)
+
+    ; Check for rounding (round-to-nearest)
+    ; Look at bits being discarded (13 bits: bits 13-0)
+    MOV r7, r0
+    MOV r8, #0
+    MOV r9, #13
+    SHR r7, r7, r9       ; r7 = discarded bits
+
+    ; Round if MSB of discarded bits is 1
+    MOV r10, #1
+    MOV r11, #12
+    SHL r10, r10, r11      ; r10 = 1 << 12 = 0x1000
+    AND r10, r10, r7       ; r10 = MSB of discarded
+    CMP r10, #0
+    JEQ no_round
+    ; Round up
+    ADD r5, r5, ONE      ; r5++
+    ; Check for overflow in mantissa
+    CMP r5, MANT_MASK
+    JLE no_mant_overflow
+    MOV r5, #0          ; Mantissa overflow, zero out
+    ADD r4, r4, ONE      ; Exp++
+
+no_mant_overflow:
+    MOV r10, MANT_SHIFT
+    SHL r10, r5, r10     ; r10 = mant << 0
+    OR r10, r10, r5       ; r10 = mant (no-op, just r5)
+
+no_round:
+    ; Assemble GF16
+    MOV r11, EXP_SHIFT
+    SHL r4, r4, r11      ; r4 = exp << 9
+    MOV r11, SIGN_SHIFT
+    SHL r3, r3, r11      ; r3 = sign << 15
+    OR r0, r3, r4       ; r0 = (sign << 15) | (exp << 9)
+    OR r0, r0, r5       ; r0 |= mant
+    RET
+
+encode_neg_zero:
+    MOV r0, GF16_ZERO_NEG
+    RET
+
+encode_pos_zero:
+    MOV r0, GF16_ZERO_POS
+    RET
+
+    ; ═════════════════════════════════════════════════════════════════════════════════════
+    ; gf16_decode_to_f32(gf16: u16) → f32: float
+    ; Decode GF16 to IEEE 754 single precision
+    ; ═══════════════════════════════════════════════════════════════════════════════════════════════
+gf16_decode_to_f32:
+    ; Input: r0 = gf16
+    ; Output: r0 = f32 (as u32 representation)
+
+    ; Check for zero
+    ; (Handled by caller or inline)
+
+    ; Check for special values (exp == 63)
+    MOV r1, r0
+    MOV r2, EXP_SHIFT
+    SHR r1, r1, r2       ; r1 = exp
+    AND r1, r1, EXP_MASK
+    CMP r1, EXP_MAX
+    JNE decode_normal
+
+    ; Special: exp == 63
+    ; Check mantissa for NaN vs Inf
+    MOV r2, r0
+    MOV r3, MANT_SHIFT
+    SHR r2, r2, r3       ; r2 = mant
+    CMP r2, #0
+    JEQ decode_inf
+
+    ; NaN
+    ; Return IEEE NaN pattern
+    MOV r0, #0x7FC00000  ; Quiet NaN
+    RET
+
+decode_inf:
+    ; Inf: return IEEE Inf with sign
+    MOV r1, r0
+    MOV r2, SIGN_SHIFT
+    SHR r1, r1, r2       ; r1 = sign
+    AND r1, r1, #1
+    MOV r2, #31
+    SHL r1, r1, r2       ; r1 = sign << 31
+    MOV r2, #0x7F800000   ; +Inf pattern
+    OR r0, r1, r2       ; r0 = (sign << 31) | 0x7F800000
+    RET
+
+decode_normal:
+    ; Normal number: value = (-1)^s * (1 + m/2^9) * 2^(e - 31)
+
+    ; Extract sign
+    MOV r1, r0
+    MOV r2, SIGN_SHIFT
+    SHR r1, r1, r2       ; r1 = sign
+
+    ; Extract mantissa and add implied 1
+    MOV r2, r0
+    MOV r3, MANT_SHIFT
+    SHR r2, r2, r3       ; r2 = mant (9 bits)
+    MOV r3, #1
+    SHL r3, r3, MANT_SHIFT ; r3 = 1 << 9 = 512
+    ADD r2, r2, r3       ; r2 = 1 + mant (as fraction)
+
+    ; Scale mantissa to f32 format (23 bits)
+    ; Shift left by 14 bits (23 - 9)
+    MOV r3, #14
+    SHL r2, r2, r3       ; r2 = (1 + mant) << 14
+
+    ; Clear sign bit for f32 mantissa
+    MOV r3, r0
+    MOV r4, SIGN_SHIFT
+    SHR r3, r3, r4       ; r3 = r0 >> 15 (remove sign)
+    MOV r4, EXP_SHIFT
+    SHR r3, r3, r4       ; r3 = exp + mantissa combined
+
+    ; Build f32 mantissa: (1+mant)<<14, exp adjusted
+    ; f32_exp = gf16_exp - 31 + 127 = gf16_exp + 96
+    MOV r4, r0
+    MOV r5, EXP_SHIFT
+    SHR r4, r4, r5       ; r4 = gf16_exp
+    MOV r5, #96
+    ADD r4, r4, r5       ; r4 = f32_exp
+
+    ; Clamp to IEEE range
+    CMP r4, #0
+    JGE f32_exp_ok
+    MOV r4, #0          ; Underflow to subnormal
+    JMP f32_exp_clamped
+
+f32_exp_ok:
+    CMP r4, #255
+    JLE f32_exp_clamped
+    MOV r4, #254         ; Clamp below Inf
+
+f32_exp_clamped:
+    ; Shift exp to position 23
+    MOV r5, #23
+    SHL r4, r4, r5       ; r4 = exp << 23
+
+    ; Clear exp in r3, keep mantissa
+    MOV r5, #0x007FFFFF  ; f32 mantissa mask (23 bits)
+    AND r3, r3, r5       ; r3 = mantissa bits
+
+    ; Assemble f32 (without sign)
+    OR r0, r3, r4       ; r0 = mantissa | exp
+
+    ; Add sign bit
+    MOV r4, r0
+    MOV r5, SIGN_SHIFT
+    SHR r4, r4, r5       ; r4 = gf16 >> 15 = sign
+    MOV r5, #31
+    SHL r4, r4, r5       ; r4 = sign << 31
+    OR r0, r0, r4       ; r0 = f32 | sign
+    RET
+
+HALT

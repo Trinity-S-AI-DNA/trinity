@@ -1,0 +1,312 @@
+// TRI-NET BitNet-style mixed layer attestation: ternary weights {-1,0,+1} times
+// GF16 activations. This is the target workload the whole GF-vs-ternary analysis
+// points at -- weights are the 0-DSP part (sign-select / popcount, as in
+// trinet_mac32), the GF16 activation and accumulated result are the value part
+// (magnitude, DSP or -nodsp soft-logic). One receipt binds BOTH: the packed_w
+// ternary weight code, the GF16 activation hash, and the GF16 result. It also
+// exposes the sparsity the ternary part exploits (zero weights are skipped).
+//
+// Weight trit encoding matches trinet_mac32: 2 bits, 01 = +1, 10 = -1, else 0.
+
+module TriComputeBitnet {
+    use base::types;
+
+    const OP_BITNET: u32 = 0x20;
+    const B_C: u32 = 0x85EBCA77;
+    const TAG_BITNET: u32 = 0x54424E50;      // "TBNP" -- bitnet-preimage domain tag
+    const SHA_PAD: u32 = 0x80000000;         // SHA-256 padding: the 0x80 byte after the message
+    const BITNET_MSG_BITS: u32 = 224;        // 7 message words * 32 bits = 28 bytes = 224 bits
+
+    fn rotl(x: u32, k: u32) -> u32 {
+        return ((x << k) | (x >> (32 - k)));
+    }
+
+    fn mix32(x: u32) -> u32 {
+        let a: u32 = x ^ (x >> 16);
+        let b: u32 = a +% (a << 3);
+        let c: u32 = b ^ (b >> 11);
+        let d: u32 = c +% (c << 15);
+        return d ^ (d >> 16);
+    }
+
+    // Count active (nonzero) ternary weights in a packed_w 4-trit word (2 bits each).
+    // This is the sparsity the 0-DSP path exploits: zero weights contribute
+    // nothing and cost nothing.
+    // A single 2-bit trit is ACTIVE (a real +1 or -1 weight) iff it is exactly 01
+    // or 10. The encoding is 01 = +1, 10 = -1, and BOTH 00 and 11 decode to 0 -- so
+    // 11 is a redundant zero, NOT active. The old `trit != 0` counted 11 as active,
+    // over-reporting sparsity/work: a packing of 11 codes (buggy or malicious, since
+    // the receipt attests untrusted weights) would inflate the attested active-
+    // weight count. Match the decode exactly, so only canonical nonzero trits count.
+    fn is_active(trit: u32) -> u32 {
+        if (trit == 1) {
+            return 1;
+        } else {
+            if (trit == 2) {
+                return 1;
+            } else {
+                return 0;
+            }
+        }
+    }
+
+    fn active_weights4(packed_w: u32) -> u32 {
+        return is_active(packed_w & 3) + is_active((packed_w >> 2) & 3)
+             + is_active((packed_w >> 4) & 3) + is_active((packed_w >> 6) & 3);
+    }
+
+    // Canonical packing: since 00 AND 11 both decode to 0, the SAME logical weight
+    // vector has multiple packed_w encodings (e.g. [0,0,0,0] is 0x00 or 0xFF or any
+    // mix), each hashing to a DIFFERENT bitnet_leaf -- weight malleability: one
+    // logical matrix, many valid receipts. Fix a canonical form: a trit is
+    // canonical iff it is NOT 0b11 (zero is always 00). A packing is canonical iff
+    // all four trits are, so each logical weight vector has exactly ONE leaf. An
+    // attestation must reject a non-canonical weight_code (Bitcoin low-S / DER
+    // canonicalization discipline).
+    fn trit_canonical(trit: u32) -> u32 {
+        if (trit == 3) {
+            return 0;
+        } else {
+            return 1;
+        }
+    }
+
+    fn weights_canonical4(packed_w: u32) -> u32 {
+        return trit_canonical(packed_w & 3) + trit_canonical((packed_w >> 2) & 3)
+             + trit_canonical((packed_w >> 4) & 3) + trit_canonical((packed_w >> 6) & 3);
+    }
+
+    fn packing_is_canonical(packed_w: u32) -> bool {
+        return weights_canonical4(packed_w) == 4;
+    }
+
+    // ---- Signed decode: what the 0-DSP popcount-MAC actually sums ----
+    //
+    // is_active/trit_canonical said WHICH trits are nonzero and canonical; this
+    // gives the SIGN. The BitNet MAC over ternary weights is sum(+1 weights) -
+    // sum(-1 weights); for unit activations it reduces to (#+1) - (#-1), the
+    // popcount adder-tree of trinet_mac32 (0 DSP). u32 has no sign, so keep the two
+    // counts separate and expose the balance BIASED by the word width (4) to stay
+    // non-negative: unbiased balance = sign_balance_biased - 4, range [-4, +4].
+    fn is_pos(trit: u32) -> u32 {
+        if (trit == 1) {
+            return 1;
+        } else {
+            return 0;
+        }
+    }
+
+    fn is_neg(trit: u32) -> u32 {
+        if (trit == 2) {
+            return 1;
+        } else {
+            return 0;
+        }
+    }
+
+    fn pos_weights4(packed_w: u32) -> u32 {
+        return is_pos(packed_w & 3) + is_pos((packed_w >> 2) & 3)
+             + is_pos((packed_w >> 4) & 3) + is_pos((packed_w >> 6) & 3);
+    }
+
+    fn neg_weights4(packed_w: u32) -> u32 {
+        return is_neg(packed_w & 3) + is_neg((packed_w >> 2) & 3)
+             + is_neg((packed_w >> 4) & 3) + is_neg((packed_w >> 6) & 3);
+    }
+
+    // The signed ternary sum for unit activations, biased by 4 to fit u32: value 4
+    // is a net zero, 8 is all +1, 0 is all -1. This is the popcount-MAC's core.
+    fn sign_balance_biased(packed_w: u32) -> u32 {
+        return (pos_weights4(packed_w) + 4) - neg_weights4(packed_w);
+    }
+
+    // Verifiable ternary part: the analogue of a GF-value recompute in a dispute.
+    // Given the committed weight_code and a CLAIMED sign balance, a challenger
+    // recomputes the balance from the weights and confirms it -- but only if the
+    // packing is CANONICAL (a non-canonical 0b11 code is rejected outright, closing
+    // the malleability). A fraudulent executor that claims a wrong ternary MAC
+    // balance, or packs non-canonical weights, fails this check. (The canonical
+    // test is inlined as weights_canonical4 == 4 -- a bool fn compared to true does
+    // not survive gen-rust.)
+    fn bitnet_balance_matches(weight_code: u32, claimed_balance_biased: u32) -> bool {
+        if (weights_canonical4(weight_code) == 4) {
+            return sign_balance_biased(weight_code) == claimed_balance_biased;
+        } else {
+            return weight_code != weight_code;
+        }
+    }
+
+    // Bind a BitNet layer op into a receipt leaf: ternary weight code (0-DSP part)
+    // + GF16 activation hash + GF16 result (value part) + executor identity.
+    // Changing EITHER the ternary weights OR the GF16 activation/result changes
+    // the leaf.
+    fn bitnet_leaf(weight_code: u32, act_hash: u32, gf_result: u32, device: u32, executor: u32, epoch: u32) -> u32 {
+        let w: u32 = mix32(weight_code ^ rotl(OP_BITNET, 5));
+        let a: u32 = mix32(w ^ rotl(act_hash, 11));
+        let r: u32 = mix32(a ^ rotl(gf_result, 17));
+        let d: u32 = mix32(r ^ rotl(device, 23));
+        // Bind executor and epoch in SEPARATE mix rounds. The old `executor + epoch`
+        // summed the two identity fields, so (exec=5,epoch=3) and (exec=3,epoch=5)
+        // hashed identically -- a cross-executor leaf collision that let two distinct
+        // (executor, epoch) receipts share one commitment. Distinct rounds make a
+        // collision require a full hash collision, not a compensating sum.
+        let e: u32 = mix32(d ^ rotl(executor, 29));
+        return mix32(e ^ rotl(epoch, 13));
+    }
+
+    // 256-bit SHA-256 preimage for a BitNet attestation, mirroring tri_compute_
+    // receipt.digest_pre. bitnet_leaf above is a 32-bit commitment (~2^16 birthday
+    // collision); this lays out a one-block SHA-256 message so the caller (via
+    // tri_sha256, as trinet_settle_signed does for the receipt) gets a 256-bit
+    // digest (~2^128), the same 2^16-commitment gap ceae3e2 closed for the compute-
+    // receipt. Message = TAG + the six fields, with executor (word 5) and epoch
+    // (word 6) as SEPARATE words so the leaf's old sum-collision cannot recur;
+    // word 7 begins the padding, word 15 is the message bit-length.
+    fn bitnet_digest_pre(idx: u32, weight_code: u32, act_hash: u32, gf_result: u32, device: u32, executor: u32, epoch: u32) -> u32 {
+        if (idx == 0) { return TAG_BITNET; }
+        if (idx == 1) { return weight_code; }
+        if (idx == 2) { return act_hash; }
+        if (idx == 3) { return gf_result; }
+        if (idx == 4) { return device; }
+        if (idx == 5) { return executor; }
+        if (idx == 6) { return epoch; }
+        if (idx == 7) { return SHA_PAD; }
+        if (idx == 15) { return BITNET_MSG_BITS; }
+        return 0;
+    }
+
+    // ---- Tests / invariants ----
+
+    // Sparsity: nonzero trits are counted, zeros are skipped.
+    test sparsity_count {
+        // packed_w 0x61 = trits [t0=+1, t1=0, t2=-1, t3=+1] -> 3 active
+        assert(active_weights4(0x61) == 3, "three nonzero weights");
+        assert(active_weights4(0x00) == 0, "all-zero weights -> nothing active");
+        assert(active_weights4(0x55) == 4, "0x55 = four +1 trits -> 4 active");
+    }
+
+    // Trit decoding: 01/10 are the only active codes; 00 AND 11 are both zero. The
+    // redundant 11 code must NOT be counted as active (it was, under `trit != 0`).
+    test trit_11_is_a_zero {
+        assert(is_active(0) == 0, "00 -> zero -> inactive");
+        assert(is_active(1) == 1, "01 -> +1 -> active");
+        assert(is_active(2) == 1, "10 -> -1 -> active");
+        assert(is_active(3) == 0, "11 -> redundant zero -> inactive, NOT counted");
+        // a word of four 11-codes has ZERO active weights, not four -- the fix.
+        assert(active_weights4(0xFF) == 0, "four 11-codes all decode to zero -> 0 active");
+        // 0x1B = {t0=11(0), t1=10(-1), t2=01(+1), t3=00(0)} -> exactly the 2 real weights
+        assert(active_weights4(0x1B) == 2, "mixed word counts only the two canonical nonzero trits");
+        // an 11 code cannot inflate the count past the real active weights.
+        assert(active_weights4(0xF5) == 2, "0xF5 = {01,01,11,11} -> 2 active (the two 11s do not count)");
+    }
+
+    // Canonical packing: a weight_code with any 0b11 trit is non-canonical and must
+    // be rejected, so each logical weight vector maps to exactly one leaf.
+    test canonical_packing_gate {
+        assert(packing_is_canonical(0x00) == true, "all-00 zeros are canonical");
+        assert(packing_is_canonical(0x55) == true, "all-+1 is canonical");
+        assert(packing_is_canonical(0x61) == true, "a mixed canonical word");
+        assert(packing_is_canonical(0xFF) == false, "all-11 is a non-canonical zero packing");
+        assert(packing_is_canonical(0x1B) == false, "a single 0b11 trit makes the word non-canonical");
+        assert(weights_canonical4(0xF5) == 2, "0xF5 has two 11-codes -> only 2 canonical trits");
+    }
+
+    // Weight malleability closed: the two encodings of the all-zero vector hash to
+    // DIFFERENT leaves, but only the canonical one (0x00) is accepted -- so a
+    // logical weight vector has exactly ONE valid receipt.
+    test canonical_form_is_unique {
+        zeros_ok = bitnet_leaf(0x00, 0xABCD, 0x4100, 0xC0FFEE01, 0xE0E0, 1);
+        zeros_bad = bitnet_leaf(0xFF, 0xABCD, 0x4100, 0xC0FFEE01, 0xE0E0, 1);
+        assert(zeros_ok != zeros_bad, "the two zero-packings hash differently (the malleability)");
+        assert(packing_is_canonical(0x00) == true, "only the 0x00 packing is canonical...");
+        assert(packing_is_canonical(0xFF) == false, "...so the 0xFF alias is rejected -> one valid leaf");
+    }
+
+    // Signed decode: +1 and -1 counts, and the popcount-MAC balance for unit acts.
+    test signed_decode_and_balance {
+        // 0x61 = {t0=01(+1), t1=00(0), t2=10(-1), t3=01(+1)} -> pos 2, neg 1
+        assert(pos_weights4(0x61) == 2, "two +1 weights");
+        assert(neg_weights4(0x61) == 1, "one -1 weight");
+        assert(sign_balance_biased(0x61) == 5, "balance +1 biased by 4 -> 5");
+        assert(pos_weights4(0x55) == 4, "0x55 = four +1");
+        assert(sign_balance_biased(0x55) == 8, "all +1 -> +4 -> biased 8");
+        assert(neg_weights4(0xAA) == 4, "0xAA = four -1");
+        assert(sign_balance_biased(0xAA) == 0, "all -1 -> -4 -> biased 0");
+        assert(sign_balance_biased(0x00) == 4, "all zero -> net 0 -> biased 4");
+        // 0b11 codes decode to zero, so they touch neither count nor the balance.
+        assert(pos_weights4(0xFF) == 0, "four 11-codes contribute no +1");
+        assert(neg_weights4(0xFF) == 0, "four 11-codes contribute no -1");
+        assert(sign_balance_biased(0xFF) == 4, "four 11-codes are net zero (biased 4)");
+    }
+
+    // Consistency with the active count: pos + neg == active_weights4 for every
+    // word -- the signed decode partitions exactly the active (nonzero) trits.
+    test pos_plus_neg_is_active {
+        assert(pos_weights4(0x61) + neg_weights4(0x61) == active_weights4(0x61), "pos+neg == active (mixed)");
+        assert(pos_weights4(0x55) + neg_weights4(0x55) == active_weights4(0x55), "pos+neg == active (all +1)");
+        assert(pos_weights4(0xFF) + neg_weights4(0xFF) == active_weights4(0xFF), "pos+neg == active (all 11 zeros)");
+    }
+
+    // Verifiable ternary recompute: a challenger confirms the claimed sign balance
+    // against the committed canonical weights, and rejects a wrong balance or a
+    // non-canonical packing.
+    test bitnet_balance_recompute {
+        // 0x61 balances to biased 5 (pos 2, neg 1 -> +1 +4).
+        assert(bitnet_balance_matches(0x61, 5) == true, "canonical weights + correct balance -> verified");
+        assert(bitnet_balance_matches(0x61, 8) == false, "canonical weights + WRONG claimed balance -> rejected (fraud)");
+        assert(bitnet_balance_matches(0x55, 8) == true, "all +1 -> biased 8 verified");
+        assert(bitnet_balance_matches(0xAA, 0) == true, "all -1 -> biased 0 verified");
+        // non-canonical packing is rejected even if the claimed balance equals what
+        // the (mis)packing would sum to: 0xFF sums to biased 4, but it has 0b11 codes.
+        assert(bitnet_balance_matches(0xFF, 4) == false, "non-canonical 0b11 packing rejected regardless of balance");
+        assert(bitnet_balance_matches(0x1B, sign_balance_biased(0x1B)) == false, "a single 0b11 trit fails the check even at its own balance");
+    }
+
+    // The receipt binds the TERNARY WEIGHTS: flipping a weight changes the leaf.
+    test weights_are_bound {
+        base = bitnet_leaf(0x61, 0xABCD, 0x4100, 0xC0FFEE01, 0xE0E0, 1);
+        flip = bitnet_leaf(0x62, 0xABCD, 0x4100, 0xC0FFEE01, 0xE0E0, 1);
+        assert(base != flip, "changing a ternary weight changes the receipt");
+    }
+
+    // The receipt binds the GF16 VALUE side: activation and result both matter.
+    test gf16_side_is_bound {
+        base = bitnet_leaf(0x61, 0xABCD, 0x4100, 0xC0FFEE01, 0xE0E0, 1);
+        act = bitnet_leaf(0x61, 0x9999, 0x4100, 0xC0FFEE01, 0xE0E0, 1);
+        res = bitnet_leaf(0x61, 0xABCD, 0x4200, 0xC0FFEE01, 0xE0E0, 1);
+        assert(base != act, "changing the GF16 activation changes the receipt");
+        assert(base != res, "changing the GF16 result changes the receipt");
+    }
+
+    // executor and epoch are bound DISTINCTLY: two receipts whose executor+epoch
+    // sum is equal but the pair differs (exec 5/epoch 3 vs exec 3/epoch 5) now hash
+    // differently -- the cross-executor collision the old `executor + epoch` allowed
+    // is closed. Each field also independently changes the leaf.
+    test executor_epoch_bound_distinctly {
+        a = bitnet_leaf(0x61, 0xABCD, 0x4100, 0xC0FFEE01, 5, 3);
+        b = bitnet_leaf(0x61, 0xABCD, 0x4100, 0xC0FFEE01, 3, 5);
+        assert(a != b, "same executor+epoch SUM, different pair -> different leaf (no collision)");
+        base = bitnet_leaf(0x61, 0xABCD, 0x4100, 0xC0FFEE01, 0xE0E0, 1);
+        exe = bitnet_leaf(0x61, 0xABCD, 0x4100, 0xC0FFEE01, 0xE0E1, 1);
+        ep = bitnet_leaf(0x61, 0xABCD, 0x4100, 0xC0FFEE01, 0xE0E0, 2);
+        assert(base != exe, "changing the executor changes the leaf");
+        assert(base != ep, "changing the epoch changes the leaf");
+    }
+
+    // The 256-bit preimage lays out one SHA-256 block: TAG, the six fields (executor
+    // and epoch as SEPARATE words 5/6), then padding and the 224-bit length.
+    test bitnet_digest_preimage {
+        assert(bitnet_digest_pre(0, 0x61, 0xABCD, 0x4100, 0xC0FFEE01, 5, 3) == TAG_BITNET, "word 0 is the bitnet domain tag");
+        assert(bitnet_digest_pre(1, 0x61, 0xABCD, 0x4100, 0xC0FFEE01, 5, 3) == 0x61, "word 1 is the weight_code");
+        assert(bitnet_digest_pre(2, 0x61, 0xABCD, 0x4100, 0xC0FFEE01, 5, 3) == 0xABCD, "word 2 is the activation hash");
+        assert(bitnet_digest_pre(3, 0x61, 0xABCD, 0x4100, 0xC0FFEE01, 5, 3) == 0x4100, "word 3 is the GF result");
+        assert(bitnet_digest_pre(4, 0x61, 0xABCD, 0x4100, 0xC0FFEE01, 5, 3) == 0xC0FFEE01, "word 4 is the device");
+        assert(bitnet_digest_pre(5, 0x61, 0xABCD, 0x4100, 0xC0FFEE01, 5, 3) == 5, "word 5 is the executor (distinct word)");
+        assert(bitnet_digest_pre(6, 0x61, 0xABCD, 0x4100, 0xC0FFEE01, 5, 3) == 3, "word 6 is the epoch (distinct -- no sum)");
+        assert(bitnet_digest_pre(7, 0x61, 0xABCD, 0x4100, 0xC0FFEE01, 5, 3) == SHA_PAD, "word 7 starts the SHA-256 padding");
+        assert(bitnet_digest_pre(10, 0x61, 0xABCD, 0x4100, 0xC0FFEE01, 5, 3) == 0, "middle padding words are zero");
+        assert(bitnet_digest_pre(15, 0x61, 0xABCD, 0x4100, 0xC0FFEE01, 5, 3) == BITNET_MSG_BITS, "word 15 is the 224-bit message length");
+        // The sum-colliding pair maps to different message words -> different digest.
+        assert(bitnet_digest_pre(5, 0, 0, 0, 0, 3, 5) == 3, "exec 3 -> word 5 = 3 (a different preimage than exec 5)");
+    }
+}

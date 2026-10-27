@@ -1,0 +1,299 @@
+module TrinityGf16WideNormT27;
+// Typed constant also avoids an unsized decimal literal in older Verilator.
+const MAX_U64: u64 = (0 as u64)-1;
+// Issue #109. gf16-wide-norm-v1: serial, bounded row arithmetic.
+// See docs/gf16-wide-normalization.md. All rounding is RNE.
+// External math ports connect to the existing generated ffn_wide.t27 engine.
+fn finite(v: u32) -> bool { return v <= 65535 && (v & 32256) != 32256; }
+fn pick(flag: bool, a: u64, b: u64) -> u64 { if (flag) { return a; } return b; }
+fn carry(a: u64, b: u64) -> u64 { if (a+b < a) { return 1; } return 0; }
+fn msb(value: u64) -> u32 {
+    var v: u64 = value; var k: u32 = 0;
+    if (v >= ((1 as u64) << 32)) { v = v >> 32; k = k+32; }
+    if (v >= 65536) { v = v >> 16; k = k+16; }
+    if (v >= 256) { v = v >> 8; k = k+8; }
+    if (v >= 16) { v = v >> 4; k = k+4; }
+    if (v >= 4) { v = v >> 2; k = k+2; }
+    if (v >= 2) { k = k+1; }
+    return k;
+}
+fn rshift(v: u64, shift: u32) -> u64 {
+    if (shift == 0) { return v; }
+    if (shift >= 64) { return 0; }
+    let q: u64 = v >> shift;
+    let rem: u64 = v & (((1 as u64) << shift)-1);
+    let half: u64 = (1 as u64) << (shift-1);
+    return q + pick(rem > half || (rem == half && (q & 1) != 0),1,0);
+}
+fn mant(v: u32) -> u64 {
+    if ((v & 32256) == 0) { return (v & 511) as u64; }
+    return ((v & 511) | 512) as u64;
+}
+fn power(v: u32) -> i32 {
+    if ((v & 32256) == 0) { return -39; }
+    return (((v >> 9) & 63) as i32)-40;
+}
+fn mul10(a: u64, b: u32) -> u64 {
+    // The GF16 significand is ten bits. Avoid the backend's general mul64.
+    var sum: u64 = 0;
+    var bit: u32 = 0;
+    while (bit < 10) {
+        if (((b >> bit) & 1) != 0) { sum = sum+(a << bit); }
+        bit = bit+1;
+    }
+    return sum;
+}
+fn pack_f32(m: u64, exponent: i32, sign: u32) -> u32 {
+    if (m == 0) { return sign; }
+    var k: u32 = msb(m);
+    var q: u64 = m;
+    if (k > 23) { q = rshift(m,k-23); } else { q = m << (23-k); }
+    if (q >= 16777216) { q = q >> 1; k = k+1; }
+    return sign | ((((k as i32)+exponent+127) as u32) << 23) | ((q as u32) & 8388607);
+}
+fn product(g: u32, u: u32) -> u32 {
+    let sign: u32 = (u & 32768) << 16;
+    if ((g & 32768) != 0) { return sign; }
+    let square: u64 = mul10(mant(g),mant(g) as u32);
+    return pack_f32(mul10(square,mant(u) as u32),power(g)+power(g)+power(u),sign);
+}
+fn encode(bits: u32) -> u32 {
+    let sign: u32 = (bits >> 16) & 32768;
+    let exponent: u32 = (bits >> 23) & 255;
+    let m: u32 = bits & 8388607;
+    if (exponent > 158) { return sign | 32256; }
+    if (exponent < 87) { return sign; }
+    if (exponent < 97) { return sign | (rshift((8388608 | m) as u64,111-exponent) as u32); }
+    return sign | (((exponent-96) << 9)+(rshift(m as u64,14) as u32));
+}
+fn multiply(a: u32, b: u32) -> u32 {
+    return encode(pack_f32(mul10(mant(a),mant(b) as u32),power(a)+power(b),((a^b) & 32768) << 16));
+}
+fn quantize(p: u32, block: i32) -> u64 {
+    if ((p & 2147483647) == 0) { return 0; }
+    let m: u64 = ((p & 8388607) | 8388608) as u64;
+    let shift: i32 = (((p >> 23) & 255) as i32)-150-block;
+    if (shift >= 0) { return m << (shift as u32); }
+    return rshift(m,(0-shift) as u32);
+}
+fn eps_low(block: i32) -> u64 {
+    let shift: i32 = -40-block-block;
+    if (shift < 0) { return rshift(10995116,(0-shift) as u32); }
+    if (shift >= 64) { return 0; }
+    return (10995116 as u64) << (shift as u32);
+}
+fn eps_high(block: i32) -> u64 {
+    let shift: i32 = -40-block-block;
+    if (shift <= 0) { return 0; }
+    if (shift >= 64) { return (10995116 as u64) << ((shift-64) as u32); }
+    return (10995116 as u64) >> ((64-shift) as u32);
+}
+fn rne_inc(q: u64, r0: u64, r1: u64, d0: u64, d1: u64) -> u64 {
+    let t0: u64 = r0 << 1;
+    let t1: u64 = (r1 << 1) | (r0 >> 63);
+    return pick(t1 > d1 || (t1 == d1 && (t0 > d0 || (t0 == d0 && (q & 1) != 0))),1,0);
+}
+fn unit_round(q: u64, r0: u64, r1: u64, d0: u64, d1: u64, sign: u32) -> u32 {
+    // q=floor(unit*2^39), retaining the divider remainder avoids double rounding.
+    if (q < 1024) { return sign | ((q+rne_inc(q,r0,r1,d0,d1)) as u32); }
+    let k: u32 = msb(q);
+    let shift: u32 = k-9;
+    let m: u64 = q >> shift;
+    let rem: u64 = q & (((1 as u64) << shift)-1);
+    let half: u64 = (1 as u64) << (shift-1);
+    let inc: u64 = pick(rem > half || (rem == half && (r0 != 0 || r1 != 0 || (m & 1) != 0)),1,0);
+    // Reuse shift: the pinned Verilog CSE hoists repeated local k-9 too early.
+    return sign | ((shift << 9)+((m+inc) as u32));
+}
+
+var state: u32 = 0;
+var busy: bool = false;
+var done: bool = false;
+var fault: bool = false;
+var error_code: u32 = 0;
+var length: u32 = 0;
+var index: u32 = 0;
+var peak: u32 = 0;
+var block: i32 = -54;
+var products: [8192]u32;
+var weights: [8192]u32;
+var sample: u32 = 0;
+var gamma: u32 = 0;
+var magnitude: u64 = 0;
+var sum0: u64 = 0;
+var sum1: u64 = 0;
+var mean0: u64 = 0;
+var mean1: u64 = 0;
+var d0: u64 = 0;
+var d1: u64 = 0;
+var root0: u64 = 0;
+var root1: u64 = 0;
+var unit: u32 = 0;
+var out_valid: bool = false;
+var out_value: u32 = 0;
+var out_product: u32 = 0;
+var out_unit: u32 = 0;
+var overflow_count: u32 = 0;
+var cycles: u64 = 0;
+var math_start: bool = false;
+var math_mode: u32 = 0;
+var a0: u64 = 0;
+var a1: u64 = 0;
+var a2: u64 = 0;
+var b0: u64 = 0;
+var b1: u64 = 0;
+var scalar_start: bool = false;
+var scalar_mode: u32 = 0;
+var scalar_x: u64 = 0;
+var scalar_y: u64 = 0;
+var scalar_r0: u64 = 0;
+var scalar_r1: u64 = 0;
+var scalar_d0: u64 = 1;
+var scalar_d1: u64 = 0;
+var scalar_negative: bool = false;
+var scalar_aux: i32 = 0;
+var in_ready: bool;
+var sum_carry: u64 = 0;
+var sum_step0: u64 = 0;
+var sum_step1: u64 = 0;
+var eps_shift: i32 = 0;
+var eps_step0: u64 = 0;
+var eps_step1: u64 = 0;
+var eps_guard: bool = false;
+var eps_sticky: bool = false;
+var d_step1: u64 = 0;
+var mean_increment: u64 = 0;
+
+var epsilon0: u64 = 0;
+var epsilon1: u64 = 0;
+var epsilon_carry: u64 = 0;
+in_ready = state == 1;
+// Keep pure arithmetic in the combinational process, outside the reset mux.
+
+fn on_clock(start: bool, row_length: u32, in_valid: bool, gate_in: u32, up_in: u32,
+            weight_in: u32, out_ready: bool, math_done: bool, math_fault: bool,
+            q0: u64, q1: u64, q2: u64, r0: u64, r1: u64,
+            scalar_done: bool, scalar_fault: bool, scalar_value: u64) {
+    // One registered read port per array; do not duplicate reads by state.
+    sample = products[index]; gamma = weights[index];
+    math_start = false; scalar_start = false; done = false;
+    if (busy) { cycles = cycles+1; }
+    if (state == 0) {
+        if (start) {
+            length = row_length; index = 0; peak = 0; cycles = 0;
+            overflow_count = 0; fault = false; error_code = 0;
+            if (row_length == 0 || row_length > 6912) {
+                done = true; fault = true; error_code = 1;
+            } else { state = 1; busy = true; }
+        }
+    } else if (state == 1) {
+        if (in_valid) {
+            if (!finite(gate_in) || !finite(up_in) || !finite(weight_in)) {
+                state = 0; busy = false; done = true; fault = true; error_code = 2;
+            } else {
+                weights[index] = weight_in & 65535;
+                scalar_mode = 1; scalar_x = gate_in as u64; scalar_y = up_in as u64;
+                scalar_start = true; state = 30;
+            }
+        }
+    } else if (state == 30) {
+        if (scalar_done) {
+            products[index] = scalar_value as u32;
+            if (((scalar_value >> 23) & 255) > (peak as u64)) { peak = ((scalar_value >> 23) & 255) as u32; }
+            if (index+1 == length) { index = 0; state = 2; } else { index = index+1; state = 1; }
+        }
+    } else if (state == 2) {
+        block = -54;
+        if (peak > 113) { block = (peak as i32)-167; }
+        sum0 = 0; sum1 = 0; state = 35;
+    } else if (state == 35) {
+        eps_step0 = 10995116; eps_step1 = 0; eps_shift = -40-block-block;
+        eps_guard = false; eps_sticky = false; state = 36;
+    } else if (state == 36) {
+        if (eps_shift > 0) {
+            eps_step0 = eps_step0 << 1; eps_step1 = (eps_step1 << 1) | (eps_step0 >> 63); eps_shift = eps_shift-1;
+        } else if (eps_shift < 0) {
+            eps_sticky = eps_sticky || eps_guard; eps_guard = (eps_step0 & 1) != 0;
+            eps_step0 = eps_step0 >> 1; eps_shift = eps_shift+1;
+        } else { state = 37; }
+    } else if (state == 37) {
+        // A right shift starts from 24 bits, so rounding cannot carry to high.
+        epsilon0 = eps_step0+pick(eps_guard && (eps_sticky || (eps_step0 & 1) != 0),1,0);
+        epsilon1 = eps_step1; state = 3;
+    } else if (state == 3) {
+        state = 4;
+    } else if (state == 4) {
+        scalar_mode = 4; scalar_x = sample as u64; scalar_aux = block; scalar_start = true; state = 31;
+    } else if (state == 31) {
+        if (scalar_done) { magnitude = scalar_value; state = 5; }
+    } else if (state == 5) {
+        a0 = magnitude; a1 = 0; a2 = 0; b0 = magnitude; b1 = 0;
+        math_mode = 1; math_start = true; state = 6;
+    } else if (state == 6) {
+        if (math_done) {
+            sum_step0 = sum0+q0; sum_step1 = sum1+q1; sum_carry = carry(sum0,q0); state = 39;
+        }
+    } else if (state == 39) {
+        sum0 = sum_step0; sum1 = sum_step1+sum_carry;
+        if (index+1 == length) { state = 7; } else { index = index+1; state = 3; }
+    } else if (state == 7) {
+        a0 = sum0; a1 = sum1; a2 = 0; b0 = length as u64; b1 = 0;
+        math_mode = 2; math_start = true; state = 8;
+    } else if (state == 8) {
+        if (math_done) {
+            mean_increment = rne_inc(q0,r0,r1,b0,b1); state = 41;
+        }
+    } else if (state == 41) {
+        mean0 = q0+mean_increment;
+        mean1 = q1+pick(q0 == MAX_U64 && mean_increment != 0,1,0); state = 9;
+    } else if (state == 9) {
+        d0 = mean0+epsilon0; d_step1 = mean1+epsilon1; epsilon_carry = carry(mean0,epsilon0); state = 38;
+    } else if (state == 38) {
+        d1 = d_step1+epsilon_carry; state = 10;
+    } else if (state == 10) {
+        a0 = 0; a1 = d0; a2 = d1; b0 = 0; b1 = 0;
+        math_mode = 3; math_start = true; state = 11;
+    } else if (state == 11) {
+        if (math_done) { root0 = q0; root1 = q1; index = 0; state = 12; }
+    } else if (state == 12) {
+        state = 13;
+    } else if (state == 13) {
+        scalar_mode = 4; scalar_x = sample as u64; scalar_aux = block; scalar_start = true; state = 32;
+    } else if (state == 32) {
+        if (scalar_done) { magnitude = scalar_value; state = 14; }
+    } else if (state == 14) {
+        a0 = 0; a1 = magnitude << 7; a2 = magnitude >> 57; b0 = root0; b1 = root1;
+        math_mode = 2; math_start = true; state = 15;
+    } else if (state == 15) {
+        if (math_done) {
+            scalar_mode = 3; scalar_x = q0; scalar_y = q1; scalar_r0 = r0; scalar_r1 = r1;
+            scalar_d0 = root0; scalar_d1 = root1; scalar_negative = (sample & 2147483648) != 0;
+            scalar_start = true; state = 33;
+        }
+    } else if (state == 33) {
+        if (scalar_done) { unit = scalar_value as u32; state = 16; }
+    } else if (state == 16) {
+        scalar_mode = 2; scalar_x = unit as u64; scalar_y = gamma as u64; scalar_start = true; state = 34;
+    } else if (state == 34) {
+        if (scalar_done) {
+            out_value = scalar_value as u32; out_unit = unit; out_product = sample;
+            out_valid = true; state = 17;
+        }
+    } else if (state == 17) {
+        if (out_ready) {
+            out_valid = false;
+            if (!finite(out_value)) { overflow_count = overflow_count+1; error_code = 4; }
+            if (index+1 == length) {
+                done = true; busy = false; state = 0;
+                fault = overflow_count != 0 || !finite(out_value);
+            } else { index = index+1; state = 12; }
+        }
+    }
+    if (busy && ((math_done && math_fault) || (scalar_done && scalar_fault))) {
+        state = 0; busy = false; done = true; fault = true; error_code = 3; out_valid = false;
+    }
+}
+
+test product_one { assert_eq(product(15872,15872),1065353216); }
+test signed_zero { assert_eq(product(48640,48640),2147483648); }
+test ratio_sticky { assert_eq(unit_round(1025,1,0,4,0,0),1025); assert_eq(unit_round(1025,0,0,4,0,0),1024); }

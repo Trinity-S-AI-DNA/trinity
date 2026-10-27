@@ -1,0 +1,394 @@
+// SPDX-License-Identifier: Apache-2.0
+// t27/specs/tri/crypto/sha256.t27
+// Merkle-Damgard construction with 64-byte blocks | φ² + 1/φ² = 3 | TRINITY
+// Rewritten 2026-10-06 from trinity specs/tri/tri_sha256.tri. The port was
+// Zig, not this dialect (@intCast, +=, if-expressions), and it was not
+// SHA-256: its four sigma functions were single rotations where FIPS 180-4
+// XORs three rotations or shifts, the 32-bit additions did not wrap, and
+// its two digest tests did not compile (final(init()) passes a value where
+// a pointer is needed). The .tri: SHA256 { state: [8]u32, buffer: [64]u8,
+// count: u64 }; init() -> SHA256; update(sha, data); final(sha) -> [32]u8;
+// hash(data) -> [32]u8; behaviour merkle_damgard, "Merkle-Damgard
+// construction with 64-byte blocks". Here the arithmetic follows FIPS
+// 180-4 section 6.2: words are held in usize and reduced mod 2^32 after
+// every sum; NOT x is written x ^ 0xffffffff because a unary operator
+// loses the parentheses around its operand in codegen (#6549). final pads
+// through update, so after final the state and count are spent and the
+// hasher must be re-initialised. The oracles are the FIPS 180-2 appendix
+// B vectors ("", "abc", the 56-byte two-block message) and digests of
+// 55, 56, 63, 64, 119 and 120 'a' bytes, which straddle every padding
+// boundary, computed with Python's hashlib.
+// Mutation-checked 2026-10-06: 25 mutants; every one fails a test.
+// 2026-10-07: to_hex/hash_hex give the 64-letter text every t27c seal,
+// FROZEN_HASH and CREDIT_HASH compare, so t27c and its build.rs hash with
+// this spec and no longer link the sha2 crate (Refs #7332).
+
+module TriSha256;
+    use base::types;
+
+    // ═══════════════════════════════════════════════════════════
+    // 1. Constants
+    // ═══════════════════════════════════════════════════════════
+
+    pub const H0 : [8]u32 = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+        0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+    ];
+
+    pub const K : [64]u32 = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5,
+        0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
+        0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc,
+        0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
+        0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3,
+        0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5,
+        0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
+        0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+    ];
+
+    pub const M32 : usize = 4294967296;
+
+    // ═══════════════════════════════════════════════════════════
+    // 2. Types
+    // ═══════════════════════════════════════════════════════════
+
+    pub const SHA256 = struct {
+        state : [8]u32,
+        buffer : [64]u8,
+        count : u64,
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    // 3. Core Functions
+    // ═══════════════════════════════════════════════════════════
+
+    fn init() -> SHA256 {
+        return SHA256{ .state = H0, .buffer = [0] ** 64, .count = 0 };
+    }
+
+    // x < 2^32 rotated right by 0 < n < 32
+    fn rotr(x: usize, n: usize) -> usize {
+        return (x >> n) | ((x << (32 - n)) % M32);
+    }
+
+    fn big_sigma0(x: usize) -> usize {
+        return rotr(x, 2) ^ rotr(x, 13) ^ rotr(x, 22);
+    }
+
+    fn big_sigma1(x: usize) -> usize {
+        return rotr(x, 6) ^ rotr(x, 11) ^ rotr(x, 25);
+    }
+
+    fn small_sigma0(x: usize) -> usize {
+        return rotr(x, 7) ^ rotr(x, 18) ^ (x >> 3);
+    }
+
+    fn small_sigma1(x: usize) -> usize {
+        return rotr(x, 17) ^ rotr(x, 19) ^ (x >> 10);
+    }
+
+    fn ch(x: usize, y: usize, z: usize) -> usize {
+        return (x & y) ^ ((x ^ 4294967295) & z);
+    }
+
+    fn maj(x: usize, y: usize, z: usize) -> usize {
+        return (x & y) ^ (x & z) ^ (y & z);
+    }
+
+    // one 64-byte block from sha.buffer into sha.state
+    fn compress(sha: *SHA256) -> void {
+        var w : [64]usize = [0] ** 64;
+        var t : usize = 0;
+        while (t < 16) {
+            w[t] = (sha.buffer[t * 4] as usize) * 16777216 + (sha.buffer[t * 4 + 1] as usize) * 65536
+                + (sha.buffer[t * 4 + 2] as usize) * 256 + (sha.buffer[t * 4 + 3] as usize);
+            t = t + 1;
+        }
+        while (t < 64) {
+            w[t] = (small_sigma1(w[t - 2]) + w[t - 7] + small_sigma0(w[t - 15]) + w[t - 16]) % M32;
+            t = t + 1;
+        }
+        var v : [8]usize = [0] ** 8;
+        var k : usize = 0;
+        while (k < 8) {
+            v[k] = sha.state[k] as usize;
+            k = k + 1;
+        }
+        t = 0;
+        while (t < 64) {
+            const t1 = (v[7] + big_sigma1(v[4]) + ch(v[4], v[5], v[6]) + (K[t] as usize) + w[t]) % M32;
+            const t2 = (big_sigma0(v[0]) + maj(v[0], v[1], v[2])) % M32;
+            v[7] = v[6];
+            v[6] = v[5];
+            v[5] = v[4];
+            v[4] = (v[3] + t1) % M32;
+            v[3] = v[2];
+            v[2] = v[1];
+            v[1] = v[0];
+            v[0] = (t1 + t2) % M32;
+            t = t + 1;
+        }
+        k = 0;
+        while (k < 8) {
+            sha.state[k] = (((sha.state[k] as usize) + v[k]) % M32) as u32;
+            k = k + 1;
+        }
+    }
+
+    fn update(sha: *SHA256, data: []const u8) -> void {
+        var i : usize = 0;
+        while (i < data.len) {
+            sha.buffer[(sha.count % 64) as usize] = data[i];
+            sha.count = sha.count + 1;
+            if (sha.count % 64 == 0) {
+                compress(sha);
+            }
+            i = i + 1;
+        }
+    }
+
+    // pads with 0x80, zeros to 56 mod 64, and the big-endian bit length
+    fn final(sha: *SHA256) -> [32]u8 {
+        const bits = (sha.count as usize) * 8;
+        const used = (sha.count % 64) as usize;
+        var zeros : usize = 119 - used;
+        if (used < 56) {
+            zeros = 55 - used;
+        }
+        var pad : [72]u8 = [0] ** 72;
+        pad[0] = 128;
+        var k : usize = 0;
+        while (k < 8) {
+            pad[1 + zeros + k] = ((bits >> (56 - 8 * k)) % 256) as u8;
+            k = k + 1;
+        }
+        update(sha, pad[0 .. zeros + 9]);
+        var out : [32]u8 = [0] ** 32;
+        var i : usize = 0;
+        while (i < 32) {
+            out[i] = (((sha.state[i / 4] as usize) >> (24 - 8 * (i % 4))) % 256) as u8;
+            i = i + 1;
+        }
+        return out;
+    }
+
+    fn hash(data: []const u8) -> [32]u8 {
+        var sha = init();
+        update(&sha, data);
+        return final(&sha);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // TDD: Tests
+    // ═══════════════════════════════════════════════════════════
+
+    fn nibble(c: u8) -> usize {
+        if (c >= 97) {
+            return (c as usize) - 87;
+        }
+        return (c as usize) - 48;
+    }
+
+    // digest equals the 64-letter lower-case hex string
+    fn is_hex(d: [32]u8, hex: []const u8) -> bool {
+        if (hex.len != 64) {
+            return false;
+        }
+        var i : usize = 0;
+        while (i < 32) {
+            if ((d[i] as usize) != nibble(hex[2 * i]) * 16 + nibble(hex[2 * i + 1])) {
+                return false;
+            }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    // one nibble 0..15 as its lower-case hex letter
+    fn hex_char(n: usize) -> u8 {
+        if (n >= 10) {
+            return (n + 87) as u8;
+        }
+        return (n + 48) as u8;
+    }
+
+    // the digest as 64 lower-case hex letters: the text form that seals,
+    // FROZEN_HASH, CREDIT_HASH and `t27c hash` print and compare
+    fn to_hex(d: [32]u8) -> [64]u8 {
+        var out : [64]u8 = [48] ** 64;
+        var i : usize = 0;
+        while (i < 32) {
+            out[2 * i] = hex_char((d[i] as usize) / 16);
+            out[2 * i + 1] = hex_char((d[i] as usize) % 16);
+            i = i + 1;
+        }
+        return out;
+    }
+
+    fn hash_hex(data: []const u8) -> [64]u8 {
+        return to_hex(hash(data));
+    }
+
+    // 64 hex letters equal the expected text, letter by letter
+    fn text_is(h: [64]u8, want: []const u8) -> bool {
+        if (want.len != 64) {
+            return false;
+        }
+        var i : usize = 0;
+        while (i < 64) {
+            if (h[i] != want[i]) {
+                return false;
+            }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    // the two FIPS digests use all sixteen hex letters between them
+    fn hex_vectors() -> usize {
+        var ok : usize = 0;
+        if (text_is(hash_hex(""), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")) {
+            ok = ok + 1;
+        }
+        if (text_is(hash_hex("abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")) {
+            ok = ok + 1;
+        }
+        // a wrong digest and a short text are refused
+        if (text_is(hash_hex("abc"), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855") == false) {
+            ok = ok + 1;
+        }
+        if (text_is(hash_hex(""), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b8") == false) {
+            ok = ok + 1;
+        }
+        return ok;
+    }
+
+    fn a_bytes(n: usize) -> [32]u8 {
+        var x : [120]u8 = [97] ** 120;
+        return hash(x[0..n]);
+    }
+
+    // FIPS 180-2 appendix B
+    fn fips_vectors() -> usize {
+        var ok : usize = 0;
+        if (is_hex(hash(""), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")) {
+            ok = ok + 1;
+        }
+        if (is_hex(hash("abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")) {
+            ok = ok + 1;
+        }
+        if (is_hex(hash("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
+                "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1")) {
+            ok = ok + 1;
+        }
+        return ok;
+    }
+
+    // n 'a' bytes for n on both sides of each padding boundary
+    fn boundary_vectors() -> usize {
+        var ok : usize = 0;
+        if (is_hex(a_bytes(55), "9f4390f8d30c2dd92ec9f095b65e2b9ae9b0a925a5258e241c9f1e910f734318")) {
+            ok = ok + 1;
+        }
+        if (is_hex(a_bytes(56), "b35439a4ac6f0948b6d6f9e3c6af0f5f590ce20f1bde7090ef7970686ec6738a")) {
+            ok = ok + 1;
+        }
+        if (is_hex(a_bytes(63), "7d3e74a05d7db15bce4ad9ec0658ea98e3f06eeecf16b4c6fff2da457ddc2f34")) {
+            ok = ok + 1;
+        }
+        if (is_hex(a_bytes(64), "ffe054fe7ae0cb6dc65c3af9b61d5209f439851db43d0ba5997337df154668eb")) {
+            ok = ok + 1;
+        }
+        if (is_hex(a_bytes(119), "31eba51c313a5c08226adf18d4a359cfdfd8d2e816b13f4af952f7ea6584dcfb")) {
+            ok = ok + 1;
+        }
+        if (is_hex(a_bytes(120), "2f3d335432c70b580af0e8e1b3674a7c020d683aa5f73aaaedfdc55af904c21c")) {
+            ok = ok + 1;
+        }
+        return ok;
+    }
+
+    fn same(a: [32]u8, b: [32]u8) -> bool {
+        var i : usize = 0;
+        while (i < 32) {
+            if (a[i] != b[i]) {
+                return false;
+            }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    // seeded random messages of 0..199 bytes fed in random chunks hash the
+    // same as in one piece, and count is the byte count before final
+    fn chunked_streams() -> usize {
+        var s : usize = 27;
+        var good : usize = 0;
+        var t : usize = 0;
+        while (t < 12) {
+            var x : [200]u8 = [0] ** 200;
+            s = (s * 1103515245 + 12345) % 2147483648;
+            const n = s % 200;
+            var k : usize = 0;
+            while (k < n) {
+                s = (s * 1103515245 + 12345) % 2147483648;
+                x[k] = ((s / 65536) % 256) as u8;
+                k = k + 1;
+            }
+            var sha = init();
+            var at : usize = 0;
+            while (at < n) {
+                s = (s * 1103515245 + 12345) % 2147483648;
+                var step = 1 + s % 70;
+                if (at + step > n) {
+                    step = n - at;
+                }
+                update(&sha, x[at .. at + step]);
+                at = at + step;
+            }
+            const counted = (sha.count as usize) == n;
+            if (counted and same(final(&sha), hash(x[0..n]))) {
+                good = good + 1;
+            }
+            t = t + 1;
+        }
+        return good;
+    }
+
+    fn initial_ok() -> bool {
+        const sha = init();
+        return sha.state[0] == 0x6a09e667 and sha.state[7] == 0x5be0cd19 and sha.count == 0;
+    }
+
+    test fips_180_2_vectors
+        given result = fips_vectors()
+        when expected = 3
+        then result == expected
+
+    test padding_boundary_vectors
+        given result = boundary_vectors()
+        when expected = 6
+        then result == expected
+
+    test chunked_updates_match_one_shot
+        given result = chunked_streams()
+        when expected = 12
+        then result == expected
+
+    test init_is_the_fips_initial_state
+        given result = initial_ok()
+        when expected = true
+        then result == expected
+
+    test hex_text_is_lower_case_and_matches_hashlib
+        given result = hex_vectors()
+        when expected = 4
+        then result == expected

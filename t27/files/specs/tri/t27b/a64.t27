@@ -1,0 +1,1683 @@
+module T27bA64;
+// AArch64 (A64) instruction words for the subset t27b emits (gHashTag/t27
+// epic #6198, issue #7531, Refs #6063). Owner's order, 2026-10-07: t27b gets no more
+// hand-written Rust; its stages move into t27. cli/t27b/src/a64.rs mounts the
+// `t27c gen-rust` output of this file (gen/rust/tri/t27b/a64.rs) and keeps
+// only what this backend cannot yet express: Cond's invert/name/from_bits,
+// the disassembler (builds Strings), and two thin adapters -- bitmask_imm
+// splits bitmask_field's packed field into a tuple, mov_imm pushes
+// mov_imm_at's words into a Vec (issue #7549).
+//
+// Every function returns one 32-bit instruction word. `sf` selects the 64-bit
+// (X) form when true and the 32-bit (W) form when false. Register 31 is the
+// zero register or SP depending on the instruction class, as in the
+// architecture. The expected words in the tests are the ones clang + otool
+// produced for cli/t27b/tests/encoder.rs. The words in
+// a64_even_registers_and_full_fields, and a sample of the others, come from
+// LLVM's assembler (zig cc -c, then objdump -d) and equal the hand Rust's.
+//
+// Each field is masked before it is shifted into place, exactly as the hand
+// Rust did, so an out-of-range operand cannot corrupt a neighbouring field.
+// The Rust debug_asserts on operand ranges are not carried over: release
+// builds never ran them, and the words for in-range operands are unchanged.
+// phi^2 + 1/phi^2 = 3 | TRINITY
+
+/// Register 31 read as the zero register (WZR / XZR).
+pub const ZR : u8 = 31;
+/// Register 31 read as the stack pointer.
+pub const SP : u8 = 31;
+/// Frame pointer, x29.
+pub const FP : u8 = 29;
+/// Link register, x30.
+pub const LR : u8 = 30;
+
+/// Condition codes, in their 4-bit encoding.
+pub const Cond = enum(u32) {
+    Eq = 0,
+    Ne = 1,
+    Hs = 2,
+    Lo = 3,
+    Mi = 4,
+    Pl = 5,
+    Vs = 6,
+    Vc = 7,
+    Hi = 8,
+    Ls = 9,
+    Ge = 10,
+    Lt = 11,
+    Gt = 12,
+    Le = 13,
+    Al = 14,
+};
+
+/// Extend option of the add/sub (extended register) form.
+pub const Ext = enum(u32) {
+    Uxtb = 0,
+    Uxth = 1,
+    Uxtw = 2,
+    Uxtx = 3,
+    Sxtb = 4,
+    Sxth = 5,
+    Sxtw = 6,
+    Sxtx = 7,
+};
+
+/// Shift type of the shifted-register forms.
+pub const Shift = enum(u32) {
+    Lsl = 0,
+    Lsr = 1,
+    Asr = 2,
+};
+
+/// AND / ORR / EOR / ANDS: the opc field of the logical forms.
+pub const LogOp = enum(u32) {
+    And = 0,
+    Orr = 1,
+    Eor = 2,
+    Ands = 3,
+};
+
+/// Bit 31: the X form.
+fn sfb(sf: bool) -> u32 {
+    if (sf) {
+        return 0x80000000;
+    }
+    return 0;
+}
+
+/// A flag as one bit.
+fn bit(flag: bool) -> u32 {
+    if (flag) {
+        return 1;
+    }
+    return 0;
+}
+
+/// A register number as a 5-bit field.
+fn r(x: u8) -> u32 {
+    return (x as u32) & 31;
+}
+
+fn cond_bits(cond: Cond) -> u32 {
+    return @intFromEnum(cond) as u32;
+}
+
+// ------------------------------------------------------------ add / subtract
+
+/// ADD/ADDS/SUB/SUBS (shifted register). Reg 31 is ZR.
+pub fn addsub_reg(sf: bool, is_sub: bool, setflags: bool, rd: u8, rn: u8, rm: u8, sh: Shift, amt: u32) -> u32 {
+    return sfb(sf) | (bit(is_sub) << 30) | (bit(setflags) << 29) | 0x0B000000 | ((@intFromEnum(sh) as u32) << 22) | (r(rm) << 16) | ((amt & 63) << 10) | (r(rn) << 5) | r(rd);
+}
+
+pub fn add(sf: bool, rd: u8, rn: u8, rm: u8) -> u32 {
+    return addsub_reg(sf, false, false, rd, rn, rm, Shift.Lsl, 0);
+}
+
+pub fn adds(sf: bool, rd: u8, rn: u8, rm: u8) -> u32 {
+    return addsub_reg(sf, false, true, rd, rn, rm, Shift.Lsl, 0);
+}
+
+pub fn sub(sf: bool, rd: u8, rn: u8, rm: u8) -> u32 {
+    return addsub_reg(sf, true, false, rd, rn, rm, Shift.Lsl, 0);
+}
+
+pub fn subs(sf: bool, rd: u8, rn: u8, rm: u8) -> u32 {
+    return addsub_reg(sf, true, true, rd, rn, rm, Shift.Lsl, 0);
+}
+
+/// CMP rn, rm (SUBS ZR).
+pub fn cmp(sf: bool, rn: u8, rm: u8) -> u32 {
+    return subs(sf, ZR, rn, rm);
+}
+
+/// CMP rn, rm, <sh> #amt.
+pub fn cmp_shifted(sf: bool, rn: u8, rm: u8, sh: Shift, amt: u32) -> u32 {
+    return addsub_reg(sf, true, true, ZR, rn, rm, sh, amt);
+}
+
+/// ADD/ADDS/SUB/SUBS (extended register). Rn and (non-flag-setting) Rd 31
+/// are SP; Rd 31 with flags is ZR.
+pub fn addsub_ext(sf: bool, is_sub: bool, setflags: bool, rd: u8, rn: u8, rm: u8, ext: Ext, lsl: u32) -> u32 {
+    return sfb(sf) | (bit(is_sub) << 30) | (bit(setflags) << 29) | 0x0B200000 | (r(rm) << 16) | ((@intFromEnum(ext) as u32) << 13) | ((lsl & 7) << 10) | (r(rn) << 5) | r(rd);
+}
+
+/// CMP rn, rm, <ext>: compares rn with the extended low part of rm.
+pub fn cmp_ext(sf: bool, rn: u8, rm: u8, ext: Ext) -> u32 {
+    return addsub_ext(sf, true, true, ZR, rn, rm, ext, 0);
+}
+
+/// ADD/ADDS/SUB/SUBS (immediate): imm12, optionally shifted left by 12.
+/// Rn 31 is SP; Rd 31 is SP without flags, ZR with flags.
+pub fn addsub_imm(sf: bool, is_sub: bool, setflags: bool, rd: u8, rn: u8, imm12: u32, lsl12: bool) -> u32 {
+    return sfb(sf) | (bit(is_sub) << 30) | (bit(setflags) << 29) | 0x11000000 | (bit(lsl12) << 22) | ((imm12 & 0xfff) << 10) | (r(rn) << 5) | r(rd);
+}
+
+pub fn add_imm(sf: bool, rd: u8, rn: u8, imm12: u32) -> u32 {
+    return addsub_imm(sf, false, false, rd, rn, imm12, false);
+}
+
+pub fn sub_imm(sf: bool, rd: u8, rn: u8, imm12: u32) -> u32 {
+    return addsub_imm(sf, true, false, rd, rn, imm12, false);
+}
+
+pub fn cmp_imm(sf: bool, rn: u8, imm12: u32) -> u32 {
+    return addsub_imm(sf, true, true, ZR, rn, imm12, false);
+}
+
+pub fn cmn_imm(sf: bool, rn: u8, imm12: u32) -> u32 {
+    return addsub_imm(sf, false, true, ZR, rn, imm12, false);
+}
+
+/// MOV between a general register and SP (ADD #0).
+pub fn mov_sp(rd: u8, rn: u8) -> u32 {
+    return add_imm(true, rd, rn, 0);
+}
+
+// ------------------------------------------------------------------- logical
+
+/// AND/ORR/EOR/ANDS (shifted register); `negate` gives BIC/ORN/EON/BICS.
+/// Reg 31 is ZR.
+pub fn logic_reg(sf: bool, op: LogOp, negate: bool, rd: u8, rn: u8, rm: u8) -> u32 {
+    return sfb(sf) | ((@intFromEnum(op) as u32) << 29) | 0x0A000000 | (bit(negate) << 21) | (r(rm) << 16) | (r(rn) << 5) | r(rd);
+}
+
+/// MOV rd, rm (ORR rd, ZR, rm). The W form zero-extends into the X register.
+pub fn mov(sf: bool, rd: u8, rm: u8) -> u32 {
+    return logic_reg(sf, LogOp.Orr, false, rd, ZR, rm);
+}
+
+/// MVN rd, rm (ORN rd, ZR, rm).
+pub fn mvn(sf: bool, rd: u8, rm: u8) -> u32 {
+    return logic_reg(sf, LogOp.Orr, true, rd, ZR, rm);
+}
+
+/// AND/ORR/EOR/ANDS (immediate) from an already-encoded (N, immr, imms).
+/// logic_imm below finds the triple and calls this.
+pub fn logic_imm_word(sf: bool, op: LogOp, rd: u8, rn: u8, n: u32, immr: u32, imms: u32) -> u32 {
+    return sfb(sf) | ((@intFromEnum(op) as u32) << 29) | 0x12000000 | (n << 22) | (immr << 16) | (imms << 10) | (r(rn) << 5) | r(rd);
+}
+
+// -------------------------------------------------------- logical immediates
+//
+// A logical (bitmask) immediate is an element of 2, 4, 8, 16, 32 or 64 bits,
+// replicated to fill the register, whose bits are one run of ones rotated
+// right. The word stores it as N:immr:imms (bits 22..10): N is 1 for a 64-bit
+// element; the high bits of imms mark the element size and its low bits hold
+// the run length minus one; immr is the right rotation. 5334 values have an
+// encoding in an X register and 1302 in a W register; 0 and all ones never do.
+
+/// The low k bits set, for 1 <= k <= 64.
+fn low_ones(k: u32) -> u64 {
+    var m: u64 = 0xffffffffffffffff;
+    if (k < 64) {
+        m = m >> (64 - k);
+    }
+    return m;
+}
+
+/// How many bits of x are set.
+fn count_ones(x: u64) -> u32 {
+    var c: u32 = 0;
+    var y: u64 = x;
+    while (y != 0) {
+        c = c + ((y & 1) as u32);
+        y = y >> 1;
+    }
+    return c;
+}
+
+/// x, an element `size` bits wide, rotated right by k (k < size).
+fn rotr_in(x: u64, k: u32, size: u32) -> u64 {
+    if (k == 0) {
+        return x;
+    }
+    return ((x >> k) | (x << (size - k))) & low_ones(size);
+}
+
+/// The packed N:immr:imms field of a logical immediate (N at bit 12, immr at
+/// bits 11..6, imms at bits 5..0), or null when `value` has no encoding. A W
+/// register (`sf` false) reads only the low 32 bits of `value`.
+pub fn bitmask_field(value: u64, sf: bool) -> ?u32 {
+    var v: u64 = value;
+    if (!sf) {
+        // Replicate the low 32 bits, so the 64-bit search covers both widths.
+        v = (value & 0xffffffff) | ((value & 0xffffffff) << 32);
+    }
+    if ((v == 0) or (v == 0xffffffffffffffff)) {
+        return null;
+    }
+    // The smallest element whose replication is v.
+    var size: u32 = 64;
+    while (size > 2) {
+        const half: u32 = size / 2;
+        if ((v & low_ones(half)) != ((v >> half) & low_ones(half))) {
+            break;
+        }
+        size = half;
+    }
+    // v is neither 0 nor all ones, so the element has 0 < ones < size, and a
+    // W value replicates into an element of at most 32 bits. The hand Rust
+    // checked both again; those guards could not fire and are not carried.
+    const elem: u64 = v & low_ones(size);
+    const ones: u32 = count_ones(elem);
+    // The right rotation that turns elem into a run of ones at the bottom.
+    var rr: u32 = 0;
+    while ((rr < size) and (rotr_in(elem, rr, size) != low_ones(ones))) {
+        rr = rr + 1;
+    }
+    if (rr == size) {
+        return null;
+    }
+    // The word rotates the run right by immr: the inverse of rr.
+    const immr: u32 = (size - rr) % size;
+    var n: u32 = 0;
+    if (size == 64) {
+        n = 1;
+    }
+    // imms = NOT(2 * size - 1) in 6 bits, OR the run length minus one.
+    const imms: u32 = ((0x3f ^ ((size * 2) - 1)) & 0x3f) | (ones - 1);
+    return (n << 12) | (immr << 6) | imms;
+}
+
+/// AND/ORR/EOR/ANDS (immediate), or null when `value` is not a logical
+/// immediate. Rd 31 is SP for AND/ORR/EOR, ZR for ANDS.
+pub fn logic_imm(sf: bool, op: LogOp, rd: u8, rn: u8, value: u64) -> ?u32 {
+    const f: ?u32 = bitmask_field(value, sf);
+    if (f == null) {
+        return null;
+    }
+    const g: u32 = f.?;
+    return logic_imm_word(sf, op, rd, rn, g >> 12, (g >> 6) & 63, g & 63);
+}
+
+// ---------------------------------------------------------------- move wide
+
+/// MOVZ rd, #imm16, LSL #(16*hw).
+pub fn movz(sf: bool, rd: u8, imm16: u32, hw: u32) -> u32 {
+    return sfb(sf) | 0x52800000 | ((hw & 3) << 21) | ((imm16 & 0xffff) << 5) | r(rd);
+}
+
+/// MOVN rd, #imm16, LSL #(16*hw).
+pub fn movn(sf: bool, rd: u8, imm16: u32, hw: u32) -> u32 {
+    return sfb(sf) | 0x12800000 | ((hw & 3) << 21) | ((imm16 & 0xffff) << 5) | r(rd);
+}
+
+/// MOVK rd, #imm16, LSL #(16*hw).
+pub fn movk(sf: bool, rd: u8, imm16: u32, hw: u32) -> u32 {
+    return sfb(sf) | 0x72800000 | ((hw & 3) << 21) | ((imm16 & 0xffff) << 5) | r(rd);
+}
+
+// ------------------------------------------------------ putting a constant
+//
+// mov_imm is the shortest sequence that puts a constant in rd: one ORR from
+// ZR when the value is a logical immediate and MOVZ or MOVN would each need
+// two or more words, else a MOVN or MOVZ followed by MOVKs, whichever is
+// shorter (MOVZ on a tie). It is mov_imm_at(.., 0) .. mov_imm_at(.., len - 1)
+// with len = mov_imm_len(..); cli/t27b/src/a64.rs pushes them into a Vec.
+
+/// The value as the register sees it: a W register keeps the low 32 bits.
+fn mov_value(sf: bool, value: u64) -> u64 {
+    if (sf) {
+        return value;
+    }
+    return value & 0xffffffff;
+}
+
+/// The number of 16-bit halfwords in the register: 4 for X, 2 for W.
+fn hw_count(sf: bool) -> u32 {
+    if (sf) {
+        return 4;
+    }
+    return 2;
+}
+
+/// Halfword i of v.
+fn hw16(v: u64, i: u32) -> u32 {
+    return ((v >> (16 * i)) & 0xffff) as u32;
+}
+
+/// How many halfwords of the register's v equal h.
+fn hw_equal(sf: bool, v: u64, h: u32) -> u32 {
+    var c: u32 = 0;
+    var i: u32 = 0;
+    while (i < hw_count(sf)) {
+        if (hw16(v, i) == h) {
+            c = c + 1;
+        }
+        i = i + 1;
+    }
+    return c;
+}
+
+/// Plan 0: MOVZ #0. Plan 1: ORR rd, ZR, #v. Plan 2: MOVN, then a MOVK for
+/// every other halfword that is not 0xffff. Plan 3: MOVZ, then a MOVK for
+/// every other halfword that is not 0.
+fn mov_plan(sf: bool, v: u64) -> u32 {
+    const need_z: u32 = hw_count(sf) - hw_equal(sf, v, 0);
+    const need_n: u32 = hw_count(sf) - hw_equal(sf, v, 0xffff);
+    if (need_z == 0) {
+        return 0;
+    }
+    if ((need_z > 1) and (need_n > 1) and (bitmask_field(v, sf) != null)) {
+        return 1;
+    }
+    if (need_n < need_z) {
+        return 2;
+    }
+    return 3;
+}
+
+/// The halfword a MOVN chain (plan 2) or a MOVZ chain (plan 3) leaves out.
+fn mov_skip(plan: u32) -> u32 {
+    if (plan == 2) {
+        return 0xffff;
+    }
+    return 0;
+}
+
+/// How many words mov_imm emits for `value`: 1 to 4 for X, 1 or 2 for W.
+pub fn mov_imm_len(sf: bool, value: u64) -> u32 {
+    const v: u64 = mov_value(sf, value);
+    const plan: u32 = mov_plan(sf, v);
+    if (plan < 2) {
+        return 1;
+    }
+    const left: u32 = hw_count(sf) - hw_equal(sf, v, mov_skip(plan));
+    if (left == 0) {
+        // All ones: a single MOVN #0.
+        return 1;
+    }
+    return left;
+}
+
+/// Word k (0 <= k < mov_imm_len) of the sequence that puts `value` in rd.
+pub fn mov_imm_at(sf: bool, rd: u8, value: u64, k: u32) -> u32 {
+    const v: u64 = mov_value(sf, value);
+    const plan: u32 = mov_plan(sf, v);
+    if (plan == 0) {
+        return movz(sf, rd, 0, 0);
+    }
+    if (plan == 1) {
+        return logic_imm(sf, LogOp.Orr, rd, ZR, v).?;
+    }
+    // Word k sets the k-th halfword that the chain does not skip.
+    var seen: u32 = 0;
+    var i: u32 = 0;
+    while (i < hw_count(sf)) {
+        const c: u32 = hw16(v, i);
+        if (c != mov_skip(plan)) {
+            if (seen == k) {
+                if (k > 0) {
+                    return movk(sf, rd, c, i);
+                }
+                if (plan == 2) {
+                    return movn(sf, rd, c ^ 0xffff, i);
+                }
+                return movz(sf, rd, c, i);
+            }
+            seen = seen + 1;
+        }
+        i = i + 1;
+    }
+    // Every halfword is 0xffff: MOVN #0.
+    return movn(sf, rd, 0, 0);
+}
+
+// ------------------------------------------------- data processing, 2 and 3
+
+fn dp2(sf: bool, opcode: u32, rd: u8, rn: u8, rm: u8) -> u32 {
+    return sfb(sf) | 0x1AC00000 | (r(rm) << 16) | (opcode << 10) | (r(rn) << 5) | r(rd);
+}
+
+pub fn udiv(sf: bool, rd: u8, rn: u8, rm: u8) -> u32 {
+    return dp2(sf, 2, rd, rn, rm);
+}
+
+pub fn sdiv(sf: bool, rd: u8, rn: u8, rm: u8) -> u32 {
+    return dp2(sf, 3, rd, rn, rm);
+}
+
+pub fn lslv(sf: bool, rd: u8, rn: u8, rm: u8) -> u32 {
+    return dp2(sf, 8, rd, rn, rm);
+}
+
+pub fn lsrv(sf: bool, rd: u8, rn: u8, rm: u8) -> u32 {
+    return dp2(sf, 9, rd, rn, rm);
+}
+
+pub fn asrv(sf: bool, rd: u8, rn: u8, rm: u8) -> u32 {
+    return dp2(sf, 10, rd, rn, rm);
+}
+
+/// MADD rd, rn, rm, ra (rd = ra + rn*rm).
+pub fn madd(sf: bool, rd: u8, rn: u8, rm: u8, ra: u8) -> u32 {
+    return sfb(sf) | 0x1B000000 | (r(rm) << 16) | (r(ra) << 10) | (r(rn) << 5) | r(rd);
+}
+
+/// MSUB rd, rn, rm, ra (rd = ra - rn*rm).
+pub fn msub(sf: bool, rd: u8, rn: u8, rm: u8, ra: u8) -> u32 {
+    return sfb(sf) | 0x1B008000 | (r(rm) << 16) | (r(ra) << 10) | (r(rn) << 5) | r(rd);
+}
+
+pub fn mul(sf: bool, rd: u8, rn: u8, rm: u8) -> u32 {
+    return madd(sf, rd, rn, rm, ZR);
+}
+
+/// SMULL xd, wn, wm (64-bit product of signed 32-bit operands).
+pub fn smull(rd: u8, rn: u8, rm: u8) -> u32 {
+    return 0x9B200000 | (r(rm) << 16) | (r(ZR) << 10) | (r(rn) << 5) | r(rd);
+}
+
+/// UMULL xd, wn, wm.
+pub fn umull(rd: u8, rn: u8, rm: u8) -> u32 {
+    return 0x9BA00000 | (r(rm) << 16) | (r(ZR) << 10) | (r(rn) << 5) | r(rd);
+}
+
+/// SMULH xd, xn, xm (high 64 bits of the signed 128-bit product).
+pub fn smulh(rd: u8, rn: u8, rm: u8) -> u32 {
+    return 0x9B400000 | (r(rm) << 16) | (r(ZR) << 10) | (r(rn) << 5) | r(rd);
+}
+
+/// UMULH xd, xn, xm.
+pub fn umulh(rd: u8, rn: u8, rm: u8) -> u32 {
+    return 0x9BC00000 | (r(rm) << 16) | (r(ZR) << 10) | (r(rn) << 5) | r(rd);
+}
+
+// ----------------------------------------------------------------- bitfield
+
+pub fn sbfm(sf: bool, rd: u8, rn: u8, immr: u32, imms: u32) -> u32 {
+    return sfb(sf) | 0x13000000 | (bit(sf) << 22) | ((immr & 63) << 16) | ((imms & 63) << 10) | (r(rn) << 5) | r(rd);
+}
+
+pub fn ubfm(sf: bool, rd: u8, rn: u8, immr: u32, imms: u32) -> u32 {
+    return sfb(sf) | 0x53000000 | (bit(sf) << 22) | ((immr & 63) << 16) | ((imms & 63) << 10) | (r(rn) << 5) | r(rd);
+}
+
+/// The register width in bits: 64 for the X form, 32 for the W form.
+fn width(sf: bool) -> u32 {
+    if (sf) {
+        return 64;
+    }
+    return 32;
+}
+
+pub fn lsl_imm(sf: bool, rd: u8, rn: u8, sh: u32) -> u32 {
+    const size = width(sf);
+    return ubfm(sf, rd, rn, (size - sh) % size, size - 1 - sh);
+}
+
+pub fn lsr_imm(sf: bool, rd: u8, rn: u8, sh: u32) -> u32 {
+    return ubfm(sf, rd, rn, sh, width(sf) - 1);
+}
+
+pub fn asr_imm(sf: bool, rd: u8, rn: u8, sh: u32) -> u32 {
+    return sbfm(sf, rd, rn, sh, width(sf) - 1);
+}
+
+pub fn uxtb(rd: u8, rn: u8) -> u32 {
+    return ubfm(false, rd, rn, 0, 7);
+}
+
+pub fn uxth(rd: u8, rn: u8) -> u32 {
+    return ubfm(false, rd, rn, 0, 15);
+}
+
+pub fn sxtb(rd: u8, rn: u8) -> u32 {
+    return sbfm(false, rd, rn, 0, 7);
+}
+
+pub fn sxth(rd: u8, rn: u8) -> u32 {
+    return sbfm(false, rd, rn, 0, 15);
+}
+
+/// SXTW xd, wn.
+pub fn sxtw(rd: u8, rn: u8) -> u32 {
+    return sbfm(true, rd, rn, 0, 31);
+}
+
+// --------------------------------------------------------- conditional select
+
+fn csinc_bits(sf: bool, rd: u8, rn: u8, rm: u8, c: u32) -> u32 {
+    return sfb(sf) | 0x1A800400 | (r(rm) << 16) | (c << 12) | (r(rn) << 5) | r(rd);
+}
+
+/// CSINC rd, rn, rm, cond.
+pub fn csinc(sf: bool, rd: u8, rn: u8, rm: u8, cond: Cond) -> u32 {
+    return csinc_bits(sf, rd, rn, rm, cond_bits(cond));
+}
+
+/// The inverse condition's 4 bits: flip bit 0, except AL stays AL.
+fn invert_bits(c: u32) -> u32 {
+    if (c == 14) {
+        return 14;
+    }
+    return c ^ 1;
+}
+
+/// CSET rd, cond (rd = cond ? 1 : 0): CSINC rd, ZR, ZR, invert(cond).
+pub fn cset(sf: bool, rd: u8, cond: Cond) -> u32 {
+    return csinc_bits(sf, rd, ZR, ZR, invert_bits(cond_bits(cond)));
+}
+
+// ----------------------------------------------------------------- branches
+
+/// B with a word offset (target - pc) / 4. Named `branch` here because the
+/// Zig test prelude's `assert_eq(a, b)` would shadow a fn named `b`;
+/// cli/t27b re-exports it as `a64::b`.
+pub fn branch(off: i32) -> u32 {
+    return 0x14000000 | ((off & 0x03ffffff) as u32);
+}
+
+pub fn bl(off: i32) -> u32 {
+    return 0x94000000 | ((off & 0x03ffffff) as u32);
+}
+
+/// The 19-bit word offset of B.cond / CBZ / CBNZ, in place at bit 5.
+fn imm19(off: i32) -> u32 {
+    return ((off & 0x7ffff) as u32) << 5;
+}
+
+pub fn b_cond(cond: Cond, off: i32) -> u32 {
+    return 0x54000000 | imm19(off) | cond_bits(cond);
+}
+
+pub fn cbz(sf: bool, rt: u8, off: i32) -> u32 {
+    return sfb(sf) | 0x34000000 | imm19(off) | r(rt);
+}
+
+pub fn cbnz(sf: bool, rt: u8, off: i32) -> u32 {
+    return sfb(sf) | 0x35000000 | imm19(off) | r(rt);
+}
+
+pub fn ret() -> u32 {
+    return 0xD65F03C0;
+}
+
+pub fn blr(rn: u8) -> u32 {
+    return 0xD63F0000 | (r(rn) << 5);
+}
+
+pub fn brk(imm16: u32) -> u32 {
+    return 0xD4200000 | ((imm16 & 0xffff) << 5);
+}
+
+pub fn nop() -> u32 {
+    return 0xD503201F;
+}
+
+// -------------------------------------------------------------- load/store
+
+/// STR xt, [xn, #imm] with imm a multiple of 8 in 0..32760. Xn 31 is SP.
+pub fn str_x(rt: u8, rn: u8, imm: u32) -> u32 {
+    return 0xF9000000 | ((imm / 8) << 10) | (r(rn) << 5) | r(rt);
+}
+
+pub fn ldr_x(rt: u8, rn: u8, imm: u32) -> u32 {
+    return 0xF9400000 | ((imm / 8) << 10) | (r(rn) << 5) | r(rt);
+}
+
+/// The 9-bit signed byte offset of the unscaled and post-index forms, in
+/// place at bit 12.
+fn imm9(simm: i32) -> u32 {
+    return ((simm & 0x1ff) as u32) << 12;
+}
+
+/// STUR xt, [xn, #simm9].
+pub fn stur_x(rt: u8, rn: u8, simm: i32) -> u32 {
+    return 0xF8000000 | imm9(simm) | (r(rn) << 5) | r(rt);
+}
+
+pub fn ldur_x(rt: u8, rn: u8, simm: i32) -> u32 {
+    return 0xF8400000 | imm9(simm) | (r(rn) << 5) | r(rt);
+}
+
+/// The 7-bit scaled signed offset of the pair forms (bytes / 8), in place at
+/// bit 15, with the second register at bit 10.
+fn pair(rt1: u8, rt2: u8, rn: u8, simm: i32) -> u32 {
+    return (((@divTrunc(simm, 8) & 0x7f) as u32) << 15) | (r(rt2) << 10) | (r(rn) << 5) | r(rt1);
+}
+
+/// STP xt1, xt2, [xn, #simm] (signed offset, multiple of 8 in -512..504).
+pub fn stp_x(rt1: u8, rt2: u8, rn: u8, simm: i32) -> u32 {
+    return 0xA9000000 | pair(rt1, rt2, rn, simm);
+}
+
+pub fn ldp_x(rt1: u8, rt2: u8, rn: u8, simm: i32) -> u32 {
+    return 0xA9400000 | pair(rt1, rt2, rn, simm);
+}
+
+/// STP xt1, xt2, [xn, #simm]! (pre-index).
+pub fn stp_x_pre(rt1: u8, rt2: u8, rn: u8, simm: i32) -> u32 {
+    return 0xA9800000 | pair(rt1, rt2, rn, simm);
+}
+
+/// LDP xt1, xt2, [xn], #simm (post-index).
+pub fn ldp_x_post(rt1: u8, rt2: u8, rn: u8, simm: i32) -> u32 {
+    return 0xA8C00000 | pair(rt1, rt2, rn, simm);
+}
+
+// ------------------------------------------------------ floating point
+//
+// Double precision (ftype 01). `d` registers are numbered 0..31 like the
+// general ones; register 31 of a general operand of FMOV / SCVTF / UCVTF is
+// the zero register.
+
+/// FMOV dd, xn (general to FP register, the 64-bit pattern unchanged).
+pub fn fmov_d_x(rd: u8, rn: u8) -> u32 {
+    return 0x9E670000 | (r(rn) << 5) | r(rd);
+}
+
+/// FMOV xd, dn (FP to general register).
+pub fn fmov_x_d(rd: u8, rn: u8) -> u32 {
+    return 0x9E660000 | (r(rn) << 5) | r(rd);
+}
+
+/// FADD dd, dn, dm.
+pub fn fadd(rd: u8, rn: u8, rm: u8) -> u32 {
+    return 0x1E602800 | (r(rm) << 16) | (r(rn) << 5) | r(rd);
+}
+
+/// FSUB dd, dn, dm.
+pub fn fsub(rd: u8, rn: u8, rm: u8) -> u32 {
+    return 0x1E603800 | (r(rm) << 16) | (r(rn) << 5) | r(rd);
+}
+
+/// FMUL dd, dn, dm.
+pub fn fmul(rd: u8, rn: u8, rm: u8) -> u32 {
+    return 0x1E600800 | (r(rm) << 16) | (r(rn) << 5) | r(rd);
+}
+
+/// FDIV dd, dn, dm.
+pub fn fdiv(rd: u8, rn: u8, rm: u8) -> u32 {
+    return 0x1E601800 | (r(rm) << 16) | (r(rn) << 5) | r(rd);
+}
+
+/// FNEG dd, dn.
+pub fn fneg(rd: u8, rn: u8) -> u32 {
+    return 0x1E614000 | (r(rn) << 5) | r(rd);
+}
+
+/// FSQRT dd, dn (correctly rounded, current rounding mode).
+pub fn fsqrt(rd: u8, rn: u8) -> u32 {
+    return 0x1E61C000 | (r(rn) << 5) | r(rd);
+}
+
+/// FCMP dn, dm (quiet compare; unordered sets NZCV to 0011).
+pub fn fcmp(rn: u8, rm: u8) -> u32 {
+    return 0x1E602000 | (r(rm) << 16) | (r(rn) << 5);
+}
+
+/// SCVTF dd, wn / xn (signed integer to double, current rounding mode).
+pub fn scvtf(sf: bool, rd: u8, rn: u8) -> u32 {
+    return 0x1E620000 | sfb(sf) | (r(rn) << 5) | r(rd);
+}
+
+/// UCVTF dd, wn / xn (unsigned integer to double).
+pub fn ucvtf(sf: bool, rd: u8, rn: u8) -> u32 {
+    return 0x1E630000 | sfb(sf) | (r(rn) << 5) | r(rd);
+}
+
+/// FCVTZS wd / xd, dn (double to signed integer, toward zero, saturating).
+pub fn fcvtzs(sf: bool, rd: u8, rn: u8) -> u32 {
+    return 0x1E780000 | sfb(sf) | (r(rn) << 5) | r(rd);
+}
+
+/// FCVTZU wd / xd, dn (double to unsigned integer, toward zero, saturating).
+pub fn fcvtzu(sf: bool, rd: u8, rn: u8) -> u32 {
+    return 0x1E790000 | sfb(sf) | (r(rn) << 5) | r(rd);
+}
+
+/// The single-precision (ftype 00) form of one of the double-precision
+/// encoders `fadd fsub fmul fdiv fneg fsqrt fcmp scvtf ucvtf fcvtzs fcvtzu`:
+/// they differ in bit 22 only.
+pub fn single(w: u32) -> u32 {
+    return w & 0xFFBFFFFF;
+}
+
+/// FMOV sd, wn (general to FP register, the 32-bit pattern unchanged).
+pub fn fmov_s_w(rd: u8, rn: u8) -> u32 {
+    return 0x1E270000 | (r(rn) << 5) | r(rd);
+}
+
+/// FMOV wd, sn (FP to general register; the upper 32 bits of xd are zeroed).
+pub fn fmov_w_s(rd: u8, rn: u8) -> u32 {
+    return 0x1E260000 | (r(rn) << 5) | r(rd);
+}
+
+/// FCVT dd, sn (single to double, exact).
+pub fn fcvt_d_s(rd: u8, rn: u8) -> u32 {
+    return 0x1E22C000 | (r(rn) << 5) | r(rd);
+}
+
+/// FCVT sd, dn (double to single, current rounding mode).
+pub fn fcvt_s_d(rd: u8, rn: u8) -> u32 {
+    return 0x1E624000 | (r(rn) << 5) | r(rd);
+}
+
+/// STR dt, [xn, #imm] with imm a multiple of 8 in 0..32760. Xn 31 is SP.
+pub fn str_d(rt: u8, rn: u8, imm: u32) -> u32 {
+    return 0xFD000000 | ((imm / 8) << 10) | (r(rn) << 5) | r(rt);
+}
+
+/// LDR dt, [xn, #imm].
+pub fn ldr_d(rt: u8, rn: u8, imm: u32) -> u32 {
+    return 0xFD400000 | ((imm / 8) << 10) | (r(rn) << 5) | r(rt);
+}
+
+/// LDP dt1, dt2, [xn, #simm] (signed offset, multiple of 8 in -512..504).
+pub fn ldp_d(rt1: u8, rt2: u8, rn: u8, simm: i32) -> u32 {
+    return 0x6D400000 | pair(rt1, rt2, rn, simm);
+}
+
+// ------------------------------------------------------ sized load/store
+//
+// `size` is log2 of the access width in bytes (0 byte, 1 half, 2 word,
+// 3 double); `opc` is one of the four constants below. Register 31 as the
+// base is SP, as the data register it is ZR.
+
+/// Store.
+pub const ST : u32 = 0;
+/// Load, zero-extending.
+pub const LD : u32 = 1;
+/// Load, sign-extending to 64 bits (`ldrsb x`, `ldrsh x`, `ldrsw`).
+pub const LDS64 : u32 = 2;
+/// Load, sign-extending to 32 bits (`ldrsb w`, `ldrsh w`).
+pub const LDS32 : u32 = 3;
+
+/// log2 of an access width of 1, 2, 4 or 8 bytes.
+pub fn size_log2(bytes: u32) -> u32 {
+    if ((bytes != 1) and (bytes != 2) and (bytes != 4) and (bytes != 8)) {
+        @panic("size_log2: an access is 1, 2, 4 or 8 bytes");
+    }
+    if (bytes == 1) {
+        return 0;
+    }
+    if (bytes == 2) {
+        return 1;
+    }
+    if (bytes == 4) {
+        return 2;
+    }
+    return 3;
+}
+
+/// 2 to the power `size`: the access width in bytes for a size field.
+fn scale(size: u32) -> u32 {
+    var p : u32 = 1;
+    var i : u32 = 0;
+    while (i < size) {
+        p = p * 2;
+        i = i + 1;
+    }
+    return p;
+}
+
+/// True when `imm` fits the scaled unsigned-offset form for this size.
+pub fn uimm_fits(size: u32, imm: u32) -> bool {
+    return (imm % scale(size) == 0) and (imm / scale(size) < 4096);
+}
+
+/// LDR/STR [xn, #imm] (unsigned offset, scaled by the access width).
+pub fn ldst_uimm(size: u32, opc: u32, rt: u8, rn: u8, imm: u32) -> u32 {
+    return (size << 30) | 0x39000000 | (opc << 22) | ((imm / scale(size)) << 10) | (r(rn) << 5) | r(rt);
+}
+
+/// LDUR/STUR [xn, #simm9] (unscaled signed offset).
+pub fn ldst_unscaled(size: u32, opc: u32, rt: u8, rn: u8, simm: i32) -> u32 {
+    return (size << 30) | 0x38000000 | (opc << 22) | imm9(simm) | (r(rn) << 5) | r(rt);
+}
+
+/// LDR/STR [xn, xm] or, when `scaled`, [xn, xm, lsl #size].
+pub fn ldst_reg(size: u32, opc: u32, rt: u8, rn: u8, rm: u8, scaled: bool) -> u32 {
+    return (size << 30) | 0x38200800 | (opc << 22) | (r(rm) << 16) | (3 << 13) | (bit(scaled) << 12) | (r(rn) << 5) | r(rt);
+}
+
+/// LDR/STR [xn], #simm9 (post-index: xn += simm after the access).
+pub fn ldst_post(size: u32, opc: u32, rt: u8, rn: u8, simm: i32) -> u32 {
+    return (size << 30) | 0x38000400 | (opc << 22) | imm9(simm) | (r(rn) << 5) | r(rt);
+}
+
+/// The 21-bit PC-relative field of ADR / ADRP: immlo at bit 29, immhi at
+/// bit 5.
+fn pcrel21(v: i32) -> u32 {
+    return (((v & 3) as u32) << 29) | ((((v >> 2) & 0x7ffff) as u32) << 5);
+}
+
+/// ADR xd, pc + off (bytes, within +-1 MiB).
+pub fn adr(rd: u8, off: i32) -> u32 {
+    return 0x10000000 | pcrel21(off) | r(rd);
+}
+
+/// ADRP xd, page(pc) + pages * 4096.
+pub fn adrp(rd: u8, pages: i32) -> u32 {
+    return 0x90000000 | pcrel21(pages) | r(rd);
+}
+
+/// Patch the page delta of an `adrp` word.
+pub fn adrp_patch(w: u32, pages: i32) -> u32 {
+    return (w & 0x9F00001F) | (adrp(0, pages) & 0x60FFFFE0);
+}
+
+/// Patch the imm12 of an `add (immediate)` word.
+pub fn add_imm_patch(w: u32, imm12: u32) -> u32 {
+    return (w & 0xFFC003FF) | (imm12 << 10);
+}
+
+// ------------------------------------------------------------------- tests
+//
+// Every expected word below is the one clang assembled and otool printed for
+// cli/t27b/tests/encoder.rs (encoders_match_clang); the comment is the
+// assembly. The logical-immediate cases stay there: their (N, immr, imms)
+// search is still hand Rust.
+
+
+test a64_addsub_matches_clang {
+    // add w2, w0, w1
+    assert_eq(add(false, 2, 0, 1), 0x0b010002);
+    // add x2, x0, x1
+    assert_eq(add(true, 2, 0, 1), 0x8b010002);
+    // adds w2, w0, w1
+    assert_eq(adds(false, 2, 0, 1), 0x2b010002);
+    // adds x3, x4, x5
+    assert_eq(adds(true, 3, 4, 5), 0xab050083);
+    // sub w2, w0, w1
+    assert_eq(sub(false, 2, 0, 1), 0x4b010002);
+    // subs x2, x0, x1
+    assert_eq(subs(true, 2, 0, 1), 0xeb010002);
+    // cmp w1, w2
+    assert_eq(cmp(false, 1, 2), 0x6b02003f);
+    // cmp x8, x9, asr #63
+    assert_eq(cmp_shifted(true, 8, 9, Shift.Asr, 63), 0xeb89fd1f);
+    // negs w0, w2
+    assert_eq(subs(false, 0, ZR, 2), 0x6b0203e0);
+}
+
+test a64_addsub_ext_matches_clang {
+    // sub sp, sp, x16, uxtx
+    assert_eq(addsub_ext(true, true, false, SP, SP, 16, Ext.Uxtx, 0), 0xcb3063ff);
+    // cmp w9, w9, uxtb
+    assert_eq(cmp_ext(false, 9, 9, Ext.Uxtb), 0x6b29013f);
+    // cmp w9, w9, sxth
+    assert_eq(cmp_ext(false, 9, 9, Ext.Sxth), 0x6b29a13f);
+    // cmp x9, w9, uxtw
+    assert_eq(cmp_ext(true, 9, 9, Ext.Uxtw), 0xeb29413f);
+    // cmp x9, w9, sxtw
+    assert_eq(cmp_ext(true, 9, 9, Ext.Sxtw), 0xeb29c13f);
+}
+
+test a64_addsub_imm_matches_clang {
+    // add w2, w0, #1
+    assert_eq(add_imm(false, 2, 0, 1), 0x11000402);
+    // adds w2, w0, #0
+    assert_eq(addsub_imm(false, false, true, 2, 0, 0, false), 0x31000002);
+    // sub sp, sp, #32
+    assert_eq(sub_imm(true, SP, SP, 32), 0xd10083ff);
+    // subs x1, x2, #4095
+    assert_eq(addsub_imm(true, true, true, 1, 2, 4095, false), 0xf13ffc41);
+    // cmp w1, #8
+    assert_eq(cmp_imm(false, 1, 8), 0x7100203f);
+    // cmn x3, #1
+    assert_eq(cmn_imm(true, 3, 1), 0xb100047f);
+    // mov x29, sp
+    assert_eq(mov_sp(29, SP), 0x910003fd);
+    // mov sp, x29
+    assert_eq(mov_sp(SP, 29), 0x910003bf);
+}
+
+test a64_logical_matches_clang {
+    // and w0, w1, w2
+    assert_eq(logic_reg(false, LogOp.And, false, 0, 1, 2), 0x0a020020);
+    // orr x0, x1, x2
+    assert_eq(logic_reg(true, LogOp.Orr, false, 0, 1, 2), 0xaa020020);
+    // eor w2, w9, w10
+    assert_eq(logic_reg(false, LogOp.Eor, false, 2, 9, 10), 0x4a0a0122);
+    // ands x0, x1, x2
+    assert_eq(logic_reg(true, LogOp.Ands, false, 0, 1, 2), 0xea020020);
+    // mov x0, x2
+    assert_eq(mov(true, 0, 2), 0xaa0203e0);
+    // mov w0, w2
+    assert_eq(mov(false, 0, 2), 0x2a0203e0);
+    // mvn w0, w2
+    assert_eq(mvn(false, 0, 2), 0x2a2203e0);
+    // mvn x0, x2
+    assert_eq(mvn(true, 0, 2), 0xaa2203e0);
+}
+
+test a64_move_wide_matches_clang {
+    // movz w1, #0x7
+    assert_eq(movz(false, 1, 7, 0), 0x528000e1);
+    // movz x1, #0x1234, lsl #16
+    assert_eq(movz(true, 1, 0x1234, 1), 0xd2a24681);
+    // movn x1, #0
+    assert_eq(movn(true, 1, 0, 0), 0x92800001);
+    // movn w1, #0
+    assert_eq(movn(false, 1, 0, 0), 0x12800001);
+    // movk x9, #0xbeef, lsl #48
+    assert_eq(movk(true, 9, 0xbeef, 3), 0xf2f7dde9);
+    // movk w9, #0xbeef, lsl #16
+    assert_eq(movk(false, 9, 0xbeef, 1), 0x72b7dde9);
+}
+
+test a64_dp2_matches_clang {
+    // udiv w0, w1, w2
+    assert_eq(udiv(false, 0, 1, 2), 0x1ac20820);
+    // sdiv x0, x1, x2
+    assert_eq(sdiv(true, 0, 1, 2), 0x9ac20c20);
+    // lsl w0, w1, w2
+    assert_eq(lslv(false, 0, 1, 2), 0x1ac22020);
+    // lsr x0, x1, x2
+    assert_eq(lsrv(true, 0, 1, 2), 0x9ac22420);
+    // asr w0, w1, w2
+    assert_eq(asrv(false, 0, 1, 2), 0x1ac22820);
+    // lsl x3, x4, x5
+    assert_eq(lslv(true, 3, 4, 5), 0x9ac52083);
+    // lsr w7, w8, w9
+    assert_eq(lsrv(false, 7, 8, 9), 0x1ac92507);
+    // asr x10, x11, x12
+    assert_eq(asrv(true, 10, 11, 12), 0x9acc296a);
+    // lsl w17, w16, w8
+    assert_eq(lslv(false, 17, 16, 8), 0x1ac82211);
+}
+
+test a64_dp3_matches_clang {
+    // madd x0, x1, x2, x3
+    assert_eq(madd(true, 0, 1, 2, 3), 0x9b020c20);
+    // msub w2, w8, w17, w2
+    assert_eq(msub(false, 2, 8, 17, 2), 0x1b118902);
+    // mul w9, w2, w17
+    assert_eq(mul(false, 9, 2, 17), 0x1b117c49);
+    // mul x9, x2, x17
+    assert_eq(mul(true, 9, 2, 17), 0x9b117c49);
+    // smull x9, w2, w17
+    assert_eq(smull(9, 2, 17), 0x9b317c49);
+    // umull x9, w2, w17
+    assert_eq(umull(9, 2, 17), 0x9bb17c49);
+    // smulh x8, x1, x2
+    assert_eq(smulh(8, 1, 2), 0x9b427c28);
+    // umulh x8, x1, x2
+    assert_eq(umulh(8, 1, 2), 0x9bc27c28);
+}
+
+test a64_bitfield_matches_clang {
+    // lsl w0, w2, #2
+    assert_eq(lsl_imm(false, 0, 2, 2), 0x531e7440);
+    // lsr w10, w2, #2
+    assert_eq(lsr_imm(false, 10, 2, 2), 0x53027c4a);
+    // asr x0, x1, #63
+    assert_eq(asr_imm(true, 0, 1, 63), 0x937ffc20);
+    // lsl x0, x1, #1
+    assert_eq(lsl_imm(true, 0, 1, 1), 0xd37ff820);
+    // asr w3, w4, #31
+    assert_eq(asr_imm(false, 3, 4, 31), 0x131f7c83);
+    // lsr x5, x6, #0
+    assert_eq(lsr_imm(true, 5, 6, 0), 0xd340fcc5);
+    // lsr x0, x16, #63
+    assert_eq(lsr_imm(true, 0, 16, 63), 0xd37ffe00);
+    // lsl w0, w16, #31
+    assert_eq(lsl_imm(false, 0, 16, 31), 0x53010200);
+    // uxtb w0, w1
+    assert_eq(uxtb(0, 1), 0x53001c20);
+    // uxth w0, w1
+    assert_eq(uxth(0, 1), 0x53003c20);
+    // sxtb w0, w1
+    assert_eq(sxtb(0, 1), 0x13001c20);
+    // sxth w0, w1
+    assert_eq(sxth(0, 1), 0x13003c20);
+    // sxtw x0, w1
+    assert_eq(sxtw(0, 1), 0x93407c20);
+}
+
+test a64_csel_matches_clang {
+    // cset w9, lo
+    assert_eq(cset(false, 9, Cond.Lo), 0x1a9f27e9);
+    // cset w0, eq
+    assert_eq(cset(false, 0, Cond.Eq), 0x1a9f17e0);
+    // cset x0, gt
+    assert_eq(cset(true, 0, Cond.Gt), 0x9a9fd7e0);
+    // csinc w0, w1, w2, ne
+    assert_eq(csinc(false, 0, 1, 2, Cond.Ne), 0x1a821420);
+}
+
+test a64_branch_matches_clang {
+    // b L1
+    assert_eq(branch(2), 0x14000002);
+    // nop
+    assert_eq(nop(), 0xd503201f);
+    // b L0
+    assert_eq(branch(-2), 0x17fffffe);
+    // bl L0
+    assert_eq(bl(-3), 0x97fffffd);
+    // b.eq L1
+    assert_eq(b_cond(Cond.Eq, -2), 0x54ffffc0);
+    // b.vs L2
+    assert_eq(b_cond(Cond.Vs, 4), 0x54000086);
+    // b.lt L0
+    assert_eq(b_cond(Cond.Lt, -6), 0x54ffff4b);
+    // cbz w1, L2
+    assert_eq(cbz(false, 1, 2), 0x34000041);
+    // cbnz x8, L0
+    assert_eq(cbnz(true, 8, -8), 0xb5ffff08);
+    // ret
+    assert_eq(ret(), 0xd65f03c0);
+    // blr x16
+    assert_eq(blr(16), 0xd63f0200);
+    // brk #0x1
+    assert_eq(brk(1), 0xd4200020);
+    // brk #0x5
+    assert_eq(brk(5), 0xd42000a0);
+    // nop
+    assert_eq(nop(), 0xd503201f);
+}
+
+test a64_ldst_x_matches_clang {
+    // str x19, [sp, #16]
+    assert_eq(str_x(19, SP, 16), 0xf9000bf3);
+    // ldr x10, [x9]
+    assert_eq(ldr_x(10, 9, 0), 0xf940012a);
+    // ldr x16, [sp, #32760]
+    assert_eq(ldr_x(16, SP, 32760), 0xf97ffff0);
+    // stur x1, [x2, #-8]
+    assert_eq(stur_x(1, 2, -8), 0xf81f8041);
+    // ldur x1, [x2, #-8]
+    assert_eq(ldur_x(1, 2, -8), 0xf85f8041);
+}
+
+test a64_ldst_pair_matches_clang {
+    // stp x19, x20, [sp, #16]
+    assert_eq(stp_x(19, 20, SP, 16), 0xa90153f3);
+    // ldp x0, x1, [x17, #48]
+    assert_eq(ldp_x(0, 1, 17, 48), 0xa9430620);
+    // stp x27, x28, [sp, #80]
+    assert_eq(stp_x(27, 28, SP, 80), 0xa90573fb);
+    // stp x29, x30, [sp, #-16]!
+    assert_eq(stp_x_pre(29, 30, SP, -16), 0xa9bf7bfd);
+    // ldp x29, x30, [sp], #16
+    assert_eq(ldp_x_post(29, 30, SP, 16), 0xa8c17bfd);
+    // stp x29, x30, [sp, #-96]!
+    assert_eq(stp_x_pre(29, 30, SP, -96), 0xa9ba7bfd);
+    // ldp x29, x30, [sp], #96
+    assert_eq(ldp_x_post(29, 30, SP, 96), 0xa8c67bfd);
+}
+
+test a64_ldst_uimm_matches_clang {
+    // strb w1, [x2, #3]
+    assert_eq(ldst_uimm(0, ST, 1, 2, 3), 0x39000c41);
+    // ldrb w1, [x2, #4095]
+    assert_eq(ldst_uimm(0, LD, 1, 2, 4095), 0x397ffc41);
+    // ldrsb w3, [x4, #1]
+    assert_eq(ldst_uimm(0, LDS32, 3, 4, 1), 0x39c00483);
+    // ldrsb x3, [x4, #1]
+    assert_eq(ldst_uimm(0, LDS64, 3, 4, 1), 0x39800483);
+    // strh w5, [x6, #2]
+    assert_eq(ldst_uimm(1, ST, 5, 6, 2), 0x790004c5);
+    // ldrh w5, [x6, #8190]
+    assert_eq(ldst_uimm(1, LD, 5, 6, 8190), 0x797ffcc5);
+    // ldrsh w7, [x8, #4]
+    assert_eq(ldst_uimm(1, LDS32, 7, 8, 4), 0x79c00907);
+    // str w9, [x10, #16380]
+    assert_eq(ldst_uimm(2, ST, 9, 10, 16380), 0xb93ffd49);
+    // ldr w9, [sp, #4]
+    assert_eq(ldst_uimm(2, LD, 9, SP, 4), 0xb94007e9);
+    // ldrsw x9, [x10, #8]
+    assert_eq(ldst_uimm(2, LDS64, 9, 10, 8), 0xb9800949);
+    // str x11, [x12, #8]
+    assert_eq(ldst_uimm(3, ST, 11, 12, 8), 0xf900058b);
+    // ldr x11, [x29, #32760]
+    assert_eq(ldst_uimm(3, LD, 11, 29, 32760), 0xf97fffab);
+    // strb wzr, [x1]
+    assert_eq(ldst_uimm(0, ST, ZR, 1, 0), 0x3900003f);
+}
+
+test a64_ldst_unscaled_matches_clang {
+    // ldurb w1, [x29, #-1]
+    assert_eq(ldst_unscaled(0, LD, 1, 29, -1), 0x385ff3a1);
+    // sturh w2, [x29, #-256]
+    assert_eq(ldst_unscaled(1, ST, 2, 29, -256), 0x781003a2);
+    // ldur w3, [x29, #255]
+    assert_eq(ldst_unscaled(2, LD, 3, 29, 255), 0xb84ff3a3);
+    // stur x4, [x29, #-8]
+    assert_eq(ldst_unscaled(3, ST, 4, 29, -8), 0xf81f83a4);
+    // ldursb w5, [x29, #-3]
+    assert_eq(ldst_unscaled(0, LDS32, 5, 29, -3), 0x38dfd3a5);
+    // ldursh w5, [x29, #-4]
+    assert_eq(ldst_unscaled(1, LDS32, 5, 29, -4), 0x78dfc3a5);
+}
+
+test a64_ldst_reg_matches_clang {
+    // ldrb w1, [x2, x3]
+    assert_eq(ldst_reg(0, LD, 1, 2, 3, false), 0x38636841);
+    // ldrsh w1, [x2, x3, lsl #1]
+    assert_eq(ldst_reg(1, LDS32, 1, 2, 3, true), 0x78e37841);
+    // str w4, [x5, x6, lsl #2]
+    assert_eq(ldst_reg(2, ST, 4, 5, 6, true), 0xb82678a4);
+    // ldr x7, [x8, x9]
+    assert_eq(ldst_reg(3, LD, 7, 8, 9, false), 0xf8696907);
+    // ldr x7, [x8, x9, lsl #3]
+    assert_eq(ldst_reg(3, LD, 7, 8, 9, true), 0xf8697907);
+}
+
+test a64_ldst_post_matches_clang {
+    // strb w8, [x16], #1
+    assert_eq(ldst_post(0, ST, 8, 16, 1), 0x38001608);
+    // ldrb w30, [x17], #1
+    assert_eq(ldst_post(0, LD, 30, 17, 1), 0x3840163e);
+    // ldr x8, [x17], #8
+    assert_eq(ldst_post(3, LD, 8, 17, 8), 0xf8408628);
+    // str x8, [x16], #8
+    assert_eq(ldst_post(3, ST, 8, 16, 8), 0xf8008608);
+}
+
+test a64_pcrel_matches_clang {
+    // adr x3, L0 (-112)
+    assert_eq(adr(3, -112), 0x10fffc83);
+    // adr x4, L1 (+12)
+    assert_eq(adr(4, 12), 0x10000064);
+    // adrp x5, #8192
+    assert_eq(adrp(5, 2), 0xd0000005);
+    // adrp x6, #-4096
+    assert_eq(adrp(6, -1), 0xf0ffffe6);
+}
+
+test a64_fp_matches_clang {
+    // fmov d16, x9
+    assert_eq(fmov_d_x(16, 9), 0x9e670130);
+    // fmov d0, xzr
+    assert_eq(fmov_d_x(0, ZR), 0x9e6703e0);
+    // fmov x9, d16
+    assert_eq(fmov_x_d(9, 16), 0x9e660209);
+    // fmov x0, d0
+    assert_eq(fmov_x_d(0, 0), 0x9e660000);
+    // fadd d16, d16, d17
+    assert_eq(fadd(16, 16, 17), 0x1e712a10);
+    // fsub d0, d1, d2
+    assert_eq(fsub(0, 1, 2), 0x1e623820);
+    // fmul d16, d16, d17
+    assert_eq(fmul(16, 16, 17), 0x1e710a10);
+    // fdiv d3, d4, d5
+    assert_eq(fdiv(3, 4, 5), 0x1e651883);
+    // fneg d16, d16
+    assert_eq(fneg(16, 16), 0x1e614210);
+    // fsqrt d16, d16
+    assert_eq(fsqrt(16, 16), 0x1e61c210);
+    // fcmp d16, d17
+    assert_eq(fcmp(16, 17), 0x1e712200);
+    // scvtf d16, w9
+    assert_eq(scvtf(false, 16, 9), 0x1e620130);
+    // scvtf d16, x9
+    assert_eq(scvtf(true, 16, 9), 0x9e620130);
+    // ucvtf d16, w9
+    assert_eq(ucvtf(false, 16, 9), 0x1e630130);
+    // ucvtf d16, x9
+    assert_eq(ucvtf(true, 16, 9), 0x9e630130);
+    // fcvtzs w9, d16
+    assert_eq(fcvtzs(false, 9, 16), 0x1e780209);
+    // fcvtzs x9, d16
+    assert_eq(fcvtzs(true, 9, 16), 0x9e780209);
+    // fcvtzu w9, d16
+    assert_eq(fcvtzu(false, 9, 16), 0x1e790209);
+    // fcvtzu x9, d16
+    assert_eq(fcvtzu(true, 9, 16), 0x9e790209);
+    // str d0, [x9, #40]
+    assert_eq(str_d(0, 9, 40), 0xfd001520);
+    // ldr d1, [sp, #16]
+    assert_eq(ldr_d(1, SP, 16), 0xfd400be1);
+    // ldp d0, d1, [x17, #64]
+    assert_eq(ldp_d(0, 1, 17, 64), 0x6d440620);
+    // ldp d6, d7, [x17, #112]
+    assert_eq(ldp_d(6, 7, 17, 112), 0x6d471e26);
+    // fmov s16, w9
+    assert_eq(fmov_s_w(16, 9), 0x1e270130);
+    // fmov w9, s16
+    assert_eq(fmov_w_s(9, 16), 0x1e260209);
+    // fcvt d16, s17
+    assert_eq(fcvt_d_s(16, 17), 0x1e22c230);
+    // fcvt s16, d17
+    assert_eq(fcvt_s_d(16, 17), 0x1e624230);
+}
+
+test a64_fp_single_matches_clang {
+    // fadd s16, s16, s17
+    assert_eq(single(fadd(16, 16, 17)), 0x1e312a10);
+    // fsub s0, s1, s2
+    assert_eq(single(fsub(0, 1, 2)), 0x1e223820);
+    // fmul s16, s16, s17
+    assert_eq(single(fmul(16, 16, 17)), 0x1e310a10);
+    // fdiv s3, s4, s5
+    assert_eq(single(fdiv(3, 4, 5)), 0x1e251883);
+    // fneg s16, s16
+    assert_eq(single(fneg(16, 16)), 0x1e214210);
+    // fsqrt s16, s16
+    assert_eq(single(fsqrt(16, 16)), 0x1e21c210);
+    // fcmp s16, s17
+    assert_eq(single(fcmp(16, 17)), 0x1e312200);
+    // scvtf s16, w9
+    assert_eq(single(scvtf(false, 16, 9)), 0x1e220130);
+    // scvtf s16, x9
+    assert_eq(single(scvtf(true, 16, 9)), 0x9e220130);
+    // ucvtf s16, w9
+    assert_eq(single(ucvtf(false, 16, 9)), 0x1e230130);
+    // ucvtf s16, x9
+    assert_eq(single(ucvtf(true, 16, 9)), 0x9e230130);
+}
+
+// ------------------------------------------------- beyond the clang table
+//
+// Expected values from the hand Rust these functions replace (it is the
+// oracle), at the edges the clang table does not reach.
+
+test a64_logic_imm_word_matches_clang {
+    // and w8, w1, #7 (N 0, immr 0, imms 2)
+    assert_eq(logic_imm_word(false, LogOp.And, 8, 1, 0, 0, 2), 0x12000828);
+    // and x0, x1, #0xffffffff00000000 (N 1, immr 32, imms 31)
+    assert_eq(logic_imm_word(true, LogOp.And, 0, 1, 1, 32, 31), 0x92607c20);
+    // orr x0, xzr, #0x5555555555555555 (N 0, immr 0, imms 60)
+    assert_eq(logic_imm_word(true, LogOp.Orr, 0, ZR, 0, 0, 60), 0xb200f3e0);
+    // eor w0, w1, #0xff (N 0, immr 0, imms 7)
+    assert_eq(logic_imm_word(false, LogOp.Eor, 0, 1, 0, 0, 7), 0x52001c20);
+    // ands w0, w1, #1 (N 0, immr 0, imms 0)
+    assert_eq(logic_imm_word(false, LogOp.Ands, 0, 1, 0, 0, 0), 0x72000020);
+}
+
+test a64_fields_are_masked_before_they_are_placed {
+    // A register number keeps its low 5 bits: 33 is register 1.
+    assert_eq(add(false, 33, 32, 34), add(false, 1, 0, 2));
+    assert_eq(fadd(48, 49, 50), fadd(16, 17, 18));
+    // Shift amount 6 bits, extend shift 3 bits, imm12 12 bits.
+    assert_eq(cmp_shifted(true, 8, 9, Shift.Asr, 127), cmp_shifted(true, 8, 9, Shift.Asr, 63));
+    assert_eq(addsub_ext(true, true, false, SP, SP, 16, Ext.Uxtx, 9), addsub_ext(true, true, false, SP, SP, 16, Ext.Uxtx, 1));
+    assert_eq(add_imm(false, 2, 0, 0x1001), add_imm(false, 2, 0, 1));
+    // hw 2 bits, imm16 16 bits.
+    assert_eq(movz(true, 1, 0x11234, 5), movz(true, 1, 0x1234, 1));
+    assert_eq(movn(true, 1, 0x10000, 4), movn(true, 1, 0, 0));
+    assert_eq(movk(true, 9, 0xfbeef, 7), movk(true, 9, 0xbeef, 3));
+    assert_eq(brk(0x10005), brk(5));
+    // immr and imms 6 bits.
+    assert_eq(ubfm(true, 0, 1, 65, 127), ubfm(true, 0, 1, 1, 63));
+    assert_eq(sbfm(true, 0, 1, 64, 95), sbfm(true, 0, 1, 0, 31));
+    // The cases above land a dropped bit on a bit the opcode already sets
+    // (hw bit 2 on bit 23, lsl bit 3 on the Uxtx bits), so a widened mask
+    // passes them. These land it on a clear bit.
+    assert_eq(movz(true, 2, 0x10001, 0), movz(true, 2, 1, 0));
+    assert_eq(movn(true, 2, 0x10001, 0), movn(true, 2, 1, 0));
+    assert_eq(movk(true, 2, 0x10001, 0), movk(true, 2, 1, 0));
+    assert_eq(addsub_ext(true, false, false, 2, 1, 3, Ext.Uxtb, 9), addsub_ext(true, false, false, 2, 1, 3, Ext.Uxtb, 1));
+}
+
+test a64_lsl12_and_the_x_bit {
+    // add x2, x0, #1, lsl #12
+    assert_eq(addsub_imm(true, false, false, 2, 0, 1, true), 0x91400402);
+    // sub w2, w0, #4095, lsl #12
+    assert_eq(addsub_imm(false, true, false, 2, 0, 4095, true), 0x517ffc02);
+    assert_eq(sfb(true), 0x80000000);
+    assert_eq(sfb(false), 0);
+}
+
+test a64_cset_inverts_every_condition {
+    // CSINC wd, wzr, wzr, invert(cond): Eq<->Ne ... Le<->Gt, Al stays Al.
+    assert_eq(cset(false, 0, Cond.Ne), 0x1a9f07e0);
+    assert_eq(cset(false, 0, Cond.Hs), 0x1a9f37e0);
+    assert_eq(cset(false, 0, Cond.Mi), 0x1a9f57e0);
+    assert_eq(cset(false, 0, Cond.Pl), 0x1a9f47e0);
+    assert_eq(cset(false, 0, Cond.Vs), 0x1a9f77e0);
+    assert_eq(cset(false, 0, Cond.Vc), 0x1a9f67e0);
+    assert_eq(cset(false, 0, Cond.Hi), 0x1a9f97e0);
+    assert_eq(cset(false, 0, Cond.Ls), 0x1a9f87e0);
+    assert_eq(cset(false, 0, Cond.Ge), 0x1a9fb7e0);
+    assert_eq(cset(false, 0, Cond.Lt), 0x1a9fa7e0);
+    assert_eq(cset(false, 0, Cond.Le), 0x1a9fc7e0);
+    assert_eq(cset(false, 0, Cond.Al), 0x1a9fe7e0);
+    assert_eq(invert_bits(14), 14);
+    assert_eq(invert_bits(13), 12);
+    assert_eq(invert_bits(0), 1);
+}
+
+test a64_branch_offset_edges {
+    // The most negative 26-bit word offset, and the largest 19-bit one.
+    assert_eq(branch(-33554432), 0x16000000);
+    assert_eq(branch(33554431), 0x15ffffff);
+    assert_eq(bl(0), 0x94000000);
+    assert_eq(b_cond(Cond.Al, 262143), 0x547fffee);
+    assert_eq(b_cond(Cond.Le, -262144), 0x5480000d);
+    assert_eq(cbz(true, 0, -1), 0xb4ffffe0);
+}
+
+test a64_offsets_divide_toward_zero {
+    // simm / 8 truncates (Rust `/`), so -4 is offset 0, not -1.
+    assert_eq(ldp_x(0, 0, 0, -4), 0xa9400000);
+    assert_eq(stp_x(0, 1, 2, -512), 0xa9200440);
+    assert_eq(stp_x(0, 1, 2, 504), 0xa91f8440);
+    assert_eq(str_x(0, 0, 15), 0xf9000400);
+    assert_eq(ldst_uimm(3, LD, 0, 0, 15), 0xf9400400);
+    // The 9-bit forms at both ends.
+    assert_eq(ldur_x(0, 0, 255), 0xf84ff000);
+    assert_eq(ldst_post(0, ST, 0, 0, -256), 0x38100400);
+}
+
+test a64_pc_relative_edges {
+    assert_eq(adr(0, 1048575), 0x707fffe0);
+    assert_eq(adr(0, -1048576), 0x10800000);
+    assert_eq(adr(1, 1), 0x30000001);
+    assert_eq(adrp(0, 3), 0xf0000000);
+    assert_eq(adrp(0, -1048576), 0x90800000);
+}
+
+test a64_patches_replace_only_their_field {
+    assert_eq(adrp_patch(adrp(5, 0), 2), 0xd0000005);
+    assert_eq(adrp_patch(adrp(6, -1), 2), adrp(6, 2));
+    assert_eq(adrp_patch(adrp(31, 77), -3), adrp(31, -3));
+    // Off the ADRP domain the formula still holds: bits 30:29 and 23:5 come
+    // from the page count, everything else from the word.
+    assert_eq(adrp_patch(0, 2), 0x40000000);
+    assert_eq(add_imm_patch(add_imm(true, 5, 5, 0), 0x123), add_imm(true, 5, 5, 0x123));
+    assert_eq(add_imm_patch(add_imm(true, 5, 5, 0xfff), 1), add_imm(true, 5, 5, 1));
+    assert_eq(add_imm_patch(add_imm(false, 31, 30, 7), 0), add_imm(false, 31, 30, 0));
+    // single clears bit 22 and nothing else.
+    assert_eq(single(0xffffffff), 0xffbfffff);
+    assert_eq(single(fmov_s_w(16, 9)), fmov_s_w(16, 9));
+    assert_eq(single(single(fadd(16, 16, 17))), single(fadd(16, 16, 17)));
+}
+
+test a64_access_sizes {
+    assert_eq(size_log2(1), 0);
+    assert_eq(size_log2(2), 1);
+    assert_eq(size_log2(4), 2);
+    assert_eq(size_log2(8), 3);
+    assert_eq(scale(0), 1);
+    assert_eq(scale(3), 8);
+    assert(uimm_fits(0, 4095));
+    assert(!uimm_fits(0, 4096));
+    assert(uimm_fits(1, 8190));
+    assert(!uimm_fits(1, 8191));
+    assert(!uimm_fits(1, 8192));
+    assert(uimm_fits(2, 16380));
+    assert(!uimm_fits(2, 16382));
+    assert(!uimm_fits(2, 16384));
+    assert(uimm_fits(3, 32760));
+    assert(!uimm_fits(3, 12));
+    assert(!uimm_fits(3, 32768));
+}
+
+test a64_register_constants {
+    // mov x29, sp
+    assert_eq(mov_sp(FP, SP), 0x910003fd);
+    // blr x30
+    assert_eq(blr(LR), 0xd63f03c0);
+    // cmp xzr, x1 reads register 31 as ZR.
+    assert_eq(cmp(true, ZR, 1), 0xeb0103ff);
+    // The four opc values of the sized forms, on one access.
+    assert_eq(ldst_uimm(2, ST, 9, 10, 8), 0xb9000949);
+    assert_eq(ldst_uimm(2, LD, 9, 10, 8), 0xb9400949);
+    assert_eq(ldst_uimm(2, LDS64, 9, 10, 8), 0xb9800949);
+    assert_eq(ldst_uimm(2, LDS32, 9, 10, 8), 0xb9c00949);
+}
+
+test a64_even_registers_and_full_fields {
+    // Words from LLVM's assembler (zig cc -c, then objdump -d), equal to the
+    // hand Rust. The clang cases mostly use odd registers and small
+    // immediates, so an opcode constant with bit 0 set, or a field mask one
+    // bit short, passed them.
+    // add x2, x1, w3, uxtb #4
+    assert_eq(addsub_ext(true, false, false, 2, 1, 3, Ext.Uxtb, 4), 0x8b231022);
+    // sub x4, x6, x8, sxtx #3
+    assert_eq(addsub_ext(true, true, false, 4, 6, 8, Ext.Sxtx, 3), 0xcb28ecc4);
+    // adds w2, w5, w7, sxth #1
+    assert_eq(addsub_ext(false, false, true, 2, 5, 7, Ext.Sxth, 1), 0x2b27a4a2);
+    // movz x2, #0xffff, lsl #48
+    assert_eq(movz(true, 2, 0xffff, 3), 0xd2ffffe2);
+    // movz w4, #0x8001, lsl #16
+    assert_eq(movz(false, 4, 0x8001, 1), 0x52b00024);
+    // movn x2, #0x1234, lsl #32
+    assert_eq(movn(true, 2, 0x1234, 2), 0x92c24682);
+    // movn w6, #0xffff, lsl #16
+    assert_eq(movn(false, 6, 0xffff, 1), 0x12bfffe6);
+    // movn x8, #0x8001, lsl #48
+    assert_eq(movn(true, 8, 0x8001, 3), 0x92f00028);
+    // movk w4, #0xffff, lsl #16
+    assert_eq(movk(false, 4, 0xffff, 1), 0x72bfffe4);
+    // movk x6, #0x8001, lsl #32
+    assert_eq(movk(true, 6, 0x8001, 2), 0xf2d00026);
+    // smull x2, w4, w6
+    assert_eq(smull(2, 4, 6), 0x9b267c82);
+    // umull x8, w10, w12
+    assert_eq(umull(8, 10, 12), 0x9bac7d48);
+    // brk #0xffff
+    assert_eq(brk(0xffff), 0xd43fffe0);
+    // stur x2, [x4, #-8]
+    assert_eq(stur_x(2, 4, -8), 0xf81f8082);
+    // stp x2, x4, [sp, #-16]!
+    assert_eq(stp_x_pre(2, 4, SP, -16), 0xa9bf13e2);
+    // ldp x2, x4, [sp], #16
+    assert_eq(ldp_x_post(2, 4, SP, 16), 0xa8c113e2);
+    // fdiv d2, d4, d6
+    assert_eq(fdiv(2, 4, 6), 0x1e661882);
+    // fcvtzs x2, d4
+    assert_eq(fcvtzs(true, 2, 4), 0x9e780082);
+    // fcvtzu w2, d4
+    assert_eq(fcvtzu(false, 2, 4), 0x1e790082);
+    // fmov w2, s4
+    assert_eq(fmov_w_s(2, 4), 0x1e260082);
+    // ldr d2, [x4, #32760]
+    assert_eq(ldr_d(2, 4, 32760), 0xfd7ffc82);
+    // str d2, [x4, #32760]
+    assert_eq(str_d(2, 4, 32760), 0xfd3ffc82);
+}
+
+// ------------------------------------------------------ logical immediates
+//
+// Expected values from the hand Rust these functions replace (bitmask_imm,
+// logic_imm and mov_imm in cli/t27b/src/a64.rs before #7549), the oracle.
+// The logic_imm words are also in the clang table of cli/t27b/tests/encoder.rs.
+
+test a64_logic_imm_matches_clang {
+    // and w8, w1, #7
+    assert_eq(logic_imm(false, LogOp.And, 8, 1, 7).?, 0x12000828);
+    // eor w0, w1, #0xff
+    assert_eq(logic_imm(false, LogOp.Eor, 0, 1, 0xff).?, 0x52001c20);
+    // eor w0, w1, #0xffff
+    assert_eq(logic_imm(false, LogOp.Eor, 0, 1, 0xffff).?, 0x52003c20);
+    // eor w0, w1, #1
+    assert_eq(logic_imm(false, LogOp.Eor, 0, 1, 1).?, 0x52000020);
+    // and x0, x1, #0xffffffff00000000
+    assert_eq(logic_imm(true, LogOp.And, 0, 1, 0xffffffff00000000).?, 0x92607c20);
+    // orr x0, xzr, #0x5555555555555555
+    assert_eq(logic_imm(true, LogOp.Orr, 0, ZR, 0x5555555555555555).?, 0xb200f3e0);
+    // and w0, w1, #0xfffffff0
+    assert_eq(logic_imm(false, LogOp.And, 0, 1, 0xfffffff0).?, 0x121c6c20);
+    // orr x0, xzr, #0xaaaaaaaaaaaaaaaa: an odd immr (1) reaches the word
+    assert_eq(logic_imm(true, LogOp.Orr, 0, ZR, 0xaaaaaaaaaaaaaaaa).?, 0xb201f3e0);
+    // eor w2, w3, #0x80000001: immr 1, imms 1
+    assert_eq(logic_imm(false, LogOp.Eor, 2, 3, 0x80000001).?, 0x52010462);
+    // ands w0, w1, #1
+    assert_eq(logic_imm(false, LogOp.Ands, 0, 1, 1).?, 0x72000020);
+    // Not a logical immediate: no word.
+    assert(logic_imm(true, LogOp.And, 0, 1, 0) == null);
+    assert(logic_imm(false, LogOp.Orr, 0, 1, 0xffffffff) == null);
+    assert(logic_imm(true, LogOp.Eor, 0, 1, 0x1234) == null);
+}
+
+test a64_bitmask_field_values {
+    // field = N << 12 | immr << 6 | imms
+    // N 0, immr 0, imms 60: 2-bit element 01
+    assert_eq(bitmask_field(0x5555555555555555, true).?, 0x3c);
+    // N 0, immr 1, imms 60: the same element rotated
+    assert_eq(bitmask_field(0xaaaaaaaaaaaaaaaa, true).?, 0x7c);
+    // N 0, immr 0, imms 57: 4-bit element 0011
+    assert_eq(bitmask_field(0x3333333333333333, true).?, 0x39);
+    // N 0, immr 0, imms 39: 16-bit element 0x00ff
+    assert_eq(bitmask_field(0x00ff00ff00ff00ff, true).?, 0x27);
+    // N 0, immr 12, imms 39: 16-bit element 0x0ff0
+    assert_eq(bitmask_field(0x0ff00ff00ff00ff0, true).?, 0x327);
+    // N 1, immr 32, imms 31
+    assert_eq(bitmask_field(0xffffffff00000000, true).?, 0x181f);
+    // N 1, immr 0, imms 31: 32 ones in a 64-bit element
+    assert_eq(bitmask_field(0xffffffff, true).?, 0x101f);
+    // N 1, immr 1, imms 0: the top bit alone
+    assert_eq(bitmask_field(0x8000000000000000, true).?, 0x1040);
+    // N 1, immr 0, imms 62
+    assert_eq(bitmask_field(0x7fffffffffffffff, true).?, 0x103e);
+    // N 1, immr 1, imms 1: a run that wraps around bit 63
+    assert_eq(bitmask_field(0x8000000000000001, true).?, 0x1041);
+    // N 1, immr 63, imms 62
+    assert_eq(bitmask_field(0xfffffffffffffffe, true).?, 0x1ffe);
+    // W register: 32-bit elements have N 0 and imms below 32.
+    assert_eq(bitmask_field(0x1, false).?, 0x0);
+    assert_eq(bitmask_field(0x7, false).?, 0x2);
+    assert_eq(bitmask_field(0xff, false).?, 0x7);
+    assert_eq(bitmask_field(0xffff, false).?, 0xf);
+    // N 0, immr 28, imms 27
+    assert_eq(bitmask_field(0xfffffff0, false).?, 0x71b);
+    // N 0, immr 1, imms 1
+    assert_eq(bitmask_field(0x80000001, false).?, 0x41);
+    // N 0, immr 31, imms 30
+    assert_eq(bitmask_field(0xfffffffe, false).?, 0x7de);
+    // N 0, immr 4, imms 51: 8-bit element 0x0f rotated by 4
+    assert_eq(bitmask_field(0xf0f0f0f0, false).?, 0x133);
+    // A W register reads only the low 32 bits.
+    assert_eq(bitmask_field(0xdead0000000000ff, false).?, 0x7);
+}
+
+test a64_bitmask_field_rejects {
+    // 0 and all ones have no encoding in either width.
+    assert(bitmask_field(0, true) == null);
+    assert(bitmask_field(0, false) == null);
+    assert(bitmask_field(0xffffffffffffffff, true) == null);
+    assert(bitmask_field(0xffffffff, false) == null);
+    // The low 32 bits are 0.
+    assert(bitmask_field(0xffffffff00000000, false) == null);
+    // Ones that are not one rotated run.
+    assert(bitmask_field(0x96, false) == null);
+    assert(bitmask_field(0x1234, true) == null);
+    assert(bitmask_field(0x5, true) == null);
+    assert(bitmask_field(0x5555555555555554, true) == null);
+    assert(bitmask_field(0x55555554, false) == null);
+}
+
+test a64_bitmask_field_every_valid_immediate {
+    // Every element size, run length and rotation, in both widths. The
+    // field must be N = (size == 64), immr = the rotation, and imms = the
+    // size marker OR (ones - 1). Counts: 5334 for X, 1302 for W.
+    var w: u32 = 0;
+    while (w < 2) {
+        const sf: bool = w == 0;
+        var max: u32 = 32;
+        if (sf) {
+            max = 64;
+        }
+        var count: u32 = 0;
+        var size: u32 = 2;
+        while (size <= max) {
+            var marker: u32 = 0;
+            if (size == 16) {
+                marker = 0x20;
+            }
+            if (size == 8) {
+                marker = 0x30;
+            }
+            if (size == 4) {
+                marker = 0x38;
+            }
+            if (size == 2) {
+                marker = 0x3c;
+            }
+            var mask: u64 = 0xffffffffffffffff;
+            if (size < 64) {
+                mask = mask >> (64 - size);
+            }
+            var ones: u32 = 1;
+            while (ones < size) {
+                const run: u64 = mask >> (size - ones);
+                var rot: u32 = 0;
+                while (rot < size) {
+                    var elem: u64 = run;
+                    if (rot > 0) {
+                        elem = ((run >> rot) | (run << (size - rot))) & mask;
+                    }
+                    var v: u64 = 0;
+                    var at: u32 = 0;
+                    while (at < 64) {
+                        v = v | (elem << at);
+                        at = at + size;
+                    }
+                    var n: u32 = 0;
+                    if (size == 64) {
+                        n = 1;
+                    }
+                    assert_eq(bitmask_field(v, sf).?, (n << 12) | (rot << 6) | marker | (ones - 1));
+                    count = count + 1;
+                    rot = rot + 1;
+                }
+                ones = ones + 1;
+            }
+            size = size * 2;
+        }
+        if (sf) {
+            assert_eq(count, 5334);
+        } else {
+            assert_eq(count, 1302);
+        }
+        w = w + 1;
+    }
+}
+
+test a64_mov_imm_sequences {
+    // 0: one MOVZ #0. movz x5, #0
+    assert_eq(mov_imm_len(true, 0), 1);
+    assert_eq(mov_imm_at(true, 5, 0, 0), 0xd2800005);
+    assert_eq(mov_imm_at(false, 5, 0, 0), 0x52800005);
+    // All ones: one MOVN #0. movn x5, #0 / movn w5, #0
+    assert_eq(mov_imm_len(true, 0xffffffffffffffff), 1);
+    assert_eq(mov_imm_at(true, 5, 0xffffffffffffffff, 0), 0x92800005);
+    assert_eq(mov_imm_len(false, 0xffffffff), 1);
+    assert_eq(mov_imm_at(false, 5, 0xffffffff, 0), 0x12800005);
+    // A logical immediate that needs 2+ MOVZ and 2+ MOVN words: one ORR.
+    // orr x5, xzr, #0x5555555555555555
+    assert_eq(mov_imm_len(true, 0x5555555555555555), 1);
+    assert_eq(mov_imm_at(true, 5, 0x5555555555555555, 0), 0xb200f3e5);
+    // orr x5, xzr, #0xffff0000ffff0000
+    assert_eq(mov_imm_at(true, 5, 0xffff0000ffff0000, 0), 0xb2103fe5);
+    // orr x5, xzr, #0xffffffff
+    assert_eq(mov_imm_len(true, 0xffffffff), 1);
+    assert_eq(mov_imm_at(true, 5, 0xffffffff, 0), 0xb2407fe5);
+    // MOVZ then MOVK. movz w5, #0x5678; movk w5, #0x1234, lsl #16
+    assert_eq(mov_imm_len(false, 0x12345678), 2);
+    assert_eq(mov_imm_at(false, 5, 0x12345678, 0), 0x528acf05);
+    assert_eq(mov_imm_at(false, 5, 0x12345678, 1), 0x72a24685);
+    // Four words.
+    assert_eq(mov_imm_len(true, 0x123456789abcdef0), 4);
+    assert_eq(mov_imm_at(true, 5, 0x123456789abcdef0, 0), 0xd29bde05);
+    assert_eq(mov_imm_at(true, 5, 0x123456789abcdef0, 1), 0xf2b35785);
+    assert_eq(mov_imm_at(true, 5, 0x123456789abcdef0, 2), 0xf2cacf05);
+    assert_eq(mov_imm_at(true, 5, 0x123456789abcdef0, 3), 0xf2e24685);
+    // One MOVN. movn x5, #0xedcb
+    assert_eq(mov_imm_len(true, 0xffffffffffff1234), 1);
+    assert_eq(mov_imm_at(true, 5, 0xffffffffffff1234, 0), 0x929db965);
+    // MOVN #0xffff, lsl #32
+    assert_eq(mov_imm_len(true, 0xffff0000ffffffff), 1);
+    assert_eq(mov_imm_at(true, 5, 0xffff0000ffffffff, 0), 0x92dfffe5);
+    // MOVN then MOVK.
+    assert_eq(mov_imm_len(true, 0xffffffff12340000), 2);
+    assert_eq(mov_imm_at(true, 5, 0xffffffff12340000, 0), 0x929fffe5);
+    assert_eq(mov_imm_at(true, 5, 0xffffffff12340000, 1), 0xf2a24685);
+    assert_eq(mov_imm_len(true, 0x1234ffff5678ffff), 2);
+    assert_eq(mov_imm_at(true, 5, 0x1234ffff5678ffff, 0), 0x92b530e5);
+    assert_eq(mov_imm_at(true, 5, 0x1234ffff5678ffff, 1), 0xf2e24685);
+    // One MOVZ in a high halfword. movz x5, #0xffff, lsl #32
+    assert_eq(mov_imm_len(true, 0x0000ffff00000000), 1);
+    assert_eq(mov_imm_at(true, 5, 0x0000ffff00000000, 0), 0xd2dfffe5);
+    assert_eq(mov_imm_at(true, 5, 0x8000000000000000, 0), 0xd2f00005);
+    // MOVZ wins a tie with MOVN.
+    assert_eq(mov_imm_len(true, 0xffff123400000000), 2);
+    assert_eq(mov_imm_at(true, 5, 0xffff123400000000, 0), 0xd2c24685);
+    assert_eq(mov_imm_at(true, 5, 0xffff123400000000, 1), 0xf2ffffe5);
+    assert_eq(mov_imm_len(true, 0xffff123400005678), 3);
+    assert_eq(mov_imm_at(true, 5, 0xffff123400005678, 0), 0xd28acf05);
+    assert_eq(mov_imm_at(true, 5, 0xffff123400005678, 1), 0xf2c24685);
+    assert_eq(mov_imm_at(true, 5, 0xffff123400005678, 2), 0xf2ffffe5);
+    assert_eq(mov_imm_len(false, 0xffff0000), 1);
+    assert_eq(mov_imm_at(false, 5, 0xffff0000, 0), 0x52bfffe5);
+    // A W register reads only the low 32 bits.
+    assert_eq(mov_imm_len(false, 0xdeadbeef00001234), 1);
+    assert_eq(mov_imm_at(false, 5, 0xdeadbeef00001234, 0), 0x52824685);
+    // movn w5, #1
+    assert_eq(mov_imm_at(false, 5, 0xfffffffe, 0), 0x12800025);
+}

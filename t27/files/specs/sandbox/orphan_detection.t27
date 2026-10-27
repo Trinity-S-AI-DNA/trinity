@@ -1,0 +1,325 @@
+// SPDX-License-Identifier: CC0-1.0
+// SANDBOX-011: Orphaned Session Detection
+
+/**
+ * Module: sandbox.orphan_detection
+ *
+ * Detects sessions with no associated Railway resources (orphaned).
+ * Orphaned sessions are those where:
+ * 1. Session exists in database
+ * 2. No corresponding Railway deployment/service exists
+ * 3. Session status is still "active" or "starting"
+ *
+ * Orphaned sessions should be flagged for cleanup to prevent
+ * resource waste and ensure accurate slot accounting.
+ */
+
+module sandbox.orphan_detection;
+
+// ---------------------------------------------
+// Session Type Definition (shared with session_timeout)
+// ---------------------------------------------
+
+/**
+ * Common Session type for sandbox management.
+ */
+// Rust `[u8; N]` is spelled `[N]u8`, and `Option<[u8; 64]>` is the t27
+// optional `?[64]u8` (null = None).
+pub struct Session {
+    id: [32]u8,
+    name: [64]u8,
+    status: SessionStatus,
+    created_at: Timestamp,
+    updated_at: Timestamp,
+    railway_id: ?[64]u8,  // Railway deployment/service ID
+}
+
+/**
+ * Timestamp type for session tracking.
+ */
+pub struct Timestamp {
+    ms: u64,
+}
+
+/**
+ * Session status enum.
+ */
+// t27 enums are integer-backed, so the original string values
+// ("starting", "active", ...) cannot be the variants' values; they are kept
+// by session_status_str below.
+pub const SessionStatus = enum(u8) {
+    Starting,
+    Active,
+    Failed,
+    Terminating,
+    Deleted,
+};
+
+// The string value each status carried in the original enum
+// (`Starting = "starting"`, ...).
+fn session_status_str(status: SessionStatus) -> []const u8 {
+    return switch (status) {
+        .Starting => "starting",
+        .Active => "active",
+        .Failed => "failed",
+        .Terminating => "terminating",
+        .Deleted => "deleted",
+    };
+}
+
+/**
+ * Optional type for railway_id field.
+ */
+// The original declared its own generic `pub enum Option<T> { Some(T), None }`.
+// t27 has no generic enums; its built-in optional `?T` is that type, so
+// `railway_id` above is `?[64]u8`: a value is Some, `null` is None.
+
+// ---------------------------------------------
+// Configuration
+// ---------------------------------------------
+
+const ORPHANED_THRESHOLD_MINUTES : u64 = 15;  // Sessions without railway_id for 15+ min are orphans
+
+/**
+ * Check if a session is orphaned.
+ *
+ * A session is considered orphaned if:
+ * 1. It has no railway_id (None or empty)
+ * 2. Its status is Starting or Active (not Failed/Terminating/Deleted)
+ * 3. It was created more than ORPHANED_THRESHOLD_MINUTES ago
+ *
+ * @param session - The session to check
+ * @param current_time_ms - Current timestamp in milliseconds
+ * @return true if session is orphaned
+ */
+// The original took `&Session` (a shared borrow); the function only reads
+// the session, so it is passed by value.
+fn is_session_orphaned(
+    session: Session,
+    current_time_ms: u64,
+) -> bool {
+    // Must have status that should have a railway resource
+    if (session.status != SessionStatus.Starting and session.status != SessionStatus.Active) {
+        return false;
+    }
+
+    // Must have no railway_id (None) or empty
+    // The original `match` arm `Option::Some(id) if !id.is_empty() => return
+    // false` is a null test plus the same length test here.
+    if (session.railway_id != null) {
+        const id = session.railway_id.?;
+        if (id.len != 0) {
+            return false;
+        }
+    }
+
+    // Must be old enough to be considered orphaned
+    const age_ms = current_time_ms - session.created_at.ms;
+    const threshold_ms = ORPHANED_THRESHOLD_MINUTES * 60_000;
+    return age_ms >= threshold_ms;
+}
+
+/**
+ * Find all orphaned sessions in a list.
+ *
+ * @param sessions - List of sessions to check
+ * @param current_time_ms - Current timestamp in milliseconds
+ * @param out - Destination buffer for the orphaned session IDs
+ * @return Vector of orphaned session IDs
+ *         (here: the IDs are written into `out` and their number is returned)
+ */
+// t27 has no heap-backed Vec: the orphan IDs are written into the
+// caller-supplied fixed-size buffer `out` and their count is returned (the
+// original returned Vec<[u8; 32]>). IDs beyond `out.len` are not written.
+fn detect_orphaned_sessions(
+    sessions: []const Session,
+    current_time_ms: u64,
+    out: [][32]u8,
+) -> usize {
+    var count : usize = 0;
+    var i : usize = 0;
+    while (i < sessions.len) {
+        if (is_session_orphaned(sessions[i], current_time_ms)) {
+            if (count < out.len) {
+                out[count] = sessions[i].id;
+                count += 1;
+            }
+        }
+        i += 1;
+    }
+    return count;
+}
+
+// ---------------------------------------------
+// Interface
+// ---------------------------------------------
+
+/**
+ * Orphan detection interface for sandbox health service.
+ */
+// t27 has no `trait`: the interface is a struct whose members are
+// function-typed fields (as in specs/sandbox/health.t27). The receiver
+// `&self` becomes an explicit `*OrphanDetector` parameter.
+pub const OrphanDetector = struct {
+    /**
+     * Scan all sessions and return orphaned ones.
+     *
+     * @param current_time_ms - Current timestamp in milliseconds
+     * @param out - Destination buffer for the orphaned session IDs
+     * @return List of orphaned session IDs
+     *         (here: the IDs are written into `out` and their number is
+     *         returned; the original returned Vec<[u8; 32]>)
+     */
+    scan_orphans : fn(*OrphanDetector, u64, [][32]u8) usize,
+
+    /**
+     * Check if a specific session is orphaned.
+     *
+     * @param session - The session to check
+     * @return true if session is orphaned
+     */
+    is_orphan : fn(*OrphanDetector, Session) bool,
+};
+
+// ---------------------------------------------
+// TDD Tests
+// ---------------------------------------------
+
+// The original wrapped these in a `.test { use sandbox.orphan_detection; ... }`
+// block; they live in the module itself, so the self-import is not needed.
+
+// Test helpers. The original test records wrote `id`, `name` and
+// `railway_id` as byte lists shorter than the declared fields ([u8; 32],
+// [u8; 64]); these copy such a list into a zero-filled array of the
+// declared size.
+fn bytes32(prefix: []const u8) -> [32]u8 {
+    var out : [32]u8 = undefined;
+    var i : usize = 0;
+    while (i < 32) {
+        if (i < prefix.len) {
+            out[i] = prefix[i];
+        } else {
+            out[i] = 0;
+        }
+        i += 1;
+    }
+    return out;
+}
+
+fn bytes64(prefix: []const u8) -> [64]u8 {
+    var out : [64]u8 = undefined;
+    var i : usize = 0;
+    while (i < 64) {
+        if (i < prefix.len) {
+            out[i] = prefix[i];
+        } else {
+            out[i] = 0;
+        }
+        i += 1;
+    }
+    return out;
+}
+
+// The original tests were written as `input: {...}; expected: ...;
+// description: "...";` records. Each is now an executable assertion of the
+// same input against the same expected value; the description is kept as
+// the first comment of the test.
+//
+// NOTE (time units): the original timestamps were microsecond-scale numbers
+// (4_000_000_000 "16 minutes ago" against 4_960_000_000 "Now" is 16 minutes
+// only in microseconds), while Timestamp.ms and current_time_ms are
+// milliseconds. Read as milliseconds, the grace-period case below is 10,000
+// minutes old and would be orphaned, contradicting its expected value, its
+// description and its "10 minutes ago" comment. Every timestamp is therefore
+// divided by 1000 (4_000_000_000 -> 4_000_000, ...), which gives the
+// 16-minute and 10-minute ages the comments state.
+
+// Test: Active session without railway_id for > 15 minutes is orphaned
+test "orphaned_active_session_no_railway_id" {
+    // Active session without railway_id for >15 min should be orphaned
+    const session = Session{
+        .id = bytes32([0x01, 0x00, 0x00, 0x00, 0x00, 0x01]),
+        .name = bytes64([0x74, 0x65, 0x73, 0x74, 0x6e, 0x73, 0x73, 0x74, 0x74, 0x00]),
+        .status = SessionStatus.Active,
+        .created_at = Timestamp{ .ms = 4_000_000 },  // 16 minutes ago
+        .updated_at = Timestamp{ .ms = 4_000_000 },
+        .railway_id = null,
+    };
+    const current_time_ms : u64 = 4_960_000;  // Now
+    assert(is_session_orphaned(session, current_time_ms) == true);
+}
+
+// Test: Active session with railway_id is NOT orphaned
+test "active_session_with_railway_id_not_orphaned" {
+    // Active session with railway_id should not be orphaned
+    const session = Session{
+        .id = bytes32([0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01]),
+        .name = bytes64([0x74, 0x65, 0x73, 0x74, 0x6e, 0x73, 0x73, 0x74, 0x74, 0x00]),
+        .status = SessionStatus.Active,
+        .created_at = Timestamp{ .ms = 4_000_000 },
+        .updated_at = Timestamp{ .ms = 4_000_000 },
+        .railway_id = bytes64([0x72, 0x77, 0x00]),  // Has railway_id
+    };
+    const current_time_ms : u64 = 4_960_000;
+    assert(is_session_orphaned(session, current_time_ms) == false);
+}
+
+// Test: Failed session is NOT orphaned (even without railway_id)
+test "failed_session_not_orphaned" {
+    // Failed sessions should not be orphaned (handled separately)
+    const session = Session{
+        .id = bytes32([0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01]),
+        .name = bytes64([0x74, 0x65, 0x73, 0x74, 0x6e, 0x73, 0x73, 0x74, 0x74, 0x00]),
+        .status = SessionStatus.Failed,
+        .created_at = Timestamp{ .ms = 4_000_000 },
+        .updated_at = Timestamp{ .ms = 4_000_000 },
+        .railway_id = null,
+    };
+    const current_time_ms : u64 = 4_960_000;
+    assert(is_session_orphaned(session, current_time_ms) == false);
+}
+
+// Test: Terminating session is NOT orphaned
+test "terminating_session_not_orphaned" {
+    // Terminating sessions should not be orphaned (already in cleanup)
+    const session = Session{
+        .id = bytes32([0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01]),
+        .name = bytes64([0x74, 0x65, 0x73, 0x74, 0x6e, 0x73, 0x73, 0x74, 0x74, 0x00]),
+        .status = SessionStatus.Terminating,
+        .created_at = Timestamp{ .ms = 4_000_000 },
+        .updated_at = Timestamp{ .ms = 4_000_000 },
+        .railway_id = null,
+    };
+    const current_time_ms : u64 = 4_960_000;
+    assert(is_session_orphaned(session, current_time_ms) == false);
+}
+
+// Test: Deleted session is NOT orphaned
+test "deleted_session_not_orphaned" {
+    // Deleted sessions should not be orphaned (already cleaned up)
+    const session = Session{
+        .id = bytes32([0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01]),
+        .name = bytes64([0x74, 0x65, 0x73, 0x74, 0x6e, 0x73, 0x73, 0x74, 0x74, 0x00]),
+        .status = SessionStatus.Deleted,
+        .created_at = Timestamp{ .ms = 4_000_000 },
+        .updated_at = Timestamp{ .ms = 4_000_000 },
+        .railway_id = null,
+    };
+    const current_time_ms : u64 = 4_960_000;
+    assert(is_session_orphaned(session, current_time_ms) == false);
+}
+
+// Test: Starting session < 15 minutes without railway_id is NOT orphaned (grace period)
+test "starting_session_grace_period_not_orphaned" {
+    // Starting session within 15 min grace period should not be orphaned
+    const session = Session{
+        .id = bytes32([0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01]),
+        .name = bytes64([0x74, 0x65, 0x73, 0x74, 0x6e, 0x73, 0x73, 0x74, 0x74, 0x00]),
+        .status = SessionStatus.Starting,
+        .created_at = Timestamp{ .ms = 4_800_000 },  // 10 minutes ago
+        .updated_at = Timestamp{ .ms = 4_800_000 },
+        .railway_id = null,
+    };
+    const current_time_ms : u64 = 5_400_000;  // Now
+    assert(is_session_orphaned(session, current_time_ms) == false);
+}

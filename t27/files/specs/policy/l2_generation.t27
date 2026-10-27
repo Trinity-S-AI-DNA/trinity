@@ -1,0 +1,922 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/policy/l2_generation.t27 -- law L2 GENERATION: which tracked gen/ files a change must show are t27c output.
+; L2 (CLAUDE.md, docs/T27-CONSTITUTION.md): files under gen/ are generated; edit the spec, then regenerate.
+; --
+; This file is the rule (#7113). tools/l2_regen_check.py is plumbing: it builds gen/c/policy/l2_generation.c
+; (t27c gen-c of this file, never hand-edited) with a one-line C main, feeds plan_all() the facts below,
+; then runs t27c on each planned copy and compares bytes. The plumbing decides nothing.
+; --
+; Input, one buffer of lines:
+;   "--pr" or "--all"                                   the mode
+;   git diff --no-renames --name-status base...head     (nothing in --all mode)
+;   "--gen", then git ls-files gen/                     the tracked copies
+;   "--specs", then git ls-files of specs/**.t27        the specs that exist
+;   "--use", then git grep of the `use` lines in specs, each "path:text"
+; Output, one plan line per copy to check, then "--end" once everything fit:
+;   <label if t27c reproduces it> TAB <label if not> TAB <t27c subcommand> TAB <spec> TAB <gen path>
+;   and for a copy no spec can be named for, the subcommand is "-" and the spec field says why: that line
+;   is a failure whatever the bytes are.
+; --
+; Decisions, stated where the rule lives:
+; - A gen/ file the change writes is checked: it passes only if t27c reproduces it byte for byte. That is
+;   every status but D: modified (#6226), added (#7127: a new hand-made file, or a copy under a name no spec
+;   has, fails as a HAND-MADE COPY), and a type change, so an unknown status is checked, not passed. Deleting
+;   a copy is allowed.
+; - A tracked copy whose spec, or any spec that spec imports through `use` (transitively: t27c's
+;   use_resolve.rs splices imports of imports), is added, modified or deleted is checked as well, so a spec
+;   edit that leaves its copy behind fails as a STALE COPY (#7103). A copy of a spec the change did not
+;   touch is not charged to it.
+; - "--all" checks every tracked copy, whatever changed.
+; - gen/<backend>/<stem>.<ext> is the copy of specs/<stem>.t27, written by the subcommand that the table
+;   below pairs with the backend. zig is `t27c gen`: t27c has no `gen-zig`, which the Python this replaces
+;   named, so a correct zig copy would have failed there.
+; - A `use` path is read as use_resolve.rs reads it: `::` and `.` both separate segments, an empty segment
+;   vanishes, a trailing comment and every trailing ';' are cut, and a path with a space but no `::` is not
+;   an import.
+; - Fail closed. An input without its four markers, a diff line without a tab, a path git quoted, and a copy
+;   with no backend, no extension or no spec each print a failure line. More `use` lines than the mark
+;   buffer holds charges every copy. Output that did not fit has no "--end", and the plumbing fails on that.
+; - On a change, the plumbing runs the BASE's copy of this rule (git show <base>:gen/c/...), so a change
+;   cannot loosen the rule that judges it: an edit here is judged by the old rule, and its own copy is
+;   then checked as a STALE COPY. Only a base without the copy (the change that adds it) runs the tree's.
+; - Open, not decided silently here: a compiler change that re-stales the copies of specs it did not touch
+;   is not charged to it (#7128).
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module PolicyL2Generation;
+
+/// base_start, ext_dot, put, put_range, put_msg, LIST_END and LIST_SEP are the Only-t27 gate's.
+use policy::own_language;
+use policy::text_lines;
+
+/// Why a copy can, or cannot, be regenerated.
+pub const R_MAPPED : u8 = 0;
+pub const R_NO_BACKEND : u8 = 1;
+pub const R_UNKNOWN_BACKEND : u8 = 2;
+pub const R_NO_EXTENSION : u8 = 3;
+pub const R_NO_SPEC : u8 = 4;
+pub const R_QUOTED : u8 = 5;
+
+/// Why a copy is in the plan; each kind prints its own pair of labels.
+pub const K_MODIFIED : u8 = 0;
+pub const K_STALE : u8 = 1;
+pub const K_ALL : u8 = 2;
+pub const K_INPUT : u8 = 3;
+pub const K_ADDED : u8 = 4;
+
+/// How a spec path is matched: against a `use` path, or against a gen/ copy's stem.
+pub const BY_USE : u8 = 0;
+pub const BY_STEM : u8 = 1;
+
+/// gen/<backend>/ and the t27c subcommand that writes it, entry for entry.
+pub const BACKENDS : str = "c,verilog,rust,zig,$";
+pub const SUBCOMMANDS : str = "gen-c,gen-verilog,gen-rust,gen,$";
+
+pub const NOT_FOUND : usize = 65535;
+
+pub const GEN_ROOT : str = "gen/$";
+pub const GEN_ROOT_LEN : usize = 4;
+pub const SPEC_ROOT : str = "specs/$";
+pub const SPEC_ROOT_LEN : usize = 6;
+pub const SPEC_EXT : str = ".t27$";
+pub const SPEC_EXT_LEN : usize = 4;
+pub const USE_WORD : str = "use $";
+pub const USE_WORD_LEN : usize = 4;
+
+pub const MARK_PR : str = "--pr$";
+pub const MARK_ALL : str = "--all$";
+pub const MARK_GEN : str = "--gen$";
+pub const MARK_SPECS : str = "--specs$";
+pub const MARK_USE : str = "--use$";
+pub const MARK_END : str = "--end$";
+
+pub const OK_MODIFIED : str = "regenerated$";
+pub const BAD_MODIFIED : str = "HAND EDIT$";
+pub const OK_STALE : str = "up to date$";
+pub const BAD_STALE : str = "STALE COPY$";
+pub const OK_ALL : str = "t27c output$";
+pub const BAD_ALL : str = "NOT OUTPUT$";
+pub const OK_INPUT : str = "read$";
+pub const BAD_INPUT : str = "UNREADABLE$";
+pub const OK_ADDED : str = "added, t27c output$";
+pub const BAD_ADDED : str = "HAND-MADE COPY$";
+
+pub const WHY_NO_BACKEND : str = "no backend directory under gen/$";
+pub const WHY_UNKNOWN_BACKEND : str = "a backend directory t27c does not write$";
+pub const WHY_NO_EXTENSION : str = "no file extension$";
+pub const WHY_NO_SPEC : str = "no spec at $";
+pub const WHY_QUOTED : str = "git quoted the path; L3 wants plain ASCII names$";
+pub const WHY_MARKERS : str = "expected --pr or --all, then --gen, --specs and --use$";
+pub const WHY_DIFF : str = "a diff line without a tab$";
+
+/// Length of a '$'-terminated piece.
+pub fn piece_len(m: []const u8) -> usize {
+    var i : usize = 0;
+    while (m[i] != LIST_END) { i += 1; }
+    return i;
+}
+
+/// Does s[from..to] start with the piece m?
+pub fn starts_with(s: []const u8, from: usize, to: usize, m: []const u8) -> bool {
+    var i : usize = 0;
+    while (m[i] != LIST_END) {
+        if (from + i >= to) { return false; }
+        if (s[from + i] != m[i]) { return false; }
+        i += 1;
+    }
+    return true;
+}
+
+/// Does s[from..to] end with the piece m?
+pub fn ends_with(s: []const u8, from: usize, to: usize, m: []const u8) -> bool {
+    const k : usize = piece_len(m);
+    if (to - from < k) { return false; }
+    return starts_with(s, to - k, to, m);
+}
+
+/// Is s[from..to] exactly the piece m?
+pub fn is_piece(s: []const u8, from: usize, to: usize, m: []const u8) -> bool {
+    return to - from == piece_len(m) and starts_with(s, from, to, m);
+}
+
+/// Index of the entry of `list` that is exactly s[from..to], or NOT_FOUND.
+pub fn list_index(list: []const u8, s: []const u8, from: usize, to: usize) -> usize {
+    var i : usize = 0;
+    var idx : usize = 0;
+    while (list[i] != LIST_END) {
+        var k : usize = from;
+        var ok : bool = true;
+        while (list[i] != LIST_SEP and list[i] != LIST_END) {
+            if (k >= to) {
+                ok = false;
+            } else {
+                if (s[k] != list[i]) { ok = false; }
+            }
+            k += 1;
+            i += 1;
+        }
+        if (ok and k == to) { return idx; }
+        if (list[i] == LIST_SEP) { i += 1; }
+        idx += 1;
+    }
+    return NOT_FOUND;
+}
+
+/// How many entries `list` has.
+pub fn list_len(list: []const u8) -> usize {
+    var i : usize = 0;
+    var n : usize = 0;
+    while (list[i] != LIST_END) {
+        if (list[i] == LIST_SEP) { n += 1; }
+        i += 1;
+    }
+    return n;
+}
+
+/// Where entry `idx` of `list` starts.
+pub fn entry_start(list: []const u8, idx: usize) -> usize {
+    var i : usize = 0;
+    var n : usize = 0;
+    while (n < idx and list[i] != LIST_END) {
+        if (list[i] == LIST_SEP) { n += 1; }
+        i += 1;
+    }
+    return i;
+}
+
+/// The '/' that ends the backend directory of a gen/ path s[from..to], or `to`.
+pub fn backend_end(s: []const u8, from: usize, to: usize) -> usize {
+    var i : usize = from + GEN_ROOT_LEN;
+    while (i < to) {
+        if (s[i] == '/') { return i; }
+        i += 1;
+    }
+    return to;
+}
+
+/// Can the copy at s[from..to] be regenerated: does it name a backend t27c writes and a stem?
+pub fn copy_reason(s: []const u8, from: usize, to: usize) -> u8 {
+    if (to > from and s[from] == '"') { return R_QUOTED; }
+    if (starts_with(s, from, to, GEN_ROOT) == false) { return R_NO_BACKEND; }
+    const b : usize = backend_end(s, from, to);
+    if (b == to) { return R_NO_BACKEND; }
+    if (list_index(BACKENDS, s, from + GEN_ROOT_LEN, b) == NOT_FOUND) { return R_UNKNOWN_BACKEND; }
+    if (ext_dot(s, from, to) == to) { return R_NO_EXTENSION; }
+    return R_MAPPED;
+}
+
+/// Is s[from..to] a gen/ path, quoted by git or not?
+pub fn is_gen(s: []const u8, from: usize, to: usize) -> bool {
+    if (starts_with(s, from, to, GEN_ROOT)) { return true; }
+    return to > from and s[from] == '"' and starts_with(s, from + 1, to, GEN_ROOT);
+}
+
+/// Is buf[lf..lt] exactly "specs/" ++ buf[sf..st] ++ ".t27"?
+pub fn is_spec_of(buf: []const u8, lf: usize, lt: usize, sf: usize, st: usize) -> bool {
+    if (lt - lf != st - sf + SPEC_ROOT_LEN + SPEC_EXT_LEN) { return false; }
+    if (starts_with(buf, lf, lt, SPEC_ROOT) == false) { return false; }
+    if (ends_with(buf, lf, lt, SPEC_EXT) == false) { return false; }
+    var k : usize = 0;
+    while (k < st - sf) {
+        if (buf[lf + SPEC_ROOT_LEN + k] != buf[sf + k]) { return false; }
+        k += 1;
+    }
+    return true;
+}
+
+/// Does the `use` path buf[ef..et] name the spec at buf[pf..pt]? `::` and `.` separate segments and an
+/// empty segment vanishes, as use_resolve.rs pushes the segments onto specs/ and sets the extension .t27.
+/// The walk needs no bound: buf[me] is the '.' of .t27, which is neither '/' nor a byte a segment holds
+/// ('.' separates), so k stops at me.
+pub fn use_names(buf: []const u8, ef: usize, et: usize, pf: usize, pt: usize) -> bool {
+    if (pt - pf <= SPEC_ROOT_LEN + SPEC_EXT_LEN) { return false; }
+    if (starts_with(buf, pf, pt, SPEC_ROOT) == false) { return false; }
+    if (ends_with(buf, pf, pt, SPEC_EXT) == false) { return false; }
+    const me : usize = pt - SPEC_EXT_LEN;
+    var k : usize = pf + SPEC_ROOT_LEN;
+    var i : usize = ef;
+    var gap : bool = false;
+    while (i < et) {
+        const c : u8 = buf[i];
+        if (c == '.' or (c == ':' and i + 1 < et and buf[i + 1] == ':')) {
+            if (k > pf + SPEC_ROOT_LEN) { gap = true; }
+            if (c == ':') { i += 1; }
+            i += 1;
+        } else {
+            if (gap) {
+                if (buf[k] != '/') { return false; }
+                k += 1;
+                gap = false;
+            }
+            if (buf[k] != c) { return false; }
+            k += 1;
+            i += 1;
+        }
+    }
+    return k == me;
+}
+
+/// Space, tab or carriage return.
+pub fn is_blank(c: u8) -> bool {
+    return c == ' ' or c == '\t' or c == '\r';
+}
+
+/// Start of the use path in a grep line buf[s..x] ("path:text"), or x when the text is not a `use` line.
+pub fn use_from(buf: []const u8, s: usize, x: usize) -> usize {
+    var i : usize = s;
+    while (i < x and buf[i] != ':') { i += 1; }
+    i += 1;
+    while (i < x and is_blank(buf[i])) { i += 1; }
+    if (starts_with(buf, i, x, USE_WORD) == false) { return x; }
+    i += USE_WORD_LEN;
+    while (i < x and is_blank(buf[i])) { i += 1; }
+    return i;
+}
+
+/// The first "//" in buf[f..x], or x.
+pub fn comment_at(buf: []const u8, f: usize, x: usize) -> usize {
+    var i : usize = f;
+    while (i + 1 < x) {
+        if (buf[i] == '/' and buf[i + 1] == '/') { return i; }
+        i += 1;
+    }
+    return x;
+}
+
+/// End of the use path that starts at f: before a comment, trailing blanks and every trailing ';'.
+pub fn use_to(buf: []const u8, f: usize, x: usize) -> usize {
+    var t : usize = comment_at(buf, f, x);
+    while (t > f and is_blank(buf[t - 1])) { t -= 1; }
+    while (t > f and buf[t - 1] == ';') { t -= 1; }
+    while (t > f and is_blank(buf[t - 1])) { t -= 1; }
+    return t;
+}
+
+/// Is buf[f..t] a path use_resolve.rs follows: not empty, and with `::` or without a space?
+pub fn use_valid(buf: []const u8, f: usize, t: usize) -> bool {
+    if (t <= f) { return false; }
+    var colons : bool = false;
+    var space : bool = false;
+    var i : usize = f;
+    while (i < t) {
+        if (buf[i] == ' ') { space = true; }
+        if (buf[i] == ':' and i + 1 < t and buf[i + 1] == ':') { colons = true; }
+        i += 1;
+    }
+    return colons or space == false;
+}
+
+/// Start of the line after the one that starts at s, or n.
+pub fn next_line(buf: []const u8, s: usize, n: usize) -> usize {
+    const e : usize = line_end(buf, s, n);
+    if (e < n) { return e + 1; }
+    return n;
+}
+
+/// Start of the first line at or after `from` that is exactly the piece m, or n.
+pub fn marker_at(buf: []const u8, n: usize, from: usize, m: []const u8) -> usize {
+    var s : usize = from;
+    while (s < n) {
+        const e : usize = line_end(buf, s, n);
+        if (is_piece(buf, s, text_end(buf, s, e), m)) { return s; }
+        s = e + 1;
+    }
+    return n;
+}
+
+/// Start of the last tab-separated field of the diff line buf[s..x], or s when it has no tab.
+pub fn diff_path(buf: []const u8, s: usize, x: usize) -> usize {
+    var p : usize = s;
+    var i : usize = s;
+    while (i < x) {
+        if (buf[i] == '\t') { p = i + 1; }
+        i += 1;
+    }
+    return p;
+}
+
+/// The first ':' in buf[s..e], or e.
+pub fn colon_at(buf: []const u8, s: usize, e: usize) -> usize {
+    var i : usize = s;
+    while (i < e and buf[i] != ':') { i += 1; }
+    return i;
+}
+
+/// Are buf[af..at] and buf[bf..bt] the same bytes?
+pub fn same(buf: []const u8, af: usize, at: usize, bf: usize, bt: usize) -> bool {
+    if (at - af != bt - bf) { return false; }
+    var k : usize = 0;
+    while (k < at - af) {
+        if (buf[af + k] != buf[bf + k]) { return false; }
+        k += 1;
+    }
+    return true;
+}
+
+/// Does the spec path buf[pf..pt] answer to x, read as `how` says?
+pub fn names(buf: []const u8, how: u8, pf: usize, pt: usize, xf: usize, xt: usize) -> bool {
+    if (how == BY_USE) { return use_names(buf, xf, xt, pf, pt); }
+    return is_spec_of(buf, pf, pt, xf, xt);
+}
+
+/// Is the spec named by x changed in the diff buf[df..dt], or the source of a use line of buf[uf..ut]
+/// that is already marked as importing a changed spec?
+pub fn charged(buf: []const u8, df: usize, dt: usize, uf: usize, ut: usize, mark: []u8, how: u8, xf: usize, xt: usize) -> bool {
+    var s : usize = df;
+    while (s < dt) {
+        const e : usize = line_end(buf, s, dt);
+        const x : usize = text_end(buf, s, e);
+        const p : usize = diff_path(buf, s, x);
+        if (p > s and names(buf, how, p, x, xf, xt)) { return true; }
+        s = e + 1;
+    }
+    var i : usize = 0;
+    s = uf;
+    while (s < ut) {
+        const e : usize = line_end(buf, s, ut);
+        if (mark[i] == 1 and names(buf, how, s, colon_at(buf, s, e), xf, xt)) { return true; }
+        i += 1;
+        s = e + 1;
+    }
+    return false;
+}
+
+/// Mark every use line of buf[uf..ut] whose source imports a changed spec, directly or through marked
+/// lines, until nothing new is marked. False when mark[0..mcap] cannot hold one byte per use line.
+pub fn close_marks(buf: []const u8, df: usize, dt: usize, uf: usize, ut: usize, mark: []u8, mcap: usize) -> bool {
+    var nu : usize = 0;
+    var s : usize = uf;
+    while (s < ut) {
+        if (nu < mcap) { mark[nu] = 0; }
+        nu += 1;
+        s = line_end(buf, s, ut) + 1;
+    }
+    if (nu > mcap) { return false; }
+    var grew : bool = true;
+    while (grew) {
+        grew = false;
+        var i : usize = 0;
+        s = uf;
+        while (s < ut) {
+            const e : usize = line_end(buf, s, ut);
+            if (mark[i] == 0) {
+                const x : usize = text_end(buf, s, e);
+                const f : usize = use_from(buf, s, x);
+                const t : usize = use_to(buf, f, x);
+                if (use_valid(buf, f, t) and charged(buf, df, dt, uf, ut, mark, BY_USE, f, t)) {
+                    mark[i] = 1;
+                    grew = true;
+                }
+            }
+            i += 1;
+            s = e + 1;
+        }
+    }
+    return true;
+}
+
+/// Is "specs/" ++ buf[sf..st] ++ ".t27" one of the lines of buf[lf..lt]?
+pub fn listed(buf: []const u8, lf: usize, lt: usize, sf: usize, st: usize) -> bool {
+    var s : usize = lf;
+    while (s < lt) {
+        const e : usize = line_end(buf, s, lt);
+        if (is_spec_of(buf, s, text_end(buf, s, e), sf, st)) { return true; }
+        s = e + 1;
+    }
+    return false;
+}
+
+/// Does the diff buf[df..dt] write the path buf[pf..pt]: any status but D?
+pub fn written(buf: []const u8, df: usize, dt: usize, pf: usize, pt: usize) -> bool {
+    var s : usize = df;
+    while (s < dt) {
+        const e : usize = line_end(buf, s, dt);
+        const x : usize = text_end(buf, s, e);
+        const p : usize = diff_path(buf, s, x);
+        if (p > s and buf[s] != 'D' and same(buf, p, x, pf, pt)) { return true; }
+        s = e + 1;
+    }
+    return false;
+}
+
+/// The kind a gen/ path the diff writes is planned as, from its status letter: A has its own labels.
+pub fn diff_kind(c: u8) -> u8 {
+    if (c == 'A') { return K_ADDED; }
+    return K_MODIFIED;
+}
+
+/// Is the copy at buf[pf..pt] charged by a changed spec: its own, or one its spec imports?
+pub fn charged_copy(buf: []const u8, df: usize, dt: usize, uf: usize, ut: usize, mark: []u8, pf: usize, pt: usize) -> bool {
+    if (copy_reason(buf, pf, pt) != R_MAPPED) { return false; }
+    const b : usize = backend_end(buf, pf, pt);
+    return charged(buf, df, dt, uf, ut, mark, BY_STEM, b + 1, ext_dot(buf, pf, pt));
+}
+
+/// Write entry `idx` of `list`.
+pub fn put_entry(out: []u8, w: usize, cap: usize, list: []const u8, idx: usize) -> usize {
+    var p : usize = w;
+    var i : usize = entry_start(list, idx);
+    while (list[i] != LIST_SEP and list[i] != LIST_END) {
+        p = put(out, p, cap, list[i]);
+        i += 1;
+    }
+    return p;
+}
+
+/// Write "specs/" ++ buf[sf..st] ++ ".t27".
+pub fn put_spec(out: []u8, w: usize, cap: usize, buf: []const u8, sf: usize, st: usize) -> usize {
+    var p : usize = put_msg(out, w, cap, SPEC_ROOT);
+    p = put_range(out, p, cap, buf, sf, st);
+    return put_msg(out, p, cap, SPEC_EXT);
+}
+
+/// Write the label a copy of this kind prints when t27c reproduces it (`ok`) or does not.
+pub fn put_label(out: []u8, w: usize, cap: usize, kind: u8, ok: bool) -> usize {
+    if (kind == K_MODIFIED) {
+        if (ok) { return put_msg(out, w, cap, OK_MODIFIED); }
+        return put_msg(out, w, cap, BAD_MODIFIED);
+    }
+    if (kind == K_STALE) {
+        if (ok) { return put_msg(out, w, cap, OK_STALE); }
+        return put_msg(out, w, cap, BAD_STALE);
+    }
+    if (kind == K_ALL) {
+        if (ok) { return put_msg(out, w, cap, OK_ALL); }
+        return put_msg(out, w, cap, BAD_ALL);
+    }
+    if (kind == K_ADDED) {
+        if (ok) { return put_msg(out, w, cap, OK_ADDED); }
+        return put_msg(out, w, cap, BAD_ADDED);
+    }
+    if (ok) { return put_msg(out, w, cap, OK_INPUT); }
+    return put_msg(out, w, cap, BAD_INPUT);
+}
+
+/// Write why a copy cannot be regenerated.
+pub fn put_why(out: []u8, w: usize, cap: usize, r: u8) -> usize {
+    if (r == R_NO_BACKEND) { return put_msg(out, w, cap, WHY_NO_BACKEND); }
+    if (r == R_UNKNOWN_BACKEND) { return put_msg(out, w, cap, WHY_UNKNOWN_BACKEND); }
+    if (r == R_NO_EXTENSION) { return put_msg(out, w, cap, WHY_NO_EXTENSION); }
+    if (r == R_NO_SPEC) { return put_msg(out, w, cap, WHY_NO_SPEC); }
+    return put_msg(out, w, cap, WHY_QUOTED);
+}
+
+/// Write a failure line about the input itself: `why`, and the offending text buf[f..t].
+pub fn put_unreadable(out: []u8, w: usize, cap: usize, why: []const u8, buf: []const u8, f: usize, t: usize) -> usize {
+    var p : usize = put_label(out, w, cap, K_INPUT, true);
+    p = put(out, p, cap, '\t');
+    p = put_label(out, p, cap, K_INPUT, false);
+    p = put(out, p, cap, '\t');
+    p = put(out, p, cap, '-');
+    p = put(out, p, cap, '\t');
+    p = put_msg(out, p, cap, why);
+    p = put(out, p, cap, '\t');
+    p = put_range(out, p, cap, buf, f, t);
+    return put(out, p, cap, '\n');
+}
+
+/// Write the plan line for the copy at buf[pf..pt]; the specs that exist are the lines of buf[sf..st].
+pub fn put_plan(out: []u8, w: usize, cap: usize, buf: []const u8, kind: u8, pf: usize, pt: usize, sf: usize, st: usize) -> usize {
+    var r : u8 = copy_reason(buf, pf, pt);
+    var b : usize = pt;
+    var d : usize = pt;
+    if (r == R_MAPPED) {
+        b = backend_end(buf, pf, pt);
+        d = ext_dot(buf, pf, pt);
+        if (listed(buf, sf, st, b + 1, d) == false) { r = R_NO_SPEC; }
+    }
+    var p : usize = put_label(out, w, cap, kind, true);
+    p = put(out, p, cap, '\t');
+    p = put_label(out, p, cap, kind, false);
+    p = put(out, p, cap, '\t');
+    if (r == R_MAPPED) {
+        p = put_entry(out, p, cap, SUBCOMMANDS, list_index(BACKENDS, buf, pf + GEN_ROOT_LEN, b));
+        p = put(out, p, cap, '\t');
+        p = put_spec(out, p, cap, buf, b + 1, d);
+    } else {
+        p = put(out, p, cap, '-');
+        p = put(out, p, cap, '\t');
+        p = put_why(out, p, cap, r);
+        if (r == R_NO_SPEC) { p = put_spec(out, p, cap, buf, b + 1, d); }
+    }
+    p = put(out, p, cap, '\t');
+    p = put_range(out, p, cap, buf, pf, pt);
+    return put(out, p, cap, '\n');
+}
+
+/// Read the facts in buf[0..n] (see the header), write the plan into out[0..cap] and return how many
+/// copies it names; mark[0..mcap] is scratch for the import closure. "--end" closes an output that fit.
+pub fn plan_all(buf: []const u8, n: usize, out: []u8, cap: usize, mark: []u8, mcap: usize) -> u32 {
+    var w : usize = 0;
+    var count : u32 = 0;
+    const m : usize = text_end(buf, 0, line_end(buf, 0, n));
+    const all : bool = is_piece(buf, 0, m, MARK_ALL);
+    const ds : usize = next_line(buf, 0, n);
+    const g : usize = marker_at(buf, n, ds, MARK_GEN);
+    const sm : usize = marker_at(buf, n, g, MARK_SPECS);
+    const u : usize = marker_at(buf, n, sm, MARK_USE);
+    if (u == n or (all == false and is_piece(buf, 0, m, MARK_PR) == false)) {
+        w = put_unreadable(out, w, cap, WHY_MARKERS, buf, 0, m);
+        count = 1;
+    } else {
+        const gs : usize = next_line(buf, g, n);
+        const ss : usize = next_line(buf, sm, n);
+        const us : usize = next_line(buf, u, n);
+        var over : bool = false;
+        if (all == false) {
+            over = close_marks(buf, ds, g, us, n, mark, mcap) == false;
+            var s : usize = ds;
+            while (s < g) {
+                const e : usize = line_end(buf, s, g);
+                const x : usize = text_end(buf, s, e);
+                const p : usize = diff_path(buf, s, x);
+                if (x > s and p == s) {
+                    w = put_unreadable(out, w, cap, WHY_DIFF, buf, s, x);
+                    count += 1;
+                }
+                if (p > s and buf[s] != 'D' and is_gen(buf, p, x)) {
+                    w = put_plan(out, w, cap, buf, diff_kind(buf[s]), p, x, ss, u);
+                    count += 1;
+                }
+                s = e + 1;
+            }
+        }
+        var t : usize = gs;
+        while (t < sm) {
+            const e : usize = line_end(buf, t, sm);
+            const x : usize = text_end(buf, t, e);
+            var kind : u8 = K_STALE;
+            var take : bool = false;
+            if (all) {
+                kind = K_ALL;
+                take = true;
+            } else {
+                if (written(buf, ds, g, t, x) == false) {
+                    take = over or charged_copy(buf, ds, g, us, n, mark, t, x);
+                }
+            }
+            if (x > t and take) {
+                w = put_plan(out, w, cap, buf, kind, t, x, ss, u);
+                count += 1;
+            }
+            t = e + 1;
+        }
+    }
+    if (w + piece_len(MARK_END) + 1 <= cap) {
+        w = put_msg(out, w, cap, MARK_END);
+        w = put(out, w, cap, '\n');
+    }
+    return count;
+}
+
+/// Does out start with the piece `want`? For the tests: a plan is read as text.
+pub fn out_starts(out: []u8, want: []const u8) -> bool {
+    var i : usize = 0;
+    while (want[i] != LIST_END) {
+        if (out[i] != want[i]) { return false; }
+        i += 1;
+    }
+    return true;
+}
+
+/// Copy s[0..n] into b, each '|' becoming a carriage return, and return n. For the tests: a t27 string
+/// literal has no \r escape (a char literal has).
+pub fn cr_copy(s: []const u8, n: usize, b: []u8) -> usize {
+    var i : usize = 0;
+    while (i < n) {
+        b[i] = s[i];
+        if (s[i] == '|') { b[i] = 13; }
+        i += 1;
+    }
+    return n;
+}
+
+test a_copy_maps_to_its_backend_and_stem {
+    assert copy_reason("gen/c/queen/priority.c", 0, 22) == R_MAPPED;
+    assert copy_reason("gen/verilog/numeric/gf16.v", 0, 26) == R_MAPPED;
+    assert copy_reason("gen/zig/a.zig", 0, 13) == R_MAPPED;
+    assert copy_reason("gen/README.md", 0, 13) == R_NO_BACKEND;
+    assert copy_reason("gen/c", 0, 5) == R_NO_BACKEND;
+    assert copy_reason("specs/a.t27", 0, 11) == R_NO_BACKEND;
+    assert copy_reason("gen/js/a.js", 0, 11) == R_UNKNOWN_BACKEND;
+    assert copy_reason("gen/cc/a.c", 0, 10) == R_UNKNOWN_BACKEND;
+    assert copy_reason("gen/c/Makefile", 0, 14) == R_NO_EXTENSION;
+    assert copy_reason("gen/c/.keep", 0, 11) == R_NO_EXTENSION;
+    assert copy_reason("gen/c.d/a", 0, 9) == R_UNKNOWN_BACKEND;
+    assert copy_reason("\"gen/c/a.c\"", 0, 11) == R_QUOTED;
+    assert is_gen("\"gen/c/a.c\"", 0, 11) == true;
+    assert is_gen("gen/c/a.c", 0, 9) == true;
+    assert is_gen("xgen/c/a.c", 0, 10) == false;
+    assert is_gen("\"specs/a\"", 0, 9) == false;
+    assert copy_reason("", 0, 0) == R_NO_BACKEND;
+    assert is_gen("", 0, 0) == false;
+}
+
+test a_spec_line_is_matched_whole {
+    assert is_spec_of("specs/a/b.t27|a/b", 0, 13, 14, 17) == true;
+    assert is_spec_of("specs/a/c.t27|a/b", 0, 13, 14, 17) == false;
+    assert is_spec_of("specs/a/b.t28|a/b", 0, 13, 14, 17) == false;
+    assert is_spec_of("spec/a/b.t27|a/b", 0, 12, 13, 16) == false;
+    assert is_spec_of("specs/a/bb.t27|a/b", 0, 14, 15, 18) == false;
+    assert is_spec_of("xpecs/a/b.t27|a/b", 0, 13, 14, 17) == false;
+}
+
+test a_use_path_names_a_spec_as_use_resolve_reads_it {
+    assert use_names("queen::control|specs/queen/control.t27", 0, 14, 15, 38) == true;
+    assert use_names("queen.control|specs/queen/control.t27", 0, 13, 14, 37) == true;
+    assert use_names("::a::::b::|specs/a/b.t27", 0, 10, 11, 24) == true;
+    assert use_names("a|specs/a.t27", 0, 1, 2, 13) == true;
+    assert use_names("queen::control|specs/queen/controls.t27", 0, 14, 15, 39) == false;
+    assert use_names("queen::controls|specs/queen/control.t27", 0, 15, 16, 39) == false;
+    assert use_names("a::b|specs/ab.t27", 0, 4, 5, 17) == false;
+    assert use_names("ab|specs/a/b.t27", 0, 2, 3, 16) == false;
+    assert use_names("a::b|specs/a/b.t2x", 0, 4, 5, 18) == false;
+    assert use_names("a::b|spec/a/b.t27", 0, 4, 5, 17) == false;
+    assert use_names("|specs/a.t27", 0, 0, 1, 12) == false;
+    assert use_names("a|specs/.t27", 0, 1, 2, 12) == false;
+    assert use_names("a::b|specs/a/b/.t27", 0, 4, 5, 19) == false;
+    assert use_names("::|specs/.t27", 0, 2, 3, 13) == false;
+    assert use_names("a|xpecs/a.t27", 0, 1, 2, 13) == false;
+    assert use_names("a:b|specs/a/b.t27", 0, 3, 4, 17) == false;
+    assert use_names("a:xb|specs/a:xb.t27", 0, 4, 5, 19) == true;
+    assert use_names("a::|specs/a.t27", 0, 2, 4, 15) == false;
+    assert use_names("a::b|specs/axb.t27", 0, 4, 5, 18) == false;
+}
+
+test a_use_line_is_cut_as_use_resolve_cuts_it {
+    assert use_from("specs/x.t27:  use a::b;  // c", 0, 29) == 18;
+    assert use_to("specs/x.t27:  use a::b;  // c", 18, 29) == 22;
+    assert use_from("specs/x.t27:use\ta;", 0, 18) == 18;
+    assert use_from("specs/x.t27:// use a;", 0, 21) == 21;
+    assert use_from("no colon use a;", 0, 15) == 15;
+    assert use_from("specs/x.t27:\t use   a;;", 0, 23) == 20;
+    var b : [32]u8 = undefined;
+    assert use_to(&b, 20, cr_copy("specs/x.t27:\t use   a;; |", 25, &b)) == 21;
+    assert use_to("specs/x.t27:use a ; ;", 16, 21) == 19;
+    assert use_to("specs/x.t27:use //", 16, 18) == 16;
+    assert use_valid("a::b {X, Y}", 0, 11) == true;
+    assert use_valid("a b", 0, 3) == false;
+    assert use_valid("a", 0, 1) == true;
+    assert use_valid("a:b c", 0, 5) == false;
+    assert use_valid("", 0, 0) == false;
+    assert use_valid("a b::", 0, 5) == true;
+    assert use_valid("a b:::", 0, 4) == false;
+    assert use_from("specs/x.t27: ", 0, 13) == 13;
+    assert use_from("specs/x.t27:use  ", 0, 16) == 16;
+    assert use_to(";", 1, 1) == 1;
+    assert comment_at("a//", 0, 2) == 2;
+    assert comment_at("a/b", 0, 3) == 3;
+}
+
+test lists_index_and_write_their_entries {
+    var out : [16]u8 = undefined;
+    assert list_index(BACKENDS, "rust", 0, 4) == 2;
+    assert list_index(BACKENDS, "rus", 0, 3) == NOT_FOUND;
+    assert list_index(BACKENDS, "rusty", 0, 5) == NOT_FOUND;
+    assert list_index(BACKENDS, "", 0, 0) == NOT_FOUND;
+    assert entry_start(SUBCOMMANDS, 2) == 18;
+    assert put_entry(&out, 0, 16, SUBCOMMANDS, 1) == 11;
+    assert out_starts(&out, "gen-verilog$");
+    assert put_entry(&out, 0, 16, SUBCOMMANDS, 3) == 3;
+    assert out[2] == 'n';
+    assert out_starts(&out, "gen-c$") == false;
+    assert starts_with("gen/", 0, 3, GEN_ROOT) == false;
+    assert ends_with(".t27", 0, 4, SPEC_EXT) == true;
+    assert ends_with(".t27", 1, 4, SPEC_EXT) == false;
+    assert piece_len(MARK_SPECS) == 7;
+    assert ends_with("ab.t27", 0, 6, SPEC_EXT) == true;
+    assert ends_with("t27", 0, 3, SPEC_EXT) == false;
+    assert is_piece("--pr", 0, 4, MARK_PR) == true;
+    assert is_piece("--prx", 0, 5, MARK_PR) == false;
+    assert is_piece("--p", 0, 3, MARK_PR) == false;
+}
+
+test a_modified_copy_is_planned_with_its_subcommand_and_spec {
+    var out : [256]u8 = undefined;
+    var mark : [8]u8 = undefined;
+    assert plan_all("--pr\nM\tgen/c/a.c\n--gen\ngen/c/a.c\n--specs\nspecs/a.t27\n--use\n", 59, &out, 256, &mark, 8) == 1;
+    assert out_starts(&out, "regenerated\tHAND EDIT\tgen-c\tspecs/a.t27\tgen/c/a.c\n--end\n$");
+    assert plan_all("--pr\nM\tgen/zig/a.zig\n--gen\n--specs\nspecs/a.t27\n--use\n", 53, &out, 256, &mark, 8) == 1;
+    assert out_starts(&out, "regenerated\tHAND EDIT\tgen\tspecs/a.t27\tgen/zig/a.zig\n--end\n$");
+}
+
+test an_added_copy_is_planned_and_a_deleted_one_is_not {
+    var out : [256]u8 = undefined;
+    var mark : [8]u8 = undefined;
+    assert plan_all("--pr\nA\tgen/c/a.c\nD\tgen/c/b.c\nM\tdocs/x.md\n--gen\ngen/c/a.c\n--specs\nspecs/a.t27\n--use\n", 83, &out, 256, &mark, 8) == 1;
+    assert out_starts(&out, "added, t27c output\tHAND-MADE COPY\tgen-c\tspecs/a.t27\tgen/c/a.c\n--end\n$");
+    assert plan_all("--pr\nA\tgen/c/ci/hand.c\nA\tgen/c/ci/own_copy.c\n--gen\ngen/c/ci/hand.c\ngen/c/ci/own_copy.c\n--specs\nspecs/policy/own_language.t27\n--use\n", 131, &out, 256, &mark, 8) == 2;
+    assert out_starts(&out, "added, t27c output\tHAND-MADE COPY\t-\tno spec at specs/ci/hand.t27\tgen/c/ci/hand.c\nadded, t27c output\tHAND-MADE COPY\t-\tno spec at specs/ci/own_copy.t27\tgen/c/ci/own_copy.c\n--end\n$");
+    assert plan_all("--pr\nD\tgen/c/b.c\n--gen\n--specs\nspecs/b.t27\n--use\n", 49, &out, 256, &mark, 8) == 0;
+    assert out_starts(&out, "--end\n$");
+}
+
+test a_copy_added_with_its_spec_is_planned_once {
+    var out : [256]u8 = undefined;
+    var mark : [8]u8 = undefined;
+    assert plan_all("--pr\nA\tgen/c/a.c\nA\tspecs/a.t27\n--gen\ngen/c/a.c\n--specs\nspecs/a.t27\n--use\n", 73, &out, 256, &mark, 8) == 1;
+    assert out_starts(&out, "added, t27c output\tHAND-MADE COPY\tgen-c\tspecs/a.t27\tgen/c/a.c\n--end\n$");
+}
+
+test any_status_but_deleted_is_planned {
+    var out : [256]u8 = undefined;
+    var mark : [8]u8 = undefined;
+    assert plan_all("--pr\nT\tgen/c/a.c\n--gen\ngen/c/a.c\n--specs\nspecs/a.t27\n--use\n", 59, &out, 256, &mark, 8) == 1;
+    assert out_starts(&out, "regenerated\tHAND EDIT\tgen-c\tspecs/a.t27\tgen/c/a.c\n--end\n$");
+    assert diff_kind('A') == K_ADDED;
+    assert diff_kind('M') == K_MODIFIED;
+    assert diff_kind('T') == K_MODIFIED;
+}
+
+test a_spec_changed_without_its_copy_charges_the_copy {
+    var out : [256]u8 = undefined;
+    var mark : [8]u8 = undefined;
+    assert plan_all("--pr\nM\tspecs/a.t27\n--gen\ngen/c/a.c\ngen/c/b.c\n--specs\nspecs/a.t27\nspecs/b.t27\n--use\n", 83, &out, 256, &mark, 8) == 1;
+    assert out_starts(&out, "up to date\tSTALE COPY\tgen-c\tspecs/a.t27\tgen/c/a.c\n--end\n$");
+}
+
+test a_copy_both_modified_and_charged_is_planned_once {
+    var out : [256]u8 = undefined;
+    var mark : [8]u8 = undefined;
+    assert plan_all("--pr\nM\tgen/c/a.c\nM\tspecs/a.t27\n--gen\ngen/c/a.c\n--specs\nspecs/a.t27\n--use\n", 73, &out, 256, &mark, 8) == 1;
+    assert out_starts(&out, "regenerated\t$");
+}
+
+test an_importer_is_charged_through_every_level {
+    var out : [256]u8 = undefined;
+    var mark : [8]u8 = undefined;
+    assert plan_all("--pr\nM\tspecs/c.t27\n--gen\ngen/c/a.c\n--specs\nspecs/a.t27\nspecs/b.t27\nspecs/c.t27\n--use\nspecs/a.t27:use b;\nspecs/b.t27:use c;\n", 123, &out, 256, &mark, 8) == 1;
+    assert out_starts(&out, "up to date\tSTALE COPY\tgen-c\tspecs/a.t27\tgen/c/a.c\n$");
+    assert mark[0] == 1;
+    assert mark[1] == 1;
+    assert plan_all("--pr\nM\tspecs/b.t27\n--gen\ngen/c/a.c\n--specs\nspecs/a.t27\n--use\nspecs/a.t27:use c;\nspecs/x.t27:use b;\n", 99, &out, 256, &mark, 8) == 0;
+    assert mark[0] == 0;
+    assert mark[1] == 1;
+    assert plan_all("--pr\nM\tspecs/q/c.t27\n--gen\ngen/c/a.c\n--specs\nspecs/a.t27\n--use\nspecs/a.t27:use q::c;\n", 85, &out, 256, &mark, 8) == 1;
+    assert mark[0] == 1;
+}
+
+test a_use_with_a_space_and_no_colons_imports_nothing {
+    var out : [256]u8 = undefined;
+    var mark : [8]u8 = undefined;
+    assert plan_all("--pr\nM\tspecs/b c.t27\n--gen\ngen/c/a.c\n--specs\nspecs/a.t27\n--use\nspecs/a.t27:use b c;\n", 84, &out, 256, &mark, 8) == 0;
+    assert mark[0] == 0;
+}
+
+test a_deleted_spec_leaves_its_copy_with_no_spec {
+    var out : [256]u8 = undefined;
+    var mark : [8]u8 = undefined;
+    assert plan_all("--pr\nD\tspecs/a.t27\n--gen\ngen/c/a.c\n--specs\n--use\n", 49, &out, 256, &mark, 8) == 1;
+    assert out_starts(&out, "up to date\tSTALE COPY\t-\tno spec at specs/a.t27\tgen/c/a.c\n--end\n$");
+}
+
+test all_mode_plans_every_tracked_copy {
+    var out : [512]u8 = undefined;
+    var mark : [8]u8 = undefined;
+    assert plan_all("--all\nM\tgen/c/b.c\n--gen\ngen/c/a.c\ngen/rust/b.rs\ngen/js/c.js\n--specs\nspecs/a.t27\nspecs/b.t27\n--use\n", 98, &out, 512, &mark, 8) == 3;
+    assert out_starts(&out, "t27c output\tNOT OUTPUT\tgen-c\tspecs/a.t27\tgen/c/a.c\nt27c output\tNOT OUTPUT\tgen-rust\tspecs/b.t27\tgen/rust/b.rs\nt27c output\tNOT OUTPUT\t-\ta backend directory t27c does not write\tgen/js/c.js\n--end\n$");
+}
+
+test unreadable_input_fails_closed {
+    var out : [256]u8 = undefined;
+    var mark : [8]u8 = undefined;
+    assert plan_all("garbage\n--gen\n--specs\n--use\n", 28, &out, 256, &mark, 8) == 1;
+    assert out_starts(&out, "read\tUNREADABLE\t-\texpected --pr or --all, then --gen, --specs and --use\tgarbage\n--end\n$");
+    assert plan_all("--pr\n--gen\n--specs\n", 19, &out, 256, &mark, 8) == 1;
+    assert plan_all("--all\n--specs\n--gen\n--use\n", 26, &out, 256, &mark, 8) == 1;
+    assert plan_all("", 0, &out, 256, &mark, 8) == 1;
+    assert plan_all("--pr\nM gen/c/a.c\n--gen\n--specs\n--use\n", 37, &out, 256, &mark, 8) == 1;
+    assert out_starts(&out, "read\tUNREADABLE\t-\ta diff line without a tab\tM gen/c/a.c\n$");
+    assert plan_all("--pr\nspecs/a.t27\n--gen\ngen/c/a.c\n--specs\nspecs/a.t27\n--use\n", 59, &out, 256, &mark, 8) == 1;
+    assert plan_all("--pr\ngen/c/a.c\n--gen\n--specs\n--use\n", 35, &out, 256, &mark, 8) == 1;
+    assert out_starts(&out, "read\tUNREADABLE\t-\ta diff line without a tab\tgen/c/a.c\n--end\n$");
+    assert plan_all("--pr\n\n--gen\n--specs\n--use\n", 26, &out, 256, &mark, 8) == 0;
+    assert plan_all("--all\n--gen\n\n--specs\n--use\n", 27, &out, 256, &mark, 8) == 0;
+}
+
+test a_quoted_path_fails_closed {
+    var out : [256]u8 = undefined;
+    var mark : [8]u8 = undefined;
+    assert plan_all("--pr\nM\t\"gen/c/a.c\"\n--gen\n--specs\n--use\n", 39, &out, 256, &mark, 8) == 1;
+    assert out_starts(&out, "regenerated\tHAND EDIT\t-\tgit quoted the path; L3 wants plain ASCII names\t\"gen/c/a.c\"\n$");
+}
+
+test crlf_lines_read_as_lf_lines {
+    var out : [256]u8 = undefined;
+    var mark : [8]u8 = undefined;
+    var b : [96]u8 = undefined;
+    assert plan_all(&b, cr_copy("--pr|\nM\tspecs/b.t27|\n--gen|\ngen/c/a.c|\n--specs|\nspecs/a.t27|\n--use|\nspecs/a.t27:use b;|\n", 88, &b), &out, 256, &mark, 8) == 1;
+    assert out_starts(&out, "up to date\tSTALE COPY\tgen-c\tspecs/a.t27\tgen/c/a.c\n--end\n$");
+    assert mark[0] == 1;
+}
+
+test too_many_use_lines_charge_every_copy {
+    var out : [256]u8 = undefined;
+    var mark : [8]u8 = undefined;
+    assert plan_all("--pr\n--gen\ngen/c/a.c\n--specs\nspecs/a.t27\n--use\nspecs/a.t27:use b;\n", 66, &out, 256, &mark, 0) == 1;
+    assert out_starts(&out, "up to date\tSTALE COPY\tgen-c\tspecs/a.t27\tgen/c/a.c\n$");
+    assert plan_all("--pr\n--gen\ngen/c/a.c\n--specs\nspecs/a.t27\n--use\nspecs/a.t27:use b;\n", 66, &out, 256, &mark, 1) == 0;
+    var one : [1]u8 = undefined;
+    assert plan_all("--pr\n--gen\ngen/c/a.c\n--specs\nspecs/a.t27\n--use\nspecs/a.t27:use b;\nspecs/a.t27:use c;\n", 85, &out, 256, &one, 1) == 1;
+    assert plan_all("--pr\nM\tspecs/b.t27\n--gen\ngen/c/a.c\ngen/c/z.c\n--specs\nspecs/a.t27\nspecs/z.t27\n--use\nspecs/a.t27:use b;\n", 102, &out, 256, &one, 1) == 1;
+    assert one[0] == 1;
+}
+
+test an_output_that_does_not_fit_has_no_end_line {
+    var out : [64]u8 = undefined;
+    var mark : [8]u8 = undefined;
+    assert plan_all("--pr\nM\tgen/c/a.c\n--gen\n--specs\nspecs/a.t27\n--use\n", 49, &out, 56, &mark, 8) == 1;
+    assert out[49] == '\n';
+    assert out[50] == '-';
+    assert out[55] == '\n';
+    out[50] = 'x';
+    out[55] = 'x';
+    assert plan_all("--pr\nM\tgen/c/a.c\n--gen\n--specs\nspecs/a.t27\n--use\n", 49, &out, 55, &mark, 8) == 1;
+    assert out[49] == '\n';
+    assert out[50] == 'x';
+    out[40] = 'x';
+    assert plan_all("--pr\nM\tgen/c/a.c\n--gen\n--specs\nspecs/a.t27\n--use\n", 49, &out, 40, &mark, 8) == 1;
+    assert out[39] == '\t';
+    assert out[40] == 'x';
+}
+
+test a_copy_t27c_does_not_write_is_not_charged_and_says_why {
+    var out : [256]u8 = undefined;
+    var mark : [8]u8 = undefined;
+    assert plan_all("--pr\nM\tspecs/c.t27\n--gen\ngen/js/c.js\ngen/README.md\n--specs\nspecs/c.t27\n--use\n", 77, &out, 256, &mark, 8) == 0;
+    assert plan_all("--all\n--gen\ngen/README.md\ngen/c/Makefile\n--specs\n--use\n", 55, &out, 256, &mark, 8) == 2;
+    assert out_starts(&out, "t27c output\tNOT OUTPUT\t-\tno backend directory under gen/\tgen/README.md\nt27c output\tNOT OUTPUT\t-\tno file extension\tgen/c/Makefile\n--end\n$");
+}
+
+test the_line_helpers_stay_inside_their_ranges {
+    assert next_line("ab", 0, 2) == 2;
+    assert diff_path("M\t", 0, 1) == 0;
+    assert colon_at("ab\n", 0, 2) == 2;
+    assert colon_at("a:b", 0, 3) == 1;
+    assert same("a|ab", 0, 1, 2, 4) == false;
+    assert same("ab|ac", 0, 1, 3, 4) == true;
+    assert same("a|b", 0, 1, 2, 3) == false;
+    assert written("Mgen|Mgen", 0, 4, 5, 9) == false;
+    assert written("A\tg|g", 0, 3, 4, 5) == true;
+    assert written("D\tg|g", 0, 3, 4, 5) == false;
+    assert written("M\tg|h", 0, 3, 4, 5) == false;
+    assert names("q::c|specs/q/c.t27", BY_USE, 5, 18, 0, 4) == true;
+    assert names("specs/a.b.t27|a.b", BY_STEM, 0, 13, 14, 17) == true;
+}
+
+invariant the_backend_table_is_pinned {
+    assert list_len(BACKENDS) == 4;
+    assert list_len(SUBCOMMANDS) == 4;
+    assert list_index(BACKENDS, "c", 0, 1) == list_index(SUBCOMMANDS, "gen-c", 0, 5);
+    assert list_index(BACKENDS, "verilog", 0, 7) == list_index(SUBCOMMANDS, "gen-verilog", 0, 11);
+    assert list_index(BACKENDS, "rust", 0, 4) == list_index(SUBCOMMANDS, "gen-rust", 0, 8);
+    assert list_index(BACKENDS, "zig", 0, 3) == list_index(SUBCOMMANDS, "gen", 0, 3);
+    assert list_index(SUBCOMMANDS, "gen-zig", 0, 7) == NOT_FOUND;
+}
+
+invariant the_fixed_lengths_are_the_pieces_lengths {
+    assert piece_len(GEN_ROOT) == GEN_ROOT_LEN;
+    assert piece_len(SPEC_ROOT) == SPEC_ROOT_LEN;
+    assert piece_len(SPEC_EXT) == SPEC_EXT_LEN;
+    assert piece_len(USE_WORD) == USE_WORD_LEN;
+}
