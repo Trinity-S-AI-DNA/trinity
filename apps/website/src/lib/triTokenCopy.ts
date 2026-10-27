@@ -21,8 +21,7 @@ export interface TokenCopy {
   rule: string
   noRate: string
   specCommits: (n: string) => string
-  laneSpecs: (n: string) => string
-  nobody: (commits: string, specs: string, tri: string) => string
+  nobody: (commits: string, tri: string) => string
   total: (tri: string, minted: string) => string
   totalNoChain: (tri: string) => string
   leaderboardLink: string
@@ -47,12 +46,11 @@ export const TOKEN_COPY: Record<'en' | 'ru', TokenCopy> = {
     chainFailed: 'The minter could not be read from TON testnet.',
     boardTitle: 'WHO EARNED IT',
     rate: (triPerSpec) => `${triPerSpec} TRI per spec, as the ledger states it.`,
-    rule: 'Counted by the leaderboard, for every .t27 spec: to its author by GitHub login (spec commits), and to the GitHub account whose lane carried an accepted spec on its own CPU, FPGA or GPU (proof of compute). One row per GitHub account, both roads summed.',
+    rule: 'Counted by the leaderboard, for every .t27 spec: to its author by GitHub login (spec commits). The board credits the login, not the agent, so a creator\'s bees earn under that creator\'s login. Lanes are not counted.',
     noRate: 'The rate per spec could not be read from the ledger, so the units are shown and the TRI is not guessed.',
     specCommits: (n) => `${n} spec commits`,
-    laneSpecs: (n) => `${n} specs on their lanes`,
-    nobody: (commits, specs, tri) =>
-      `${commits} spec commits and ${specs} lane specs have no GitHub account behind them: ${tri} TRI counted here and credited to nobody.`,
+    nobody: (commits, tri) =>
+      `${commits} spec commits have no GitHub account behind them: ${tri} TRI counted here and credited to nobody.`,
     total: (tri, minted) => `Earned in all: ${tri} TRI. Minted on chain so far: ${minted} TRI.`,
     totalNoChain: (tri) => `Earned in all: ${tri} TRI. How much is minted only the minter can say, and it could not be read.`,
     leaderboardLink: 'The leaderboard these counts come from',
@@ -75,12 +73,11 @@ export const TOKEN_COPY: Record<'en' | 'ru', TokenCopy> = {
     chainFailed: 'Минтер в TON testnet прочитать не удалось.',
     boardTitle: 'КТО ЗАРАБОТАЛ',
     rate: (triPerSpec) => `${triPerSpec} TRI за спеку — так пишет журнал.`,
-    rule: 'Считается по лидерборду, за каждую спеку .t27: её автору по логину GitHub (коммиты в спеки) и GitHub-аккаунту, чья полоса вынесла принятую спеку на своих CPU, FPGA или GPU (proof of compute). Одна строка на аккаунт GitHub, обе дороги сложены.',
+    rule: 'Считается по лидерборду, за каждую спеку .t27: её автору по логину GitHub (коммиты в спеки). Доска засчитывает логин, а не агента, поэтому пчёлы автора зарабатывают под логином своего создателя. Полосы не считаются.',
     noRate: 'Ставку за спеку из журнала прочитать не удалось, поэтому показаны единицы, а TRI не угадывается.',
     specCommits: (n) => `коммитов в спеки: ${n}`,
-    laneSpecs: (n) => `спек на его полосах: ${n}`,
-    nobody: (commits, specs, tri) =>
-      `Коммитов в спеки без аккаунта GitHub: ${commits}, спек на непривязанных полосах: ${specs} — это ${tri} TRI, посчитаны здесь и не приписаны никому.`,
+    nobody: (commits, tri) =>
+      `Коммитов в спеки без аккаунта GitHub: ${commits} — это ${tri} TRI, посчитаны здесь и не приписаны никому.`,
     total: (tri, minted) => `Заработано всего: ${tri} TRI. Выпущено в сети на сейчас: ${minted} TRI.`,
     totalNoChain: (tri) => `Заработано всего: ${tri} TRI. Сколько выпущено, знает только минтер, а его прочитать не удалось.`,
     leaderboardLink: 'Лидерборд, из которого эти числа',
