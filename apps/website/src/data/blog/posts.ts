@@ -18,6 +18,7 @@ import { body as body_course_zero_t27_basics, ruBody as ruBody_course_zero_t27_b
 import { body as body_tri_test_now_runs_the_tests, ruBody as ruBody_tri_test_now_runs_the_tests } from './bodies/tri-test-now-runs-the-tests'
 import { body as body_two_courses_twenty_seven_lessons_each, ruBody as ruBody_two_courses_twenty_seven_lessons_each } from './bodies/two-courses-twenty-seven-lessons-each'
 import { body as body_a_course_pr_carries_its_post, ruBody as ruBody_a_course_pr_carries_its_post } from './bodies/a-course-pr-carries-its-post'
+import { body as body_seventy_bees_nothing_to_choose, ruBody as ruBody_seventy_bees_nothing_to_choose } from './bodies/seventy-bees-nothing-to-choose'
 import { body as body_one_outlier_twenty_three_zeros, ruBody as ruBody_one_outlier_twenty_three_zeros } from './bodies/one-outlier-twenty-three-zeros'
 import { body as body_a_terminal_for_seven_backends_in_an_x_post, ruBody as ruBody_a_terminal_for_seven_backends_in_an_x_post } from './bodies/a-terminal-for-seven-backends-in-an-x-post'
 import { body as body_t27c_compile_time_and_a_backend_without_llvm, ruBody as ruBody_t27c_compile_time_and_a_backend_without_llvm } from './bodies/t27c-compile-time-and-a-backend-without-llvm'
@@ -134,6 +135,7 @@ const bodies: Record<string, PostBody> = {
   'tri-test-now-runs-the-tests': { body: body_tri_test_now_runs_the_tests, ruBody: ruBody_tri_test_now_runs_the_tests },
   'two-courses-twenty-seven-lessons-each': { body: body_two_courses_twenty_seven_lessons_each, ruBody: ruBody_two_courses_twenty_seven_lessons_each },
   'a-course-pr-carries-its-post': { body: body_a_course_pr_carries_its_post, ruBody: ruBody_a_course_pr_carries_its_post },
+  'seventy-bees-nothing-to-choose': { body: body_seventy_bees_nothing_to_choose, ruBody: ruBody_seventy_bees_nothing_to_choose },
   'one-outlier-twenty-three-zeros': { body: body_one_outlier_twenty_three_zeros, ruBody: ruBody_one_outlier_twenty_three_zeros },
   'a-terminal-for-seven-backends-in-an-x-post': { body: body_a_terminal_for_seven_backends_in_an_x_post, ruBody: ruBody_a_terminal_for_seven_backends_in_an_x_post },
   't27c-compile-time-and-a-backend-without-llvm': { body: body_t27c_compile_time_and_a_backend_without_llvm, ruBody: ruBody_t27c_compile_time_and_a_backend_without_llvm },
