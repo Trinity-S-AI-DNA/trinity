@@ -33,6 +33,13 @@ START = "<!-- t27-work-report -->"
 END = "<!-- /t27-work-report -->"
 MAX_EVENT_BYTES = 2 * 1024 * 1024
 MAX_REPORT_CHARS = 65536
+
+# The field bounds live in specs/report/work_report.t27; pr-blog-report.yml reads
+# the spec and passes them here as WR_* env (the POST_DIR precedent). The literals
+# are the spec's own values, so a run without the env behaves identically.
+MIN_RESULT = int(os.environ.get("WR_MIN_RESULT", "12"))
+MIN_OUTLINE = int(os.environ.get("WR_MIN_OUTLINE", "80"))
+MAX_FIELD = int(os.environ.get("WR_MAX_FIELD", "4000"))
 SHA = re.compile(r"[0-9a-fA-F]{40}\Z")
 REPOSITORY = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9][A-Za-z0-9._-]{0,99}\Z")
 CAST = re.compile(r"term/[a-z0-9][a-z0-9-]{0,63}/session\.cast\Z")
@@ -97,7 +104,7 @@ def mapping(value: Any, name: str, keys: set[str] | None = None,
     return value
 
 
-def text(value: Any, name: str, minimum: int = 12, maximum: int = 4000,
+def text(value: Any, name: str, minimum: int = MIN_RESULT, maximum: int = MAX_FIELD,
          words: int = 0) -> str:
     if not isinstance(value, str):
         fail(f"{name} must be a string")
@@ -219,7 +226,7 @@ def validate_event(event: Any) -> dict[str, Any]:
             fail(f"{prefix}.status must be passed, failed, or not_run")
         normalized_tests.append({
             "command": text(test["command"], f"{prefix}.command", 2, 1000),
-            "result": text(test["result"], f"{prefix}.result", 12, words=3),
+            "result": text(test["result"], f"{prefix}.result", MIN_RESULT, words=3),
             "status": test["status"],
             "evidence": text(test["evidence"], f"{prefix}.evidence", 12),
         })
@@ -263,7 +270,7 @@ def validate_event(event: Any) -> dict[str, Any]:
         "blog": {
             "title": text(blog["title"], "work report.blog.title", 15, 180, words=3),
             "summary": text(blog["summary"], "work report.blog.summary", 40, 600, words=6),
-            "outline": text_list(blog["outline"], "work report.blog.outline", 3, 20, 80, 12),
+            "outline": text_list(blog["outline"], "work report.blog.outline", 3, 20, MIN_OUTLINE, 12),
             **extras,
         },
     }
