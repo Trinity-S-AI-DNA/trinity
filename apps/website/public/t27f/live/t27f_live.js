@@ -173,13 +173,15 @@ export async function replay(el, log) {
   for(let i=0;i<evts.length;i++){ cur=i; tick() }
   let s0=0; const settle=()=>{ layout(); if(s0++<50)requestAnimationFrame(settle) }; requestAnimationFrame(settle)
 
-  // the log can grow -- and the Queen now publishes a live feed. The feed is
-  // tried first on every poll (15 s: seconds-level realtime, unauthenticated,
+  // the log can grow -- and the Queen now publishes a feed. T27OS is a batch
+  // executor, so the feed is PULL: a static file the t27os workflow re-exports
+  // every 15 minutes from the recorded replay (seed:true until the live bus is
+  // online). The feed is tried first on every poll (15 s; unauthenticated,
   // CORS-open); only when it fails or answers a foreign format does the old
   // recorded-log re-fetch run, and at its own old 5-minute cadence. Both
   // deliver events down the SAME tick() path above -- the feed's carry
   // kind/tick plus task/spec labels, which tick() now draws.
-  const FEED='https://trios-agent-server-production.up.railway.app/queen/public-feed'
+  const FEED='https://raw.githubusercontent.com/Trinity-S-AI-DNA/t27os/master/runs/queen-feed.json'
   const logUrl=new URL('./logs/recorded_log.json', import.meta.url)
   let lastSeq=evts.reduce((m,e)=>Math.max(m,Number(e.seq)||0),0), lastLog=0
   const grow=(add)=>{ if(!add.length)return
