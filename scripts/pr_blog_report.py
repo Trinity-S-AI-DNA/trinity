@@ -617,7 +617,25 @@ def main(argv: list[str] | None = None) -> int:
     validate.add_argument("--commits", type=Path,
                           help="PR commits as JSON lines {sha,author,committer,verified}")
     validate.add_argument("--posts", type=Path, help="directory of the changed post bodies, saved as text")
+    check = commands.add_parser("check", help="check a PR body file locally before the pull request exists")
+    check.add_argument("--body", type=Path, required=True)
+    check.add_argument("--head-sha", required=True)
     args = parser.parse_args(argv)
+    if args.command == "check":
+        try:
+            body = args.body.read_text(encoding="utf-8")
+            event = {"repository": {"full_name": "local/check"}, "number": 1,
+                     "pull_request": {"number": 1,
+                                       "html_url": "https://github.com/local/check/pull/1",
+                                       "user": {"login": "local-agent"},
+                                       "state": "open", "merged": False, "created_at": "2026-10-27T00:00:00Z",
+                                       "head": {"sha": args.head_sha}, "body": body}}
+            report = validate_event(event)
+            print(f"Body checks out locally: {lifecycle(report)}. Bounds: specs/report/work_report.t27")
+            return 0
+        except (ReportError, OSError, UnicodeError, RecursionError) as exc:
+            print(f"PR work report check failed: {exc}", file=sys.stderr)
+            return 1
     try:
         with args.event.open("rb") as stream:
             raw = stream.read(MAX_EVENT_BYTES + 1)
