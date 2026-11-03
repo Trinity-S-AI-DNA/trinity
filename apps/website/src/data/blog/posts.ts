@@ -88,6 +88,7 @@ import { body as body_eleven_verdicts_were_windows_not_checkpoints, ruBody as ru
 import { body as body_each_half_imported_the_other, ruBody as ruBody_each_half_imported_the_other } from './bodies/each-half-imported-the-other'
 import { body as body_a_suite_that_runs_nothing_exits_zero, ruBody as ruBody_a_suite_that_runs_nothing_exits_zero } from './bodies/a-suite-that-runs-nothing-exits-zero'
 import { body as body_a_repair_reaches_only_the_copy_it_lands_in, ruBody as ruBody_a_repair_reaches_only_the_copy_it_lands_in } from './bodies/a-repair-reaches-only-the-copy-it-lands-in'
+import { body as body_one_spec_five_targets_the_t27_backend_shootout, ruBody as ruBody_one_spec_five_targets_the_t27_backend_shootout } from './bodies/one-spec-five-targets-the-t27-backend-shootout'
 import { body as body_green_ci_does_not_mean_usable, ruBody as ruBody_green_ci_does_not_mean_usable } from './bodies/green-ci-does-not-mean-usable'
 import { body as body_scale_field_width_already_published, ruBody as ruBody_scale_field_width_already_published } from './bodies/scale-field-width-already-published'
 import { body as body_open_gigabit_ethernet_artix7, ruBody as ruBody_open_gigabit_ethernet_artix7 } from './bodies/open-gigabit-ethernet-artix7'
@@ -117,6 +118,7 @@ import { body as body_features_that_change_no_bits, ruBody as ruBody_features_th
 import { body as body_one_commit_nine_workflow_outcomes, ruBody as ruBody_one_commit_nine_workflow_outcomes } from './bodies/one-commit-nine-workflow-outcomes'
 
 const bodies: Record<string, PostBody> = {
+  'one-spec-five-targets-the-t27-backend-shootout': { body: body_one_spec_five_targets_the_t27_backend_shootout, ruBody: ruBody_one_spec_five_targets_the_t27_backend_shootout },
   'a-wasm-interpreter-ran-on-the-board': { body: body_a_wasm_interpreter_ran_on_the_board, ruBody: ruBody_a_wasm_interpreter_ran_on_the_board },
   'a-3-mb-compiler-spec-to-aarch64-in-5-ms': { body: body_a_3_mb_compiler_spec_to_aarch64_in_5_ms, ruBody: ruBody_a_3_mb_compiler_spec_to_aarch64_in_5_ms },
   'actors-beat-the-loop-on-recovery-not-everywhere': { body: body_actors_beat_the_loop_on_recovery_not_everywhere, ruBody: ruBody_actors_beat_the_loop_on_recovery_not_everywhere },

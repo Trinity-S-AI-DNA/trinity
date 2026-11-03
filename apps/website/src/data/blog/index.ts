@@ -3,6 +3,40 @@ import type { PostMeta } from './types'
 /** Индекс блога: список и метаданные без тяжёлых тел публикаций. */
 export const postsIndex: PostMeta[] = [
   {
+    slug: "one-spec-five-targets-the-t27-backend-shootout",
+    title: "One spec, five targets: the t27 backend shootout",
+    summary: "[measured on arm64 Mac, warm cache, median of three runs] One spec — specs/t27os/heartbeat_monitor.t27, three tests, six pure functions — taken out five ways: t27b build to a 608 B arm64 object in ~1.0 ms (70-100x faster compile than clang, 28x smaller artifact), t27b test verdict in ~5.3 ms, and t27b verilog to ~311 lines RTL. Runtime sits within 2.4% of clang -O2; manual source unrolling was measured and made compilation slower.",
+    date: "2026-10-27",
+    readingMinutes: 6,
+    tags: ["Compiler", "Benchmark", "t27b", "arm64", "Verilog"],
+    receipts: [
+      { label: "t27 #12907 — the shootout measurements", href: "https://github.com/gHashTag/t27/issues/12907" },
+      { label: "t27 #12908 — the superiority column", href: "https://github.com/gHashTag/t27/issues/12908" },
+      { label: "t27 #12909 — compile-time metaprogramming", href: "https://github.com/gHashTag/t27/issues/12909" },
+      { label: "t27 #12910 — the infographics", href: "https://github.com/gHashTag/t27/issues/12910" },
+      { label: "The approved article source, release backend-shootout-v1.0.0", href: "https://github.com/gHashTag/t27/blob/b0809d173cd9b12c8b255dd8bfb5d2c317ee268e/docs/blog/2026-10-27-t27b-backend-shootout.md" },
+    ],
+    openQuestions: [
+      "Every timing is a warm-cache median of three runs on one arm64 Mac; no cold-build, CI-machine or silicon figures are established.",
+      "The 70-100x compile, 28x size and runtime figures are measurements against the listed toolchain versions on that machine; they were not rerun for this publication.",
+      "Manual source unrolling was measured and made compilation slower; compiler-level `--unroll` is not implemented, so runtime Calls/s for unrolled specs is not measured.",
+      "The Python runtime figure is normalized from a 10M-call run (4.5 s), not a direct 200M-call measurement.",
+      "`tri shootout improve` and `specs/tri/shootout/*.t27` are proposed contracts, not built commands."
+    ],
+    published: true,
+    ru: {
+      title: "Одна спека, пять целей: shootout бэкендов t27",
+      summary: "[измерено на arm64 Mac, тёплый кэш, медиана трёх запусков] Одна спека — specs/t27os/heartbeat_monitor.t27, три теста, шесть чистых функций — пятью путями наружу: t27b build в arm64-объект 608 B за ~1.0 мс (компиляция в 70-100 раз быстрее clang, артефакт в 28 раз меньше), вердикт t27b test за ~5.3 мс и t27b verilog в ~311 строк RTL. Время выполнения в пределах 2.4% от clang -O2; ручное разворачивание исходника измерено и сделало компиляцию медленнее.",
+      openQuestions: [
+        "Каждый тайминг — медиана трёх запусков с прогретым кэшем на одном arm64 Mac; холодных сборок, цифр CI-машины или кремния здесь нет.",
+        "Цифры компиляции в 70-100 раз, размера в 28 раз и времени выполнения — измерения против перечисленных версий тулчейнов на этой машине; для этой публикации они не повторялись.",
+        "Ручное разворачивание исходника измерено и сделало компиляцию медленнее; компиляторный `--unroll` не реализован, поэтому вызовов/с во время выполнения для развёрнутых спек не измерено.",
+        "Цифра Python нормализована из запуска на 10M вызовов (4.5 с), а не измерена напрямую на 200M вызовах.",
+        "`tri shootout improve` и `specs/tri/shootout/*.t27` — предложенные контракты, а не собранные команды."
+      ],
+    },
+  },
+  {
     slug: 'graph-neural-networks-the-2026-field-guide',
     title: 'Graph neural networks: the 2026 field guide',
     summary: 'The Distill classic, five years later: the ladder kept, and what the field learned to NAME -- oversmoothing, oversquashing, the Weisfeiler-Leman ceiling, the transformer convergence. With a runnable three-line message-passing core and the design lessons revisited.',
