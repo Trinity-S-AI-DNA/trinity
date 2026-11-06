@@ -418,3 +418,15 @@ The Queen and the swarm move to the actor model.
 The Queen server lives in gHashTag/trios, on branches `queen` and `queen-runners`. The gHashTag/BrowserOS fork holds the browser extension and nothing else.
 
 The full rule is in [gHashTag/t27 `AGENTS.md`, "Actors, not threads"](https://github.com/gHashTag/t27/blob/master/AGENTS.md#actors-not-threads-owner-rule-2026-10-08). This section points to it; it is not a copy.
+
+## Epic progress posts
+
+Owner, 2026-10-26: every epic and every initiative (issue -> epic -> initiative; on
+Trinity-S-AI-DNA/t27 the label `initiative`, the three most prioritized pinned on the issues
+page) carries public progress posts in one house format: a `.t27` card with the percent, the
+breakthroughs and the blockers, redrawn after every iteration. Claude drafts, the owner approves.
+
+This is a pointer, not the rule. The rule lives in the skill `epic-progress-posts`; the
+publication path in the skill `tri-blog` (`tri blog` is not a subcommand of the built `tri`
+yet: Trinity-S-AI-DNA/t27#12630); the card spec is the one those skills name; the first
+dashboard run this way is Trinity-S-AI-DNA/t27#12387; Trinity-S-AI-DNA/t27#12629 filed this section.
