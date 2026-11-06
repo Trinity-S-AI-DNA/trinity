@@ -1,0 +1,351 @@
+module TrinityBramTritMatvecT27;
+
+// Matrix-vector store of the block-RAM trit packing bench (fpga/ax7203/tms_bram_bench.v):
+// y = W x for a ternary matrix W held in d5d2 words (22 trits per 36-bit word) and an
+// int8 vector x, both array initializers, so configuration loads them and a run only
+// reads. tools/generate-bram-bench.py --rom-trits --matvec-act writes it with the
+// words, the activations and the expected checksum, and renames it to the d5d2
+// engine module, so the adapter wires it like t27/rtl/bram_trit_rom.t27 (same ports,
+// enc_word unused, enc_lanes and write_ticks zero).
+//
+// Order: W has ROWS rows (a multiple of 22) and COLS columns. Word k of group g holds
+// column k of rows 22g .. 22g+21, lane j row 22g + j, so a group is COLS words and
+// the store GROUPS * COLS words: exactly ROWS * COLS / 22 words, with no padding. One
+// word is read per clock together with its activation x[k] (act_mem holds four
+// signed bytes per 32-bit word, one block RAM), and each of 22 accumulators adds
+// t_j * x[k] for its lane's trit t_j. After a group's last column the 22 sums are
+// that group's outputs; they are copied to hold registers and added up one per clock
+// while the next group accumulates.
+//
+// Pipeline: the read (rdata_*, ract), the decode (d_*: the adapter's d5d2 decoder on
+// rdata, the activation byte sign-extended and negated), the accumulate (acc*), and
+// for each output a pick (em_y) and a sum. Accumulators are 20-bit two's complement,
+// three per u64 (acc7 has lane 21 only); |y| <= COLS * 128 must stay below 2^19,
+// which the generator checks. read_ticks = WORDS + 25.
+//
+// Report: pos and neg count the outputs above and below zero, dot is their sum and
+// chk the rotate-xor checksum of the outputs in row order as 64-bit two's complement.
+// bad_words is 1 when chk differs from Y_CHECK, the host's checksum of y = W x
+// (tools/bram_trit_model.py, matvec_results), so the store checks its own product.
+// Every statement of on_clock reads a variable before the same tick writes it.
+const FORMAT: u32 = 2;
+const LANES: u32 = 22;
+const ROWS: u32 = 22;
+const COLS: u32 = 24;
+const WORDS: u32 = 24;
+const ACT_WORDS: u32 = 6;
+const BANK_BITS: u32 = 14;
+const BANK_MASK: u32 = 16383;
+const B0_WORDS: u32 = 24;
+const B1_WORDS: u32 = 1;
+const B2_WORDS: u32 = 1;
+const B3_WORDS: u32 = 1;
+const Y_CHECK: u64 = 0;
+const ACC_MASK: u32 = 1048575;
+const SIGN_BIT: u32 = 524288;
+const WORD_MASK: u64 = 68719476735;
+const PH_IDLE: u32 = 0;
+const PH_READ: u32 = 2;
+const PH_DONE: u32 = 3;
+
+var mem_b0: [B0_WORDS]u64 = [B0_WORDS]u64{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+var mem_b1: [B1_WORDS]u64 = [B1_WORDS]u64{ 0 };
+var mem_b2: [B2_WORDS]u64 = [B2_WORDS]u64{ 0 };
+var mem_b3: [B3_WORDS]u64 = [B3_WORDS]u64{ 0 };
+var act_mem: [ACT_WORDS]u32 = [ACT_WORDS]u32{ 0, 0, 0, 0, 0, 0 };
+var rdata_b0: u64;
+var rdata_b1: u64;
+var rdata_b2: u64;
+var rdata_b3: u64;
+var ract: u32;
+var r_bank: u32 = 0;
+var phase: u32 = 0;
+var r_addr: u32 = 0;
+var r_col: u32 = 0;
+var r_issue: bool = false;
+var r_valid: bool = false;
+var r_sel: u32 = 0;
+var r_first: bool = false;
+var r_last: bool = false;
+var d_valid: bool = false;
+var d_lanes: u64 = 0;
+var d_inv: u32 = 0;
+var d_xs: u32 = 0;
+var d_xn: u32 = 0;
+var d_first: bool = false;
+var d_last: bool = false;
+var acc0: u64 = 0;
+var acc1: u64 = 0;
+var acc2: u64 = 0;
+var acc3: u64 = 0;
+var acc4: u64 = 0;
+var acc5: u64 = 0;
+var acc6: u64 = 0;
+var acc7: u64 = 0;
+var hold0: u64 = 0;
+var hold1: u64 = 0;
+var hold2: u64 = 0;
+var hold3: u64 = 0;
+var hold4: u64 = 0;
+var hold5: u64 = 0;
+var hold6: u64 = 0;
+var hold7: u64 = 0;
+var em_active: bool = false;
+var em_g: u32 = 0;
+var em_k: u32 = 0;
+var em_valid: bool = false;
+var em_y: u32 = 0;
+var outputs: u32 = 0;
+var read_ticks: u32 = 0;
+var bad_words: u32 = 0;
+var invalid_groups: u32 = 0;
+var pos: u32 = 0;
+var neg: u32 = 0;
+var dot: i64 = 0;
+var chk: u64 = 0;
+var done: bool = false;
+
+fn lane_mask(lanes: u32) -> u64 {
+    var one: u64 = 1;
+    return (one << (lanes << 1)) - 1;
+}
+
+fn rotl1(x: u64) -> u64 {
+    return (x << 1) | (x >> 63);
+}
+
+// Byte sel (0-3) of an activation word, sign-extended to 20 bits.
+fn act_of(word: u32, sel: u32) -> u32 {
+    var b: u32 = (word >> (sel << 3)) & 255;
+    if (b >= 128) { return b | 1048320; }
+    return b;
+}
+
+fn negate20(x: u32) -> u32 {
+    return (1048576 - x) & ACC_MASK;
+}
+
+// Next value of `count` (1-3) 20-bit accumulators packed in a u64 (bits 0-19, 20-39,
+// 40-59; lanes lane0, lane0 + 1, lane0 + 2): each adds xs (= x) for a +1 trit and xn
+// (= -x) for a -1 trit, starting from zero on the first column of a group.
+fn acc_next(acc: u64, first: bool, lanes: u64, lane0: u32, count: u32, xs: u32, xn: u32) -> u64 {
+    var out: u64 = 0;
+    var k: u32 = 0;
+    while (k < 3) {
+        if (k < count) {
+            var sh: u32 = (k << 4) + (k << 2);
+            var old: u32 = 0;
+            if (!first) { old = ((acc >> sh) & 1048575) as u32; }
+            var code: u64 = (lanes >> ((lane0 + k) << 1)) & 3;
+            var term: u32 = 0;
+            if (code == 1) { term = xs; }
+            if (code == 2) { term = xn; }
+            var nw: u64 = ((old + term) & 1048575) as u64;
+            out = out | (nw << sh);
+        }
+        k = k + 1;
+    }
+    return out;
+}
+
+// Output 3g + k of the finished group (20-bit two's complement).
+fn pick_hold(g: u32, k: u32, h0: u64, h1: u64, h2: u64, h3: u64, h4: u64, h5: u64, h6: u64, h7: u64) -> u32 {
+    var w: u64 = h0;
+    if (g == 1) { w = h1; }
+    if (g == 2) { w = h2; }
+    if (g == 3) { w = h3; }
+    if (g == 4) { w = h4; }
+    if (g == 5) { w = h5; }
+    if (g == 6) { w = h6; }
+    if (g == 7) { w = h7; }
+    var sh: u32 = 0;
+    if (k == 1) { sh = 20; }
+    if (k == 2) { sh = 40; }
+    return ((w >> sh) & 1048575) as u32;
+}
+
+// A 20-bit two's complement value as 64 bits: (v xor 2^19) - 2^19, modulo 2^64.
+fn widen20(v: u32) -> u64 {
+    var s: u64 = (v ^ 524288) as u64;
+    return s - 524288;
+}
+
+fn select_bank(bank: u32, w0: u64, w1: u64, w2: u64, w3: u64) -> u64 {
+    if (bank == 0) { return w0; }
+    if (bank == 1) { return w1; }
+    if (bank == 2) { return w2; }
+    return w3;
+}
+
+// Module-level (combinational), as in the engine.
+var enc_lanes: u64;
+var rdata: u64;
+var xs_now: u32;
+var xn_now: u32;
+var nacc0: u64;
+var nacc1: u64;
+var nacc2: u64;
+var nacc3: u64;
+var nacc4: u64;
+var nacc5: u64;
+var nacc6: u64;
+var nacc7: u64;
+var y_pick: u32;
+var y_wide: u64;
+var y_signed: i64;
+var chk_next: u64;
+var write_ticks: u32;
+var words_out: u32;
+var format_out: u32;
+var lanes_out: u32;
+rdata = select_bank(r_bank, rdata_b0, rdata_b1, rdata_b2, rdata_b3);
+xs_now = act_of(ract, r_sel);
+xn_now = negate20(xs_now);
+nacc0 = acc_next(acc0, d_first, d_lanes, 0, 3, d_xs, d_xn);
+nacc1 = acc_next(acc1, d_first, d_lanes, 3, 3, d_xs, d_xn);
+nacc2 = acc_next(acc2, d_first, d_lanes, 6, 3, d_xs, d_xn);
+nacc3 = acc_next(acc3, d_first, d_lanes, 9, 3, d_xs, d_xn);
+nacc4 = acc_next(acc4, d_first, d_lanes, 12, 3, d_xs, d_xn);
+nacc5 = acc_next(acc5, d_first, d_lanes, 15, 3, d_xs, d_xn);
+nacc6 = acc_next(acc6, d_first, d_lanes, 18, 3, d_xs, d_xn);
+nacc7 = acc_next(acc7, d_first, d_lanes, 21, 1, d_xs, d_xn);
+y_pick = pick_hold(em_g, em_k, hold0, hold1, hold2, hold3, hold4, hold5, hold6, hold7);
+y_wide = widen20(em_y);
+y_signed = y_wide as i64;
+chk_next = rotl1(chk) ^ y_wide;
+enc_lanes = 0;
+write_ticks = 0;
+words_out = WORDS;
+format_out = FORMAT;
+lanes_out = LANES;
+
+// dec_out = decode(FORMAT, rdata) comes from the adapter's decoder instance;
+// enc_word (the encoder instance) is not used.
+fn on_clock(start: bool, enc_word: u64, dec_out: u64) {
+    if (phase == PH_IDLE || phase == PH_DONE) {
+        if (start) {
+            phase = PH_READ;
+            r_addr = 0;
+            r_col = 0;
+            r_issue = true;
+            r_valid = false;
+            d_valid = false;
+            em_active = false;
+            em_valid = false;
+            em_g = 0;
+            em_k = 0;
+            outputs = 0;
+            read_ticks = 0;
+            bad_words = 0;
+            invalid_groups = 0;
+            pos = 0;
+            neg = 0;
+            dot = 0;
+            chk = 0;
+            done = false;
+        }
+    } else if (phase == PH_READ) {
+        read_ticks = read_ticks + 1;
+        // Sum up the output picked in the previous tick.
+        if (em_valid) {
+            chk = chk_next;
+            dot = dot + y_signed;
+            if (em_y >= SIGN_BIT) { neg = neg + 1; }
+            if (em_y != 0 && em_y < SIGN_BIT) { pos = pos + 1; }
+            if (outputs == ROWS - 1) {
+                if (chk_next != Y_CHECK) { bad_words = 1; }
+                phase = PH_DONE;
+                done = true;
+            }
+            outputs = outputs + 1;
+        }
+        // Pick the next output of the finished group, lanes 0 to 21.
+        em_valid = em_active;
+        em_y = y_pick;
+        if (em_active) {
+            if (em_g == 7) { em_active = false; }
+            if (em_k == 2) {
+                em_k = 0;
+                em_g = em_g + 1;
+            } else {
+                em_k = em_k + 1;
+            }
+        }
+        // Accumulate the word decoded in the previous tick; after a group's last
+        // column its sums become the outputs to pick (this write wins over the one
+        // above, which never happens in the same tick for COLS >= 24).
+        if (d_valid) {
+            invalid_groups = invalid_groups + d_inv;
+            acc0 = nacc0;
+            acc1 = nacc1;
+            acc2 = nacc2;
+            acc3 = nacc3;
+            acc4 = nacc4;
+            acc5 = nacc5;
+            acc6 = nacc6;
+            acc7 = nacc7;
+            if (d_last) {
+                hold0 = nacc0;
+                hold1 = nacc1;
+                hold2 = nacc2;
+                hold3 = nacc3;
+                hold4 = nacc4;
+                hold5 = nacc5;
+                hold6 = nacc6;
+                hold7 = nacc7;
+                em_active = true;
+                em_g = 0;
+                em_k = 0;
+            }
+        }
+        // Decode stage: the word and the activation word read in the previous tick.
+        d_valid = r_valid;
+        d_lanes = dec_out & lane_mask(LANES);
+        d_inv = ((dec_out >> 48) & 255) as u32;
+        d_xs = xs_now;
+        d_xn = xn_now;
+        d_first = r_first;
+        d_last = r_last;
+        if (r_issue) {
+            rdata_b0 = mem_b0[r_addr & BANK_MASK];
+            rdata_b1 = mem_b1[r_addr & BANK_MASK];
+            rdata_b2 = mem_b2[r_addr & BANK_MASK];
+            rdata_b3 = mem_b3[r_addr & BANK_MASK];
+            ract = act_mem[r_col >> 2];
+            r_bank = r_addr >> BANK_BITS;
+            r_sel = r_col & 3;
+            r_first = r_col == 0;
+            r_last = r_col == COLS - 1;
+            r_valid = true;
+            if (r_col == COLS - 1) { r_col = 0; } else { r_col = r_col + 1; }
+            if (r_addr == WORDS - 1) { r_issue = false; } else { r_addr = r_addr + 1; }
+        } else {
+            r_valid = false;
+        }
+    }
+}
+
+test activation_bytes {
+    assert_eq(act_of(2155872001, 0), 1);
+    assert_eq(act_of(2155872001, 1), 1048575);
+    assert_eq(act_of(2155872001, 2), 127);
+    assert_eq(act_of(2155872001, 3), 1048448);
+    assert_eq(negate20(1048575), 1);
+    assert_eq(negate20(0), 0);
+}
+test accumulators {
+    // lanes 0, 1, 2 = +1, -1, 0 with x = 5: 5, -5, 0 from zero, then again on top.
+    assert_eq(acc_next(0, true, 9, 0, 3, 5, 1048571), 1099506384901);
+    assert_eq(acc_next(1099506384901, false, 9, 0, 3, 5, 1048571), 1099501142026);
+    assert_eq(acc_next(123, true, 0, 0, 3, 5, 1048571), 0);
+    assert_eq(acc_next(0, true, 4398046511104, 21, 1, 7, 1048569), 7);
+}
+test outputs_and_widening {
+    assert_eq(pick_hold(7, 0, 0, 0, 0, 0, 0, 0, 0, 9), 9);
+    assert_eq(pick_hold(2, 2, 0, 0, 3298534883328, 0, 0, 0, 0, 0), 3);
+    assert_eq(widen20(5), 5);
+    assert_eq(widen20(1048575), 18446744073709551615);
+    assert_eq(rotl1(9223372036854775808), 1);
+}
+test bank_select { assert_eq(select_bank(0, 5, 6, 7, 8), 5); assert_eq(select_bank(3, 5, 6, 7, 8), 8); }
+endmodule

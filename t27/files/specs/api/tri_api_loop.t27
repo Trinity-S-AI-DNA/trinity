@@ -1,0 +1,212 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/api/tri_api_loop.t27 -- the agent loop of gHashTag/trinity's tri-api at the pin
+; S07 of gHashTag/trinity#988 (gHashTag/t27#3569). tri-api posts a conversation to a Messages endpoint,
+; scans the reply for text and tool_use blocks, runs each tool, appends the result and posts again.
+; This file states what src/tri-api/{main,tool_protocol,mcp_client}.zig do at the edges: how a turn ends,
+; what a failed request costs, which limits exist, what the reply scanner sees and misses, and which
+; provider features the loop does not use. Every decision is a function the C backend executes.
+; Three kinds of evidence stand behind it, kept apart (tools/trinity_tri_api.py):
+;   model   a Python reading of the source, compared with the compiled Zig on 148 vectors
+;   zig     the pinned .zig files compiled and run (their own tests plus generated test blocks)
+;   binary  the real tri-api built from main.zig, driven by a scripted Messages server and a scripted MCP
+;           server: real process, real files, real exit codes, a fake key
+; Not measured: a real provider, a real model, a real MCP server, streaming, any credential.
+; The permission boundary is specs/api/tri_api_permissions.t27, the context budget specs/api/tri_api_context.t27.
+; ASCII only (L3).
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module TriApiLoop;
+
+pub const KIND : str = "agent-loop";
+pub const ID : str = "api/tri_api_loop";
+pub const NAME : str = "The agent loop of the pinned tri-api";
+pub const CONSUMER_REPO : str = "gHashTag/trinity";
+pub const PINNED_REVISION : str = "afc9d38435ad01c48af6c33c311da422c38f046e";
+pub const ISSUE_BASELINE : str = "03ae2f93f5af2fd4fa23e4c613a3c0e19ac51530";
+pub const SOURCE_NOTE : str = "src/tri-api has no diff between the issue baseline and the pin, so the issue's reading and this one are the same tree";
+pub const SOURCE_LINES : str = "main.zig: constants :18-20, main :22, runAgenticLoop :277-428, loop bound :294, stop test :419, loadMcpServers :431, httpPost :520-; tool_protocol.zig: parseResponse :33-110, text window :63, writeToolResult :115, extractField :147; mcp_client.zig: connectServer :52, discoverTools :147";
+; --- Provider configuration ---------------------------------------------------------------------
+pub const ENDPOINT_PATH : str = "/v1/messages";
+pub const BASE_URL_ENV : str = "ANTHROPIC_BASE_URL";
+pub const KEY_ENV : str = "ANTHROPIC_API_KEY";
+pub const API_VERSION : str = "2023-06-01";
+pub const DEFAULT_MODEL : str = "claude-sonnet-4-20250514";
+pub const KEY_RULE : str = "the key is read from ANTHROPIC_API_KEY on every request and sent as x-api-key; with no key the process prints an error and exits 1; the token rotator runs first and, with no rotation state, prints NoTokensAvailable and falls back to the key";
+pub const MAX_TOKENS : u32 = 8192;
+pub const MAX_TURNS : u32 = 20;
+pub const BUILTIN_TOOLS : [4]str = ["read_file", "write_file", "bash", "grep"];
+pub const REQUEST_SHAPE : str = "one JSON object built by string concatenation: model, max_tokens, optional system, tools (four built-ins, then MCP tools), messages (the history, which is itself a string that grows by appended fragments); no temperature, no tool_choice, no stream";
+; --- Turn rules -----------------------------------------------------------------------------------
+pub const TURN_RULE : str = "one request per turn; every text block of the reply is printed to stdout followed by a newline; every tool_use block is executed in order and its result appended as its own user message; the loop stops when stop_reason is end_turn or no tool_use block was found";
+pub const TERMINATION_CONTINUE : u32 = 0;
+pub const TERMINATION_DONE : u32 = 1;
+pub const TERMINATION_TURN_LIMIT : u32 = 2;
+pub const TERMINATION_TRANSPORT : u32 = 3;
+pub const TRANSPORT_OK : u32 = 0;
+pub const TRANSPORT_STATUS : u32 = 1;
+pub const TRANSPORT_FAILED : u32 = 2;
+pub const STATUS_RULE : str = "a status other than 200 prints an API status line and the body is parsed like any reply: an error body holds no content blocks, so the turn ends as done with stop_reason end_turn; nothing is retried";
+pub const TRANSPORT_RULE : str = "a failure below HTTP (connect, TLS, a bad URL) prints HTTP error and leaves the loop without a done line";
+pub const EXIT_CODE : u32 = 0;
+pub const EXIT_RULE : str = "every way the loop can end, including a provider error, a garbage body, an exhausted turn budget and a transport failure, exits 0";
+pub const TURN_LIMIT_RULE : str = "after twenty requests the loop ends with no message at all: no done line, no warning, exit 0";
+; --- What the reply scanner sees ---------------------------------------------------------------------
+pub const SCANNER : str = "tool_protocol.parseResponse searches the raw reply text for the markers \"type\":\"text\" and \"type\":\"tool_use\" and cuts fields out with extractField; it does not parse JSON";
+pub const SCANNER_COMPACT_ONLY : str = "the markers have no whitespace, so a pretty-printed reply holds no blocks and a space after a colon turns stop_reason into the default end_turn";
+pub const USAGE_RULE : str = "usage numbers are read with extractField, which only returns quoted strings; a JSON number is not found, so input and output tokens are always 0 and the printed total is always 0 input + 0 output";
+pub const TEXT_WINDOW_BYTES : u32 = 8192;
+pub const TEXT_PRINTED_MAX : u32 = 8170;
+pub const TEXT_WINDOW_RULE : str = "a text block is read from a window of 8192 bytes that starts 50 bytes before its marker; a block whose text is longer is printed cut at 8170 bytes (measured, marker at least 50 bytes into the reply) while the history keeps every byte";
+pub const INPUT_RULE : str = "a tool_use input object is cut out by brace matching and handed on as raw text; a nested \"type\":\"text\" inside an input is found by the text search and printed as assistant text";
+pub const ESCAPE_RULE : str = "strings cut out of a reply are not unescaped: a path or a command with an escaped quote is used with the backslash in it";
+pub const DUPLICATE_RULE : str = "tool_use blocks are executed in order with no check on the id: two blocks with the same id run twice and answer twice";
+pub const HANG_RULE : str = "a tool_use block that holds a second \"type\" key makes the scanner revisit the same position: the process neither exits nor stops growing; measured 41 MB after two seconds and 1.3 GB after six";
+pub const MESSAGE_RULE : str = "several tool_use blocks in one reply become several consecutive user messages, one tool_result each, where the Messages protocol expects one user message holding all the results";
+pub const END_TURN_RULE : str = "a reply that carries both a tool_use block and stop_reason end_turn has its tools executed, their results appended, and then the loop stops: the results are never sent";
+; --- Cancellation, timeout, retry ----------------------------------------------------------------------
+pub const RETRY_RULE : str = "none: one request per turn whatever the status; the token rotator's 429 hook exists but a 429 reaches the loop as an API status line";
+pub const TIMEOUT_RULE : str = "none in the loop: a reply delayed four seconds is waited for; there is no deadline on the request, on a tool, or on an MCP call";
+pub const CANCEL_RULE : str = "none: SIGTERM ends the process at once (exit signal 15) and the session is not saved, so every turn of the run is lost";
+pub const SESSION_SHAPE : str = "~/.trinity/api/sessions/<id>.json {id,ts,messages:<the history as one JSON string>} and index.json; written once, at a normal end";
+pub const AUDIT_SHAPE : str = "~/.tri-api/audit.jsonl (or AUDIT_LOG_PATH): ts, tool, arg cut to 200 bytes and redacted, result ok or error; file contents are never logged";
+; --- Provider features the loop does not use (declared, not supported) --------------------------------------
+pub const UNSUPPORTED_COUNT : u32 = 9;
+pub const UNSUPPORTED : [9]str = ["streaming (no stream field, the reply is read whole)", "tool_choice", "parallel tool results in one message", "stop sequences", "temperature and top_p", "prompt caching (no cache_control)", "extended thinking blocks (only text and tool_use are scanned)", "tool_result content blocks other than text", "provider selection: one Messages endpoint, no fallback provider"];
+; --- Findings: each is measured, and the tag names the evidence ---------------------------------------------
+pub const FINDINGS_COUNT : u32 = 15;
+pub const FINDINGS : [15]str = [
+    "f01 usage tokens are always 0/0 [e08, vector pr-usage-numbers]",
+    "f02 the reply scanner accepts compact JSON only [e07, vectors pr-pretty pr-stop-space]",
+    "f03 a 400, 429, 500 or garbage 200 ends as done end_turn with empty stdout and exit 0 [e05]",
+    "f04 the turn limit ends the run silently with exit 0 after 20 requests [e06]",
+    "f05 nothing is retried [e05, e19]",
+    "f06 no timeout and no cancel: a slow reply is waited for, SIGTERM loses the session [e18, e19]",
+    "f07 several tool_use blocks become consecutive user messages [e02]",
+    "f08 a duplicate tool_use id executes twice [e15]",
+    "f09 a nested \"type\":\"text\" inside a tool input is printed as assistant text [e14, vector pr-nested-text]",
+    "f10 a text block is cut at 8170 bytes of 20000 while the history keeps all [e14]",
+    "f20 paths and commands are not unescaped [e14, vectors unesc-basic ef-escaped-quote]",
+    "f21 read_file over 512 KiB answers FileTooBig [e14]",
+    "f22 a duplicate type key inside a tool_use block never returns and grows without bound [e21, vector pr-hang-duplicate-type, model]",
+    "f23 not a defect, a shape: session file, audit log, rotator message and the key requirement are documented above [e01]",
+    "f26 end_turn with a tool_use block runs the tool and never sends the result [e22]"
+];
+pub const ENABLED : bool = true;
+
+; --- Rules ------------------------------------------------------------------------------------------------------
+
+pub fn turn_continues(stop_is_end_turn: bool, has_tool_use: bool) -> bool {
+    if (stop_is_end_turn) { return false; }
+    return has_tool_use;
+}
+
+pub fn turn_limit_reached(turn: u32) -> bool {
+    return turn >= MAX_TURNS;
+}
+
+pub fn transport_class(status: u32, connected: bool) -> u32 {
+    if (connected == false) { return TRANSPORT_FAILED; }
+    if (status == 200) { return TRANSPORT_OK; }
+    return TRANSPORT_STATUS;
+}
+
+pub fn termination(transport: u32, continues: bool, turn: u32) -> u32 {
+    if (transport == TRANSPORT_FAILED) { return TERMINATION_TRANSPORT; }
+    if (continues == false) { return TERMINATION_DONE; }
+    if (turn_limit_reached(turn + 1)) { return TERMINATION_TURN_LIMIT; }
+    return TERMINATION_CONTINUE;
+}
+
+pub fn exit_code_for(termination_kind: u32) -> u32 {
+    return EXIT_CODE;
+}
+
+pub fn usage_recorded(provider_reported: u32) -> u32 {
+    return 0;
+}
+
+pub fn user_messages_for_results(tool_blocks: u32) -> u32 {
+    return tool_blocks;
+}
+
+pub fn executions(tool_blocks: u32, duplicate_ids: bool) -> u32 {
+    return tool_blocks;
+}
+
+pub fn text_printed(text_bytes: u32) -> u32 {
+    if (text_bytes <= TEXT_PRINTED_MAX) { return text_bytes; }
+    return TEXT_PRINTED_MAX;
+}
+
+pub fn requests_sent(tool_use_every_turn: bool) -> u32 {
+    if (tool_use_every_turn) { return MAX_TURNS; }
+    return 1;
+}
+
+pub fn retries_after(status: u32) -> u32 {
+    return 0;
+}
+
+pub fn session_saved_on_cancel() -> bool {
+    return false;
+}
+
+pub fn results_sent_after_end_turn(has_tool_use: bool) -> bool {
+    return false;
+}
+
+invariant the_turn_budget_is_twenty { MAX_TURNS == 20 }
+invariant every_ending_exits_zero { EXIT_CODE == 0 }
+invariant the_builtin_tools_are_four { BUILTIN_TOOLS[0] == "read_file" and BUILTIN_TOOLS[3] == "grep" }
+invariant the_printed_text_is_shorter_than_the_window { TEXT_PRINTED_MAX < TEXT_WINDOW_BYTES }
+
+test a_turn_continues_only_on_tool_use_without_end_turn {
+    assert turn_continues(false, true) == true;
+    assert turn_continues(true, true) == false;
+    assert turn_continues(false, false) == false;
+    assert turn_continues(true, false) == false;
+}
+
+test the_twentieth_request_is_the_last {
+    assert turn_limit_reached(19) == false;
+    assert turn_limit_reached(20) == true;
+    assert requests_sent(true) == 20;
+    assert requests_sent(false) == 1;
+}
+
+test a_failed_turn_is_classified_by_what_reached_the_loop {
+    assert transport_class(200, true) == TRANSPORT_OK;
+    assert transport_class(400, true) == TRANSPORT_STATUS;
+    assert transport_class(429, true) == TRANSPORT_STATUS;
+    assert transport_class(500, true) == TRANSPORT_STATUS;
+    assert transport_class(0, false) == TRANSPORT_FAILED;
+}
+
+test the_loop_ends_in_four_ways_and_all_exit_zero {
+    assert termination(TRANSPORT_OK, true, 0) == TERMINATION_CONTINUE;
+    assert termination(TRANSPORT_OK, false, 0) == TERMINATION_DONE;
+    assert termination(TRANSPORT_STATUS, false, 0) == TERMINATION_DONE;
+    assert termination(TRANSPORT_OK, true, 19) == TERMINATION_TURN_LIMIT;
+    assert termination(TRANSPORT_FAILED, true, 3) == TERMINATION_TRANSPORT;
+    assert exit_code_for(TERMINATION_TURN_LIMIT) == 0;
+    assert exit_code_for(TERMINATION_TRANSPORT) == 0;
+    assert retries_after(429) == 0;
+}
+
+test the_loop_counts_no_usage_keeps_no_session_on_cancel_and_sends_nothing_after_end_turn {
+    assert usage_recorded(1234) == 0;
+    assert session_saved_on_cancel() == false;
+    assert results_sent_after_end_turn(true) == false;
+}
+
+test several_tool_blocks_make_several_user_messages_and_a_duplicate_id_runs_twice {
+    assert user_messages_for_results(2) == 2;
+    assert executions(2, true) == 2;
+    assert executions(1, false) == 1;
+}
+
+test a_long_text_block_is_cut_at_the_window {
+    assert text_printed(20000) == 8170;
+    assert text_printed(8170) == 8170;
+    assert text_printed(100) == 100;
+}

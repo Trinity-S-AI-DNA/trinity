@@ -1,0 +1,972 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/turbobaby/commerce.t27 -- cart, checkout, order, and replay safety for bike deals
+; This contract owns the transactional seam that the catalog and pricing contracts stop before:
+; a cart is locked, exactly one deal shape is selected, an authoritative quote is snapshotted,
+; fulfillment is admissible, an idempotency key chooses create/replay/conflict, and a committed
+; order makes the cart terminal. It covers both rental and sale without pretending they are the
+; same payload. D7 fixes the spelling `fulfillment`; D8 fixes a rental line on a family rather
+; than a physical unit; D9 and D11 forbid checkout from manufacturing a missing number.
+; --
+; WHY (measured 2026-09-13): the repository already has a durable order-idempotency table and a
+; transaction that records its key with the order. It also has two tagged bike deal shapes, one
+; rental and one sale. What the six canonical domain specs do not own is the join between those
+; facts: which cart state permits the write, how a same-key retry differs from a conflicting
+; payload, when the quote becomes immutable, and which fulfillment prerequisites are required.
+; Without one contract, a retry can create a second order or a stale cart can cross checkout with
+; a quote that was never authorized.
+; --
+; REUSE, NOT RESTATEMENT: price_authorized is the entire answer supplied by the price authority;
+; upstream_bookable is the entire rental answer supplied by availability; upstream_saleable is
+; the equivalent decision supplied by the sale owner. No price number, discount, stock count,
+; deposit amount, location, or tariff appears here. Quote identity, revision, expiry, and scope
+; are transport booleans: the snapshot retains the authoritative answer but this file does not
+; recompute it. Fulfillment similarly consumes pickup_allowed and delivery_allowed decisions
+; instead of copying geographic or operational rules.
+; --
+; WHAT THIS FILE NEVER DOES: it never carries a customer identity, contact field, unit identifier,
+; payment credential, source-sheet detail, or historical transaction fixture. It does not assign
+; a bike unit, calculate a rental total, derive a sale price, convert a deposit, or decide live
+; availability. A failed transaction leaves no durable idempotency record, and a committed order
+; cannot replace its quote snapshot. Both are expressed as executable gates below.
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module commerce;
+
+pub const KIND : str = "contract";
+pub const ID : str = "turbobaby/commerce";
+pub const NAME : str = "TurboBaby commerce transaction contract";
+pub const IMPLEMENTATION_BOUNDARY : str = "cart -> checkout lock -> committed order";
+
+; CORRECTED 2026-09-24. The header's "It covers both rental and sale" is kept as written and is now
+; half history. The owner ruled on 2026-09-24 that a customer may only rent (rental only, Phuket
+; only; turbobaby/legacy-retirement records the ruling), so the sale half of this file describes
+; lines that already exist and no longer a line a customer can place. Placed orders still carry
+; bike_sale and still deserialize through BikeDeal::BikeSale, which is why DEAL_NAMES and
+; DEAL_KIND_COUNT below do not move. src/api/orders.rs validate_bike_lines now refuses a NEW sale
+; line with 422, the status its other "you cannot have this" refusals use, and with no new sentence;
+; a malformed sale price is still refused as malformed first. So upstream_saleable, "the equivalent
+; decision supplied by the sale owner" in the header, has a supplier from this date and its answer
+; is no. Also corrected, because it was never true: until this date no contract owned that decision
+; ("saleable" occurred in this file only), and the order path never asked it -- a sale line naming
+; any known family was admitted, which is the gap the ruling closed.
+pub const SALE_LINE_ADMITTED_AT_CHECKOUT : bool = false;
+pub const SALE_LINE_ADMITTED_AT_CHECKOUT_BEFORE_2026_09_24 : bool = true;
+pub const SALE_LINE_REFUSAL_ARMS : u8 = 1;
+pub const PLACED_SALE_LINES_STILL_READ : bool = true;
+pub const SALE_OWNER_ID : str = "turbobaby/legacy-retirement";
+pub const SALE_OWNER_WAS_NAMED_BEFORE_2026_09_24 : bool = false;
+
+; Exactly one tagged deal shape per bike line.
+pub const DEAL_INVALID : u8 = 0;
+pub const DEAL_RENTAL : u8 = 1;
+pub const DEAL_SALE : u8 = 2;
+pub const DEAL_NAMES : [2]str = ["bike_rental", "bike_sale"];
+; Added 2026-09-22: the variants src/db/orders.rs declares in `pub enum BikeDeal`, measured 2
+; (BikeRental, BikeSale). serde tags each variant on its own, so this counts the deal kinds that
+; can reach the wire whether or not a test names them; DEAL_NAMES spells them and is held to it.
+pub const DEAL_KIND_COUNT : u8 = 2;
+
+; Cart lifecycle. Converted and abandoned are terminal; a failed locked checkout may reopen.
+pub const CART_STATE_INVALID : u8 = 0;
+pub const CART_STATE_OPEN : u8 = 1;
+pub const CART_STATE_LOCKED : u8 = 2;
+pub const CART_STATE_CONVERTED : u8 = 3;
+pub const CART_STATE_ABANDONED : u8 = 4;
+pub const CART_STATE_NAMES : [4]str = ["open", "locked", "converted", "abandoned"];
+
+; Fulfillment discriminants are protocol shape only. Eligibility comes from upstream booleans.
+pub const FULFILLMENT_INVALID : u8 = 0;
+pub const FULFILLMENT_PICKUP : u8 = 1;
+pub const FULFILLMENT_DELIVERY : u8 = 2;
+pub const FULFILLMENT_NAMES : [2]str = ["pickup", "delivery"];
+
+; Idempotency decisions. A replay returns the prior committed order and never writes another one.
+pub const IDEM_REJECT_KEY : u8 = 1;
+pub const IDEM_CREATE_NEW : u8 = 2;
+pub const IDEM_RETURN_PRIOR : u8 = 3;
+pub const IDEM_IN_PROGRESS : u8 = 4;
+pub const IDEM_CONFLICT : u8 = 5;
+pub const IDEM_DECISION_COUNT : u8 = 5;
+
+; Checkout decisions are internal outcomes, not prices and not order status strings.
+pub const CHECKOUT_READY : u8 = 1;
+pub const CHECKOUT_BAD_DEAL : u8 = 2;
+pub const CHECKOUT_BAD_CART_STATE : u8 = 3;
+pub const CHECKOUT_PRICE_UNAUTHORIZED : u8 = 4;
+pub const CHECKOUT_NOT_FULFILLABLE : u8 = 5;
+pub const CHECKOUT_QUOTE_INVALID : u8 = 6;
+pub const CHECKOUT_FULFILLMENT_INVALID : u8 = 7;
+pub const CHECKOUT_IDEMPOTENCY_BLOCKED : u8 = 8;
+pub const CHECKOUT_RETURN_PRIOR : u8 = 9;
+
+pub const QUOTE_SNAPSHOT_RULE : str = "authorized quote identity, revision, scope and expiry are frozen before commit";
+pub const IDEMPOTENCY_COMMIT_RULE : str = "the key and order become durable in the same successful transaction";
+
+pub fn commerce_deal_is_known(deal_kind: u8) bool {
+    return deal_kind == DEAL_RENTAL or deal_kind == DEAL_SALE;
+}
+
+; The tagged union shape: rental payload or sale payload, never both and never neither.
+pub fn commerce_deal_shape_valid(deal_kind: u8, rental_payload_present: bool, sale_payload_present: bool) bool {
+    if (deal_kind == DEAL_RENTAL) {
+        return rental_payload_present and !sale_payload_present;
+    }
+    if (deal_kind == DEAL_SALE) {
+        return sale_payload_present and !rental_payload_present;
+    }
+    return false;
+}
+
+; Availability and sale eligibility remain upstream facts. This function selects which one the
+; deal discriminant consumes and refuses an unknown deal instead of falling back to either.
+pub fn commerce_deal_fulfillable(deal_kind: u8, upstream_bookable: bool, upstream_saleable: bool) bool {
+    if (deal_kind == DEAL_RENTAL) {
+        return upstream_bookable;
+    }
+    if (deal_kind == DEAL_SALE) {
+        return upstream_saleable;
+    }
+    return false;
+}
+
+pub fn commerce_cart_state_is_known(state: u8) bool {
+    return state >= CART_STATE_OPEN and state <= CART_STATE_ABANDONED;
+}
+
+; A lock may roll back to open after failure. Conversion requires the transaction to have
+; committed. Converted and abandoned carts are terminal, apart from idempotent same-state reads.
+pub fn commerce_cart_transition_allowed(from_state: u8, to_state: u8, transaction_committed: bool) bool {
+    if (!commerce_cart_state_is_known(from_state) or !commerce_cart_state_is_known(to_state)) {
+        return false;
+    }
+    if (from_state == to_state) {
+        return true;
+    }
+    if (from_state == CART_STATE_OPEN) {
+        return to_state == CART_STATE_LOCKED or to_state == CART_STATE_ABANDONED;
+    }
+    if (from_state == CART_STATE_LOCKED) {
+        if (to_state == CART_STATE_OPEN) {
+            return true;
+        }
+        if (to_state == CART_STATE_CONVERTED) {
+            return transaction_committed;
+        }
+    }
+    return false;
+}
+
+; No amount is inspected here. `price_authorized` is the result of the pricing owner. Identity,
+; revision, scope, and expiry keep that decision bound to this exact line and checkout attempt.
+pub fn commerce_quote_snapshot_valid(snapshot_id_valid: bool, revision_present: bool, price_authorized: bool, scope_matches: bool, not_expired: bool) bool {
+    return snapshot_id_valid and revision_present and price_authorized and scope_matches and not_expired;
+}
+
+pub fn commerce_quote_snapshot_may_replace(cart_state: u8, order_exists: bool) bool {
+    return cart_state == CART_STATE_OPEN and !order_exists;
+}
+
+; Pickup ignores destination readiness but still needs upstream pickup approval. Delivery needs
+; both upstream approval and a complete destination handoff. Unknown modes fail closed.
+pub fn commerce_fulfillment_valid(mode: u8, pickup_allowed: bool, delivery_allowed: bool, delivery_destination_ready: bool) bool {
+    if (mode == FULFILLMENT_PICKUP) {
+        return pickup_allowed;
+    }
+    if (mode == FULFILLMENT_DELIVERY) {
+        return delivery_allowed and delivery_destination_ready;
+    }
+    return false;
+}
+
+; The key is claimed inside the same transaction as the order. `prior_committed` distinguishes a
+; safe replay from a concurrent request whose result is not durable yet.
+pub fn commerce_idempotency_decision(key_valid: bool, key_seen: bool, payload_matches: bool, prior_committed: bool) u8 {
+    if (!key_valid) {
+        return IDEM_REJECT_KEY;
+    }
+    if (!key_seen) {
+        return IDEM_CREATE_NEW;
+    }
+    if (!payload_matches) {
+        return IDEM_CONFLICT;
+    }
+    if (prior_committed) {
+        return IDEM_RETURN_PRIOR;
+    }
+    return IDEM_IN_PROGRESS;
+}
+
+pub fn commerce_idempotency_permits_write(idempotency_decision: u8) bool {
+    return idempotency_decision == IDEM_CREATE_NEW;
+}
+
+pub fn commerce_idempotency_returns_prior(idempotency_decision: u8) bool {
+    return idempotency_decision == IDEM_RETURN_PRIOR;
+}
+
+; Transactional persistence in one bit: rollback removes both the order and the key record.
+pub fn commerce_idempotency_record_is_durable(transaction_committed: bool) bool {
+    return transaction_committed;
+}
+
+; The checkout join. It consumes decisions from the shape, price, availability/sale, quote,
+; fulfillment, and idempotency owners; it performs none of their underlying computations.
+pub fn commerce_checkout_decision(deal_kind: u8, cart_state: u8, shape_valid: bool, price_authorized: bool, upstream_fulfillable: bool, quote_snapshot_valid: bool, fulfillment_valid: bool, idempotency_decision: u8) u8 {
+    // A committed replay is already proven to have the same payload. It must return before the
+    // cart and domain gates: the first commit converted the cart and may have consumed the last
+    // available unit, so re-running those gates would make a successful retry look unavailable.
+    if (commerce_idempotency_returns_prior(idempotency_decision)) {
+        return CHECKOUT_RETURN_PRIOR;
+    }
+    if (!commerce_idempotency_permits_write(idempotency_decision)) {
+        return CHECKOUT_IDEMPOTENCY_BLOCKED;
+    }
+    if (!commerce_deal_is_known(deal_kind) or !shape_valid) {
+        return CHECKOUT_BAD_DEAL;
+    }
+    if (cart_state != CART_STATE_LOCKED) {
+        return CHECKOUT_BAD_CART_STATE;
+    }
+    if (!price_authorized) {
+        return CHECKOUT_PRICE_UNAUTHORIZED;
+    }
+    if (!upstream_fulfillable) {
+        return CHECKOUT_NOT_FULFILLABLE;
+    }
+    if (!quote_snapshot_valid) {
+        return CHECKOUT_QUOTE_INVALID;
+    }
+    if (!fulfillment_valid) {
+        return CHECKOUT_FULFILLMENT_INVALID;
+    }
+    return CHECKOUT_READY;
+}
+
+pub fn commerce_checkout_may_commit(checkout_decision: u8) bool {
+    return checkout_decision == CHECKOUT_READY;
+}
+
+; Order-status vocabulary remains in the order owner. This gate takes only three facts about a
+; requested transition: whether the current state is terminal, whether this is an idempotent
+; same-state write, and whether the order owner authorizes the edge.
+pub fn commerce_order_transition_allowed(current_is_terminal: bool, same_state: bool, transition_authorized: bool) bool {
+    if (same_state) {
+        return true;
+    }
+    if (current_is_terminal) {
+        return false;
+    }
+    return transition_authorized;
+}
+
+test commerce_deal_discriminant_accepts_exactly_rental_or_sale {
+    assert commerce_deal_is_known(DEAL_RENTAL) == true;
+    assert commerce_deal_is_known(DEAL_SALE) == true;
+    assert commerce_deal_is_known(DEAL_INVALID) == false;
+    assert commerce_deal_is_known(3) == false;
+    assert DEAL_NAMES[0] == "bike_rental";
+    assert DEAL_NAMES[1] == "bike_sale";
+    assert DEAL_KIND_COUNT == 2;
+    assert DEAL_NAMES.len == DEAL_KIND_COUNT;
+}
+
+test commerce_deal_shape_is_exclusive {
+    assert commerce_deal_shape_valid(DEAL_RENTAL, true, false) == true;
+    assert commerce_deal_shape_valid(DEAL_SALE, false, true) == true;
+    assert commerce_deal_shape_valid(DEAL_RENTAL, true, true) == false;
+    assert commerce_deal_shape_valid(DEAL_SALE, true, true) == false;
+    assert commerce_deal_shape_valid(DEAL_RENTAL, false, false) == false;
+    assert commerce_deal_shape_valid(DEAL_INVALID, true, false) == false;
+}
+
+test commerce_fulfillability_consumes_upstream_decisions_without_recomputing_them {
+    assert commerce_deal_fulfillable(DEAL_RENTAL, true, false) == true;
+    assert commerce_deal_fulfillable(DEAL_RENTAL, false, true) == false;
+    assert commerce_deal_fulfillable(DEAL_SALE, false, true) == true;
+    assert commerce_deal_fulfillable(DEAL_SALE, true, false) == false;
+    assert commerce_deal_fulfillable(DEAL_INVALID, true, true) == false;
+}
+
+test commerce_cart_state_machine_locks_commits_rolls_back_and_stays_terminal {
+    assert commerce_cart_transition_allowed(CART_STATE_OPEN, CART_STATE_LOCKED, false) == true;
+    assert commerce_cart_transition_allowed(CART_STATE_OPEN, CART_STATE_ABANDONED, false) == true;
+    assert commerce_cart_transition_allowed(CART_STATE_LOCKED, CART_STATE_OPEN, false) == true;
+    assert commerce_cart_transition_allowed(CART_STATE_LOCKED, CART_STATE_CONVERTED, false) == false;
+    assert commerce_cart_transition_allowed(CART_STATE_LOCKED, CART_STATE_CONVERTED, true) == true;
+    assert commerce_cart_transition_allowed(CART_STATE_CONVERTED, CART_STATE_OPEN, true) == false;
+    assert commerce_cart_transition_allowed(CART_STATE_ABANDONED, CART_STATE_LOCKED, true) == false;
+}
+
+test commerce_cart_same_state_retry_is_idempotent_only_for_known_states {
+    assert commerce_cart_transition_allowed(CART_STATE_OPEN, CART_STATE_OPEN, false) == true;
+    assert commerce_cart_transition_allowed(CART_STATE_LOCKED, CART_STATE_LOCKED, false) == true;
+    assert commerce_cart_transition_allowed(CART_STATE_CONVERTED, CART_STATE_CONVERTED, false) == true;
+    assert commerce_cart_transition_allowed(CART_STATE_INVALID, CART_STATE_INVALID, false) == false;
+}
+
+test commerce_quote_snapshot_requires_every_authority_property {
+    assert commerce_quote_snapshot_valid(true, true, true, true, true) == true;
+    assert commerce_quote_snapshot_valid(false, true, true, true, true) == false;
+    assert commerce_quote_snapshot_valid(true, false, true, true, true) == false;
+    assert commerce_quote_snapshot_valid(true, true, false, true, true) == false;
+    assert commerce_quote_snapshot_valid(true, true, true, false, true) == false;
+    assert commerce_quote_snapshot_valid(true, true, true, true, false) == false;
+}
+
+test commerce_quote_snapshot_can_refresh_only_before_checkout_lock {
+    assert commerce_quote_snapshot_may_replace(CART_STATE_OPEN, false) == true;
+    assert commerce_quote_snapshot_may_replace(CART_STATE_LOCKED, false) == false;
+    assert commerce_quote_snapshot_may_replace(CART_STATE_CONVERTED, true) == false;
+    assert commerce_quote_snapshot_may_replace(CART_STATE_OPEN, true) == false;
+}
+
+test commerce_fulfillment_checks_mode_specific_upstream_gates {
+    assert commerce_fulfillment_valid(FULFILLMENT_PICKUP, true, false, false) == true;
+    assert commerce_fulfillment_valid(FULFILLMENT_PICKUP, false, true, true) == false;
+    assert commerce_fulfillment_valid(FULFILLMENT_DELIVERY, false, true, true) == true;
+    assert commerce_fulfillment_valid(FULFILLMENT_DELIVERY, true, true, false) == false;
+    assert commerce_fulfillment_valid(FULFILLMENT_DELIVERY, true, false, true) == false;
+    assert commerce_fulfillment_valid(FULFILLMENT_INVALID, true, true, true) == false;
+}
+
+test commerce_idempotency_distinguishes_new_replay_in_progress_and_conflict {
+    assert commerce_idempotency_decision(false, false, false, false) == IDEM_REJECT_KEY;
+    assert commerce_idempotency_decision(true, false, false, false) == IDEM_CREATE_NEW;
+    assert commerce_idempotency_decision(true, true, true, true) == IDEM_RETURN_PRIOR;
+    assert commerce_idempotency_decision(true, true, true, false) == IDEM_IN_PROGRESS;
+    assert commerce_idempotency_decision(true, true, false, true) == IDEM_CONFLICT;
+}
+
+test commerce_only_a_new_key_permits_a_write_and_replay_returns_prior {
+    assert commerce_idempotency_permits_write(IDEM_CREATE_NEW) == true;
+    assert commerce_idempotency_permits_write(IDEM_RETURN_PRIOR) == false;
+    assert commerce_idempotency_permits_write(IDEM_IN_PROGRESS) == false;
+    assert commerce_idempotency_permits_write(IDEM_CONFLICT) == false;
+    assert commerce_idempotency_returns_prior(IDEM_RETURN_PRIOR) == true;
+    assert commerce_idempotency_returns_prior(IDEM_CREATE_NEW) == false;
+}
+
+; A retry happens after the first order consumed the availability and converted the cart. The
+; committed result must therefore win before current cart, quote, or inventory gates run.
+test commerce_committed_replay_short_circuits_changed_world_state {
+    assert commerce_checkout_decision(DEAL_INVALID, CART_STATE_CONVERTED, false, false, false, false, false, IDEM_RETURN_PRIOR) == CHECKOUT_RETURN_PRIOR;
+    assert commerce_checkout_may_commit(CHECKOUT_RETURN_PRIOR) == false;
+}
+
+test commerce_idempotency_record_is_atomic_with_commit {
+    assert commerce_idempotency_record_is_durable(false) == false;
+    assert commerce_idempotency_record_is_durable(true) == true;
+}
+
+test commerce_checkout_accepts_a_complete_rental_without_seeing_domain_arithmetic {
+    const upstream_fulfillable = commerce_deal_fulfillable(DEAL_RENTAL, true, false);
+    const shape_valid = commerce_deal_shape_valid(DEAL_RENTAL, true, false);
+    const quote_valid = commerce_quote_snapshot_valid(true, true, true, true, true);
+    const fulfillment_valid = commerce_fulfillment_valid(FULFILLMENT_PICKUP, true, false, false);
+    assert commerce_checkout_decision(DEAL_RENTAL, CART_STATE_LOCKED, shape_valid, true, upstream_fulfillable, quote_valid, fulfillment_valid, IDEM_CREATE_NEW) == CHECKOUT_READY;
+}
+
+test commerce_checkout_accepts_sale_only_through_the_sale_upstream_gate {
+    // Algebra only since 2026-09-24: the sale upstream now answers no (SALE_LINE_ADMITTED_AT_CHECKOUT).
+    const upstream_fulfillable = commerce_deal_fulfillable(DEAL_SALE, false, true);
+    const shape_valid = commerce_deal_shape_valid(DEAL_SALE, false, true);
+    const quote_valid = commerce_quote_snapshot_valid(true, true, true, true, true);
+    const fulfillment_valid = commerce_fulfillment_valid(FULFILLMENT_PICKUP, true, false, false);
+    assert commerce_checkout_decision(DEAL_SALE, CART_STATE_LOCKED, shape_valid, true, upstream_fulfillable, quote_valid, fulfillment_valid, IDEM_CREATE_NEW) == CHECKOUT_READY;
+    assert commerce_deal_fulfillable(DEAL_SALE, true, false) == false;
+}
+
+test commerce_checkout_refusal_precedence_is_stable {
+    assert commerce_checkout_decision(DEAL_INVALID, CART_STATE_OPEN, false, false, false, false, false, IDEM_REJECT_KEY) == CHECKOUT_IDEMPOTENCY_BLOCKED;
+    assert commerce_checkout_decision(DEAL_INVALID, CART_STATE_OPEN, false, false, false, false, false, IDEM_CREATE_NEW) == CHECKOUT_BAD_DEAL;
+    assert commerce_checkout_decision(DEAL_RENTAL, CART_STATE_OPEN, true, true, true, true, true, IDEM_CREATE_NEW) == CHECKOUT_BAD_CART_STATE;
+    assert commerce_checkout_decision(DEAL_RENTAL, CART_STATE_LOCKED, true, false, true, true, true, IDEM_CREATE_NEW) == CHECKOUT_PRICE_UNAUTHORIZED;
+    assert commerce_checkout_decision(DEAL_RENTAL, CART_STATE_LOCKED, true, true, false, true, true, IDEM_CREATE_NEW) == CHECKOUT_NOT_FULFILLABLE;
+    assert commerce_checkout_decision(DEAL_RENTAL, CART_STATE_LOCKED, true, true, true, false, true, IDEM_CREATE_NEW) == CHECKOUT_QUOTE_INVALID;
+    assert commerce_checkout_decision(DEAL_RENTAL, CART_STATE_LOCKED, true, true, true, true, false, IDEM_CREATE_NEW) == CHECKOUT_FULFILLMENT_INVALID;
+    assert commerce_checkout_decision(DEAL_RENTAL, CART_STATE_LOCKED, true, true, true, true, true, IDEM_IN_PROGRESS) == CHECKOUT_IDEMPOTENCY_BLOCKED;
+}
+
+test commerce_only_ready_checkout_may_commit {
+    assert commerce_checkout_may_commit(CHECKOUT_READY) == true;
+    assert commerce_checkout_may_commit(CHECKOUT_RETURN_PRIOR) == false;
+    assert commerce_checkout_may_commit(CHECKOUT_BAD_DEAL) == false;
+    assert commerce_checkout_may_commit(CHECKOUT_PRICE_UNAUTHORIZED) == false;
+    assert commerce_checkout_may_commit(CHECKOUT_IDEMPOTENCY_BLOCKED) == false;
+}
+
+test commerce_order_transition_refuses_mutation_after_terminal_state {
+    assert commerce_order_transition_allowed(false, false, true) == true;
+    assert commerce_order_transition_allowed(false, false, false) == false;
+    assert commerce_order_transition_allowed(false, true, false) == true;
+    assert commerce_order_transition_allowed(true, true, false) == true;
+    assert commerce_order_transition_allowed(true, false, true) == false;
+}
+
+test commerce_a_new_sale_line_is_refused_and_a_placed_one_still_reads {
+    assert SALE_LINE_ADMITTED_AT_CHECKOUT == false;
+    assert SALE_LINE_ADMITTED_AT_CHECKOUT_BEFORE_2026_09_24 == true;
+    assert SALE_LINE_REFUSAL_ARMS == 1;
+    assert PLACED_SALE_LINES_STILL_READ == true;
+    assert DEAL_KIND_COUNT == 2;
+    assert DEAL_NAMES[1] == "bike_sale";
+    assert SALE_OWNER_ID == "turbobaby/legacy-retirement";
+    assert SALE_OWNER_WAS_NAMED_BEFORE_2026_09_24 == false;
+    assert commerce_deal_fulfillable(DEAL_SALE, true, SALE_LINE_ADMITTED_AT_CHECKOUT) == false;
+    assert commerce_deal_fulfillable(DEAL_RENTAL, true, SALE_LINE_ADMITTED_AT_CHECKOUT) == true;
+    assert commerce_deal_fulfillable(DEAL_SALE, false, SALE_LINE_ADMITTED_AT_CHECKOUT_BEFORE_2026_09_24) == true;
+}
+
+invariant commerce_deal_domain_has_exactly_two_shapes
+    assert DEAL_NAMES.len == 2 and DEAL_RENTAL != DEAL_SALE
+
+invariant commerce_mixed_rental_and_sale_payload_is_unrepresentable
+    assert commerce_deal_shape_valid(DEAL_RENTAL, true, true) == false and commerce_deal_shape_valid(DEAL_SALE, true, true) == false
+
+invariant commerce_terminal_cart_states_never_reopen
+    assert commerce_cart_transition_allowed(CART_STATE_CONVERTED, CART_STATE_OPEN, true) == false and commerce_cart_transition_allowed(CART_STATE_ABANDONED, CART_STATE_OPEN, true) == false
+
+invariant commerce_quote_cannot_be_replaced_after_order_creation
+    assert commerce_quote_snapshot_may_replace(CART_STATE_CONVERTED, true) == false
+
+invariant commerce_unauthorized_price_never_reaches_commit
+    assert commerce_checkout_decision(DEAL_RENTAL, CART_STATE_LOCKED, true, false, true, true, true, IDEM_CREATE_NEW) == CHECKOUT_PRICE_UNAUTHORIZED
+
+invariant commerce_unbookable_rental_never_reaches_commit
+    assert commerce_checkout_decision(DEAL_RENTAL, CART_STATE_LOCKED, true, true, commerce_deal_fulfillable(DEAL_RENTAL, false, false), true, true, IDEM_CREATE_NEW) == CHECKOUT_NOT_FULFILLABLE
+
+invariant commerce_replay_never_creates_a_second_order
+    assert commerce_idempotency_permits_write(commerce_idempotency_decision(true, true, true, true)) == false and commerce_idempotency_returns_prior(commerce_idempotency_decision(true, true, true, true)) == true
+
+invariant commerce_committed_replay_precedes_current_cart_and_inventory_state
+    assert commerce_checkout_decision(DEAL_INVALID, CART_STATE_CONVERTED, false, false, false, false, false, IDEM_RETURN_PRIOR) == CHECKOUT_RETURN_PRIOR
+
+invariant commerce_failed_transaction_persists_no_idempotency_record
+    assert commerce_idempotency_record_is_durable(false) == false
+
+invariant commerce_delivery_without_ready_destination_never_reaches_checkout
+    assert commerce_fulfillment_valid(FULFILLMENT_DELIVERY, true, true, false) == false
+
+invariant commerce_refused_checkout_has_no_commit_path
+    assert commerce_checkout_may_commit(CHECKOUT_PRICE_UNAUTHORIZED) == false and commerce_checkout_may_commit(CHECKOUT_NOT_FULFILLABLE) == false and commerce_checkout_may_commit(CHECKOUT_IDEMPOTENCY_BLOCKED) == false
+
+; ============================================================================================
+; EPIC #28: THREE OBLIGATIONS THE EPIC STATES AND NO CONTRACT OWNED
+; --
+; WHY (measured 2026-09-20; the absence RE-MEASURED 2026-09-21 over the corpus as it now
+; stands, 43 files): three sentences of epic #28 had no owner anywhere in this corpus, and they
+; still have none outside this file. The corpus has grown since the first measurement, so the
+; absence was re-run rather than carried forward -- an absence that was true when written is the
+; one claim a reader never re-checks. Today grep over specs/ finds "#28" in this file alone, the
+; concurrent-capacity sentence in this file alone, and the client-price sentence in this file
+; alone. The one contract that could have absorbed the second sentence explicitly does not:
+; turbobaby/cart-persistence says in its own header that it owns the distance between the cart
+; machine turbobaby/commerce declares and the two tables the repository ships, which defers the
+; machine itself back here.
+; The first -- client-submitted prices, deposits, fees and totals are never authoritative -- is
+; obeyed all over the shipped order path and written down in no contract. The second is D8's
+; dated line identity, which lived in a decision record and a migration only. The third --
+; concurrent overlapping rentals cannot exceed available capacity -- is a FAMILY-level rule that
+; the availability contract cannot state, because it counts units at a point in time and knows
+; no window at all. All three belong here: this is the file that already owns the cart, the
+; quote snapshot and the checkout join, and none of them needs a number this file must not hold.
+; --
+; WHERE THE ISSUE IS REFUTED: the capacity sentence reads as a guarantee the code already makes,
+; and it is not one. src/api/orders.rs:757-761 says in its own words that the fleet check
+; reserves nothing and that there is no reservation table in the schema, and
+; src/api/orders.rs:820-828 logs a shortfall at info level and lets the order through. What is
+; added below is therefore a PREDICATE over inputs, and the absent mechanism is a named refusal
+; rather than a silence. The authority sentence is also narrower in the shipped code than it
+; sounds: a claimed total is compared against the server's own figure, a fee has no field to
+; arrive in at all, and a deposit is only bounded. That third one is a gap, and it is declared
+; below instead of being papered over by a rule that nothing enforces.
+; CORRECTED 2026-09-24 (T27 C3): the third is no longer a gap. A rental line's money deposit is
+; compared with the family's own published deposit on the order path and refused when it is not
+; that figure, when the family publishes none, or when it is written in a currency no published
+; rate converts. The gap as it stood is kept word for word under the _BEFORE_THE_DEPOSIT_CHECK
+; names below; the paragraph above is its record and is not rewritten.
+; --
+; WHAT THIS SECTION NEVER DOES: it names no price, no deposit amount, no fee, no fleet row and
+; no customer, so the promise the header makes is still true after it. Units of a family are an
+; abstract integer owned by the availability contract; a rental window is an abstract pair of day
+; ordinals and no calendar arithmetic happens here; a family key is an opaque string. No lock
+; name, no hold table, no timeout and no expiry is invented: where the repository ships none,
+; the absence itself is the declaration.
+
+; Current t27c does not support brace imports. Bookability of a family is the availability
+; contract's entire answer; the dated rules below consume it through the `upstream_bookable`
+; argument the checkout join already takes, and this file restates no status name of its own.
+pub const REUSES_AVAILABILITY_ID : str = "turbobaby/availability";
+
+; --------------------------------------------------------------------------------------------
+; (1) AN AMOUNT WHOSE ORIGIN IS THE BROWSER IS INPUT, NEVER AUTHORITY
+; --------------------------------------------------------------------------------------------
+; Measured in the shipped create-order path, 2026-09-20:
+;   src/api/orders.rs:56 and :63      `subtotal` and `total` arrive in the request body as f64.
+;   src/api/orders.rs:69-73           the struct does not deny unknown fields, so a key the
+;                                     server has no field for is dropped, not rejected.
+;   src/api/orders.rs:210-217         the server recomputes the total it expects and refuses a
+;                                     body whose total differs from it by more than a hundredth.
+;   src/api/orders.rs:957-961         a bike line's `unit_price` is overwritten with nothing at
+;                                     all rather than trusted: the client's figure is erased.
+;   src/api/orders.rs:1109, 1159-1180 the claimed subtotal is compared against the catalog's own
+;                                     sum, and a disagreement is a refusal plus an audit row.
+;   src/api/orders.rs:469-475         the server's expected figure is never echoed back, so the
+;                                     client cannot probe its way to the authoritative number.
+;   src/api/orders.rs:1293-1305       the bonus ceiling is read from configuration, not the body.
+;   src/api/orders.rs:1920            a delivery fee shown to a customer is read from the zone
+;                                     row; there is no fee field in the request at all.
+; None of that arithmetic belongs to this contract. What belongs here is the one rule all of it
+; obeys, stated over the quote-snapshot model this file already owns.
+
+pub const AMOUNT_ORIGIN_UNSET : u8 = 0;
+pub const AMOUNT_ORIGIN_BROWSER : u8 = 1;
+pub const AMOUNT_ORIGIN_QUOTE_SNAPSHOT : u8 = 2;
+pub const AMOUNT_ORIGIN_NAMES : [2]str = ["browser", "quote_snapshot"];
+pub const CLIENT_AMOUNT_RULE : str = "an amount whose origin is the browser is input; the authoritative amount is the snapshotted quote";
+
+; The three browser figures epic #28 names, as subjects of that rule.
+pub const CLIENT_AMOUNT_INVALID : u8 = 0;
+pub const CLIENT_AMOUNT_TOTAL : u8 = 1;
+pub const CLIENT_AMOUNT_DEPOSIT : u8 = 2;
+pub const CLIENT_AMOUNT_EXTRA_FEE : u8 = 3;
+pub const CLIENT_AMOUNT_NAMES : [3]str = ["total", "deposit", "extra_fee"];
+
+; How each one is disarmed. Not one of the three branches promotes a browser figure to
+; authority; they differ only in what the path does with it after refusing it that status.
+pub const DISPOSITION_INVALID : u8 = 0;
+pub const DISPOSITION_COMPARED : u8 = 1;
+pub const DISPOSITION_BOUNDED : u8 = 2;
+pub const DISPOSITION_IGNORED : u8 = 3;
+pub const DISPOSITION_NAMES : [3]str = ["compared", "bounded", "ignored"];
+
+pub fn commerce_amount_origin_is_known(origin: u8) bool {
+    return origin == AMOUNT_ORIGIN_BROWSER or origin == AMOUNT_ORIGIN_QUOTE_SNAPSHOT;
+}
+
+pub fn commerce_amount_is_authoritative(origin: u8) bool {
+    return origin == AMOUNT_ORIGIN_QUOTE_SNAPSHOT;
+}
+
+; Which figure a commit is allowed to use. `client_amount_present` is accepted and then never
+; read: both of its values give the same answer, which is what "never authoritative" looks like
+; written as code instead of as prose. With no valid snapshot there is no authoritative amount
+; at all, and the browser's figure does not inherit the vacancy.
+pub fn commerce_authoritative_amount_origin(client_amount_present: bool, snapshot_valid: bool) u8 {
+    if (snapshot_valid) {
+        return AMOUNT_ORIGIN_QUOTE_SNAPSHOT;
+    }
+    return AMOUNT_ORIGIN_UNSET;
+}
+
+pub fn commerce_client_amount_is_known(subject: u8) bool {
+    return subject >= CLIENT_AMOUNT_TOTAL and subject <= CLIENT_AMOUNT_EXTRA_FEE;
+}
+
+; CORRECTED 2026-09-24 (T27 C3): the deposit moved from BOUNDED to COMPARED. The old answer is
+; CLIENT_AMOUNT_DEPOSIT_DISPOSITION_BEFORE_THE_DEPOSIT_CHECK below. No subject is BOUNDED since:
+; the disposition stays in the vocabulary as a name, with no figure disarmed that way.
+pub fn commerce_client_amount_disposition(subject: u8) u8 {
+    if (subject == CLIENT_AMOUNT_TOTAL) {
+        return DISPOSITION_COMPARED;
+    }
+    if (subject == CLIENT_AMOUNT_DEPOSIT) {
+        return DISPOSITION_COMPARED;
+    }
+    if (subject == CLIENT_AMOUNT_EXTRA_FEE) {
+        return DISPOSITION_IGNORED;
+    }
+    return DISPOSITION_INVALID;
+}
+
+; Denying a figure authority is not denying the request, and the two must not be run together. A
+; compared figure refuses only when it disagrees with the server's own number; a bounded or an
+; ignored figure refuses nothing ever. In all three cases the browser's number stays input.
+pub fn commerce_client_amount_refuses_request(disposition: u8, disagrees: bool) bool {
+    if (disposition == DISPOSITION_COMPARED) {
+        return disagrees;
+    }
+    return false;
+}
+
+; Whether the attempt proceeds is the existing checkout decision's answer, and that decision
+; takes no browser figure as an argument anywhere in its signature.
+pub fn commerce_request_may_proceed_despite_client_amount(checkout_decision: u8) bool {
+    return commerce_checkout_may_commit(checkout_decision);
+}
+
+; The honest edge of obligation (1), declared rather than hidden behind the rule above. A
+; lowered deposit is bounded and recorded, and nothing compares it against a server-side figure.
+; CORRECTED 2026-09-24 (T27 C3): that edge is closed. The two sentences above and the three
+; _BEFORE_THE_DEPOSIT_CHECK constants are the record of f0640f8, and their line citations are
+; that tree's lines, deliberately not re-pointed.
+pub const CLIENT_DEPOSIT_RECONCILIATION_IS_NOT_SHIPPED_BEFORE_THE_DEPOSIT_CHECK : bool = true;
+pub const CLIENT_AMOUNT_DEPOSIT_DISPOSITION_BEFORE_THE_DEPOSIT_CHECK : u8 = DISPOSITION_BOUNDED;
+pub const CLIENT_DEPOSIT_RECONCILIATION_NOTE_BEFORE_THE_DEPOSIT_CHECK : str = "A client deposit is bounded at src/api/orders.rs:344-352 and derived from nothing (src/api/orders.rs:267-270), so a lowered one is recorded rather than refused. The quoted rate has a reconciliation - src/api/orders.rs:624-637 detects a divergence of one baht or more and is pure by construction, src/api/orders.rs:736-741 logs what it found, and neither side is corrected - and the deposit has no equivalent anywhere in the path. The figure exists: bikes.deposit_thb (migrations/077_bikes.sql:44) is mapped at src/db/bikes.rs:78 and is already in hand at src/api/orders.rs:729-734, the very place the rate is reconciled and the deposit is not. What is missing is the comparison, not the number.";
+
+; The comparison, as shipped on 2026-09-24. The order path reads each rented family once
+; (check_bike_lines) and holds every rental line of it to that family's own published deposit
+; through one pure verdict. The three refusals are listed in the order the verdict decides them,
+; which is the order that matters: a family with nothing published refuses the money form before
+; any figure is read, and a figure in a currency no published rate converts is refused before it
+; could be compared with a baht figure. Gate 3 reads that order out of the source.
+; What it still admits, and why each is not a gap: the passport (no amount by construction, on
+; any family); a money form whose figure is not agreed yet (a dash, not a claim -- nothing to
+; compare); and no deposit form at all. A foreign-currency FIGURE is refused, not admitted:
+; turbobaby/deposit-tiers keeps REFUND_FX_CONVERSION_ALLOWED false for want of a published rate,
+; and a figure nothing can compare is exactly the unauthoritative browser amount (1) forbids.
+pub const CLIENT_DEPOSIT_RECONCILIATION_IS_NOT_SHIPPED : bool = false;
+pub const CLIENT_DEPOSIT_REFUSALS : [3]str = ["NotPublished", "NotComparable", "Differs"];
+pub const CLIENT_DEPOSIT_REFUSAL_COUNT : u8 = 3;
+pub const CLIENT_DEPOSIT_PASSPORT_IS_ADMITTED : bool = true;
+pub const CLIENT_DEPOSIT_UNAGREED_FIGURE_IS_ADMITTED : bool = true;
+pub const CLIENT_DEPOSIT_FOREIGN_FIGURE_IS_ADMITTED : bool = false;
+pub const CLIENT_DEPOSIT_RECONCILIATION_SITE : str = "src/api/orders.rs:694-726";
+; CORRECTED 2026-09-24 (review of T27 C3): the note below first justified the exact comparison
+; with "deposits are whole-baht tiers", which turbobaby/catalog-api contradicts
+; (DEPOSIT_COLUMN_ADMITS_A_FRACTION true, DEPOSIT_TIER_CHECK_IS_SHIPPED false). It now says "the
+; published figure, exactly", and it declares the figure per unit, which it did not say at all.
+pub const CLIENT_DEPOSIT_RECONCILIATION_NOTE : str = "Since 2026-09-24 a rental line's money deposit is compared, not only bounded. src/api/orders.rs:344-352 still bounds it first. The verdict is deposit_refusal at src/api/orders.rs:694-726, over the refusals declared at src/api/orders.rs:658-672; rental_deposit_refusal at src/api/orders.rs:730-745 applies it to every rental line of one family; check_bike_lines calls it at src/api/orders.rs:816-818 with bikes.deposit_thb, the row it already reads for the offered and rate gates; create_order answers 422 at src/api/orders.rs:1271-1283. The published figure goes through published_money, so an absent, non-finite, zero or negative column is no deposit and refuses the money form. A figure must be the published figure, exactly, and it is never discounted: the body may repeat the figure, never name it. That is not a claim that the column holds whole-baht tiers -- turbobaby/catalog-api keeps DEPOSIT_COLUMN_ADMITS_A_FRACTION true and DEPOSIT_TIER_CHECK_IS_SHIPPED false. The figure is PER UNIT: bikes.deposit_thb is one bike's deposit and the verdict does not read the line's quantity, so a line of two units passes with the one-bike figure and is refused with twice it (src/api/orders.rs test a_multi_unit_line_carries_the_per_unit_deposit_not_the_line_total, which records the rule as shipped, not a decision). The rate reconciliation is unchanged (src/api/orders.rs:634-647 decides, src/api/orders.rs:848-853 logs) and still corrects nothing. Three things are not decided here: no fraud event is recorded for this refusal, because no fraud code names it and a cart left open across a tariff edit lands here as honestly as a lowered figure; whether a multi-unit line's figure is per unit or per line, which is the owner's; and how a deposit a manager lowered for a multi-bike rental reaches an order is an owner question, because no field carries that agreement and the body's figure is refused.";
+
+; --------------------------------------------------------------------------------------------
+; (2) DATED RENTAL LINE IDENTITY -- DECISIONS.md D8 AND ITS AMENDMENT
+; --------------------------------------------------------------------------------------------
+; DECISIONS.md:82-92 (D8) puts the cart rental line on the FAMILY key, never on a unit
+; (DECISIONS.md:88-89, echoed at migrations/081_cart_rental_lines.sql:9-11), and widens the line
+; key to include the window. DECISIONS.md:94-114 (the amendment) records what that widening
+; breaks. Both are implemented in one migration:
+;   migrations/059_cart_tables.sql:24            the original key, three columns, no dates.
+;   migrations/081_cart_rental_lines.sql:82-84   the widened key: those three columns plus both
+;                                                ends of the window.
+;   migrations/081_cart_rental_lines.sql:106-111 the window arrives as a pair and in order; a
+;                                                half-dated line is refused by a CHECK.
+;   migrations/081_cart_rental_lines.sql:128-130 the partial unique index that keeps two UNDATED
+;                                                lines of one family from becoming two rows,
+;                                                which the widened key alone stopped preventing
+;                                                because Postgres compares NULLs in a UNIQUE as
+;                                                distinct.
+;   src/api/cart.rs:75-85 and 125-131            the upsert repeats that predicate, because a
+;                                                partial index cannot be inferred from the
+;                                                columns alone.
+; What follows is the rule, not the schema: no table, no column and no index name is a value
+; here, and bookability of the family over that window stays with the availability contract.
+
+pub const RENTAL_LINE_IDENTITY : [3]str = ["family_key", "rental_start", "rental_end"];
+pub const RENTAL_LINE_KEY_IS_A_FAMILY : bool = true;
+pub const RENTAL_LINE_KEY_IS_A_UNIT : bool = false;
+pub const D8_MIGRATION : str = "migrations/081_cart_rental_lines.sql";
+pub const D8_IDENTITY_RULE : str = "one family with two different windows is two lines; one family with no window at all is one line";
+
+pub fn commerce_line_is_dated(start_present: bool, end_present: bool) bool {
+    return start_present and end_present;
+}
+
+; A window is a pair or it is absent. A half-dated line is neither: it would collide with
+; nothing and grow a duplicate on every click, so it is not a legal line at all.
+pub fn commerce_line_window_shape_valid(start_present: bool, end_present: bool, end_not_before_start: bool) bool {
+    if (!start_present and !end_present) {
+        return true;
+    }
+    if (start_present and end_present) {
+        return end_not_before_start;
+    }
+    return false;
+}
+
+; Day ordinals, compared and never arithmetic: this contract does not know a calendar.
+pub fn commerce_rental_window_differs(a_start: i32, a_end: i32, b_start: i32, b_end: i32) bool {
+    if (a_start == b_start and a_end == b_end) {
+        return false;
+    }
+    return true;
+}
+
+pub fn commerce_rental_line_same_identity(a_family: str, a_start: i32, a_end: i32, b_family: str, b_start: i32, b_end: i32) bool {
+    if (a_family == b_family) {
+        if (commerce_rental_window_differs(a_start, a_end, b_start, b_end)) {
+            return false;
+        }
+        return true;
+    }
+    return false;
+}
+
+; One function for both halves of the amendment. Same family, both dated, different windows: two
+; lines, which is the whole point of the widening. Same family, both undated: one line, which is
+; what the partial index restores. One dated and one undated: two lines, because a line whose
+; dates the customer has not picked yet is still a legal line.
+pub fn commerce_cart_lines_may_coexist(a_family: str, a_dated: bool, a_start: i32, a_end: i32, b_family: str, b_dated: bool, b_start: i32, b_end: i32) bool {
+    if (a_family == b_family) {
+        if (a_dated and b_dated) {
+            return commerce_rental_window_differs(a_start, a_end, b_start, b_end);
+        }
+        if (!a_dated and !b_dated) {
+            return false;
+        }
+        return true;
+    }
+    return true;
+}
+
+; --------------------------------------------------------------------------------------------
+; (3) FAMILY-LEVEL DATED CAPACITY
+; --------------------------------------------------------------------------------------------
+; Because D8 puts the line on the family, the capacity question is a COUNT of units of one
+; family over one overlapping window, and not a lock on one machine. The count of units is the
+; availability contract's number and arrives here as an abstract integer; the count of confirmed
+; overlapping rentals is an input this repository cannot yet supply, and that is declared below
+; rather than assumed. The predicate is pure and answers whenever both inputs are given.
+
+pub const CAPACITY_SUBJECT : str = "family";
+pub const CAPACITY_IS_A_FAMILY_COUNT : bool = true;
+pub const CAPACITY_IS_A_UNIT_LOCK : bool = false;
+pub const CAPACITY_UNITS_INPUT : str = "units of one family available over the window, supplied by the availability contract";
+
+; One more rental is admissible only while the family still has a unit left over the window.
+; A count that cannot be true is refused rather than read as headroom.
+pub fn commerce_family_capacity_admits(units_available: i32, confirmed_overlapping: i32) bool {
+    if (units_available <= 0) {
+        return false;
+    }
+    if (confirmed_overlapping < 0) {
+        return false;
+    }
+    return (confirmed_overlapping + 1) <= units_available;
+}
+
+pub fn commerce_family_capacity_remaining(units_available: i32, confirmed_overlapping: i32) i32 {
+    if (units_available <= 0) {
+        return 0;
+    }
+    if (confirmed_overlapping < 0) {
+        return 0;
+    }
+    if (confirmed_overlapping >= units_available) {
+        return 0;
+    }
+    return units_available - confirmed_overlapping;
+}
+
+; The two named refusals of obligation (3), each checked in the places a mechanism would have to
+; appear before it was written down.
+pub const OVERLAP_RESERVATION_IS_NOT_SHIPPED : bool = true;
+pub const OVERLAP_RESERVATION_NOTE : str = "Nothing in this repository holds a unit while a window is being confirmed. src/api/orders.rs:757-761 states that the fleet check reserves nothing and that there is no reservation table in the schema; src/api/orders.rs:820-828 logs a shortfall at info level and lets the order through. Migrations 077-086 add bikes, units, rental terms, service records, seeds, images, the sale flag and the dated cart line of 081, and none of them declares a hold row, an expiry column or an exclusion constraint. turbobaby/availability records the same absence from the unit side, in RESERVED_STATUS (declared empty) and RESERVED_STATUS_NOTE: the four wire values of migrations/078_bike_units.sql:32 carry no reserved status. That edge is named by owner and declaration rather than by line number, because a line into a sibling contract goes stale the day that contract is edited and this one already had. What is missing is the mechanism, not the rule: a hold with an owner and an expiry, and a decision on whether an unconfirmed cart line consumes capacity. No lock name and no timeout is invented here in its place.";
+pub const CONFIRMED_OVERLAP_COUNT_IS_NOT_DERIVABLE : bool = true;
+pub const CONFIRMED_OVERLAP_COUNT_NOTE : str = "No shipped code counts the rentals of a family that overlap a window. migrations/081_cart_rental_lines.sql:132-136 adds an index by rental date for the availability check that would need that count, and says so in its own comment, but no query reads it: rental_start and rental_end appear in src/api/cart.rs only inside the partial-index predicate of the undated upsert, and the order path reads units at base today (src/api/orders.rs:820) rather than over a range. The second argument of commerce_family_capacity_admits is therefore an input this repository cannot yet produce. What is missing is the overlap query and a decision on which order statuses count as confirmed.";
+
+; --------------------------------------------------------------------------------------------
+; Executable gates for the three obligations.
+; --------------------------------------------------------------------------------------------
+
+test commerce_an_amount_from_the_browser_is_input_and_the_snapshot_is_authority {
+    assert commerce_amount_is_authoritative(AMOUNT_ORIGIN_BROWSER) == false;
+    assert commerce_amount_is_authoritative(AMOUNT_ORIGIN_QUOTE_SNAPSHOT) == true;
+    assert commerce_amount_is_authoritative(AMOUNT_ORIGIN_UNSET) == false;
+    assert commerce_amount_origin_is_known(AMOUNT_ORIGIN_BROWSER) == true;
+    assert commerce_amount_origin_is_known(AMOUNT_ORIGIN_QUOTE_SNAPSHOT) == true;
+    assert commerce_amount_origin_is_known(AMOUNT_ORIGIN_UNSET) == false;
+    assert AMOUNT_ORIGIN_NAMES[0] == "browser";
+    assert AMOUNT_ORIGIN_NAMES[1] == "quote_snapshot";
+}
+
+test commerce_the_payload_figure_does_not_move_the_authority {
+    assert commerce_authoritative_amount_origin(true, true) == AMOUNT_ORIGIN_QUOTE_SNAPSHOT;
+    assert commerce_authoritative_amount_origin(false, true) == AMOUNT_ORIGIN_QUOTE_SNAPSHOT;
+    assert commerce_authoritative_amount_origin(true, false) == AMOUNT_ORIGIN_UNSET;
+    assert commerce_authoritative_amount_origin(false, false) == AMOUNT_ORIGIN_UNSET;
+    assert commerce_authoritative_amount_origin(true, false) != AMOUNT_ORIGIN_BROWSER;
+}
+
+; The request epic #28 describes: a body claiming a lower total, a lower deposit and a fee the
+; server has no field for. Each arrives from the browser, so each is refused authority; the
+; request's own fate belongs to the checkout gates, which read none of the three.
+test commerce_a_lower_total_a_lower_deposit_and_an_extra_fee_are_each_input_only {
+    const lower_total = AMOUNT_ORIGIN_BROWSER;
+    const lower_deposit = AMOUNT_ORIGIN_BROWSER;
+    const extra_fee = AMOUNT_ORIGIN_BROWSER;
+    assert commerce_amount_is_authoritative(lower_total) == false;
+    assert commerce_amount_is_authoritative(lower_deposit) == false;
+    assert commerce_amount_is_authoritative(extra_fee) == false;
+    assert commerce_client_amount_is_known(CLIENT_AMOUNT_TOTAL) == true;
+    assert commerce_client_amount_is_known(CLIENT_AMOUNT_DEPOSIT) == true;
+    assert commerce_client_amount_is_known(CLIENT_AMOUNT_EXTRA_FEE) == true;
+    assert commerce_client_amount_is_known(CLIENT_AMOUNT_INVALID) == false;
+    assert commerce_client_amount_is_known(4) == false;
+    assert commerce_request_may_proceed_despite_client_amount(CHECKOUT_READY) == true;
+    assert commerce_request_may_proceed_despite_client_amount(CHECKOUT_PRICE_UNAUTHORIZED) == false;
+    assert commerce_authoritative_amount_origin(true, true) == AMOUNT_ORIGIN_QUOTE_SNAPSHOT;
+}
+
+test commerce_each_client_figure_is_disarmed_in_its_own_way {
+    assert commerce_client_amount_disposition(CLIENT_AMOUNT_TOTAL) == DISPOSITION_COMPARED;
+    assert commerce_client_amount_disposition(CLIENT_AMOUNT_DEPOSIT) == DISPOSITION_COMPARED;
+    assert commerce_client_amount_disposition(CLIENT_AMOUNT_EXTRA_FEE) == DISPOSITION_IGNORED;
+    assert commerce_client_amount_disposition(CLIENT_AMOUNT_INVALID) == DISPOSITION_INVALID;
+    assert commerce_client_amount_refuses_request(DISPOSITION_COMPARED, true) == true;
+    assert commerce_client_amount_refuses_request(DISPOSITION_COMPARED, false) == false;
+    assert commerce_client_amount_refuses_request(DISPOSITION_BOUNDED, true) == false;
+    assert commerce_client_amount_refuses_request(DISPOSITION_IGNORED, true) == false;
+    assert DISPOSITION_NAMES[0] == "compared";
+    assert DISPOSITION_NAMES[1] == "bounded";
+    assert DISPOSITION_NAMES[2] == "ignored";
+    assert CLIENT_AMOUNT_NAMES[0] == "total";
+    assert CLIENT_AMOUNT_NAMES[1] == "deposit";
+    assert CLIENT_AMOUNT_NAMES[2] == "extra_fee";
+}
+
+; CORRECTED 2026-09-24 (T27 C3). This test was
+; commerce_the_unreconciled_deposit_is_declared_and_not_claimed_as_enforced, and it asserted the
+; gap: not shipped, BOUNDED, not COMPARED. The gap is closed, so the name would now be false; the
+; three facts it pinned are kept as history under the _BEFORE_THE_DEPOSIT_CHECK names and asserted
+; as such, beside the facts that replaced them.
+test commerce_the_deposit_is_compared_and_the_old_gap_is_kept_as_history {
+    assert CLIENT_DEPOSIT_RECONCILIATION_IS_NOT_SHIPPED == false;
+    assert CLIENT_DEPOSIT_RECONCILIATION_IS_NOT_SHIPPED_BEFORE_THE_DEPOSIT_CHECK == true;
+    assert CLIENT_AMOUNT_DEPOSIT_DISPOSITION_BEFORE_THE_DEPOSIT_CHECK == DISPOSITION_BOUNDED;
+    assert commerce_client_amount_disposition(CLIENT_AMOUNT_DEPOSIT) == DISPOSITION_COMPARED;
+    assert commerce_client_amount_disposition(CLIENT_AMOUNT_DEPOSIT) != CLIENT_AMOUNT_DEPOSIT_DISPOSITION_BEFORE_THE_DEPOSIT_CHECK;
+    assert commerce_amount_is_authoritative(AMOUNT_ORIGIN_BROWSER) == false;
+    // A compared figure refuses the request when it disagrees (Differs); the old bounded one never did.
+    // Disagreement is not the only refusal: NotPublished (money on a family that publishes no
+    // deposit) and NotComparable (a figure in a currency no published rate converts) refuse with
+    // nothing to disagree with, so this pair of asserts covers Differs alone (CLIENT_DEPOSIT_REFUSALS).
+    assert commerce_client_amount_refuses_request(commerce_client_amount_disposition(CLIENT_AMOUNT_DEPOSIT), true) == true;
+    assert commerce_client_amount_refuses_request(commerce_client_amount_disposition(CLIENT_AMOUNT_DEPOSIT), false) == false;
+    assert commerce_client_amount_refuses_request(CLIENT_AMOUNT_DEPOSIT_DISPOSITION_BEFORE_THE_DEPOSIT_CHECK, true) == false;
+}
+
+; The shipped comparison's shape. Three refusals, decided in this order; what stays admitted is
+; the passport, a money form with no figure yet and no form at all; a foreign figure is not.
+test commerce_the_deposit_comparison_refuses_three_ways_and_admits_the_passport {
+    assert CLIENT_DEPOSIT_REFUSALS.len == 3;
+    assert CLIENT_DEPOSIT_REFUSAL_COUNT == 3;
+    assert CLIENT_DEPOSIT_REFUSALS.len == CLIENT_DEPOSIT_REFUSAL_COUNT;
+    assert CLIENT_DEPOSIT_REFUSALS[0] == "NotPublished";
+    assert CLIENT_DEPOSIT_REFUSALS[1] == "NotComparable";
+    assert CLIENT_DEPOSIT_REFUSALS[2] == "Differs";
+    assert CLIENT_DEPOSIT_PASSPORT_IS_ADMITTED == true;
+    assert CLIENT_DEPOSIT_UNAGREED_FIGURE_IS_ADMITTED == true;
+    assert CLIENT_DEPOSIT_FOREIGN_FIGURE_IS_ADMITTED == false;
+    assert CLIENT_DEPOSIT_RECONCILIATION_SITE == "src/api/orders.rs:694-726";
+}
+
+test commerce_a_rental_line_is_identified_by_its_family_and_its_window {
+    assert RENTAL_LINE_IDENTITY.len == 3;
+    assert RENTAL_LINE_IDENTITY[0] == "family_key";
+    assert RENTAL_LINE_IDENTITY[1] == "rental_start";
+    assert RENTAL_LINE_IDENTITY[2] == "rental_end";
+    assert RENTAL_LINE_KEY_IS_A_FAMILY == true;
+    assert RENTAL_LINE_KEY_IS_A_UNIT == false;
+    assert commerce_rental_line_same_identity("nmax-155", 1, 7, "nmax-155", 1, 7) == true;
+    assert commerce_rental_line_same_identity("nmax-155", 1, 7, "nmax-155", 30, 37) == false;
+    assert commerce_rental_line_same_identity("nmax-155", 1, 7, "pcx-150", 1, 7) == false;
+    assert D8_MIGRATION == "migrations/081_cart_rental_lines.sql";
+}
+
+test commerce_two_windows_of_one_family_are_two_lines_and_two_undated_lines_are_one {
+    assert commerce_cart_lines_may_coexist("nmax-155", true, 1, 7, "nmax-155", true, 30, 37) == true;
+    assert commerce_cart_lines_may_coexist("nmax-155", true, 1, 7, "nmax-155", true, 1, 7) == false;
+    assert commerce_cart_lines_may_coexist("nmax-155", false, 0, 0, "nmax-155", false, 0, 0) == false;
+    assert commerce_cart_lines_may_coexist("nmax-155", true, 1, 7, "nmax-155", false, 0, 0) == true;
+    assert commerce_cart_lines_may_coexist("nmax-155", false, 0, 0, "pcx-150", false, 0, 0) == true;
+    assert commerce_rental_window_differs(1, 7, 1, 7) == false;
+    assert commerce_rental_window_differs(1, 7, 1, 8) == true;
+    assert commerce_rental_window_differs(1, 7, 2, 7) == true;
+}
+
+test commerce_a_half_dated_line_is_not_a_line {
+    assert commerce_line_window_shape_valid(false, false, false) == true;
+    assert commerce_line_window_shape_valid(true, true, true) == true;
+    assert commerce_line_window_shape_valid(true, true, false) == false;
+    assert commerce_line_window_shape_valid(true, false, true) == false;
+    assert commerce_line_window_shape_valid(false, true, true) == false;
+    assert commerce_line_is_dated(true, true) == true;
+    assert commerce_line_is_dated(true, false) == false;
+    assert commerce_line_is_dated(false, true) == false;
+    assert commerce_line_is_dated(false, false) == false;
+}
+
+test commerce_bookability_over_a_window_stays_with_the_availability_owner {
+    assert REUSES_AVAILABILITY_ID == "turbobaby/availability";
+    assert commerce_deal_fulfillable(DEAL_RENTAL, true, false) == true;
+    assert commerce_deal_fulfillable(DEAL_RENTAL, false, true) == false;
+}
+
+test commerce_capacity_is_a_family_count_over_an_overlapping_window {
+    assert CAPACITY_IS_A_FAMILY_COUNT == true;
+    assert CAPACITY_IS_A_UNIT_LOCK == false;
+    assert CAPACITY_SUBJECT == "family";
+    assert commerce_family_capacity_admits(3, 0) == true;
+    assert commerce_family_capacity_admits(3, 1) == true;
+    assert commerce_family_capacity_admits(3, 2) == true;
+    assert commerce_family_capacity_admits(3, 3) == false;
+    assert commerce_family_capacity_admits(3, 4) == false;
+    assert commerce_family_capacity_admits(0, 0) == false;
+    assert commerce_family_capacity_admits(3, -1) == false;
+    assert commerce_family_capacity_admits(-1, 0) == false;
+}
+
+test commerce_capacity_headroom_and_admission_agree_at_every_edge {
+    assert commerce_family_capacity_remaining(3, 0) == 3;
+    assert commerce_family_capacity_remaining(3, 2) == 1;
+    assert commerce_family_capacity_remaining(3, 3) == 0;
+    assert commerce_family_capacity_remaining(3, 4) == 0;
+    assert commerce_family_capacity_remaining(0, 0) == 0;
+    assert commerce_family_capacity_remaining(3, -1) == 0;
+    assert commerce_family_capacity_remaining(1, 0) == 1;
+    assert commerce_family_capacity_admits(1, 0) == true;
+    assert commerce_family_capacity_admits(1, 1) == false;
+    assert commerce_family_capacity_remaining(1, 1) == 0;
+}
+
+test commerce_the_repository_ships_no_reservation_and_this_file_invents_none {
+    assert OVERLAP_RESERVATION_IS_NOT_SHIPPED == true;
+    assert CONFIRMED_OVERLAP_COUNT_IS_NOT_DERIVABLE == true;
+    assert CAPACITY_IS_A_UNIT_LOCK == false;
+    assert commerce_family_capacity_admits(3, 2) == true;
+}
+
+invariant commerce_a_browser_figure_is_never_the_authoritative_amount
+    assert commerce_amount_is_authoritative(AMOUNT_ORIGIN_BROWSER) == false and commerce_authoritative_amount_origin(true, true) == AMOUNT_ORIGIN_QUOTE_SNAPSHOT
+
+invariant commerce_the_payload_cannot_change_which_origin_is_authoritative
+    assert commerce_authoritative_amount_origin(true, true) == commerce_authoritative_amount_origin(false, true) and commerce_authoritative_amount_origin(true, false) == commerce_authoritative_amount_origin(false, false)
+
+invariant commerce_an_absent_snapshot_never_promotes_the_browser
+    assert commerce_authoritative_amount_origin(true, false) == AMOUNT_ORIGIN_UNSET
+
+invariant commerce_refusing_a_figure_authority_is_not_refusing_the_request
+    assert commerce_client_amount_refuses_request(DISPOSITION_BOUNDED, true) == false and commerce_client_amount_refuses_request(DISPOSITION_IGNORED, true) == false
+
+invariant commerce_a_rental_line_is_never_identified_by_a_unit
+    assert RENTAL_LINE_KEY_IS_A_UNIT == false and RENTAL_LINE_KEY_IS_A_FAMILY == true
+
+invariant commerce_one_family_with_two_windows_is_two_lines
+    assert commerce_cart_lines_may_coexist("nmax-155", true, 1, 7, "nmax-155", true, 30, 37) == true
+
+invariant commerce_one_family_with_no_window_is_one_line
+    assert commerce_cart_lines_may_coexist("nmax-155", false, 0, 0, "nmax-155", false, 0, 0) == false
+
+invariant commerce_the_window_is_a_pair_or_it_is_absent
+    assert commerce_line_window_shape_valid(true, false, true) == false and commerce_line_window_shape_valid(false, true, true) == false
+
+invariant commerce_availability_owns_bookability
+    assert REUSES_AVAILABILITY_ID == "turbobaby/availability"
+
+invariant commerce_capacity_refuses_the_rental_that_would_exceed_it
+    assert commerce_family_capacity_admits(3, 3) == false and commerce_family_capacity_admits(3, 4) == false
+
+invariant commerce_capacity_admits_while_a_unit_is_left
+    assert commerce_family_capacity_admits(3, 2) == true and commerce_family_capacity_remaining(3, 2) == 1
+
+invariant commerce_an_empty_family_admits_nothing
+    assert commerce_family_capacity_admits(0, 0) == false and commerce_family_capacity_remaining(0, 0) == 0
+
+invariant commerce_capacity_is_counted_on_the_family_and_not_locked_on_a_unit
+    assert CAPACITY_IS_A_FAMILY_COUNT == true and CAPACITY_IS_A_UNIT_LOCK == false
+
+invariant commerce_no_reservation_mechanism_is_invented_here
+    assert OVERLAP_RESERVATION_IS_NOT_SHIPPED == true and CONFIRMED_OVERLAP_COUNT_IS_NOT_DERIVABLE == true
+
+invariant commerce_no_new_sale_line_is_fulfillable_while_sales_are_retired
+    assert commerce_deal_fulfillable(DEAL_SALE, true, SALE_LINE_ADMITTED_AT_CHECKOUT) == false and DEAL_NAMES.len == DEAL_KIND_COUNT and PLACED_SALE_LINES_STILL_READ == true

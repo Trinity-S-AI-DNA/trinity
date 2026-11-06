@@ -1,0 +1,703 @@
+// SPDX-License-Identifier: Apache-2.0
+; purkinje_thermal_gate.t27 — Purkinje Thermal Gate
+; Thermally-gated activation inspired by Purkinje neural dynamics
+; φ² + 1/φ² = 3 | TRINITY
+
+module purkinje-thermal-gate;
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+pub const PTG_OPCODE : u8 = 0xF4;  // Purkinje Thermal Gate opcode
+
+pub const TEMP_MIN_C : i8 = -40;      // -40°C minimum
+pub const TEMP_MAX_C : i8 = 125;      // 125°C maximum
+pub const TEMP_NOMINAL_C : i8 = 25;   // 25°C nominal
+
+pub const TEMP_THRESHOLD_LOW_C : i8 = 0;     // 0°C low threshold
+pub const TEMP_THRESHOLD_HIGH_C : i8 = 85;   // 85°C high threshold
+pub const TEMP_CRITICAL_C : i8 = 100;        // 100°C critical
+
+pub const TEMP_HYSTERESIS_C : i8 = 5;        // 5°C hysteresis
+pub const TEMP_SETTLING_MS : u16 = 100;      // 100ms settling time
+
+pub const GATE_STATE_CLOSED : u8 = 0;
+pub const GATE_STATE_OPEN : u8 = 1;
+pub const GATE_STATE_THROTTLING : u8 = 2;
+pub const GATE_STATE_ERROR : u8 = 3;
+
+pub const THROTTLE_LEVEL_NONE : u8 = 0;
+pub const THROTTLE_LEVEL_LOW : u8 = 1;
+pub const THROTTLE_LEVEL_MED : u8 = 2;
+pub const THROTTLE_LEVEL_HIGH : u8 = 3;
+pub const THROTTLE_LEVEL_MAX : u8 = 4;
+
+// ============================================================================
+// Types
+// ============================================================================
+
+pub const GateState = enum(u8) {
+    closed = GATE_STATE_CLOSED,
+    open = GATE_STATE_OPEN,
+    throttling = GATE_STATE_THROTTLING,
+    error = GATE_STATE_ERROR,
+}
+
+pub const ThrottleLevel = enum(u8) {
+    none = THROTTLE_LEVEL_NONE,
+    low = THROTTLE_LEVEL_LOW,
+    medium = THROTTLE_LEVEL_MED,
+    high = THROTTLE_LEVEL_HIGH,
+}
+
+pub const ThermalState = struct {
+    temp_c : i8,
+    gate_state : GateState,
+    throttle_level : ThrottleLevel,
+    error_code : u8,
+}
+
+pub const GateConfig = struct {
+    low_threshold_c : i8,
+    high_threshold_c : i8,
+    critical_temp_c : i8,
+    hysteresis_c : i8,
+    auto_throttle : bool,
+}
+
+pub const GateStatus = struct {
+    current_state : GateState,
+    temp_measured_c : i8,
+    throttle_level : ThrottleLevel,
+    cycle_count : u32,
+    fault_count : u8,
+}
+
+// ============================================================================
+// Config Functions
+// ============================================================================
+
+// ptg_config_init() -> GateConfig
+// Initialize Purkinje thermal gate config
+pub fn ptg_config_init() -> GateConfig {
+    return GateConfig {
+        .low_threshold_c = TEMP_THRESHOLD_LOW_C,
+        .high_threshold_c = TEMP_THRESHOLD_HIGH_C,
+        .critical_temp_c = TEMP_CRITICAL_C,
+        .hysteresis_c = TEMP_HYSTERESIS_C,
+        .auto_throttle = true,
+    };
+}
+
+// ptg_config_strict() -> GateConfig
+// Create strict thermal gate config (lower thresholds)
+pub fn ptg_config_strict() -> GateConfig {
+    return GateConfig {
+        .low_threshold_c = 0,
+        .high_threshold_c = 70,
+        .critical_temp_c = 90,
+        .hysteresis_c = 3,
+        .auto_throttle = true,
+    };
+}
+
+// ptg_config_permissive() -> GateConfig
+// Create permissive thermal gate config (higher thresholds)
+pub fn ptg_config_permissive() -> GateConfig {
+    return GateConfig {
+        .low_threshold_c = -20,
+        .high_threshold_c = 100,
+        .critical_temp_c = 115,
+        .hysteresis_c = 10,
+        .auto_throttle = true,
+    };
+}
+
+// ptg_config_manual() -> GateConfig
+// Create manual config (no auto throttle)
+pub fn ptg_config_manual() -> GateConfig {
+    return GateConfig {
+        .low_threshold_c = TEMP_THRESHOLD_LOW_C,
+        .high_threshold_c = TEMP_THRESHOLD_HIGH_C,
+        .critical_temp_c = TEMP_CRITICAL_C,
+        .hysteresis_c = TEMP_HYSTERESIS_C,
+        .auto_throttle = false,
+    };
+}
+
+// ============================================================================
+// Temperature Validation
+// ============================================================================
+
+// ptg_temp_valid(temp_c: i8) -> bool
+// Check if temperature is valid
+pub fn ptg_temp_valid(temp_c: i8) -> bool {
+    return temp_c >= TEMP_MIN_C and temp_c <= TEMP_MAX_C;
+}
+
+// ptg_temp_critical(temp_c: i8, config: GateConfig) -> bool
+// Check if temperature is critical
+pub fn ptg_temp_critical(temp_c: i8, config: GateConfig) -> bool {
+    return temp_c >= config.critical_temp_c;
+}
+
+// ptg_temp_high(temp_c: i8, config: GateConfig) -> bool
+// Check if temperature is high (above high threshold)
+pub fn ptg_temp_high(temp_c: i8, config: GateConfig) -> bool {
+    return temp_c >= config.high_threshold_c;
+}
+
+// ptg_temp_low(temp_c: i8, config: GateConfig) -> bool
+// Check if temperature is low (below low threshold)
+pub fn ptg_temp_low(temp_c: i8, config: GateConfig) -> bool {
+    return temp_c < config.low_threshold_c;
+}
+
+// ptg_temp_in_hysteresis(temp_c: i8, threshold: i8, hysteresis: i8) -> bool
+// Check if temperature is within hysteresis band
+pub fn ptg_temp_in_hysteresis(temp_c: i8, threshold: i8, hysteresis: i8) -> bool {
+    if (temp_c >= threshold) {
+        return (temp_c - threshold) <= hysteresis;
+    } else {
+        return (threshold - temp_c) <= hysteresis;
+    }
+}
+
+// ============================================================================
+// Gate State Functions
+// ============================================================================
+
+// ptg_thermal_state_init() -> ThermalState
+// Initialize thermal state
+pub fn ptg_thermal_state_init() -> ThermalState {
+    return ThermalState {
+        .temp_c = TEMP_NOMINAL_C,
+        .gate_state = GateState.open,
+        .throttle_level = ThrottleLevel.none,
+        .error_code = 0,
+    };
+}
+
+// ptg_gate_state_from_temp(temp_c: i8, config: GateConfig) -> GateState
+// Determine gate state from temperature
+pub fn ptg_gate_state_from_temp(temp_c: i8, config: GateConfig) -> GateState {
+    if (!ptg_temp_valid(temp_c)) {
+        return GateState.error;
+    } else if (ptg_temp_critical(temp_c, config)) {
+        return GateState.error;
+    } else if (ptg_temp_high(temp_c, config)) {
+        return GateState.throttling;
+    } else if (ptg_temp_low(temp_c, config)) {
+        return GateState.closed;
+    } else {
+        return GateState.open;
+    }
+}
+
+// ptg_throttle_from_temp(temp_c: i8, config: GateConfig) -> ThrottleLevel
+// Determine throttle level from temperature
+pub fn ptg_throttle_from_temp(temp_c: i8, config: GateConfig) -> ThrottleLevel {
+    if (ptg_temp_critical(temp_c, config)) {
+        return ThrottleLevel.high;
+    } else if (temp_c >= config.high_threshold_c + 20) {
+        return ThrottleLevel.high;
+    } else if (temp_c >= config.high_threshold_c + 10) {
+        return ThrottleLevel.medium;
+    } else if (temp_c >= config.high_threshold_c) {
+        return ThrottleLevel.low;
+    } else {
+        return ThrottleLevel.none;
+    }
+}
+
+// ptg_thermal_state_update(thermal: ThermalState, temp_c: i8, config: GateConfig) -> ThermalState
+// Update thermal state with new temperature
+pub fn ptg_thermal_state_update(thermal: ThermalState, temp_c: i8, config: GateConfig) -> ThermalState {
+    var new_state = thermal;
+    new_state.temp_c = temp_c;
+    new_state.gate_state = ptg_gate_state_from_temp(temp_c, config);
+
+    if (config.auto_throttle) {
+        new_state.throttle_level = ptg_throttle_from_temp(temp_c, config);
+    }
+
+    if (new_state.gate_state == GateState.error) {
+        new_state.error_code = 1;  // Thermal error
+    } else if (new_state.gate_state != GateState.error) {
+        new_state.error_code = 0;
+    }
+
+    return new_state;
+}
+
+// ============================================================================
+// Gate Status Functions
+// ============================================================================
+
+// ptg_gate_status_init() -> GateStatus
+// Initialize gate status
+pub fn ptg_gate_status_init() -> GateStatus {
+    return GateStatus {
+        .current_state = GateState.open,
+        .temp_measured_c = TEMP_NOMINAL_C,
+        .throttle_level = ThrottleLevel.none,
+        .cycle_count = 0,
+        .fault_count = 0,
+    };
+}
+
+// ptg_gate_status_open(status: GateStatus) -> GateStatus
+// Open the gate
+pub fn ptg_gate_status_open(status: GateStatus) -> GateStatus {
+    return GateStatus {
+        .current_state = GateState.open,
+        .temp_measured_c = status.temp_measured_c,
+        .throttle_level = ThrottleLevel.none,
+        .cycle_count = status.cycle_count,
+        .fault_count = status.fault_count,
+    };
+}
+
+// ptg_gate_status_close(status: GateStatus) -> GateStatus
+// Close the gate
+pub fn ptg_gate_status_close(status: GateStatus) -> GateStatus {
+    return GateStatus {
+        .current_state = GateState.closed,
+        .temp_measured_c = status.temp_measured_c,
+        .throttle_level = ThrottleLevel.high,
+        .cycle_count = status.cycle_count,
+        .fault_count = status.fault_count,
+    };
+}
+
+// ptg_gate_status_throttle(status: GateStatus, level: ThrottleLevel) -> GateStatus
+// Set gate to throttling state
+pub fn ptg_gate_status_throttle(status: GateStatus, level: ThrottleLevel) -> GateStatus {
+    return GateStatus {
+        .current_state = GateState.throttling,
+        .temp_measured_c = status.temp_measured_c,
+        .throttle_level = level,
+        .cycle_count = status.cycle_count,
+        .fault_count = status.fault_count,
+    };
+}
+
+// ptg_gate_status_error(status: GateStatus) -> GateStatus
+// Set gate to error state
+pub fn ptg_gate_status_error(status: GateStatus) -> GateStatus {
+    return GateStatus {
+        .current_state = GateState.error,
+        .temp_measured_c = status.temp_measured_c,
+        .throttle_level = ThrottleLevel.high,
+        .cycle_count = status.cycle_count,
+        .fault_count = status.fault_count + 1,
+    };
+}
+
+// ptg_gate_status_update_temp(status: GateStatus, temp_c: i8) -> GateStatus
+// Update measured temperature
+pub fn ptg_gate_status_update_temp(status: GateStatus, temp_c: i8) -> GateStatus {
+    return GateStatus {
+        .current_state = status.current_state,
+        .temp_measured_c = temp_c,
+        .throttle_level = status.throttle_level,
+        .cycle_count = status.cycle_count,
+        .fault_count = status.fault_count,
+    };
+}
+
+// ptg_gate_status_increment_cycle(status: GateStatus) -> GateStatus
+// Increment cycle counter
+pub fn ptg_gate_status_increment_cycle(status: GateStatus) -> GateStatus {
+    return GateStatus {
+        .current_state = status.current_state,
+        .temp_measured_c = status.temp_measured_c,
+        .throttle_level = status.throttle_level,
+        .cycle_count = status.cycle_count + 1,
+        .fault_count = status.fault_count,
+    };
+}
+
+// ============================================================================
+// Opcode Encoding/Decoding
+// ============================================================================
+
+// encode_ptg_cmd(opcode: u8, temp_c: i8, threshold: u8) -> u16
+// Encode Purkinje thermal gate command
+pub fn encode_ptg_cmd(opcode: u8, temp_c: i8, threshold: u8) u16 {
+    // Format: [OP:8][TEMP_SIGNED:7][THRESHOLD:1]
+    const op_field : u16 = @as(u16, opcode) << 8;
+    const temp_field : u16 = @as(u16, @as(u8, @bitCast(temp_c))) << 1;
+    const thresh_field : u16 = @as(u16, threshold & 0x01);
+    return op_field | temp_field | thresh_field;
+}
+
+// decode_ptg_cmd(encoded: u16) -> struct { opcode: u8, temp_c: i8, threshold: u8 }
+// Decode Purkinje thermal gate command
+pub fn decode_ptg_cmd(encoded: u16) -> struct { opcode: u8, temp_c: i8, threshold: u8 } {
+    const opcode : u8 = @as(u8, @truncate((encoded >> 8) & 0xFF));
+    const temp_u8 : u8 = @as(u8, @truncate((encoded >> 1) & 0x7F));
+    const temp_c : i8 = @bitCast(temp_u8);
+    const threshold : u8 = @as(u8, @truncate(encoded & 0x01));
+    return .{ .opcode = opcode, .temp_c = temp_c, .threshold = threshold };
+}
+
+// ============================================================================
+// TDD Tests
+// ============================================================================
+
+test "ptg_opcode_constant" {
+    assert(PTG_OPCODE == 0xF4);
+}
+
+test "temp_constants" {
+    assert(TEMP_MIN_C == -40);
+    assert(TEMP_MAX_C == 125);
+    assert(TEMP_NOMINAL_C == 25);
+}
+
+test "temp_threshold_constants" {
+    assert(TEMP_THRESHOLD_LOW_C == 0);
+    assert(TEMP_THRESHOLD_HIGH_C == 85);
+    assert(TEMP_CRITICAL_C == 100);
+}
+
+test "temp_hysteresis_constant" {
+    assert(TEMP_HYSTERESIS_C == 5);
+}
+
+test "gate_state_constants" {
+    assert(GATE_STATE_CLOSED == 0);
+    assert(GATE_STATE_OPEN == 1);
+    assert(GATE_STATE_THROTTLING == 2);
+    assert(GATE_STATE_ERROR == 3);
+}
+
+test "throttle_level_constants" {
+    assert(THROTTLE_LEVEL_NONE == 0);
+    assert(THROTTLE_LEVEL_LOW == 1);
+    assert(THROTTLE_LEVEL_MED == 2);
+    assert(THROTTLE_LEVEL_HIGH == 3);
+}
+
+test "ptg_config_init_structure" {
+    const config = ptg_config_init();
+    assert(config.low_threshold_c == TEMP_THRESHOLD_LOW_C);
+    assert(config.high_threshold_c == TEMP_THRESHOLD_HIGH_C);
+    assert(config.auto_throttle == true);
+}
+
+test "ptg_config_strict_structure" {
+    const config = ptg_config_strict();
+    assert(config.high_threshold_c == 70);
+    assert(config.critical_temp_c == 90);
+}
+
+test "ptg_config_permissive_structure" {
+    const config = ptg_config_permissive();
+    assert(config.high_threshold_c == 100);
+    assert(config.critical_temp_c == 115);
+}
+
+test "ptg_config_manual_structure" {
+    const config = ptg_config_manual();
+    assert(config.auto_throttle == false);
+}
+
+test "ptg_temp_valid_true" {
+    assert(ptg_temp_valid(0) == true);
+    assert(ptg_temp_valid(25) == true);
+    assert(ptg_temp_valid(100) == true);
+}
+
+test "ptg_temp_valid_false" {
+    assert(ptg_temp_valid(-50) == false);
+    assert(ptg_temp_valid(150) == false);
+}
+
+test "ptg_temp_critical_true" {
+    const config = ptg_config_init();
+    assert(ptg_temp_critical(105, config) == true);
+    assert(ptg_temp_critical(100, config) == true);
+}
+
+test "ptg_temp_critical_false" {
+    const config = ptg_config_init();
+    assert(ptg_temp_critical(90, config) == false);
+}
+
+test "ptg_temp_high_true" {
+    const config = ptg_config_init();
+    assert(ptg_temp_high(90, config) == true);
+    assert(ptg_temp_high(85, config) == true);
+}
+
+test "ptg_temp_high_false" {
+    const config = ptg_config_init();
+    assert(ptg_temp_high(80, config) == false);
+}
+
+test "ptg_temp_low_true" {
+    const config = ptg_config_init();
+    assert(ptg_temp_low(-10, config) == true);
+    assert(ptg_temp_low(-1, config) == true);
+}
+
+test "ptg_temp_low_false" {
+    const config = ptg_config_init();
+    assert(ptg_temp_low(0, config) == false);
+    assert(ptg_temp_low(10, config) == false);
+}
+
+test "ptg_temp_in_hysteresis_true" {
+    assert(ptg_temp_in_hysteresis(85, 85, 5) == true);
+    assert(ptg_temp_in_hysteresis(87, 85, 5) == true);
+    assert(ptg_temp_in_hysteresis(83, 85, 5) == true);
+}
+
+test "ptg_temp_in_hysteresis_false" {
+    assert(ptg_temp_in_hysteresis(95, 85, 5) == false);
+    assert(ptg_temp_in_hysteresis(75, 85, 5) == false);
+}
+
+test "ptg_thermal_state_init_structure" {
+    const thermal = ptg_thermal_state_init();
+    assert(thermal.temp_c == TEMP_NOMINAL_C);
+    assert(thermal.gate_state == GateState.open);
+}
+
+test "ptg_gate_state_from_temp_open" {
+    const config = ptg_config_init();
+    assert(ptg_gate_state_from_temp(50, config) == GateState.open);
+}
+
+test "ptg_gate_state_from_temp_throttling" {
+    const config = ptg_config_init();
+    assert(ptg_gate_state_from_temp(90, config) == GateState.throttling);
+}
+
+test "ptg_gate_state_from_temp_closed" {
+    const config = ptg_config_init();
+    assert(ptg_gate_state_from_temp(-10, config) == GateState.closed);
+}
+
+test "ptg_gate_state_from_temp_error" {
+    const config = ptg_config_init();
+    assert(ptg_gate_state_from_temp(105, config) == GateState.error);
+}
+
+test "ptg_throttle_from_temp_none" {
+    const config = ptg_config_init();
+    assert(ptg_throttle_from_temp(50, config) == ThrottleLevel.none);
+}
+
+test "ptg_throttle_from_temp_low" {
+    const config = ptg_config_init();
+    assert(ptg_throttle_from_temp(90, config) == ThrottleLevel.low);
+}
+
+test "ptg_throttle_from_temp_medium" {
+    const config = ptg_config_init();
+    assert(ptg_throttle_from_temp(100, config) == ThrottleLevel.medium);
+}
+
+test "ptg_throttle_from_temp_high" {
+    const config = ptg_config_init();
+    assert(ptg_throttle_from_temp(110, config) == ThrottleLevel.high);
+}
+
+test "ptg_thermal_state_update" {
+    const thermal = ptg_thermal_state_init();
+    const config = ptg_config_init();
+    const result = ptg_thermal_state_update(thermal, 90, config);
+    assert(result.temp_c == 90);
+    assert(result.gate_state == GateState.throttling);
+}
+
+test "ptg_gate_status_init_structure" {
+    const status = ptg_gate_status_init();
+    assert(status.current_state == GateState.open);
+    assert(status.fault_count == 0);
+}
+
+test "ptg_gate_status_open" {
+    const status = ptg_gate_status_init();
+    const result = ptg_gate_status_open(status);
+    assert(result.current_state == GateState.open);
+    assert(result.throttle_level == ThrottleLevel.none);
+}
+
+test "ptg_gate_status_close" {
+    const status = ptg_gate_status_init();
+    const result = ptg_gate_status_close(status);
+    assert(result.current_state == GateState.closed);
+    assert(result.throttle_level == ThrottleLevel.high);
+}
+
+test "ptg_gate_status_throttle" {
+    const status = ptg_gate_status_init();
+    const result = ptg_gate_status_throttle(status, ThrottleLevel.medium);
+    assert(result.current_state == GateState.throttling);
+    assert(result.throttle_level == ThrottleLevel.medium);
+}
+
+test "ptg_gate_status_error" {
+    const status = ptg_gate_status_init();
+    const result = ptg_gate_status_error(status);
+    assert(result.current_state == GateState.error);
+    assert(result.fault_count == 1);
+}
+
+test "ptg_gate_status_update_temp" {
+    const status = ptg_gate_status_init();
+    const result = ptg_gate_status_update_temp(status, 75);
+    assert(result.temp_measured_c == 75);
+}
+
+test "ptg_gate_status_increment_cycle" {
+    const status = ptg_gate_status_init();
+    const result = ptg_gate_status_increment_cycle(status);
+    assert(result.cycle_count == 1);
+}
+
+test "encode_ptg_cmd" {
+    const encoded = encode_ptg_cmd(0x10, 25, 1);
+    assert((encoded >> 8) == 0x10);
+}
+
+test "decode_ptg_cmd" {
+    const decoded = decode_ptg_cmd(0x1033);
+    assert(decoded.opcode == 0x10);
+    assert(decoded.temp_c == 25);
+}
+
+// ============================================================================
+// Invariants
+// ============================================================================
+
+invariant temp_range_valid
+    assert TEMP_MIN_C < TEMP_MAX_C
+    assert TEMP_NOMINAL_C > TEMP_MIN_C
+    assert TEMP_NOMINAL_C < TEMP_MAX_C
+
+invariant temp_thresholds_ordered
+    assert TEMP_THRESHOLD_LOW_C < TEMP_THRESHOLD_HIGH_C
+    assert TEMP_THRESHOLD_HIGH_C < TEMP_CRITICAL_C
+
+invariant temp_hysteresis_positive
+    assert TEMP_HYSTERESIS_C > 0
+
+invariant ptg_config_init_valid
+    given config = ptg_config_init()
+    assert config.low_threshold_c < config.high_threshold_c
+    assert config.high_threshold_c < config.critical_temp_c
+
+invariant ptg_config_strict_lower_thresholds
+    given strict = ptg_config_strict()
+    and normal = ptg_config_init()
+    assert strict.high_threshold_c < normal.high_threshold_c
+    assert strict.critical_temp_c < normal.critical_temp_c
+
+invariant ptg_config_permissive_higher_thresholds
+    given perm = ptg_config_permissive()
+    and normal = ptg_config_init()
+    assert perm.high_threshold_c > normal.high_threshold_c
+    assert perm.critical_temp_c > normal.critical_temp_c
+
+invariant ptg_config_manual_no_auto_throttle
+    given config = ptg_config_manual()
+    assert config.auto_throttle == false
+
+invariant ptg_thermal_state_init_open
+    given thermal = ptg_thermal_state_init()
+    assert thermal.gate_state == GateState.open
+
+invariant ptg_gate_state_from_temp_nominal_open
+    given config = ptg_config_init()
+    and state = ptg_gate_state_from_temp(TEMP_NOMINAL_C, config)
+    assert state == GateState.open
+
+invariant ptg_throttle_from_temp_nominal_none
+    given config = ptg_config_init()
+    and level = ptg_throttle_from_temp(TEMP_NOMINAL_C, config)
+    assert level == ThrottleLevel.none
+
+invariant ptg_gate_status_init_open
+    given status = ptg_gate_status_init()
+    assert status.current_state == GateState.open
+
+invariant ptg_gate_status_error_increments_fault
+    given status = ptg_gate_status_init()
+    and result = ptg_gate_status_error(status)
+    assert result.fault_count == 1
+
+invariant ptg_gate_status_increment_cycle_increments
+    given status = ptg_gate_status_init()
+    and result = ptg_gate_status_increment_cycle(status)
+    assert result.cycle_count == 1
+
+invariant ptg_gate_status_close_high_throttle
+    given status = ptg_gate_status_init()
+    and result = ptg_gate_status_close(status)
+    assert result.throttle_level == ThrottleLevel.high
+
+// ============================================================================
+// Benchmarks
+// ============================================================================
+
+bench ptg_config_init_latency
+    measure: nanoseconds to ptg_config_init()
+    target: < 20ns
+
+bench ptg_temp_valid_latency
+    measure: nanoseconds to ptg_temp_valid(25)
+    target: < 10ns
+
+bench ptg_temp_critical_latency
+    measure: nanoseconds to ptg_temp_critical(100, ptg_config_init())
+    target: < 15ns
+
+bench ptg_temp_high_latency
+    measure: nanoseconds to ptg_temp_high(90, ptg_config_init())
+    target: < 15ns
+
+bench ptg_temp_low_latency
+    measure: nanoseconds to ptg_temp_low(-10, ptg_config_init())
+    target: < 15ns
+
+bench ptg_temp_in_hysteresis_latency
+    measure: nanoseconds to ptg_temp_in_hysteresis(87, 85, 5)
+    target: < 15ns
+
+bench ptg_thermal_state_init_latency
+    measure: nanoseconds to ptg_thermal_state_init()
+    target: < 20ns
+
+bench ptg_gate_state_from_temp_latency
+    measure: nanoseconds to ptg_gate_state_from_temp(50, ptg_config_init())
+    target: < 20ns
+
+bench ptg_throttle_from_temp_latency
+    measure: nanoseconds to ptg_throttle_from_temp(90, ptg_config_init())
+    target: < 20ns
+
+bench ptg_thermal_state_update_latency
+    measure: nanoseconds to ptg_thermal_state_update(ptg_thermal_state_init(), 90, ptg_config_init())
+    target: < 30ns
+
+bench ptg_gate_status_init_latency
+    measure: nanoseconds to ptg_gate_status_init()
+    target: < 20ns
+
+bench ptg_gate_status_open_latency
+    measure: nanoseconds to ptg_gate_status_open(ptg_gate_status_init())
+    target: < 15ns
+
+bench encode_ptg_cmd_latency
+    measure: nanoseconds to encode_ptg_cmd(0x10, 25, 1)
+    target: < 20ns
+
+bench decode_ptg_cmd_latency
+    measure: nanoseconds to decode_ptg_cmd(0x1033)
+    target: < 20ns

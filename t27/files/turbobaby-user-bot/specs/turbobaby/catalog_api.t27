@@ -1,0 +1,851 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/turbobaby/catalog_api.t27 -- public HTTP behavior for the bike catalog
+; This contract owns only the transport boundary requested by issue #8: filter composition,
+; page-limit normalization, opaque cursor validation, DTO release gates, and HTTP outcomes.
+; Catalog taxonomy belongs to bike_catalog.t27, current inventory and offerability belong to
+; availability.t27, and price provenance belongs to pricing_honesty.t27. This file deliberately
+; imports none of them. Instead, the transport receives their decisions as booleans such as
+; upstream_bookable, class_matches, and source_values_valid. That keeps an API contract from
+; becoming a second implementation of any domain rule.
+; --
+; WHY (measured 2026-09-13): GET /api/bikes currently accepts available_only and returns one
+; unpaged JSON document. Issue #8 also names class, cc_min, cc_max, and for_sale filters. A
+; future pagination patch without a contract can change the meaning of a filter between page
+; one and page two, accept a cursor made for a different query, or serialize a public DTO before
+; the redaction proof has passed. Those are wire failures, not catalog failures, so they need a
+; transport owner separate from the six existing domain specs.
+; --
+; The page values below are CHOSEN protocol budgets, not fleet measurements: 20 is the default,
+; 100 is the maximum, and 256 bytes is the maximum encoded cursor. They intentionally do not
+; depend on today's catalog size. A requested numeric limit is clamped into the closed 1..100
+; interval after parsing; an unparseable limit is a bad request and never reaches the clamp.
+; A cursor is opaque. The transport validates its size, decoder result, version, and filter-scope
+; binding, but this file gives the cursor no offset, row key, timestamp, or business meaning.
+; --
+; WHERE THE CONTRACT WAS WRONG, AND WHY THE CODE WON (measured 2026-09-21). A survey compared
+; this file against the shipped endpoint and found three divergences. Two are this file's fault
+; and are corrected below; the third is a gap in the code, pinned here rather than written up as
+; though it were closed.
+; (1) THE FILTER WORDS. This file declared cc_min and cc_max. src/api/bikes.rs:324-325 parses
+;     min_cc and max_cc, src/api/bikes.rs:285-286 spells the struct fields the same way, and the
+;     module table at src/api/bikes.rs:6 publishes the same two to readers. Three shipped sites
+;     against one unshipped contract, so the code wins and FILTER_NAMES is corrected. The two
+;     dead words are kept as NEVER_SHIPPED_FILTER_NAMES, because a correction that erases the
+;     wrong name leaves the next reader no way to recognise it in an old client.
+; (2) THE BRIEF SAID THE UNKNOWN KEYS ARE REJECTED. They are not, and the truth is worse.
+;     src/api/bikes.rs:265-271 states the asymmetry as a decision: an unknown VALUE is a 400, an
+;     unknown KEY is ignored as ordinary HTTP manners. CatalogFilter::parse at
+;     src/api/bikes.rs:295 reads class, min_cc and max_cc and nothing else, and available_only is
+;     read apart from it at src/api/bikes.rs:417 -- the test at src/api/bikes.rs:2620-2627 exists
+;     to keep those two separate. So a request carrying this contract's old word answers 200 with
+;     the WHOLE catalog. That is the same silent lie src/api/bikes.rs:259-263 records as the
+;     reason the class filter was written at all, measured there against production, and it is
+;     why the name drift was a live defect and not a spelling matter: a wrong word here does not
+;     produce a 400 a client can see, it produces a wider catalog a client cannot.
+; (3) for_sale IS NOT A FILTER. No query parse mentions it; it is a column that leaves in the
+;     body, pinned there by the test at src/api/bikes.rs:2205-2220. It moves out of the filter
+;     vocabulary into RESPONSE_ONLY_FIELDS. The transport combinator keeps its for_sale arm,
+;     which is an abstract upstream decision and never a claim that the query word exists.
+; (4) ADDED BY THE REVIEW OF 2026-09-21. The paging census below said this repository ships THREE
+;     page ladders and that all three carry an offset, and it used "none of the three agrees with
+;     20" as the proof that the chosen page budget was not derived. Three wrong things: the count
+;     is SIX, only two of the six carry an offset, and one of the six -- the leaderboard limit at
+;     src/api/game.rs:33-35 and src/api/game.rs:50 -- agrees with this file's default, floor and
+;     ceiling all at once. The census is corrected, the offset claim is withdrawn, and the "no
+;     agreement" argument is replaced by the count plus a flag saying precedent is not derivation.
+;     The one claim the wrong count did not damage is the one that mattered: zero cursors.
+; --
+; WHAT THE PAGE AND CURSOR BUDGETS CONSTRAIN TODAY: NOTHING (measured 2026-09-21). list_bikes at
+; src/api/bikes.rs:412-525 reads no limit, no page and no offset, and serves one document at
+; src/api/bikes.rs:478; admin_list_bikes serves the same unpaged shape at src/api/bikes.rs:1100.
+; A grep for cursor over src/api/ returns zero, and the 184 lines that carry the word over src/
+; are the CSS property with TWO exceptions (re-measured 2026-09-21). 182 of the 184 hold the
+; literal property (src/main.rs:1910 is one). (Re-measured 2026-09-22: 185 lines, 183 of them the
+; property; the same two exceptions, and still zero under src/api/. CURSOR_WORD_LINES_IN_SRC says
+; which line was added.) The other two are Rust identifiers that PRODUCE a
+; value for that property and never a pagination token: cursor_style at
+; src/ui/game/shop_game.rs:1710 returns "pointer" or "default", and btn_cursor at
+; src/ui/screens/checkout_screen.rs:1664 picks "pointer" or "not-allowed". The exceptions are
+; named rather than folded in because "all" is a word a reader checks by finding one
+; counterexample; they do not touch the conclusion, which is about pagination and not about CSS.
+; Where this repository does page, it pages by a clamped limit and
+; sometimes an offset: SIX such ladders, measured 2026-09-21 and listed with their numbers beside
+; SHIPPED_PAGE_LADDERS below. Not one of the six is cursor-shaped and not one of them is this
+; endpoint. (This paragraph said THREE until the review of 2026-09-21; the corrected census and
+; the argument the wrong count was propping up are both below.)
+; The bounds below are NOT deleted: a transport contract written before its transport is
+; legitimate, and deleting it would throw away the decision along with the error. They are marked
+; instead, so no reader takes PAGE_LIMIT_MAX or CURSOR_BYTES_MAX for a rule that refuses anything.
+; --
+; THE DEPOSIT THIS TRANSPORT SERVES MEETS NO AUDIT (measured 2026-09-21). deposit_thb leaves
+; through here: family_json serializes the listing whole at src/api/bikes.rs:599, and the wire
+; rule that keeps it there is a test constant, MONEY_FIELDS at src/api/bikes.rs:1857-1863 (inside
+; the test module that opens at src/api/bikes.rs:1843), requiring the field on every family and
+; null when unpublished. Named precisely because a reader looking for a production guard on the
+; wire shape will not find one: the guard is a test, and a test is what would break, not a request.
+; turbobaby/deposit-tiers owns the closed ladder and owns the two predicates that judge an amount
+; against it, is_published_tier and deposit_needs_tier_log. Neither runs anywhere: a grep for
+; deposit_tier over src/ and migrations/ returns zero, the only shipped constraint on the number
+; is migrations/077_bikes.sql:62 asking that it be positive, and the column is DOUBLE PRECISION at
+; migrations/077_bikes.sql:44, so a served deposit need not be a whole baht at all. This file
+; adopts no rung and copies no amount; it records that the owner's audit never runs on the value
+; this transport publishes, and that the gap is a MISSING LOG, never a licence to withhold a
+; published number.
+; --
+; WHAT THIS FILE NEVER DOES: it never decides that a family is offered, bookable, or for sale;
+; never re-declares a class, body, status, unit count, price, or deposit; never lists forbidden
+; repository fields; and never carries a person or a unit record in a fixture. The DTO gate takes
+; redaction_proof_passed as an input from the schema/privacy owner. A false proof fails closed as
+; an internal error, so a serialization defect is never converted into a partial public response.
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module catalog-api;
+
+pub const KIND : str = "transport";
+pub const ID : str = "turbobaby/catalog-api";
+pub const NAME : str = "TurboBaby catalog HTTP contract";
+pub const ISSUE : str = "#8";
+pub const LIST_ENDPOINT : str = "GET /api/bikes";
+pub const DETAIL_ENDPOINT : str = "GET /api/bikes/:key";
+
+; CORRECTED 2026-09-21 to the words the endpoint actually reads. class, min_cc and max_cc are
+; parsed by CatalogFilter::parse at src/api/bikes.rs:324-325 into the fields declared at
+; src/api/bikes.rs:285-286; available_only is read separately at src/api/bikes.rs:417 and the test
+; at src/api/bikes.rs:2620-2627 keeps it out of the filter struct on purpose. Their values are
+; parsed elsewhere; catalog_api_filter_matches consumes only match decisions and upstream domain
+; booleans. POSITION 3 IS LOAD-BEARING OUTSIDE THIS FILE: turbobaby/ride-game composes its
+; RIDEABLE_SOURCE from LIST_ENDPOINT and from this array's position 3, and names that position in
+; its RIDEABLE_SOURCE_NOTE, so the correction keeps available_only exactly where it was.
+pub const FILTER_NAMES : [4]str = ["class", "min_cc", "max_cc", "available_only"];
+pub const FILTER_COUNT : u8 = 4;
+
+; The two words this contract carried until 2026-09-21 and the endpoint never read. Kept rather
+; than erased: a client written against the old contract still sends them today, and a reader who
+; meets one in a log needs to recognise it as this file's error and not as a shipped parameter.
+pub const NEVER_SHIPPED_FILTER_NAMES : [2]str = ["cc_min", "cc_max"];
+pub const NEVER_SHIPPED_FILTER_COUNT : u8 = 2;
+
+; Served in the body, never accepted in the query. for_sale is a column on the family row that
+; family_json emits with the rest of the listing at src/api/bikes.rs:599; the test at
+; src/api/bikes.rs:2205-2220 pins it as always present on the wire, and no parse reads it.
+pub const RESPONSE_ONLY_FIELDS : [1]str = ["for_sale"];
+pub const RESPONSE_ONLY_FIELD_COUNT : u8 = 1;
+
+; The asymmetry the endpoint declares at src/api/bikes.rs:265-271, and the outcome it produces for
+; a word this file used to publish. UNKNOWN_QUERY_KEY_STATUS is the status such a request gets
+; today, not the status it ought to get.
+pub const UNKNOWN_FILTER_VALUE_IS_REJECTED : bool = true;
+pub const UNKNOWN_QUERY_KEY_IS_REJECTED : bool = false;
+pub const UNKNOWN_QUERY_KEY_STATUS : u16 = 200;
+pub const FILTER_NAME_DRIFT_IS_SILENT : bool = true;
+pub const FILTER_NAME_DRIFT_NOTE : str = "A query word this endpoint does not know is dropped, not refused. src/api/bikes.rs:265-271 records that as a decision and CatalogFilter::parse at src/api/bikes.rs:295 reads only class, min_cc and max_cc, so GET /api/bikes?cc_min=400 answers 200 with every offered family and no status, header or body field tells the caller its filter was ignored. src/api/bikes.rs:259-263 measured the same shape against production for class before issue #8. Closing this needs either a known-key allowlist at the parse site or a body field naming the filters actually applied; until one ships, a wrong filter word is a wider catalog under a success.";
+
+; CHOSEN transport budgets. Zero is never a returned page limit.
+pub const PAGE_LIMIT_MIN : u16 = 1;
+pub const PAGE_LIMIT_DEFAULT : u16 = 20;
+pub const PAGE_LIMIT_MAX : u16 = 100;
+pub const CURSOR_BYTES_MAX : u16 = 256;
+
+; HTTP outcomes owned by this read-only API.
+pub const HTTP_OK : u16 = 200;
+pub const HTTP_NOT_MODIFIED : u16 = 304;
+pub const HTTP_BAD_REQUEST : u16 = 400;
+pub const HTTP_NOT_FOUND : u16 = 404;
+pub const HTTP_INTERNAL_ERROR : u16 = 500;
+
+; Stable error-envelope discriminants. A 304 is the only outcome with no body.
+pub const ERROR_NONE : u8 = 0;
+pub const ERROR_BAD_QUERY : u8 = 1;
+pub const ERROR_MISSING_FAMILY : u8 = 2;
+pub const ERROR_INTERNAL : u8 = 3;
+
+; Normalize only after syntax parsing has succeeded. Absence selects the default; an explicit
+; zero is clamped to one; oversized requests are bounded independently of fleet size.
+pub fn catalog_api_normalize_limit(requested: u16, limit_supplied: bool) u16 {
+    if (!limit_supplied) {
+        return PAGE_LIMIT_DEFAULT;
+    }
+    if (requested < PAGE_LIMIT_MIN) {
+        return PAGE_LIMIT_MIN;
+    }
+    if (requested > PAGE_LIMIT_MAX) {
+        return PAGE_LIMIT_MAX;
+    }
+    return requested;
+}
+
+; Combine filter results. The match booleans are computed by their upstream owners. When a
+; filter is absent, its accompanying match bit is ignored rather than treated as a default.
+pub fn catalog_api_filter_matches(class_requested: bool, class_matches: bool, cc_requested: bool, cc_matches: bool, available_only_requested: bool, upstream_bookable: bool, for_sale_requested: bool, upstream_for_sale: bool) bool {
+    if (class_requested and !class_matches) {
+        return false;
+    }
+    if (cc_requested and !cc_matches) {
+        return false;
+    }
+    if (available_only_requested and !upstream_bookable) {
+        return false;
+    }
+    if (for_sale_requested and !upstream_for_sale) {
+        return false;
+    }
+    return true;
+}
+
+; Bounds ordering is transport validation, not a displacement taxonomy. A single-sided range is
+; legal; only a supplied lower bound greater than a supplied upper bound is malformed.
+pub fn catalog_api_cc_bounds_valid(min_supplied: bool, cc_min: u16, max_supplied: bool, cc_max: u16) bool {
+    if (min_supplied and max_supplied and cc_min > cc_max) {
+        return false;
+    }
+    return true;
+}
+
+; Parsing failures are never normalized into defaults. Each boolean is produced by the parser
+; for one part of the public query; `cc_bounds_ordered` is the result above when both exist.
+pub fn catalog_api_query_valid(limit_parse_ok: bool, class_parse_ok: bool, cc_min_parse_ok: bool, cc_max_parse_ok: bool, flag_parse_ok: bool, cc_bounds_ordered: bool) bool {
+    return limit_parse_ok and class_parse_ok and cc_min_parse_ok and cc_max_parse_ok and flag_parse_ok and cc_bounds_ordered;
+}
+
+; An absent cursor starts a traversal. A supplied one must pass every independent wire proof.
+; filter_scope_matches binds it to the exact query that produced it.
+pub fn catalog_api_cursor_valid(cursor_supplied: bool, encoded_bytes: u16, decoded: bool, version_supported: bool, filter_scope_matches: bool) bool {
+    if (!cursor_supplied) {
+        return true;
+    }
+    if (encoded_bytes == 0 or encoded_bytes > CURSOR_BYTES_MAX) {
+        return false;
+    }
+    return decoded and version_supported and filter_scope_matches;
+}
+
+; DTO release is an all-of gate. `absence_is_explicit` means a nullable public value is carried
+; as null rather than omitted for a downstream default. `redaction_proof_passed` is deliberately
+; abstract: the privacy owner supplies it, and this transport does not copy that owner's list.
+pub fn catalog_api_dto_valid(required_shape: bool, source_values_valid: bool, absence_is_explicit: bool, redaction_proof_passed: bool) bool {
+    return required_shape and source_values_valid and absence_is_explicit and redaction_proof_passed;
+}
+
+; Query and cursor errors precede serialization. A malformed DTO is never a client 4xx. The
+; conditional ETag path is reachable only after a public DTO has passed its release gates.
+pub fn catalog_api_list_status(query_valid: bool, cursor_valid: bool, dto_valid: bool, etag_matches: bool) u16 {
+    if (!query_valid or !cursor_valid) {
+        return HTTP_BAD_REQUEST;
+    }
+    if (!dto_valid) {
+        return HTTP_INTERNAL_ERROR;
+    }
+    if (etag_matches) {
+        return HTTP_NOT_MODIFIED;
+    }
+    return HTTP_OK;
+}
+
+pub fn catalog_api_detail_status(key_syntax_valid: bool, upstream_found: bool, dto_valid: bool) u16 {
+    if (!key_syntax_valid) {
+        return HTTP_BAD_REQUEST;
+    }
+    if (!upstream_found) {
+        return HTTP_NOT_FOUND;
+    }
+    if (!dto_valid) {
+        return HTTP_INTERNAL_ERROR;
+    }
+    return HTTP_OK;
+}
+
+pub fn catalog_api_error_code(status: u16) u8 {
+    if (status == HTTP_OK or status == HTTP_NOT_MODIFIED) {
+        return ERROR_NONE;
+    }
+    if (status == HTTP_BAD_REQUEST) {
+        return ERROR_BAD_QUERY;
+    }
+    if (status == HTTP_NOT_FOUND) {
+        return ERROR_MISSING_FAMILY;
+    }
+    return ERROR_INTERNAL;
+}
+
+pub fn catalog_api_response_has_body(status: u16) bool {
+    return status != HTTP_NOT_MODIFIED;
+}
+
+; A cursor is emitted only for a successful page when the upstream traversal says another page
+; exists and a freshly generated cursor passed the same validator used for incoming cursors.
+pub fn catalog_api_may_emit_next_cursor(status: u16, upstream_has_more: bool, generated_cursor_valid: bool) bool {
+    return status == HTTP_OK and upstream_has_more and generated_cursor_valid;
+}
+
+; --- Filter words: is this one shipped, and what happens when it is not -------------------------
+; Composed from FILTER_NAMES rather than from four literals, so a later correction to the array
+; cannot leave this predicate behind describing the previous vocabulary.
+pub fn filter_word_is_shipped(word: str) bool {
+    if (word == FILTER_NAMES[0]) {
+        return true;
+    }
+    if (word == FILTER_NAMES[1]) {
+        return true;
+    }
+    if (word == FILTER_NAMES[2]) {
+        return true;
+    }
+    if (word == FILTER_NAMES[3]) {
+        return true;
+    }
+    return false;
+}
+
+; The measured consequence of the two corrections above taken together. An unshipped word is
+; dropped in silence, so the narrowing the caller asked for never happens and the answer it gets
+; is wider than the one it requested. The second argument is the endpoint's own decision.
+pub fn filter_word_is_silently_dropped(word_is_shipped: bool, unknown_key_is_rejected: bool) bool {
+    if (word_is_shipped) {
+        return false;
+    }
+    return !unknown_key_is_rejected;
+}
+
+; What a request carrying an unshipped word answers today, and what it would answer the day a
+; known-key allowlist ships. Nothing else in this file changes on that day.
+pub fn unshipped_filter_word_status(word_is_shipped: bool, unknown_key_is_rejected: bool) u16 {
+    if (word_is_shipped) {
+        return HTTP_OK;
+    }
+    if (unknown_key_is_rejected) {
+        return HTTP_BAD_REQUEST;
+    }
+    return HTTP_OK;
+}
+
+; --- MEASURED TRIPWIRE: THE PAGE AND CURSOR BUDGETS BIND NOTHING ---------------------------------
+; Everything above about limits and cursors is a contract for a transport nobody implements.
+; list_bikes at src/api/bikes.rs:412-525 reads no limit, no page and no offset and serves one
+; document at src/api/bikes.rs:478; admin_list_bikes repeats the unpaged shape at
+; src/api/bikes.rs:1100. A grep for cursor over src/api/ returns zero on 2026-09-21. The
+; declarations stay, because the decision they record is still the decision; these booleans exist
+; so that no reader mistakes them for a guard that refuses a live request.
+pub const LIST_IS_UNPAGED : bool = true;
+pub const UNPAGED_LIST_HANDLERS : u8 = 2;
+pub const LIMIT_IS_PARSED_BY_THE_LIST_ENDPOINT : bool = false;
+pub const CURSOR_IS_PARSED_BY_THE_LIST_ENDPOINT : bool = false;
+pub const CURSOR_OCCURRENCES_IN_THE_API_MODULE : u8 = 0;
+
+; CORRECTED 2026-09-21 by review: this census said THREE and the repository ships SIX. The count
+; came from three ladders somebody happened to open; the measurement is
+; `grep -rn 'clamp(1,' src/` plus `grep -rn '.limit' src/api/` on 2026-09-21, which finds six
+; handlers that take a client-supplied row count and bound it, in file order:
+;   src/api/client_errors.rs:118 -- default CLIENT_ERROR_PAGE (50, src/api/client_errors.rs:92),
+;     clamped into 1..500, no offset;
+;   src/api/events.rs:407-411 (:405-409 before 2026-09-21) -- default 100, clamped into 1..100, no offset;
+;   src/api/game.rs:50 -- clamped into 1..100, default 20 at src/api/game.rs:33-35 (the board this
+;     ladder serves belongs to turbobaby/game-score; only the transport numbers are read here);
+;   src/api/loyalty.rs:592-596 -- default 50, clamped into 1..100 at src/api/loyalty.rs:608-609,
+;     with an offset floored at 0 at src/api/loyalty.rs:609;
+;   src/api/orders.rs:1800-1809 -- default 100, clamped into 1..500, offset floored at 0;
+;   src/api/referrals.rs:208 -- default 10, clamped into 1..50, no offset.
+; Two of the six carry an offset; every one of the six floors at 1; not one of the six carries a
+; cursor, which is the claim this census exists to make and the only one the wrong count did not
+; damage. src/api/bikes.rs:755 and src/api/orders.rs:2503 (:2502 until 2026-09-26) are NOT in the
+; census: both are fixed caps the handler chooses, not a number the client supplies.
+pub const SHIPPED_PAGE_LADDERS : u8 = 6;
+pub const SHIPPED_CURSOR_LADDERS : u8 = 0;
+pub const SHIPPED_PAGE_LADDER_DEFAULTS : [6]u16 = [50, 100, 20, 50, 100, 10];
+pub const SHIPPED_PAGE_LADDER_MAXIMA : [6]u16 = [500, 100, 100, 100, 500, 50];
+pub const SHIPPED_PAGE_LADDER_FLOOR : u16 = 1;
+pub const SHIPPED_PAGE_LADDERS_WITH_AN_OFFSET : u8 = 2;
+pub const SHIPPED_PAGE_LADDERS_ON_THIS_ENDPOINT : u8 = 0;
+
+; --- The cursor census, with its exceptions counted rather than waved past -------------------
+; The header used to say the 184 lines carrying "cursor" over src/ are ALL the CSS property.
+; Two are not, and both are still CSS: cursor_style at src/ui/game/shop_game.rs:1710 and
+; btn_cursor at src/ui/screens/checkout_screen.rs:1664 are identifiers that RETURN a value for
+; the property. The split is declared because "all" is checked by one counterexample, and a
+; reader who finds one stops trusting the sentence that mattered -- which is the last number
+; here, not the first two. Measured 2026-09-21.
+; CORRECTED 2026-09-22: the first two were 184 and 182. Re-measured at a33e500, git grep -n cursor
+; over src/ returns 185 lines in .rs files, against 184 at 2c21df1^. 2c21df1 (2026-09-21 19:31)
+; split the cart's checkout button in src/ui/screens/cart_screen.rs into a disabled copy for an
+; unpriced cart (cursor: not-allowed) and the linked one (cursor: pointer), where one cursor:
+; pointer line stood before, so the added line is the CSS property. The
+; two identifier lines above are unchanged and the pagination count is still zero, which is the
+; number this census exists for.
+pub const CURSOR_WORD_LINES_IN_SRC : u16 = 185;
+pub const CURSOR_WORD_LINES_AS_CSS_PROPERTY : u16 = 183;
+pub const CURSOR_WORD_LINES_AS_CSS_IDENTIFIER : u16 = 2;
+pub const CURSOR_WORD_LINES_AS_PAGINATION : u16 = 0;
+; RE-POINTED 2026-09-26, not re-measured: cursor_style, cited twice above at
+; src/ui/game/shop_game.rs:1710, stands at :1415 since the shop game's farm left that file on that
+; date (legacy_retirement.t27, LEFTOVERS_2026_09_26_*); the function itself did not change. The
+; three counts above keep the reading of the tree they were taken on.
+
+; REFUTED 2026-09-21: this file used to assert that no shipped ladder agrees with the budget it
+; chose, and offered that as the proof the budget was not derived. One does, and it agrees on all
+; three numbers at once: the leaderboard ladder defaults to 20 (src/api/game.rs:33-35), floors at 1
+; and caps at 100 (src/api/game.rs:50) -- exactly PAGE_LIMIT_DEFAULT, PAGE_LIMIT_MIN and
+; PAGE_LIMIT_MAX. That does not make the budget measured: nothing about the catalog produced those
+; numbers, and the agreement was found by review, not used by the author. It does destroy the
+; argument, so the argument is replaced by the count. The one agreeing ladder is on another
+; endpoint, so it still binds nothing here.
+pub const SHIPPED_LADDERS_AGREEING_WITH_THIS_BUDGET : u8 = 1;
+pub const THE_AGREEING_LADDER_IS_ON_THIS_ENDPOINT : bool = false;
+pub const PAGE_BUDGET_WAS_DERIVED_FROM_A_MEASUREMENT : bool = false;
+pub const PAGE_BUDGET_PRECEDENT_NOTE : str = "PAGE_LIMIT_MIN 1, PAGE_LIMIT_DEFAULT 20 and PAGE_LIMIT_MAX 100 are chosen, not derived, and a review on 2026-09-21 found that one shipped ladder matches all three: src/api/game.rs:33-35 defaults a leaderboard limit to 20 and src/api/game.rs:50 clamps it into 1..100. The older wording here claimed no shipped ladder agreed and used that as evidence of independence; the agreement is coincidence rather than derivation, but the claim was false and a false supporting claim is worse than no support. The honest statement is the census: six ladders, one agreement, zero cursors, and none of the six on GET /api/bikes.";
+
+; Is a chosen budget precedented anywhere in this repository? One count answers it, and the answer
+; is not a licence: precedent is not derivation, which is why the flag above stays false.
+pub fn budget_is_precedented(agreeing_ladders: u8) bool {
+    return agreeing_ladders > 0;
+}
+
+; The one numeric cap inside the catalog module, named here so it is never read as a page size.
+; src/api/bikes.rs:741 declares it and src/api/bikes.rs:755 applies it to the per-family unit
+; rollup behind GET /api/bikes/:key. It bounds rows of one helper query, not families of a page,
+; and it is not a count of anything in the fleet.
+pub const UNIT_ROLLUP_QUERY_ROW_CAP : u32 = 1000;
+pub const UNIT_ROLLUP_CAP_IS_A_PAGE_LIMIT : bool = false;
+
+pub const PAGINATION_TRANSPORT_IS_NOT_SHIPPED : bool = true;
+pub const PAGINATION_TRANSPORT_NOTE : str = "No page limit and no cursor reaches GET /api/bikes. list_bikes at src/api/bikes.rs:412-525 parses neither and serves the whole offered catalog in one document at src/api/bikes.rs:478, and admin_list_bikes repeats that shape at src/api/bikes.rs:1100. A grep for cursor over src/api/ returns zero on 2026-09-21. PAGE_LIMIT_MIN, PAGE_LIMIT_DEFAULT, PAGE_LIMIT_MAX and CURSOR_BYTES_MAX therefore refuse nothing, and catalog_api_normalize_limit, catalog_api_cursor_valid and catalog_api_may_emit_next_cursor have never been entered by a shipped request. Closing this needs a limit parsed at the handler and a cursor encoder beside it; until then these numbers are a proposal with a test suite. CORRECTED 2026-09-21: this sentence used to say the repository ships three page ladders and that all three are offset ladders. Both halves were wrong -- the census above measures six, and only two of the six (src/api/loyalty.rs:609 and src/api/orders.rs:1805-1809) carry an offset at all, the other four being bare clamped limits. What survives is the part that mattered: not one of the six is cursor-shaped, so a cursor here is a change of shape for this repository and not only a new parameter.";
+
+; Does a declared bound refuse anything? Only if something parses the thing it bounds. Both
+; arguments are measured facts above, and both are false today.
+pub fn page_limit_binds_a_request(limit_is_parsed: bool) bool {
+    return limit_is_parsed;
+}
+
+pub fn cursor_rule_binds_a_request(cursor_is_parsed: bool) bool {
+    return cursor_is_parsed;
+}
+
+; How many served requests the page budget actually bounded. With no parser the answer is zero for
+; every possible traffic count -- the tripwire stated as arithmetic instead of as a sentence.
+pub fn requests_bounded_by_the_page_budget(limit_is_parsed: bool, requests_served: u16) u16 {
+    if (!limit_is_parsed) {
+        return 0;
+    }
+    return requests_served;
+}
+
+; --- MEASURED TRIPWIRE: THE SERVED DEPOSIT MEETS NO TIER AUDIT -----------------------------------
+; This is the transport that publishes deposit_thb, so the gap is recorded here. family_json
+; serializes the listing whole at src/api/bikes.rs:599 and the wire rule at
+; src/api/bikes.rs:1857-1863 requires the field on every family -- a test constant inside the test
+; module opening at src/api/bikes.rs:1843, not a production guard. turbobaby/deposit-tiers owns the
+; closed ladder and owns is_published_tier and deposit_needs_tier_log, the two predicates that
+; judge an amount against it. Neither is evaluated anywhere in this repository: a grep for
+; deposit_tier over src/ and migrations/ returns zero on 2026-09-21. The only shipped constraint on
+; the number is migrations/077_bikes.sql:62 -- CHECK (deposit_thb IS NULL OR deposit_thb > 0) --
+; which is the owner's publishable rule and none of its ladder, and the write validator at
+; src/api/bikes.rs:1005-1012 adds only finiteness and non-negativity. The column is DOUBLE
+; PRECISION at migrations/077_bikes.sql:44, so a served amount need not be a whole baht and could
+; not match a rung even in principle. No rung is copied into this file.
+pub const REUSES_DEPOSIT_TIERS_ID : str = "turbobaby/deposit-tiers";
+pub const DEPOSIT_IS_SERVED_BY_THIS_TRANSPORT : bool = true;
+pub const DEPOSIT_TIER_CHECK_IS_SHIPPED : bool = false;
+pub const DEPOSIT_TIER_LOG_IS_SHIPPED : bool = false;
+pub const DEPOSIT_COLUMN_CHECKS_ONLY_POSITIVITY : bool = true;
+pub const DEPOSIT_COLUMN_ADMITS_A_FRACTION : bool = true;
+pub const DEPOSIT_TIER_LADDER_IS_RESTATED_HERE : bool = false;
+pub const DEPOSIT_TIER_RUNGS_COPIED_HERE : u8 = 0;
+
+; The gap is a missing LOG, not a missing refusal. The owner is explicit that an authoritative
+; amount off the measured ladder is shown and recorded, never snapped, so this transport must not
+; learn to withhold a published number on the strength of an audit it does not run.
+pub const AUDIT_MAY_WITHHOLD_A_PUBLISHED_DEPOSIT : bool = false;
+pub const DEPOSIT_TIER_AUDIT_IS_NOT_SHIPPED : bool = true;
+pub const DEPOSIT_TIER_AUDIT_NOTE : str = "The deposit this endpoint publishes is never compared with the ladder turbobaby/deposit-tiers declares. Nothing calls that owner's is_published_tier or deposit_needs_tier_log: a grep for deposit_tier over src/ and migrations/ returns zero on 2026-09-21, migrations/077_bikes.sql:62 asks only that the amount be positive, and the write validator at src/api/bikes.rs:1005-1012 asks only that it be finite and not negative. An amount on no rung is therefore serialized at src/api/bikes.rs:599 exactly like one on a rung and no log line marks it. Closing this needs the owner's predicate evaluated where the field is serialized and its answer emitted as a log event. It does not need this file to copy a rung, and it must never become a reason to withhold, round or snap the number.";
+
+; Two abstract booleans from the owner, one decision here: did anything look? With
+; DEPOSIT_TIER_CHECK_IS_SHIPPED false, nothing did, for every amount.
+pub fn served_deposit_is_audited(tier_check_shipped: bool, amount_examined: bool) bool {
+    return tier_check_shipped and amount_examined;
+}
+
+; The owner decides publishable and on-a-rung; this transport decides only whether a mismatch
+; becomes a visible event. Today that is false for every pair of answers, because nothing checks.
+pub fn off_ladder_deposit_is_reported(tier_check_shipped: bool, amount_is_publishable: bool, amount_is_on_a_published_rung: bool) bool {
+    if (!tier_check_shipped) {
+        return false;
+    }
+    return amount_is_publishable and !amount_is_on_a_published_rung;
+}
+
+; Release is the owner's publishable rule and nothing else. The withholding arm exists so the
+; invariant below can name the shape this file refuses: a missing audit is not a reason to hide a
+; published number, and a future audit must not become one either.
+pub fn deposit_is_released_to_the_wire(amount_is_publishable: bool, audit_reported_a_mismatch: bool, audit_may_withhold: bool) bool {
+    if (audit_reported_a_mismatch and audit_may_withhold) {
+        return false;
+    }
+    return amount_is_publishable;
+}
+
+; --- The sale offer on the public wire (added 2026-09-24) -----------------------------------------
+; The owner ruled on 2026-09-24 that a customer may only rent (rental only, Phuket only;
+; turbobaby/legacy-retirement records the ruling). for_sale still LEAVES IN THE BODY -- the key is on
+; every family, so RESPONSE_ONLY_FIELDS above is unchanged and an old cached client keeps parsing --
+; but the two PUBLIC reads no longer carry the stored value. list_bikes and get_bike serialise the
+; family through BikeListing::with_sale_withheld (src/db/bikes.rs), which serves for_sale = false and
+; sale_price_thb = null whatever the row holds. admin_list_bikes reuses family_json on the stored
+; listing, so the admin is not blinded, and no row is written: the stored flag and asking price are
+; kept, which is the mask-on-read shape public_display_name already set. The test pinning
+; family_json's output (src/api/bikes.rs:2205-2220) pins the SHARED serialiser and stays true; the
+; public mask is pinned by the_public_catalog_serves_both_sale_keys_withheld beside it. Until this
+; date the public reads carried the stored values, and the bike detail screen showed a buy-out block
+; whenever either was set: a data gate, one admin tick from every customer.
+pub const PUBLIC_READS_WITHHOLDING_THE_SALE_OFFER : u8 = 2;
+pub const PUBLIC_READS_WITHHOLDING_THE_SALE_OFFER_BEFORE_2026_09_24 : u8 = 0;
+pub const PUBLIC_READ_COUNT_SERVING_A_FAMILY : u8 = 2;
+pub const ADMIN_READ_CARRIES_THE_STORED_SALE_OFFER : bool = true;
+pub const SALE_KEYS_STAY_ON_THE_PUBLIC_WIRE : bool = true;
+pub const PUBLIC_SALE_MASK_WRITES_A_ROW : bool = false;
+; Where the served sale fields used to land. src/ui/screens/bike_detail.rs rendered the buy-out block
+; from them -- the T_BIKE_SALE_TITLE heading and the T_BIKE_SALE_PRICE label -- and was the only
+; client screen that did. Counted as code lines under src/ui naming either key: 3 on the tree before
+; the ruling (the import line and the two render lines), 0 after. The keys stay declared and
+; translated in src/trios/i18n.rs, and the wire fields stay parsed in catalog_screen.rs, unrendered.
+pub const SALE_BLOCK_KEY_LINES_IN_UI : u8 = 0;
+pub const SALE_BLOCK_KEY_LINES_IN_UI_BEFORE_2026_09_24 : u8 = 3;
+
+pub fn public_for_sale(stored_for_sale: bool, public_read: bool) bool {
+    if (public_read) {
+        return false;
+    }
+    return stored_for_sale;
+}
+
+pub fn public_sale_price_present(stored_price_present: bool, public_read: bool) bool {
+    if (public_read) {
+        return false;
+    }
+    return stored_price_present;
+}
+
+test catalog_api_filter_vocabulary_is_exact_and_transport_only {
+    assert FILTER_NAMES.len == FILTER_COUNT;
+    assert FILTER_NAMES[0] == "class";
+    assert FILTER_NAMES[1] == "min_cc";
+    assert FILTER_NAMES[2] == "max_cc";
+    assert FILTER_NAMES[3] == "available_only";
+    // Corrected 2026-09-21: the fifth word was never a filter. It is a body field, and the
+    // assertion that used to pin it here now pins it where it belongs.
+    assert RESPONSE_ONLY_FIELDS[0] == "for_sale";
+}
+
+test catalog_api_limit_defaults_clamps_and_preserves {
+    assert catalog_api_normalize_limit(0, false) == PAGE_LIMIT_DEFAULT;
+    assert catalog_api_normalize_limit(0, true) == PAGE_LIMIT_MIN;
+    assert catalog_api_normalize_limit(37, true) == 37;
+    assert catalog_api_normalize_limit(101, true) == PAGE_LIMIT_MAX;
+    assert catalog_api_normalize_limit(65535, true) == PAGE_LIMIT_MAX;
+}
+
+test catalog_api_filters_are_conjoined_without_rebuilding_domain_rules {
+    assert catalog_api_filter_matches(false, false, false, false, false, false, false, false) == true;
+    assert catalog_api_filter_matches(true, true, true, true, true, true, true, true) == true;
+    assert catalog_api_filter_matches(true, false, false, false, false, false, false, false) == false;
+    assert catalog_api_filter_matches(false, false, true, false, false, false, false, false) == false;
+}
+
+test catalog_api_available_only_consumes_the_upstream_bookable_answer {
+    assert catalog_api_filter_matches(false, false, false, false, true, true, false, false) == true;
+    assert catalog_api_filter_matches(false, false, false, false, true, false, false, false) == false;
+    assert catalog_api_filter_matches(false, false, false, false, false, false, false, false) == true;
+}
+
+test catalog_api_for_sale_is_independent_of_rental_bookability {
+    assert catalog_api_filter_matches(false, false, false, false, false, false, true, true) == true;
+    assert catalog_api_filter_matches(false, false, false, false, false, true, true, false) == false;
+    assert catalog_api_filter_matches(false, false, false, false, true, false, true, true) == false;
+}
+
+test catalog_api_cc_bounds_validate_order_only_when_both_are_present {
+    assert catalog_api_cc_bounds_valid(false, 0, false, 0) == true;
+    assert catalog_api_cc_bounds_valid(true, 700, false, 0) == true;
+    assert catalog_api_cc_bounds_valid(false, 0, true, 125) == true;
+    assert catalog_api_cc_bounds_valid(true, 125, true, 750) == true;
+    assert catalog_api_cc_bounds_valid(true, 750, true, 125) == false;
+}
+
+test catalog_api_query_validation_combines_parser_and_range_proofs {
+    assert catalog_api_query_valid(true, true, true, true, true, true) == true;
+    assert catalog_api_query_valid(false, true, true, true, true, true) == false;
+    assert catalog_api_query_valid(true, false, true, true, true, true) == false;
+    assert catalog_api_query_valid(true, true, false, true, true, true) == false;
+    assert catalog_api_query_valid(true, true, true, false, true, true) == false;
+    assert catalog_api_query_valid(true, true, true, true, false, true) == false;
+    assert catalog_api_query_valid(true, true, true, true, true, false) == false;
+}
+
+test catalog_api_cursor_absence_is_valid_but_a_supplied_cursor_fails_closed {
+    assert catalog_api_cursor_valid(false, 0, false, false, false) == true;
+    assert catalog_api_cursor_valid(true, 1, true, true, true) == true;
+    assert catalog_api_cursor_valid(true, 0, true, true, true) == false;
+    assert catalog_api_cursor_valid(true, CURSOR_BYTES_MAX + 1, true, true, true) == false;
+    assert catalog_api_cursor_valid(true, 32, false, true, true) == false;
+    assert catalog_api_cursor_valid(true, 32, true, false, true) == false;
+    assert catalog_api_cursor_valid(true, 32, true, true, false) == false;
+}
+
+test catalog_api_dto_requires_shape_values_nulls_and_redaction_proof {
+    assert catalog_api_dto_valid(true, true, true, true) == true;
+    assert catalog_api_dto_valid(false, true, true, true) == false;
+    assert catalog_api_dto_valid(true, false, true, true) == false;
+    assert catalog_api_dto_valid(true, true, false, true) == false;
+    assert catalog_api_dto_valid(true, true, true, false) == false;
+}
+
+test catalog_api_list_status_has_safe_precedence {
+    assert catalog_api_list_status(false, true, true, false) == HTTP_BAD_REQUEST;
+    assert catalog_api_list_status(true, false, true, false) == HTTP_BAD_REQUEST;
+    assert catalog_api_list_status(true, true, false, false) == HTTP_INTERNAL_ERROR;
+    assert catalog_api_list_status(true, true, true, true) == HTTP_NOT_MODIFIED;
+    assert catalog_api_list_status(true, true, true, false) == HTTP_OK;
+}
+
+test catalog_api_detail_status_distinguishes_input_absence_and_serialization {
+    assert catalog_api_detail_status(false, true, true) == HTTP_BAD_REQUEST;
+    assert catalog_api_detail_status(true, false, true) == HTTP_NOT_FOUND;
+    assert catalog_api_detail_status(true, true, false) == HTTP_INTERNAL_ERROR;
+    assert catalog_api_detail_status(true, true, true) == HTTP_OK;
+}
+
+test catalog_api_error_envelopes_are_stable_and_not_modified_has_no_body {
+    assert catalog_api_error_code(HTTP_OK) == ERROR_NONE;
+    assert catalog_api_error_code(HTTP_NOT_MODIFIED) == ERROR_NONE;
+    assert catalog_api_error_code(HTTP_BAD_REQUEST) == ERROR_BAD_QUERY;
+    assert catalog_api_error_code(HTTP_NOT_FOUND) == ERROR_MISSING_FAMILY;
+    assert catalog_api_error_code(HTTP_INTERNAL_ERROR) == ERROR_INTERNAL;
+    assert catalog_api_response_has_body(HTTP_NOT_MODIFIED) == false;
+    assert catalog_api_response_has_body(HTTP_OK) == true;
+    assert catalog_api_response_has_body(HTTP_BAD_REQUEST) == true;
+}
+
+test catalog_api_next_cursor_requires_a_complete_successful_page {
+    assert catalog_api_may_emit_next_cursor(HTTP_OK, true, true) == true;
+    assert catalog_api_may_emit_next_cursor(HTTP_OK, false, true) == false;
+    assert catalog_api_may_emit_next_cursor(HTTP_OK, true, false) == false;
+    assert catalog_api_may_emit_next_cursor(HTTP_NOT_MODIFIED, true, true) == false;
+    assert catalog_api_may_emit_next_cursor(HTTP_INTERNAL_ERROR, true, true) == false;
+}
+
+test catalog_api_the_old_filter_words_were_never_read_by_the_endpoint {
+    assert NEVER_SHIPPED_FILTER_NAMES.len == NEVER_SHIPPED_FILTER_COUNT;
+    assert NEVER_SHIPPED_FILTER_NAMES[0] == "cc_min";
+    assert NEVER_SHIPPED_FILTER_NAMES[1] == "cc_max";
+    assert filter_word_is_shipped(NEVER_SHIPPED_FILTER_NAMES[0]) == false;
+    assert filter_word_is_shipped(NEVER_SHIPPED_FILTER_NAMES[1]) == false;
+    assert filter_word_is_shipped(FILTER_NAMES[1]) == true;
+    assert filter_word_is_shipped(FILTER_NAMES[2]) == true;
+    assert filter_word_is_shipped("class") == true;
+    assert filter_word_is_shipped("available_only") == true;
+}
+
+test catalog_api_an_unshipped_filter_word_widens_the_answer_instead_of_failing {
+    assert UNKNOWN_FILTER_VALUE_IS_REJECTED == true;
+    assert UNKNOWN_QUERY_KEY_IS_REJECTED == false;
+    assert FILTER_NAME_DRIFT_IS_SILENT == true;
+    assert filter_word_is_silently_dropped(false, UNKNOWN_QUERY_KEY_IS_REJECTED) == true;
+    assert filter_word_is_silently_dropped(true, UNKNOWN_QUERY_KEY_IS_REJECTED) == false;
+    assert filter_word_is_silently_dropped(false, true) == false;
+    assert unshipped_filter_word_status(false, UNKNOWN_QUERY_KEY_IS_REJECTED) == UNKNOWN_QUERY_KEY_STATUS;
+    assert unshipped_filter_word_status(false, UNKNOWN_QUERY_KEY_IS_REJECTED) == HTTP_OK;
+    assert unshipped_filter_word_status(false, true) == HTTP_BAD_REQUEST;
+    assert unshipped_filter_word_status(true, false) == HTTP_OK;
+}
+
+test catalog_api_for_sale_leaves_in_the_body_and_never_in_the_query {
+    assert RESPONSE_ONLY_FIELDS.len == RESPONSE_ONLY_FIELD_COUNT;
+    assert RESPONSE_ONLY_FIELDS[0] == "for_sale";
+    assert filter_word_is_shipped(RESPONSE_ONLY_FIELDS[0]) == false;
+    // The combinator keeps its for_sale arm on purpose: it is an abstract upstream decision and
+    // stays correct the day a for_sale query word ships. It is not evidence that one exists.
+    assert catalog_api_filter_matches(false, false, false, false, false, false, true, false) == false;
+    assert catalog_api_filter_matches(false, false, false, false, false, false, true, true) == true;
+}
+
+test catalog_api_the_public_reads_serve_the_sale_offer_withheld {
+    assert PUBLIC_READS_WITHHOLDING_THE_SALE_OFFER == PUBLIC_READ_COUNT_SERVING_A_FAMILY;
+    assert PUBLIC_READS_WITHHOLDING_THE_SALE_OFFER_BEFORE_2026_09_24 == 0;
+    assert public_for_sale(true, true) == false;
+    assert public_for_sale(true, false) == true;
+    assert public_sale_price_present(true, true) == false;
+    assert public_sale_price_present(true, false) == true;
+    assert ADMIN_READ_CARRIES_THE_STORED_SALE_OFFER == true;
+    assert SALE_KEYS_STAY_ON_THE_PUBLIC_WIRE == true;
+    assert PUBLIC_SALE_MASK_WRITES_A_ROW == false;
+    assert SALE_BLOCK_KEY_LINES_IN_UI == 0;
+    assert SALE_BLOCK_KEY_LINES_IN_UI_BEFORE_2026_09_24 == 3;
+    // The key still leaves in the body; only its value is withheld.
+    assert RESPONSE_ONLY_FIELDS[0] == "for_sale";
+}
+
+test catalog_api_page_and_cursor_budgets_bind_no_shipped_request {
+    assert LIST_IS_UNPAGED == true;
+    assert UNPAGED_LIST_HANDLERS == 2;
+    assert LIMIT_IS_PARSED_BY_THE_LIST_ENDPOINT == false;
+    assert CURSOR_IS_PARSED_BY_THE_LIST_ENDPOINT == false;
+    assert CURSOR_OCCURRENCES_IN_THE_API_MODULE == 0;
+    assert page_limit_binds_a_request(LIMIT_IS_PARSED_BY_THE_LIST_ENDPOINT) == false;
+    assert cursor_rule_binds_a_request(CURSOR_IS_PARSED_BY_THE_LIST_ENDPOINT) == false;
+    assert requests_bounded_by_the_page_budget(LIMIT_IS_PARSED_BY_THE_LIST_ENDPOINT, 65535) == 0;
+    assert requests_bounded_by_the_page_budget(true, 37) == 37;
+    // The bounds are kept, not deleted: they still say what the transport should do when it
+    // exists. These two asserts are the proposal; the eight above are why it is only a proposal.
+    assert catalog_api_normalize_limit(101, true) == PAGE_LIMIT_MAX;
+    assert catalog_api_cursor_valid(true, CURSOR_BYTES_MAX + 1, true, true, true) == false;
+}
+
+test catalog_api_where_this_repository_pages_it_pages_by_offset_and_never_by_cursor {
+    assert SHIPPED_PAGE_LADDERS == 6;
+    assert SHIPPED_CURSOR_LADDERS == 0;
+    assert SHIPPED_PAGE_LADDERS_ON_THIS_ENDPOINT == 0;
+    assert SHIPPED_PAGE_LADDER_DEFAULTS.len == SHIPPED_PAGE_LADDERS;
+    assert SHIPPED_PAGE_LADDER_MAXIMA.len == SHIPPED_PAGE_LADDERS;
+    assert SHIPPED_PAGE_LADDERS_WITH_AN_OFFSET == 2;
+    // The census of the word itself. The two exceptions are counted in, so the split adds up
+    // and neither half can be quietly dropped later.
+    assert CURSOR_WORD_LINES_AS_CSS_PROPERTY + CURSOR_WORD_LINES_AS_CSS_IDENTIFIER == CURSOR_WORD_LINES_IN_SRC;
+    assert CURSOR_WORD_LINES_AS_CSS_IDENTIFIER == 2;
+    // The claim the exceptions do not touch, and the reason the census is here at all.
+    assert CURSOR_WORD_LINES_AS_PAGINATION == 0;
+    assert CURSOR_WORD_LINES_AS_PAGINATION == SHIPPED_CURSOR_LADDERS;
+    assert SHIPPED_PAGE_LADDERS_WITH_AN_OFFSET < SHIPPED_PAGE_LADDERS;
+    assert SHIPPED_PAGE_LADDER_FLOOR == PAGE_LIMIT_MIN;
+    // client_errors / events / game / loyalty / orders / referrals, in that order.
+    assert SHIPPED_PAGE_LADDER_DEFAULTS[0] == 50;
+    assert SHIPPED_PAGE_LADDER_DEFAULTS[1] == 100;
+    assert SHIPPED_PAGE_LADDER_DEFAULTS[2] == 20;
+    assert SHIPPED_PAGE_LADDER_DEFAULTS[3] == 50;
+    assert SHIPPED_PAGE_LADDER_DEFAULTS[4] == 100;
+    assert SHIPPED_PAGE_LADDER_DEFAULTS[5] == 10;
+    assert SHIPPED_PAGE_LADDER_MAXIMA[0] == 500;
+    assert SHIPPED_PAGE_LADDER_MAXIMA[4] == 500;
+}
+
+test catalog_api_one_shipped_ladder_matches_this_chosen_budget_exactly {
+    // The claim this file used to make -- that no shipped ladder agrees with 20 -- is refuted by
+    // the leaderboard ladder, which agrees on the default, the floor and the ceiling at once.
+    assert SHIPPED_PAGE_LADDER_DEFAULTS[2] == PAGE_LIMIT_DEFAULT;
+    assert SHIPPED_PAGE_LADDER_MAXIMA[2] == PAGE_LIMIT_MAX;
+    assert SHIPPED_PAGE_LADDER_FLOOR == PAGE_LIMIT_MIN;
+    assert SHIPPED_LADDERS_AGREEING_WITH_THIS_BUDGET == 1;
+    assert budget_is_precedented(SHIPPED_LADDERS_AGREEING_WITH_THIS_BUDGET) == true;
+    assert budget_is_precedented(0) == false;
+    // Agreement is not derivation, and the agreeing ladder is on somebody else's endpoint, so it
+    // binds nothing here and buys the budget no authority it did not have.
+    assert PAGE_BUDGET_WAS_DERIVED_FROM_A_MEASUREMENT == false;
+    assert THE_AGREEING_LADDER_IS_ON_THIS_ENDPOINT == false;
+    assert SHIPPED_PAGE_LADDERS_ON_THIS_ENDPOINT == 0;
+    assert PAGE_BUDGET_PRECEDENT_NOTE != "";
+    // The other five disagree with the default, which is why the count is one and not six.
+    assert SHIPPED_PAGE_LADDER_DEFAULTS[0] != PAGE_LIMIT_DEFAULT;
+    assert SHIPPED_PAGE_LADDER_DEFAULTS[1] != PAGE_LIMIT_DEFAULT;
+    assert SHIPPED_PAGE_LADDER_DEFAULTS[3] != PAGE_LIMIT_DEFAULT;
+    assert SHIPPED_PAGE_LADDER_DEFAULTS[4] != PAGE_LIMIT_DEFAULT;
+    assert SHIPPED_PAGE_LADDER_DEFAULTS[5] != PAGE_LIMIT_DEFAULT;
+}
+
+test catalog_api_the_unit_rollup_cap_is_not_a_catalog_page_limit {
+    assert UNIT_ROLLUP_QUERY_ROW_CAP == 1000;
+    assert UNIT_ROLLUP_CAP_IS_A_PAGE_LIMIT == false;
+    assert page_limit_binds_a_request(UNIT_ROLLUP_CAP_IS_A_PAGE_LIMIT) == false;
+}
+
+test catalog_api_the_served_deposit_meets_no_tier_audit {
+    assert REUSES_DEPOSIT_TIERS_ID == "turbobaby/deposit-tiers";
+    assert REUSES_DEPOSIT_TIERS_ID != ID;
+    assert DEPOSIT_IS_SERVED_BY_THIS_TRANSPORT == true;
+    assert DEPOSIT_TIER_CHECK_IS_SHIPPED == false;
+    assert DEPOSIT_TIER_LOG_IS_SHIPPED == false;
+    assert DEPOSIT_COLUMN_CHECKS_ONLY_POSITIVITY == true;
+    assert DEPOSIT_COLUMN_ADMITS_A_FRACTION == true;
+    assert served_deposit_is_audited(DEPOSIT_TIER_CHECK_IS_SHIPPED, true) == false;
+    assert served_deposit_is_audited(true, true) == true;
+    assert served_deposit_is_audited(true, false) == false;
+    assert off_ladder_deposit_is_reported(DEPOSIT_TIER_CHECK_IS_SHIPPED, true, false) == false;
+    assert off_ladder_deposit_is_reported(true, true, false) == true;
+    assert off_ladder_deposit_is_reported(true, true, true) == false;
+    assert off_ladder_deposit_is_reported(true, false, false) == false;
+}
+
+test catalog_api_the_missing_audit_never_withholds_a_published_deposit {
+    assert AUDIT_MAY_WITHHOLD_A_PUBLISHED_DEPOSIT == false;
+    assert DEPOSIT_TIER_LADDER_IS_RESTATED_HERE == false;
+    assert DEPOSIT_TIER_RUNGS_COPIED_HERE == 0;
+    assert deposit_is_released_to_the_wire(true, true, AUDIT_MAY_WITHHOLD_A_PUBLISHED_DEPOSIT) == true;
+    assert deposit_is_released_to_the_wire(true, false, AUDIT_MAY_WITHHOLD_A_PUBLISHED_DEPOSIT) == true;
+    assert deposit_is_released_to_the_wire(false, false, AUDIT_MAY_WITHHOLD_A_PUBLISHED_DEPOSIT) == false;
+    // The one shape this file refuses, written down so it cannot arrive by accident.
+    assert deposit_is_released_to_the_wire(true, true, true) == false;
+}
+
+test catalog_api_every_gap_the_survey_found_is_named_with_a_note {
+    assert FILTER_NAME_DRIFT_IS_SILENT == true;
+    assert PAGINATION_TRANSPORT_IS_NOT_SHIPPED == true;
+    assert DEPOSIT_TIER_AUDIT_IS_NOT_SHIPPED == true;
+    assert FILTER_NAME_DRIFT_NOTE != "";
+    assert PAGINATION_TRANSPORT_NOTE != "";
+    assert DEPOSIT_TIER_AUDIT_NOTE != "";
+}
+
+invariant catalog_api_page_limit_is_a_closed_nonzero_interval
+    assert PAGE_LIMIT_MIN > 0 and PAGE_LIMIT_DEFAULT >= PAGE_LIMIT_MIN and PAGE_LIMIT_DEFAULT <= PAGE_LIMIT_MAX
+
+invariant catalog_api_filter_count_cannot_fall_to_zero
+    assert FILTER_COUNT > 0 and FILTER_NAMES.len == FILTER_COUNT
+
+invariant catalog_api_invalid_cursor_never_reaches_success
+    assert catalog_api_list_status(true, catalog_api_cursor_valid(true, 0, true, true, true), true, false) == HTTP_BAD_REQUEST
+
+invariant catalog_api_redaction_proof_is_mandatory_for_a_success_body
+    assert catalog_api_list_status(true, true, catalog_api_dto_valid(true, true, true, false), false) == HTTP_INTERNAL_ERROR
+
+invariant catalog_api_not_modified_is_the_only_bodyless_outcome
+    assert catalog_api_response_has_body(HTTP_NOT_MODIFIED) == false and catalog_api_response_has_body(HTTP_OK) == true and catalog_api_response_has_body(HTTP_BAD_REQUEST) == true and catalog_api_response_has_body(HTTP_NOT_FOUND) == true and catalog_api_response_has_body(HTTP_INTERNAL_ERROR) == true
+
+invariant catalog_api_cursor_scope_is_bound_to_the_filter_set
+    assert catalog_api_cursor_valid(true, 32, true, true, false) == false
+
+invariant catalog_api_query_parser_failure_never_becomes_a_default
+    assert catalog_api_query_valid(false, true, true, true, true, true) == false
+
+invariant catalog_api_the_filter_words_are_the_ones_the_endpoint_parses
+    assert filter_word_is_shipped("min_cc") == true and filter_word_is_shipped("max_cc") == true and filter_word_is_shipped("cc_min") == false and filter_word_is_shipped("cc_max") == false
+
+invariant catalog_api_position_three_stays_available_only_for_its_outside_reader
+    assert FILTER_NAMES[3] == "available_only" and FILTER_NAMES.len == FILTER_COUNT
+
+invariant catalog_api_a_body_field_can_never_enter_the_filter_vocabulary
+    assert RESPONSE_ONLY_FIELDS[0] == "for_sale" and filter_word_is_shipped(RESPONSE_ONLY_FIELDS[0]) == false
+
+invariant catalog_api_an_unshipped_filter_word_is_a_wider_answer_and_not_a_client_error
+    assert filter_word_is_silently_dropped(false, UNKNOWN_QUERY_KEY_IS_REJECTED) == true and unshipped_filter_word_status(false, UNKNOWN_QUERY_KEY_IS_REJECTED) == HTTP_OK
+
+invariant catalog_api_no_page_or_cursor_bound_refuses_a_request_today
+    assert page_limit_binds_a_request(LIMIT_IS_PARSED_BY_THE_LIST_ENDPOINT) == false and cursor_rule_binds_a_request(CURSOR_IS_PARSED_BY_THE_LIST_ENDPOINT) == false and requests_bounded_by_the_page_budget(LIMIT_IS_PARSED_BY_THE_LIST_ENDPOINT, 65535) == 0
+
+invariant catalog_api_the_only_numeric_cap_in_the_module_is_not_a_page_size
+    assert UNIT_ROLLUP_CAP_IS_A_PAGE_LIMIT == false and SHIPPED_PAGE_LADDERS_ON_THIS_ENDPOINT == 0 and SHIPPED_CURSOR_LADDERS == 0
+
+invariant catalog_api_no_served_deposit_is_examined_against_the_owners_ladder
+    assert served_deposit_is_audited(DEPOSIT_TIER_CHECK_IS_SHIPPED, true) == false and off_ladder_deposit_is_reported(DEPOSIT_TIER_CHECK_IS_SHIPPED, true, false) == false
+
+invariant catalog_api_the_tier_gap_is_a_missing_log_and_never_a_withheld_number
+    assert AUDIT_MAY_WITHHOLD_A_PUBLISHED_DEPOSIT == false and deposit_is_released_to_the_wire(true, true, AUDIT_MAY_WITHHOLD_A_PUBLISHED_DEPOSIT) == true
+
+invariant catalog_api_names_the_deposit_owner_and_copies_none_of_its_rungs
+    assert REUSES_DEPOSIT_TIERS_ID == "turbobaby/deposit-tiers" and REUSES_DEPOSIT_TIERS_ID != ID and DEPOSIT_TIER_RUNGS_COPIED_HERE == 0 and DEPOSIT_TIER_LADDER_IS_RESTATED_HERE == false
+
+invariant catalog_api_every_survey_gap_is_named_rather_than_filled
+    assert FILTER_NAME_DRIFT_IS_SILENT == true and PAGINATION_TRANSPORT_IS_NOT_SHIPPED == true and DEPOSIT_TIER_AUDIT_IS_NOT_SHIPPED == true
+
+invariant catalog_api_the_page_ladder_census_counts_exactly_what_it_lists
+    assert SHIPPED_PAGE_LADDERS == 6 and SHIPPED_PAGE_LADDER_DEFAULTS.len == SHIPPED_PAGE_LADDERS and SHIPPED_PAGE_LADDER_MAXIMA.len == SHIPPED_PAGE_LADDERS and SHIPPED_PAGE_LADDERS_WITH_AN_OFFSET < SHIPPED_PAGE_LADDERS and SHIPPED_CURSOR_LADDERS == 0
+
+invariant catalog_api_a_precedent_for_the_budget_is_never_a_derivation_of_it
+    assert SHIPPED_LADDERS_AGREEING_WITH_THIS_BUDGET == 1 and budget_is_precedented(SHIPPED_LADDERS_AGREEING_WITH_THIS_BUDGET) == true and PAGE_BUDGET_WAS_DERIVED_FROM_A_MEASUREMENT == false and THE_AGREEING_LADDER_IS_ON_THIS_ENDPOINT == false and SHIPPED_PAGE_LADDERS_ON_THIS_ENDPOINT == 0
+
+invariant catalog_api_no_public_read_serves_a_stored_sale_offer
+    assert public_for_sale(true, true) == false and public_sale_price_present(true, true) == false and PUBLIC_READS_WITHHOLDING_THE_SALE_OFFER == PUBLIC_READ_COUNT_SERVING_A_FAMILY

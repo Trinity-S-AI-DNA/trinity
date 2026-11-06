@@ -1,0 +1,390 @@
+module port::scripts::tri_loop::t27b_rules;
+
+// Port of scripts/tri_loop/t27b_rules.py (gHashTag/t27, #6210), the t27b
+// steward's plumbing, to .t27. The Python module compiles the spec's
+// steward.c with the system C compiler and calls it through ctypes; every
+// decision it adds on top of that is ported here as a pure function, with
+// the world passed in as parameters. Nothing here reads or writes the
+// world.
+//
+// The decisions, in the original's order:
+//
+// - _cache_dir: XDG_CACHE_HOME when set to a non-empty value, else the home
+//   fallback -- Python's `or` treats unset and empty the same. The path
+//   join (".cache", then "t27/t27b-rules") stays with the caller: t27 has
+//   no string building.
+// - _build: read the generated C first -- unreadable is RulesUnavailable
+//   even when a cached library exists, because the source's hash names the
+//   cache file; reuse the cached shared library when it exists; otherwise
+//   compile, and a failing compile is RulesUnavailable. The platform picks
+//   the suffix: dylib on darwin, so elsewhere. The hash part of the cache
+//   name and the compiler's stderr need string building and SHA-256, which
+//   t27 has no construct for (original lines 45 and 55): the caller names
+//   the file and truncates the stderr.
+// - lib: the rules are available when they were already loaded or the fresh
+//   build succeeded; the lazily built handle itself is world state.
+// - verdict: the lab's verdict strings map to the spec's verdict codes in
+//   the lab's order; an unknown string is an error, never a guess.
+// - delta: the compiled rules' delta code maps to the spec's transition
+//   name; code 0 is Python's None, no transition. The caller converts the
+//   four verdict strings with verdict() and calls the compiled delta_code
+//   with the codes and both check counts, exactly as the original's delta
+//   does; the ctypes call stays with the caller.
+// - is_red: the transition name must be one of the spec's five (an unknown
+//   name is ValueError in the original, an error never a guess); the red
+//   answer itself is the compiled rules', passed in by the caller.
+// - pct: the honest percentage as tenths splits into the whole part and the
+//   single decimal digit; the '.'-joined one-decimal text needs string
+//   building (original line 96), so the caller joins them.
+//
+// The ctypes signatures the original configures (lines 58-63) are the
+// port's types: delta_code takes four verdict codes and two check counts
+// and answers u8; delta_is_red takes u8 and answers bool; pct_tenths takes
+// two u32 counts and answers u32.
+
+pub struct CacheBase {
+    // True when XDG_CACHE_HOME supplied the base directory.
+    from_xdg: bool,
+    // The base as given: the XDG value, or the home directory when the
+    // fallback applies. The caller joins the fixed parts onto it.
+    base: []const u8,
+}
+
+pub struct BuildPlan {
+    // False when the generated C is unreadable or the compile failed:
+    // RulesUnavailable, nothing is decided without the rules.
+    ok: bool,
+    // True when the cached shared library is reused instead of compiled.
+    reuse: bool,
+    // The shared library's suffix: dylib on darwin, so elsewhere.
+    suffix: []const u8,
+}
+
+pub struct Verdict {
+    // False for a string that is not one of the lab's verdicts: an error,
+    // never a guess.
+    ok: bool,
+    // The spec's verdict code, in the order of the lab's strings; -1 when
+    // the string is unknown.
+    code: i64,
+}
+
+pub struct Delta {
+    // False for a code outside the spec's six; the original raises
+    // IndexError there, and the port reports instead of crashing.
+    known: bool,
+    // True for code 0, Python's None: no transition between the runs.
+    none: bool,
+    // The spec's transition name, empty when there is none.
+    name: []const u8,
+}
+
+pub struct IsRed {
+    // False when the name is not one of the five transitions; the original
+    // raises ValueError there.
+    ok: bool,
+    // The compiled rules' answer for that transition, passed in by the
+    // caller.
+    red: bool,
+}
+
+pub struct PctParts {
+    // The whole part of the percentage: tenths / 10.
+    whole: u32,
+    // The single decimal digit: tenths % 10. The caller joins whole and
+    // tenth with '.'.
+    tenth: u32,
+}
+
+// Python's _cache_dir reads XDG_CACHE_HOME, falling back to $HOME/.cache
+// when it is unset or empty (Python's `or` treats both the same), and joins
+// t27/t27b-rules under it. The env read, the home expansion and the path
+// join are plumbing; the fallback decision is here. The caller passes the
+// env value as xdg_cache_home, using the empty string for unset or empty,
+// and the expanded home as home.
+pub fn _cache_dir(xdg_cache_home: []const u8, home: []const u8) -> CacheBase {
+    if (xdg_cache_home.len == 0) {
+        return CacheBase { from_xdg: false, base: home };
+    }
+    return CacheBase { from_xdg: true, base: xdg_cache_home };
+}
+
+// The suffix choice inside Python's _build: the cached shared library ends
+// in dylib on darwin and in so everywhere else.
+pub fn so_suffix(is_darwin: bool) -> []const u8 {
+    if (is_darwin) {
+        return "dylib";
+    }
+    return "so";
+}
+
+// Python's _build reads the generated steward.c, names the cached shared
+// library after the source's hash, compiles it with cc when the cache is
+// cold, and loads it through ctypes. The file read, the hash, the
+// subprocess and the dlopen are plumbing; the plan's decisions are here.
+// The caller passes the world in: whether the generated C was readable
+// (read first, so a cached library does not help when it is not), whether
+// the cached library exists, the platform, and the compiler's exit code,
+// which only means something when the compile ran.
+pub fn _build(src_readable: bool, lib_exists: bool, is_darwin: bool, cc_exit: i32) -> BuildPlan {
+    const suffix = so_suffix(is_darwin);
+    if (!src_readable) {
+        return BuildPlan { ok: false, reuse: false, suffix: suffix };
+    }
+    if (lib_exists) {
+        return BuildPlan { ok: true, reuse: true, suffix: suffix };
+    }
+    if (cc_exit != 0) {
+        return BuildPlan { ok: false, reuse: false, suffix: suffix };
+    }
+    return BuildPlan { ok: true, reuse: false, suffix: suffix };
+}
+
+// Python's lib() builds the compiled rules once and returns their handle.
+// The handle is world state; the decision the port keeps is readiness: the
+// rules are available when they were already loaded or the fresh build
+// succeeded, and a failed build is RulesUnavailable, never a guess.
+pub fn lib(cached: bool, build_ok: bool) -> bool {
+    if (cached) {
+        return true;
+    }
+    return build_ok;
+}
+
+// Python's verdict maps the lab's verdict strings to the spec's verdict
+// codes, in the order the lab lists them (line 26). An unknown string is an
+// error, never a guess.
+pub fn verdict(v: []const u8) -> Verdict {
+    if (v == "pass") {
+        return Verdict { ok: true, code: 0 };
+    }
+    if (v == "pass_vacuous") {
+        return Verdict { ok: true, code: 1 };
+    }
+    if (v == "blocked") {
+        return Verdict { ok: true, code: 2 };
+    }
+    if (v == "frontend") {
+        return Verdict { ok: true, code: 3 };
+    }
+    if (v == "codegen") {
+        return Verdict { ok: true, code: 4 };
+    }
+    if (v == "fail") {
+        return Verdict { ok: true, code: 5 };
+    }
+    if (v == "mismatch") {
+        return Verdict { ok: true, code: 6 };
+    }
+    if (v == "crash") {
+        return Verdict { ok: true, code: 7 };
+    }
+    if (v == "timeout") {
+        return Verdict { ok: true, code: 8 };
+    }
+    if (v == "not run") {
+        return Verdict { ok: true, code: 9 };
+    }
+    return Verdict { ok: false, code: -1 };
+}
+
+// Python's delta forwards the two runs' verdict codes and check counts to
+// the compiled delta_code and names the code it returns (line 83). The
+// ctypes call stays with the caller; the naming decision is here: code 0 is
+// Python's None, no transition; 1 to 5 are the spec's transition names in
+// order; a code outside the six is reported, not guessed.
+pub fn delta(code: u8) -> Delta {
+    if (code == 0) {
+        return Delta { known: true, none: true, name: "" };
+    }
+    if (code == 1) {
+        return Delta { known: true, none: false, name: "REF-MOVED" };
+    }
+    if (code == 2) {
+        return Delta { known: true, none: false, name: "REGRESSED" };
+    }
+    if (code == 3) {
+        return Delta { known: true, none: false, name: "NEW-MISMATCH" };
+    }
+    if (code == 4) {
+        return Delta { known: true, none: false, name: "GAINED" };
+    }
+    if (code == 5) {
+        return Delta { known: true, none: false, name: "CHECK-LOST" };
+    }
+    return Delta { known: false, none: false, name: "" };
+}
+
+// Python's DELTAS.index(name), which is_red uses before it asks the
+// compiled rules: the name's position in the spec's transition table
+// (line 28), or -1 when the name is not one of the five.
+pub fn delta_code_of(name: []const u8) -> i64 {
+    if (name == "REF-MOVED") {
+        return 1;
+    }
+    if (name == "REGRESSED") {
+        return 2;
+    }
+    if (name == "NEW-MISMATCH") {
+        return 3;
+    }
+    if (name == "GAINED") {
+        return 4;
+    }
+    if (name == "CHECK-LOST") {
+        return 5;
+    }
+    return -1;
+}
+
+// Python's is_red looks the transition name up in DELTAS and asks the
+// compiled rules whether that transition is red (line 89). The compiled
+// answer is world data; the caller passes it in as lib_says_red. An unknown
+// name is ValueError in the original: an error, never a guess.
+pub fn is_red(name: []const u8, lib_says_red: bool) -> IsRed {
+    const code = delta_code_of(name);
+    if (code < 0) {
+        return IsRed { ok: false, red: false };
+    }
+    return IsRed { ok: true, red: lib_says_red };
+}
+
+// Python's pct calls the compiled pct_tenths(in_ref, reference) and formats
+// the honest percentage as text with one decimal (line 93). The ctypes call
+// and the text join are plumbing: t27 has no string building, so the caller
+// calls the compiled rules and joins whole and tenth with '.'. The split is
+// here.
+pub fn pct(tenths: u32) -> PctParts {
+    return PctParts { whole: tenths / 10, tenth: tenths % 10 };
+}
+
+test cache_dir_prefers_xdg {
+    const d = _cache_dir("/home/u/.xdg", "/home/u");
+    assert(d.from_xdg);
+    assert(d.base == "/home/u/.xdg");
+}
+
+test cache_dir_empty_xdg_falls_back {
+    // Python's `or`: an empty XDG_CACHE_HOME falls back to the home, exactly
+    // like an unset one.
+    const d = _cache_dir("", "/home/u");
+    assert(!d.from_xdg);
+    assert(d.base == "/home/u");
+}
+
+test cache_dir_whitespace_xdg_is_kept {
+    // A non-empty XDG_CACHE_HOME is used as given, even whitespace.
+    const d = _cache_dir(" ", "/home/u");
+    assert(d.from_xdg);
+    assert(d.base == " ");
+}
+
+test build_reuses_cached_lib {
+    // The cached library is reused without a compile: cc_exit is ignored
+    // even when it would have meant a failing compile.
+    const p = _build(true, true, false, 1);
+    assert(p.ok);
+    assert(p.reuse);
+    assert(p.suffix == "so");
+}
+
+test build_missing_source_is_rules_unavailable {
+    // The source is read first, so even a cached library does not help when
+    // the generated C is missing.
+    const p = _build(false, true, true, 0);
+    assert(!p.ok);
+    assert(!p.reuse);
+}
+
+test build_failing_compile_is_rules_unavailable {
+    const p = _build(true, false, false, 1);
+    assert(!p.ok);
+    assert(!p.reuse);
+}
+
+test build_suffix_by_platform {
+    const mac = _build(true, false, true, 0);
+    assert(mac.ok);
+    assert(mac.suffix == "dylib");
+    const other = _build(true, false, false, 0);
+    assert(other.ok);
+    assert(other.suffix == "so");
+    assert(so_suffix(true) == "dylib");
+    assert(so_suffix(false) == "so");
+}
+
+test lib_readiness {
+    assert(lib(true, false));
+    assert(lib(false, true));
+    assert(!lib(false, false));
+}
+
+test verdict_codes_in_lab_order {
+    assert(verdict("pass").code == 0);
+    assert(verdict("pass_vacuous").code == 1);
+    assert(verdict("blocked").code == 2);
+    assert(verdict("frontend").code == 3);
+    assert(verdict("codegen").code == 4);
+    assert(verdict("fail").code == 5);
+    assert(verdict("mismatch").code == 6);
+    assert(verdict("crash").code == 7);
+    assert(verdict("timeout").code == 8);
+    assert(verdict("not run").code == 9);
+}
+
+test verdict_known_strings_are_ok {
+    assert(verdict("pass").ok);
+    assert(verdict("not run").ok);
+    assert(verdict("timeout").ok);
+}
+
+test verdict_unknown_is_error_never_a_guess {
+    assert(!verdict("bogus").ok);
+    assert(!verdict("").ok);
+    assert(verdict("bogus").code == -1);
+}
+
+test delta_names_in_spec_order {
+    assert(delta(0).none);
+    assert(delta(1).name == "REF-MOVED");
+    assert(delta(2).name == "REGRESSED");
+    assert(delta(3).name == "NEW-MISMATCH");
+    assert(delta(4).name == "GAINED");
+    assert(delta(5).name == "CHECK-LOST");
+}
+
+test delta_out_of_range_is_reported {
+    assert(!delta(6).known);
+    assert(!delta(255).known);
+}
+
+test delta_code_of_maps_names_back {
+    assert(delta_code_of("REF-MOVED") == 1);
+    assert(delta_code_of("CHECK-LOST") == 5);
+    assert(delta_code_of("bogus") == -1);
+}
+
+test is_red_reports_the_compiled_answer {
+    const red = is_red("REGRESSED", true);
+    assert(red.ok);
+    assert(red.red);
+    const not_red = is_red("GAINED", false);
+    assert(not_red.ok);
+    assert(!not_red.red);
+}
+
+test is_red_unknown_name_is_error_never_a_guess {
+    assert(!is_red("bogus", true).ok);
+}
+
+test pct_splits_tenths {
+    const p = pct(875);
+    assert(p.whole == 87);
+    assert(p.tenth == 5);
+    assert(pct(0).whole == 0);
+    assert(pct(0).tenth == 0);
+    assert(pct(1000).whole == 100);
+    assert(pct(1000).tenth == 0);
+    assert(pct(7).whole == 0);
+    assert(pct(7).tenth == 7);
+}

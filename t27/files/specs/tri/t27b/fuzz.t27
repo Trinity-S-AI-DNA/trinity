@@ -1,0 +1,1327 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/tri/t27b/fuzz.t27 -- the seeded program generator of the t27b differential fuzzer (gHashTag/t27#6442)
+; Refs #6488 (sieve C3) and #6063 (t27b epic). Csmith / YARPGen style: build a random program as data,
+; evaluate it here with a model of t27's integer semantics, then print it with a checksum assert, so the
+; expected verdict of every generated test is known BEFORE either compiler sees the program.
+; One case is one module of 1 to 3 functions. Each function has one integer type T (u8 .. i64), 1 to 3
+; params of type T, locals declared at depth 0, if/else and fixed-count while loops nested at most twice,
+; and expressions that are left-deep chains of up to four atoms (param, local, or constant). Constants are
+; biased: about three draws in four are 0, 1, -1 / all-ones, 2^k, 2^k - 1, 2^k + 1, MIN, MAX, MIN + 1,
+; MAX - 1 or a small number; the rest are uniform.
+; Every function gets one test, named for its expected verdict:
+;   f<K>_expect_pass  -- the model saw no trap; checksum is the value the function must return.
+;   f<K>_expect_trap  -- the model saw a checked + - * overflow and KEPT it (about one function in four
+;                        that hits one). The checksum is the value the function would return if that one
+;                        operation wrapped, so a compiler that forgets the trap PASSES the assert and the
+;                        oracle (fuzz_oracle.t27) sees it.
+; Every other checked overflow the model meets is rewritten to its wrapping form (+ to +%, - to -%,
+; * to *%) and the function re-evaluated, until no unkept hazard is left (YARPGen's UB fixpoint).
+; Unsigned / and % divide by (x | 1), so division by zero cannot happen; signed / and % are not emitted
+; (Zig wants @divTrunc there). Shift amounts are a constant below the width or (x & (bits - 1)).
+; Not here: writing the rendered bytes to a file, running t27b and the reference, reading their output.
+; Those are I/O, and t27 has no I/O yet; a driver imports `t27c gen` of this module and does them.
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module T27bFuzz;
+
+/// The constructs a generated case uses, in t27b's reject vocabulary (cli/t27b/src/lower.rs and
+/// blockers.rs name a refused construct by node kind). A t27b `blocked` verdict on a generated case
+/// naming one of these is allow-list drift: the generator emitted something t27b does not lower.
+pub const EMITTED : str = "FnDecl,StmtLocal,StmtAssign,StmtIf,StmtWhile,StmtReturn,ExprBinary,ExprBinary(<< >>),ExprUnary(-),ExprLiteral,ExprIdentifier,ExprCall,ExprCall(assert_eq),TestDecl";
+
+/// Constructs t27b lowers that the generator does not emit yet, so a fuzz run says nothing about them.
+pub const NOT_YET : str = "ExprSwitch,StructDecl,ExprArrayLiteral,optional,f64,for-range,ExprCast,call-between-fns,signed-division";
+
+/// Integer types, by code: 0 u8, 1 u16, 2 u32, 3 u64, 4 i8, 5 i16, 6 i32, 7 i64.
+pub const TYPE_NAMES : str = "u8,u16,u32,u64,i8,i16,i32,i64";
+
+/// Operators of one expression step, by code. Codes 0..2 are checked and trap on overflow.
+pub const OP_ADD : u8 = 0;
+pub const OP_SUB : u8 = 1;
+pub const OP_MUL : u8 = 2;
+pub const OP_ADDW : u8 = 3;
+pub const OP_SUBW : u8 = 4;
+pub const OP_MULW : u8 = 5;
+pub const OP_AND : u8 = 6;
+pub const OP_OR : u8 = 7;
+pub const OP_XOR : u8 = 8;
+pub const OP_SHLK : u8 = 9;
+pub const OP_SHRK : u8 = 10;
+pub const OP_SHLV : u8 = 11;
+pub const OP_SHRV : u8 = 12;
+pub const OP_DIV : u8 = 13;
+pub const OP_REM : u8 = 14;
+
+/// Atom kinds.
+pub const A_PARAM : u8 = 0;
+pub const A_LOCAL : u8 = 1;
+pub const A_CONST : u8 = 2;
+
+/// Statement kinds. ELSE and END are block markers; every IF has an ELSE.
+pub const S_DECL : u8 = 0;
+pub const S_ASSIGN : u8 = 1;
+pub const S_IF : u8 = 2;
+pub const S_ELSE : u8 = 3;
+pub const S_END : u8 = 4;
+pub const S_LOOP : u8 = 5;
+pub const S_RET : u8 = 6;
+
+/// Comparisons of an IF.
+pub const C_LT : u32 = 0;
+pub const C_GT : u32 = 1;
+pub const C_LE : u32 = 2;
+pub const C_GE : u32 = 3;
+pub const C_EQ : u32 = 4;
+pub const C_NE : u32 = 5;
+
+/// Limits: functions per case, statements per function, expressions per function, atoms per
+/// expression, locals per function, params per function.
+pub const MAX_FN : u32 = 3;
+pub const MAX_ST : u32 = 32;
+pub const MAX_EX : u32 = 64;
+pub const MAX_AT : u32 = 4;
+pub const MAX_LOC : u32 = 6;
+pub const MAX_PAR : u32 = 3;
+
+/// No kept trap site.
+pub const NONE : u32 = 65535;
+
+/// Hazard flags of one evaluation.
+pub const HZ_NONE : u8 = 0;
+pub const HZ_TRAP : u8 = 1;
+pub const HZ_SHAPE : u8 = 2;
+
+pub const ALL : u64 = 18446744073709551615;
+pub const GAMMA : u64 = 0x9E3779B97F4A7C15;
+pub const MIX1 : u64 = 0xBF58476D1CE4E5B9;
+pub const MIX2 : u64 = 0x94D049BB133111EB;
+pub const CASE_MIX : u64 = 0xD1B54A32D192ED03;
+
+/// Rendered bytes of one case. 16 KiB holds the largest case the limits allow.
+pub const OUT_CAP : u32 = 16384;
+
+pub struct Out {
+    buf: [16384]u8,
+    len: u32,
+    over: bool,
+}
+
+pub struct FuzzRng {
+    s: u64,
+}
+
+/// One generated case. Statement index = f * MAX_ST + s; expression index = f * MAX_EX + e;
+/// atom index = expression index * MAX_AT + i.
+pub struct Module {
+    seed: u64,
+    case_no: u64,
+    nfn: u32,
+    fty: [3]u8,
+    fnp: [3]u32,
+    fns: [3]u32,
+    fnl: [3]u32,
+    ftrap: [3]u8,
+    fkeep: [3]u32,
+    fv: [3]u64,
+    farg: [9]u64,
+    nex: [3]u32,
+    sk: [96]u8,
+    sa: [96]u32,
+    sx: [96]u32,
+    sy: [96]u32,
+    sm: [96]u32,
+    en: [192]u32,
+    eop: [768]u8,
+    ek: [768]u8,
+    ev: [768]u64,
+}
+
+/// The values one evaluation of one function works on.
+pub struct Frame {
+    p: [3]u64,
+    l: [6]u64,
+    cnt: [32]u32,
+}
+
+/// Result of evaluating an expression or a function: the value, a hazard flag, and the atom index
+/// of the operation that trapped.
+pub struct Eval {
+    v: u64,
+    hz: u8,
+    at: u32,
+}
+
+// ---- PRNG: splitmix64 ----
+
+pub fn rng_next(r: *FuzzRng) -> u64 {
+    r.s = r.s +% GAMMA;
+    var z: u64 = r.s;
+    z = (z ^ (z >> 30)) *% MIX1;
+    z = (z ^ (z >> 27)) *% MIX2;
+    return z ^ (z >> 31);
+}
+
+pub fn rng_below(r: *FuzzRng, n: u64) -> u64 {
+    return rng_next(r) % n;
+}
+
+pub fn rng_for(seed: u64, case_no: u64) -> FuzzRng {
+    return FuzzRng { s: seed ^ (case_no *% CASE_MIX) };
+}
+
+// ---- integer types ----
+
+pub fn ty_bits(t: u8) -> u64 {
+    const w: u8 = t & 3;
+    if (w == 0) { return 8; }
+    if (w == 1) { return 16; }
+    if (w == 2) { return 32; }
+    return 64;
+}
+
+pub fn ty_signed(t: u8) -> bool {
+    return t >= 4;
+}
+
+pub fn mask_of(bits: u64) -> u64 {
+    if (bits >= 64) { return ALL; }
+    var one: u64 = 1;
+    return (one << bits) - 1;
+}
+
+pub fn sign_of(bits: u64) -> u64 {
+    var one: u64 = 1;
+    return one << (bits - 1);
+}
+
+/// Sign-extend the low `bits` of v to 64 bits (as a bit pattern).
+pub fn sext(v: u64, t: u8) -> u64 {
+    const bits = ty_bits(t);
+    const mk = mask_of(bits);
+    if ((v & sign_of(bits)) == 0) { return v & mk; }
+    return (v & mk) | (ALL ^ mk);
+}
+
+/// Arithmetic right shift of a 64-bit pattern.
+pub fn ashr64(x: u64, k: u64) -> u64 {
+    if ((x >> 63) == 0) { return x >> k; }
+    return (x >> k) | (ALL ^ (ALL >> k));
+}
+
+// ---- the semantic model ----
+
+pub fn ovf_add(a: u64, b: u64, t: u8) -> bool {
+    const bits = ty_bits(t);
+    const mk = mask_of(bits);
+    const r: u64 = (a +% b) & mk;
+    if (ty_signed(t)) {
+        return ((a ^ r) & (b ^ r) & sign_of(bits)) != 0;
+    }
+    const s: u64 = a +% b;
+    if (s < a) { return true; }
+    return s > mk;
+}
+
+pub fn ovf_sub(a: u64, b: u64, t: u8) -> bool {
+    const bits = ty_bits(t);
+    const r: u64 = (a -% b) & mask_of(bits);
+    if (ty_signed(t)) {
+        return ((a ^ b) & (a ^ r) & sign_of(bits)) != 0;
+    }
+    return b > a;
+}
+
+pub fn ovf_mul(a: u64, b: u64, t: u8) -> bool {
+    const bits = ty_bits(t);
+    const mk = mask_of(bits);
+    if (ty_signed(t) == false) {
+        if (a == 0) { return false; }
+        const p: u64 = a *% b;
+        if ((p / a) != b) { return true; }
+        return p > mk;
+    }
+    const sg = sign_of(bits);
+    var ma: u64 = a;
+    var mb: u64 = b;
+    var neg: u8 = 0;
+    if ((a & sg) != 0) {
+        ma = (0 -% a) & mk;
+        neg = neg ^ 1;
+    }
+    if ((b & sg) != 0) {
+        mb = (0 -% b) & mk;
+        neg = neg ^ 1;
+    }
+    if (ma == 0) { return false; }
+    if (mb == 0) { return false; }
+    const p: u64 = ma *% mb;
+    if ((p / ma) != mb) { return true; }
+    if (neg == 1) { return p > sg; }
+    return p > (sg - 1);
+}
+
+/// One expression step `a op b` in type t, both operands already masked to the width.
+pub fn apply(op: u8, a: u64, b: u64, t: u8) -> Eval {
+    const bits = ty_bits(t);
+    const mk = mask_of(bits);
+    var r: u64 = 0;
+    var hz: u8 = HZ_NONE;
+    if (op == OP_ADD) {
+        r = (a +% b) & mk;
+        if (ovf_add(a, b, t)) { hz = HZ_TRAP; }
+    }
+    if (op == OP_SUB) {
+        r = (a -% b) & mk;
+        if (ovf_sub(a, b, t)) { hz = HZ_TRAP; }
+    }
+    if (op == OP_MUL) {
+        r = (a *% b) & mk;
+        if (ovf_mul(a, b, t)) { hz = HZ_TRAP; }
+    }
+    if (op == OP_ADDW) { r = (a +% b) & mk; }
+    if (op == OP_SUBW) { r = (a -% b) & mk; }
+    if (op == OP_MULW) { r = (a *% b) & mk; }
+    if (op == OP_AND) { r = a & b; }
+    if (op == OP_OR) { r = a | b; }
+    if (op == OP_XOR) { r = a ^ b; }
+    if (op == OP_SHLK) { r = (a << (b & (bits - 1))) & mk; }
+    if (op == OP_SHLV) { r = (a << (b & (bits - 1))) & mk; }
+    if (op == OP_SHRK) {
+        r = a >> (b & (bits - 1));
+        if (ty_signed(t)) { r = ashr64(sext(a, t), b & (bits - 1)) & mk; }
+    }
+    if (op == OP_SHRV) {
+        r = a >> (b & (bits - 1));
+        if (ty_signed(t)) { r = ashr64(sext(a, t), b & (bits - 1)) & mk; }
+    }
+    if (op == OP_DIV) { r = a / (b | 1); }
+    if (op == OP_REM) { r = a % (b | 1); }
+    return Eval { v: r, hz: hz, at: 0 };
+}
+
+/// a < b in type t (signed compares flip the sign bit of both sides).
+pub fn less(a: u64, b: u64, t: u8) -> bool {
+    if (ty_signed(t)) {
+        const sg = sign_of(ty_bits(t));
+        return (a ^ sg) < (b ^ sg);
+    }
+    return a < b;
+}
+
+pub fn compare(c: u32, a: u64, b: u64, t: u8) -> bool {
+    if (c == C_LT) { return less(a, b, t); }
+    if (c == C_GT) { return less(b, a, t); }
+    if (c == C_LE) { return less(b, a, t) == false; }
+    if (c == C_GE) { return less(a, b, t) == false; }
+    if (c == C_EQ) { return a == b; }
+    return a != b;
+}
+
+// ---- biased constants ----
+
+/// A constant of type t as a bit pattern masked to the width. About 3 draws in 4 are special values.
+pub fn biased_const(r: *FuzzRng, t: u8) -> u64 {
+    const bits = ty_bits(t);
+    const mk = mask_of(bits);
+    var top: u64 = mk;
+    var low: u64 = 0;
+    if (ty_signed(t)) {
+        top = sign_of(bits) - 1;
+        low = sign_of(bits);
+    }
+    const pick = rng_below(r, 16);
+    var one: u64 = 1;
+    const p2: u64 = (one << rng_below(r, bits)) & mk;
+    if (pick == 0) { return 0; }
+    if (pick == 1) { return 1; }
+    if (pick == 2) { return mk; }
+    if (pick == 3) { return p2; }
+    if (pick == 4) { return (p2 -% 1) & mk; }
+    if (pick == 5) { return (p2 +% 1) & mk; }
+    if (pick == 6) { return low; }
+    if (pick == 7) { return top; }
+    if (pick == 8) { return (low +% 1) & mk; }
+    if (pick == 9) { return (top -% 1) & mk; }
+    if (pick == 10) { return 2 + rng_below(r, 8); }
+    if (pick == 11) { return (0 -% (2 + rng_below(r, 8))) & mk; }
+    return rng_next(r) & mk;
+}
+
+/// Whether v is one of the special values of type t.
+pub fn is_special(v: u64, t: u8) -> bool {
+    const bits = ty_bits(t);
+    const mk = mask_of(bits);
+    if (v == 0) { return true; }
+    if (v == 1) { return true; }
+    if (v == mk) { return true; }
+    if (v < 10) { return true; }
+    if (((0 -% v) & mk) < 10) { return true; }
+    const sg = sign_of(bits);
+    if (v == sg) { return true; }
+    if (v == (sg - 1)) { return true; }
+    if (v == (sg + 1)) { return true; }
+    if (v == (sg - 2)) { return true; }
+    var k: u64 = 0;
+    var one: u64 = 1;
+    while (k < bits) {
+        const p: u64 = one << k;
+        if (v == p) { return true; }
+        if (v == (p - 1)) { return true; }
+        if (v == ((p + 1) & mk)) { return true; }
+        k += 1;
+    }
+    return false;
+}
+
+// ---- building a case ----
+
+pub fn module_empty(seed: u64, case_no: u64) -> Module {
+    return Module {
+        seed: seed,
+        case_no: case_no,
+        nfn: 0,
+        fty: [0; 3],
+        fnp: [0; 3],
+        fns: [0; 3],
+        fnl: [0; 3],
+        ftrap: [0; 3],
+        fkeep: [65535; 3],
+        fv: [0; 3],
+        farg: [0; 9],
+        nex: [0; 3],
+        sk: [0; 96],
+        sa: [0; 96],
+        sx: [0; 96],
+        sy: [0; 96],
+        sm: [0; 96],
+        en: [0; 192],
+        eop: [0; 768],
+        ek: [0; 768],
+        ev: [0; 768],
+    };
+}
+
+/// A random variable atom: one of the params or one of the `nloc` locals declared so far.
+pub fn pick_var(m: *Module, r: *FuzzRng, f: u32, nloc: u32, a: u32) {
+    const k: u32 = rng_below(r, m.fnp[f] + nloc) as u32;
+    if (k < m.fnp[f]) {
+        m.ek[a] = A_PARAM;
+        m.ev[a] = k;
+    } else {
+        m.ek[a] = A_LOCAL;
+        m.ev[a] = k - m.fnp[f];
+    }
+}
+
+/// A random expression over the params and the first `nloc` locals; returns its expression index.
+pub fn new_expr(m: *Module, r: *FuzzRng, f: u32, nloc: u32) -> u32 {
+    const t = m.fty[f];
+    const g: u32 = f * MAX_EX + m.nex[f];
+    m.nex[f] += 1;
+    const n: u32 = (1 + rng_below(r, MAX_AT)) as u32;
+    m.en[g] = n;
+    pick_var(m, r, f, nloc, g * MAX_AT);
+    var nops: u64 = 15;
+    if (ty_signed(t)) { nops = 13; }
+    var i: u32 = 1;
+    while (i < n) {
+        const a: u32 = g * MAX_AT + i;
+        const op: u8 = rng_below(r, nops) as u8;
+        m.eop[a] = op;
+        if (op == OP_SHLK) {
+            m.ek[a] = A_CONST;
+            m.ev[a] = rng_below(r, ty_bits(t));
+        } else {
+            if (op == OP_SHRK) {
+                m.ek[a] = A_CONST;
+                m.ev[a] = rng_below(r, ty_bits(t));
+            } else {
+                if (rng_below(r, 2) == 0) {
+                    m.ek[a] = A_CONST;
+                    m.ev[a] = biased_const(r, t);
+                } else {
+                    pick_var(m, r, f, nloc, a);
+                }
+            }
+        }
+        i += 1;
+    }
+    return g;
+}
+
+/// The first statement: `var v0: T = p0 ^ p1 ^ ...`, so every param is read.
+pub fn first_expr(m: *Module, f: u32) -> u32 {
+    const g: u32 = f * MAX_EX + m.nex[f];
+    m.nex[f] += 1;
+    m.en[g] = m.fnp[f];
+    var i: u32 = 0;
+    while (i < m.fnp[f]) {
+        const a: u32 = g * MAX_AT + i;
+        m.ek[a] = A_PARAM;
+        m.ev[a] = i;
+        m.eop[a] = OP_XOR;
+        i += 1;
+    }
+    return g;
+}
+
+pub fn emit(m: *Module, f: u32, k: u8) -> u32 {
+    const s = m.fns[f];
+    m.sk[f * MAX_ST + s] = k;
+    m.fns[f] += 1;
+    return s;
+}
+
+/// Close the innermost open block. An IF still in its then-part gets its ELSE; anything else its END.
+/// Returns true when the block is gone (depth goes down).
+pub fn close_block(m: *Module, f: u32, opener: u32, in_else: bool) -> bool {
+    const base = f * MAX_ST;
+    if (m.sk[base + opener] == S_IF) {
+        if (in_else == false) {
+            const e = emit(m, f, S_ELSE);
+            m.sm[base + opener] = e;
+            return false;
+        }
+        const end_if = emit(m, f, S_END);
+        const e2 = m.sm[base + opener];
+        m.sm[base + e2] = end_if;
+        m.sm[base + end_if] = opener;
+        return true;
+    }
+    const end_loop = emit(m, f, S_END);
+    m.sm[base + opener] = end_loop;
+    m.sm[base + end_loop] = opener;
+    return true;
+}
+
+/// Generate the statements of function f.
+pub fn gen_fn(m: *Module, r: *FuzzRng, f: u32) {
+    const base = f * MAX_ST;
+    const t: u8 = rng_below(r, 8) as u8;
+    m.fty[f] = t;
+    m.fnp[f] = (1 + rng_below(r, MAX_PAR)) as u32;
+    var i: u32 = 0;
+    while (i < m.fnp[f]) {
+        m.farg[f * MAX_PAR + i] = biased_const(r, t);
+        i += 1;
+    }
+    const d0 = emit(m, f, S_DECL);
+    m.sa[base + d0] = 0;
+    m.sx[base + d0] = first_expr(m, f);
+    var nloc: u32 = 1;
+    var depth: u32 = 0;
+    var open: [2]u32 = [0; 2];
+    var in_else: [2]u8 = [0; 2];
+    const target: u32 = (6 + rng_below(r, 20)) as u32;
+    var going: bool = true;
+    while (going) {
+        if ((m.fns[f] + 2 * depth + 4) > MAX_ST) { going = false; }
+        if (m.fns[f] >= target) { going = false; }
+        var done: bool = true;
+        var c: u64 = 0;
+        if (going) {
+            c = rng_below(r, 10);
+            done = false;
+        }
+        if (c < 2) {
+            if (depth == 0) {
+                if (nloc < MAX_LOC) {
+                    const s = emit(m, f, S_DECL);
+                    m.sx[base + s] = new_expr(m, r, f, nloc);
+                    m.sa[base + s] = nloc;
+                    nloc += 1;
+                    done = true;
+                }
+            }
+        }
+        if (done == false) {
+            if (c == 5) {
+                if (depth < 2) {
+                    const s = emit(m, f, S_IF);
+                    m.sa[base + s] = rng_below(r, 6) as u32;
+                    m.sx[base + s] = new_expr(m, r, f, nloc);
+                    m.sy[base + s] = new_expr(m, r, f, nloc);
+                    open[depth] = s;
+                    in_else[depth] = 0;
+                    depth += 1;
+                    done = true;
+                }
+            }
+        }
+        if (done == false) {
+            if (c == 6) {
+                if (depth < 2) {
+                    const s = emit(m, f, S_LOOP);
+                    m.sa[base + s] = (1 + rng_below(r, 8)) as u32;
+                    open[depth] = s;
+                    in_else[depth] = 0;
+                    depth += 1;
+                    done = true;
+                }
+            }
+        }
+        if (done == false) {
+            if (c >= 7) {
+                if (depth > 0) {
+                    if (close_block(m, f, open[depth - 1], in_else[depth - 1] == 1)) {
+                        depth -= 1;
+                    } else {
+                        in_else[depth - 1] = 1;
+                    }
+                    done = true;
+                }
+            }
+        }
+        if (done == false) {
+            const s = emit(m, f, S_ASSIGN);
+            m.sx[base + s] = new_expr(m, r, f, nloc);
+            m.sa[base + s] = rng_below(r, nloc) as u32;
+        }
+    }
+    while (depth > 0) {
+        if (close_block(m, f, open[depth - 1], in_else[depth - 1] == 1)) {
+            depth -= 1;
+        } else {
+            in_else[depth - 1] = 1;
+        }
+    }
+    const ret = emit(m, f, S_RET);
+    m.sx[base + ret] = new_expr(m, r, f, nloc);
+    m.fnl[f] = nloc;
+}
+
+// ---- evaluating a case ----
+
+pub fn atom_val(m: *Module, fr: *Frame, a: u32) -> u64 {
+    if (m.ek[a] == A_PARAM) { return fr.p[m.ev[a]]; }
+    if (m.ek[a] == A_LOCAL) { return fr.l[m.ev[a]]; }
+    return m.ev[a];
+}
+
+/// Evaluate expression g of function f. In shadow mode the kept trap site wraps instead of trapping.
+pub fn eval_expr(m: *Module, fr: *Frame, f: u32, g: u32, shadow: bool) -> Eval {
+    const t = m.fty[f];
+    var acc: u64 = atom_val(m, fr, g * MAX_AT);
+    var i: u32 = 1;
+    while (i < m.en[g]) {
+        const a: u32 = g * MAX_AT + i;
+        var op: u8 = m.eop[a];
+        if (shadow) {
+            if (m.fkeep[f] == a) {
+                if (op <= OP_MUL) { op = op + 3; }
+            }
+        }
+        const e = apply(op, acc, atom_val(m, fr, a), t);
+        if (e.hz != HZ_NONE) { return Eval { v: 0, hz: HZ_TRAP, at: a }; }
+        acc = e.v;
+        i += 1;
+    }
+    return Eval { v: acc, hz: HZ_NONE, at: 0 };
+}
+
+/// Run function f on its test arguments.
+pub fn run_fn(m: *Module, f: u32, shadow: bool) -> Eval {
+    var fr = Frame { p: [0; 3], l: [0; 6], cnt: [0; 32] };
+    var i: u32 = 0;
+    while (i < m.fnp[f]) {
+        fr.p[i] = m.farg[f * MAX_PAR + i];
+        i += 1;
+    }
+    const base = f * MAX_ST;
+    const t = m.fty[f];
+    var pc: u32 = 0;
+    while (pc < m.fns[f]) {
+        const s = base + pc;
+        const k = m.sk[s];
+        if (k == S_RET) {
+            return eval_expr(m, &fr, f, m.sx[s], shadow);
+        }
+        if (k <= S_ASSIGN) {
+            const e = eval_expr(m, &fr, f, m.sx[s], shadow);
+            if (e.hz != HZ_NONE) { return e; }
+            fr.l[m.sa[s]] = e.v;
+            pc += 1;
+        }
+        if (k == S_IF) {
+            const x = eval_expr(m, &fr, f, m.sx[s], shadow);
+            if (x.hz != HZ_NONE) { return x; }
+            const y = eval_expr(m, &fr, f, m.sy[s], shadow);
+            if (y.hz != HZ_NONE) { return y; }
+            if (compare(m.sa[s], x.v, y.v, t)) {
+                pc += 1;
+            } else {
+                pc = m.sm[s] + 1;
+            }
+        }
+        if (k == S_ELSE) {
+            pc = m.sm[s] + 1;
+        }
+        if (k == S_LOOP) {
+            fr.cnt[pc] = 0;
+            pc += 1;
+        }
+        if (k == S_END) {
+            const o = m.sm[s];
+            if (m.sk[base + o] == S_LOOP) {
+                fr.cnt[o] += 1;
+                if (fr.cnt[o] < m.sa[base + o]) {
+                    pc = o + 1;
+                } else {
+                    pc += 1;
+                }
+            } else {
+                pc += 1;
+            }
+        }
+    }
+    return Eval { v: 0, hz: HZ_SHAPE, at: 0 };
+}
+
+/// The hazard fixpoint of function f. With `keep`, the first checked overflow met is kept as an
+/// expected trap; every other one is rewritten to its wrapping form. Sets ftrap, fkeep and fv.
+pub fn settle(m: *Module, f: u32, keep: bool) {
+    m.fkeep[f] = NONE;
+    m.ftrap[f] = 0;
+    var e = run_fn(m, f, true);
+    var rounds: u32 = 0;
+    while (e.hz == HZ_TRAP) {
+        if (rounds > 800) {
+            e = Eval { v: 0, hz: HZ_SHAPE, at: 0 };
+        } else {
+            settle_step(m, f, keep, e.at);
+            e = run_fn(m, f, true);
+            rounds += 1;
+        }
+    }
+    m.fv[f] = e.v;
+    if (m.fkeep[f] != NONE) {
+        const real = run_fn(m, f, false);
+        if (real.hz == HZ_TRAP) {
+            if (real.at == m.fkeep[f]) { m.ftrap[f] = 1; }
+        }
+    }
+}
+
+/// One fixpoint step: keep the hazard at atom `at` as the expected trap, or rewrite it to wrap.
+pub fn settle_step(m: *Module, f: u32, keep: bool, at: u32) {
+    if (keep) {
+        if (m.fkeep[f] == NONE) {
+            m.fkeep[f] = at;
+            return;
+        }
+    }
+    m.eop[at] = m.eop[at] + 3;
+}
+
+/// Build case `case_no` of run `seed`: same (seed, case_no), same module, on every host.
+pub fn gen_case(seed: u64, case_no: u64, m: *Module) {
+    var r = rng_for(seed, case_no);
+    m.seed = seed;
+    m.case_no = case_no;
+    m.nfn = (1 + rng_below(&r, MAX_FN)) as u32;
+    var f: u32 = 0;
+    while (f < m.nfn) {
+        gen_fn(m, &r, f);
+        const keep: bool = rng_below(&r, 4) == 0;
+        settle(m, f, keep);
+        f += 1;
+    }
+}
+
+/// Functions of a case whose test is expected to trap.
+pub fn trap_count(m: *Module) -> u32 {
+    var n: u32 = 0;
+    var f: u32 = 0;
+    while (f < m.nfn) {
+        n += m.ftrap[f];
+        f += 1;
+    }
+    return n;
+}
+
+/// Whether the case is self-consistent: no function ends in a malformed shape, every expect_trap
+/// function traps at its kept site, and every expect_pass function runs clean to the checksum.
+pub fn case_ok(m: *Module) -> bool {
+    var f: u32 = 0;
+    while (f < m.nfn) {
+        const sh = run_fn(m, f, true);
+        if (sh.hz != HZ_NONE) { return false; }
+        if (sh.v != m.fv[f]) { return false; }
+        const real = run_fn(m, f, false);
+        if (m.ftrap[f] == 1) {
+            if (real.hz != HZ_TRAP) { return false; }
+            if (real.at != m.fkeep[f]) { return false; }
+        } else {
+            if (real.hz != HZ_NONE) { return false; }
+            if (real.v != m.fv[f]) { return false; }
+        }
+        f += 1;
+    }
+    return true;
+}
+
+// ---- rendering ----
+
+pub fn out_empty() -> Out {
+    return Out { buf: [0; 16384], len: 0, over: false };
+}
+
+pub fn put(o: *Out, c: u8) {
+    if (o.len >= OUT_CAP) {
+        o.over = true;
+        return;
+    }
+    o.buf[o.len] = c;
+    o.len += 1;
+}
+
+/// `n` bytes of `s`. The length is passed because t27c gen-c lowers a slice to a bare pointer.
+pub fn put_str(o: *Out, s: []const u8, n: u32) {
+    var i: u32 = 0;
+    while (i < n) {
+        put(o, s[i]);
+        i += 1;
+    }
+}
+
+pub fn put_u64(o: *Out, v: u64) {
+    var tmp: [20]u8 = [0; 20];
+    var n: u32 = 0;
+    var x: u64 = v;
+    if (x == 0) {
+        put(o, 48);
+        return;
+    }
+    while (x > 0) {
+        tmp[n] = (48 + (x % 10)) as u8;
+        x = x / 10;
+        n += 1;
+    }
+    while (n > 0) {
+        n -= 1;
+        put(o, tmp[n]);
+    }
+}
+
+pub fn put_type(o: *Out, t: u8) {
+    if (ty_signed(t)) {
+        put(o, 105);
+    } else {
+        put(o, 117);
+    }
+    put_u64(o, ty_bits(t));
+}
+
+/// A constant of type t in source form. Negative values print in parentheses; MIN prints as
+/// (-MAX - 1) so no literal is out of range before the minus applies.
+pub fn put_const(o: *Out, v: u64, t: u8) {
+    const bits = ty_bits(t);
+    const sg = sign_of(bits);
+    if (ty_signed(t)) {
+        if ((v & sg) != 0) {
+            const mag: u64 = (0 -% v) & mask_of(bits);
+            put_str(o, "(-", 2);
+            if (mag == sg) {
+                put_u64(o, sg - 1);
+                put_str(o, " - 1)", 5);
+                return;
+            }
+            put_u64(o, mag);
+            put(o, 41);
+            return;
+        }
+    }
+    put_u64(o, v);
+}
+
+pub fn put_atom(o: *Out, m: *Module, f: u32, a: u32) {
+    if (m.ek[a] == A_PARAM) {
+        put(o, 112);
+        put_u64(o, m.ev[a]);
+        return;
+    }
+    if (m.ek[a] == A_LOCAL) {
+        put(o, 118);
+        put_u64(o, m.ev[a]);
+        return;
+    }
+    if (m.eop[a] == OP_SHLK) {
+        put_u64(o, m.ev[a]);
+        return;
+    }
+    if (m.eop[a] == OP_SHRK) {
+        put_u64(o, m.ev[a]);
+        return;
+    }
+    put_const(o, m.ev[a], m.fty[f]);
+}
+
+pub fn put_op(o: *Out, op: u8) {
+    if (op == OP_ADD) { put_str(o, " + ", 3); }
+    if (op == OP_SUB) { put_str(o, " - ", 3); }
+    if (op == OP_MUL) { put_str(o, " * ", 3); }
+    if (op == OP_ADDW) { put_str(o, " +% ", 4); }
+    if (op == OP_SUBW) { put_str(o, " -% ", 4); }
+    if (op == OP_MULW) { put_str(o, " *% ", 4); }
+    if (op == OP_AND) { put_str(o, " & ", 3); }
+    if (op == OP_OR) { put_str(o, " | ", 3); }
+    if (op == OP_XOR) { put_str(o, " ^ ", 3); }
+    if (op == OP_SHLK) { put_str(o, " << ", 4); }
+    if (op == OP_SHRK) { put_str(o, " >> ", 4); }
+    if (op == OP_SHLV) { put_str(o, " << (", 5); }
+    if (op == OP_SHRV) { put_str(o, " >> (", 5); }
+    if (op == OP_DIV) { put_str(o, " / (", 4); }
+    if (op == OP_REM) { put_str(o, " % (", 4); }
+}
+
+/// A left-deep expression, fully parenthesized: ((a op b) op c).
+pub fn put_expr(o: *Out, m: *Module, f: u32, g: u32) {
+    const n = m.en[g];
+    var i: u32 = 1;
+    while (i < n) {
+        put(o, 40);
+        i += 1;
+    }
+    put_atom(o, m, f, g * MAX_AT);
+    i = 1;
+    while (i < n) {
+        const a: u32 = g * MAX_AT + i;
+        const op = m.eop[a];
+        put_op(o, op);
+        put_atom(o, m, f, a);
+        if (op >= OP_SHLV) {
+            if (op <= OP_SHRV) {
+                put_str(o, " & ", 3);
+                put_u64(o, ty_bits(m.fty[f]) - 1);
+                put(o, 41);
+            } else {
+                put_str(o, " | 1)", 5);
+            }
+        }
+        put(o, 41);
+        i += 1;
+    }
+}
+
+pub fn put_cmp(o: *Out, c: u32) {
+    if (c == C_LT) { put_str(o, " < ", 3); }
+    if (c == C_GT) { put_str(o, " > ", 3); }
+    if (c == C_LE) { put_str(o, " <= ", 4); }
+    if (c == C_GE) { put_str(o, " >= ", 4); }
+    if (c == C_EQ) { put_str(o, " == ", 4); }
+    if (c == C_NE) { put_str(o, " != ", 4); }
+}
+
+pub fn put_indent(o: *Out, depth: u32) {
+    var i: u32 = 0;
+    while (i < depth) {
+        put_str(o, "    ", 4);
+        i += 1;
+    }
+}
+
+pub fn put_fn(o: *Out, m: *Module, f: u32) {
+    const base = f * MAX_ST;
+    const t = m.fty[f];
+    put_str(o, "fn f", 4);
+    put_u64(o, f);
+    put(o, 40);
+    var i: u32 = 0;
+    while (i < m.fnp[f]) {
+        if (i > 0) { put_str(o, ", ", 2); }
+        put(o, 112);
+        put_u64(o, i);
+        put_str(o, ": ", 2);
+        put_type(o, t);
+        i += 1;
+    }
+    put_str(o, ") -> ", 5);
+    put_type(o, t);
+    put_str(o, " {", 2);
+    put(o, 10);
+    var depth: u32 = 1;
+    var pc: u32 = 0;
+    while (pc < m.fns[f]) {
+        const s = base + pc;
+        const k = m.sk[s];
+        if (k == S_DECL) {
+            put_indent(o, depth);
+            put_str(o, "var v", 5);
+            put_u64(o, m.sa[s]);
+            put_str(o, ": ", 2);
+            put_type(o, t);
+            put_str(o, " = ", 3);
+            put_expr(o, m, f, m.sx[s]);
+            put(o, 59);
+            put(o, 10);
+        }
+        if (k == S_ASSIGN) {
+            put_indent(o, depth);
+            put(o, 118);
+            put_u64(o, m.sa[s]);
+            put_str(o, " = ", 3);
+            put_expr(o, m, f, m.sx[s]);
+            put(o, 59);
+            put(o, 10);
+        }
+        if (k == S_IF) {
+            put_indent(o, depth);
+            put_str(o, "if (", 4);
+            put_expr(o, m, f, m.sx[s]);
+            put_cmp(o, m.sa[s]);
+            put_expr(o, m, f, m.sy[s]);
+            put_str(o, ") {", 3);
+            put(o, 10);
+            depth += 1;
+        }
+        if (k == S_ELSE) {
+            put_indent(o, depth - 1);
+            put_str(o, "} else {", 8);
+            put(o, 10);
+        }
+        if (k == S_LOOP) {
+            put_indent(o, depth);
+            put_str(o, "var k", 5);
+            put_u64(o, pc);
+            put_str(o, ": u32 = 0;", 10);
+            put(o, 10);
+            put_indent(o, depth);
+            put_str(o, "while (k", 8);
+            put_u64(o, pc);
+            put_str(o, " < ", 3);
+            put_u64(o, m.sa[s]);
+            put_str(o, ") {", 3);
+            put(o, 10);
+            depth += 1;
+        }
+        if (k == S_END) {
+            const op = m.sm[s];
+            if (m.sk[base + op] == S_LOOP) {
+                put_indent(o, depth);
+                put(o, 107);
+                put_u64(o, op);
+                put_str(o, " += 1;", 6);
+                put(o, 10);
+            }
+            depth -= 1;
+            put_indent(o, depth);
+            put(o, 125);
+            put(o, 10);
+        }
+        if (k == S_RET) {
+            put_indent(o, depth);
+            put_str(o, "return ", 7);
+            put_expr(o, m, f, m.sx[s]);
+            put(o, 59);
+            put(o, 10);
+        }
+        pc += 1;
+    }
+    put(o, 125);
+    put(o, 10);
+    put(o, 10);
+}
+
+pub fn put_test(o: *Out, m: *Module, f: u32) {
+    const t = m.fty[f];
+    put_str(o, "test f", 6);
+    put_u64(o, f);
+    if (m.ftrap[f] == 1) {
+        put_str(o, "_expect_trap {", 14);
+    } else {
+        put_str(o, "_expect_pass {", 14);
+    }
+    put(o, 10);
+    put_str(o, "    const checksum: ", 20);
+    put_type(o, t);
+    put_str(o, " = f", 4);
+    put_u64(o, f);
+    put(o, 40);
+    var i: u32 = 0;
+    while (i < m.fnp[f]) {
+        if (i > 0) { put_str(o, ", ", 2); }
+        put_const(o, m.farg[f * MAX_PAR + i], t);
+        i += 1;
+    }
+    put_str(o, ");", 2);
+    put(o, 10);
+    put_str(o, "    assert_eq(checksum, ", 24);
+    put_const(o, m.fv[f], t);
+    put_str(o, ");", 2);
+    put(o, 10);
+    put(o, 125);
+    put(o, 10);
+    put(o, 10);
+}
+
+/// The whole case as .t27 source.
+pub fn render_case(m: *Module, o: *Out) {
+    put_str(o, "; t27b fuzz case -- seed ", 25);
+    put_u64(o, m.seed);
+    put_str(o, " case ", 6);
+    put_u64(o, m.case_no);
+    put_str(o, " (gHashTag/t27#6442)", 20);
+    put(o, 10);
+    put_str(o, "module FuzzCase;", 16);
+    put(o, 10);
+    put(o, 10);
+    var f: u32 = 0;
+    while (f < m.nfn) {
+        put_fn(o, m, f);
+        f += 1;
+    }
+    f = 0;
+    while (f < m.nfn) {
+        put_test(o, m, f);
+        f += 1;
+    }
+}
+
+/// The entry a driver calls: build case `case_no` of run `seed` and render it into `o`. False when the
+/// case does not fit the buffer or is not self-consistent; a driver then writes nothing and counts it.
+pub fn fuzz_render(seed: u64, case_no: u64, o: *Out) -> bool {
+    var m = module_empty(seed, case_no);
+    gen_case(seed, case_no, &m);
+    o.len = 0;
+    o.over = false;
+    render_case(&m, o);
+    if (o.over) { return false; }
+    return case_ok(&m);
+}
+
+/// FNV-1a of the rendered bytes: the fingerprint a run records per case.
+pub fn digest(o: *Out) -> u64 {
+    var h: u64 = 0xCBF29CE484222325;
+    var i: u32 = 0;
+    while (i < o.len) {
+        h = (h ^ o.buf[i]) *% 0x100000001B3;
+        i += 1;
+    }
+    return h;
+}
+
+/// Whether line k (0-based) of the output is exactly s.
+pub fn line_is(o: *Out, k: u32, s: []const u8, n: u32) -> bool {
+    var i: u32 = 0;
+    var line: u32 = 0;
+    while (line < k) {
+        if (i >= o.len) { return false; }
+        if (o.buf[i] == 10) { line += 1; }
+        i += 1;
+    }
+    var j: u32 = 0;
+    while (j < n) {
+        if (i >= o.len) { return false; }
+        if (o.buf[i] != s[j]) { return false; }
+        i += 1;
+        j += 1;
+    }
+    if (i >= o.len) { return false; }
+    return o.buf[i] == 10;
+}
+
+// ---- tests ----
+
+test splitmix_known_vector {
+    var r = FuzzRng { s: 0 };
+    assert(rng_next(&r) == 0xE220A8397B1DCDAF);
+    assert(rng_next(&r) == 0x6E789E6AA1B965F4);
+}
+
+test types_and_masks {
+    assert(ty_bits(0) == 8);
+    assert(ty_bits(3) == 64);
+    assert(ty_bits(6) == 32);
+    assert(ty_signed(4));
+    assert(ty_signed(3) == false);
+    assert(mask_of(8) == 255);
+    assert(mask_of(64) == ALL);
+    assert(sign_of(16) == 32768);
+    assert(sext(128, 4) == 18446744073709551488);
+    assert(sext(127, 4) == 127);
+}
+
+test model_checked_overflow {
+    assert(apply(OP_ADD, 200, 100, 0).hz == HZ_TRAP);
+    assert(apply(OP_ADD, 200, 55, 0).hz == HZ_NONE);
+    assert(apply(OP_ADDW, 200, 100, 0).v == 44);
+    assert(apply(OP_ADD, 127, 1, 4).hz == HZ_TRAP);
+    assert(apply(OP_ADD, 255, 255, 4).hz == HZ_NONE);
+    assert(apply(OP_SUB, 0, 1, 2).hz == HZ_TRAP);
+    assert(apply(OP_SUB, 128, 1, 4).hz == HZ_TRAP);
+    assert(apply(OP_SUB, 0, 128, 4).hz == HZ_TRAP);
+    assert(apply(OP_SUB, 255, 128, 4).hz == HZ_NONE);
+    assert(apply(OP_MUL, 128, 255, 4).hz == HZ_TRAP);
+    assert(apply(OP_MUL, 64, 254, 4).v == 128);
+    assert(apply(OP_MUL, 64, 254, 4).hz == HZ_NONE);
+    assert(apply(OP_MUL, 46341, 46341, 6).hz == HZ_TRAP);
+    assert(apply(OP_MUL, 46340, 46340, 6).hz == HZ_NONE);
+    assert(apply(OP_MUL, 4294967296, 4294967296, 3).hz == HZ_TRAP);
+    assert(apply(OP_MUL, 4294967296, 4294967295, 3).hz == HZ_NONE);
+    assert(apply(OP_MUL, 0x8000000000000000, ALL, 7).hz == HZ_TRAP);
+    assert(apply(OP_MUL, 0x4000000000000000, 18446744073709551614, 7).hz == HZ_NONE);
+    assert(apply(OP_MUL, 0x4000000000000000, 2, 7).hz == HZ_TRAP);
+}
+
+test model_shifts_and_division {
+    assert(apply(OP_SHLK, 80, 3, 4).v == 128);
+    assert(apply(OP_SHRK, 128, 1, 4).v == 192);
+    assert(apply(OP_SHRK, 128, 1, 0).v == 64);
+    assert(apply(OP_SHRV, 255, 9, 4).v == 255);
+    assert(apply(OP_SHLV, 3, 65, 3).v == 6);
+    assert(apply(OP_DIV, 9, 0, 0).v == 9);
+    assert(apply(OP_REM, 9, 4, 0).v == 4);
+    assert(less(255, 0, 4));
+    assert(less(255, 0, 0) == false);
+    assert(compare(C_GE, 128, 127, 4) == false);
+}
+
+test biased_constants_are_mostly_special {
+    var r = rng_for(42, 0);
+    var special: u32 = 0;
+    var i: u32 = 0;
+    while (i < 1000) {
+        if (is_special(biased_const(&r, 2), 2)) { special += 1; }
+        i += 1;
+    }
+    assert(special >= 700);
+    assert(special < 1000);
+}
+
+test same_seed_same_case {
+    var a = module_empty(0, 0);
+    var b = module_empty(0, 0);
+    gen_case(7, 3, &a);
+    gen_case(7, 3, &b);
+    var oa = out_empty();
+    var ob = out_empty();
+    render_case(&a, &oa);
+    render_case(&b, &ob);
+    assert(oa.len == ob.len);
+    assert(digest(&oa) == digest(&ob));
+    var c = module_empty(0, 0);
+    gen_case(7, 4, &c);
+    var oc = out_empty();
+    render_case(&c, &oc);
+    assert(digest(&oa) != digest(&oc));
+}
+
+test cases_are_consistent_and_fit {
+    var traps: u32 = 0;
+    var fns: u32 = 0;
+    var k: u64 = 0;
+    while (k < 200) {
+        var m = module_empty(0, 0);
+        gen_case(20261006, k, &m);
+        assert(case_ok(&m));
+        var o = out_empty();
+        render_case(&m, &o);
+        assert(o.over == false);
+        traps += trap_count(&m);
+        fns += m.nfn;
+        k += 1;
+    }
+    assert(traps > 0);
+    assert((traps * 4) < fns);
+}
+
+test render_hand_built_case {
+    var m = module_empty(1, 2);
+    m.nfn = 1;
+    m.fty[0] = 4;
+    m.fnp[0] = 2;
+    m.farg[0] = 128;
+    m.farg[1] = 3;
+    const d0 = emit(&m, 0, S_DECL);
+    m.sx[d0] = first_expr(&m, 0);
+    const l = emit(&m, 0, S_LOOP);
+    m.sa[l] = 2;
+    const a = emit(&m, 0, S_ASSIGN);
+    m.sa[a] = 0;
+    m.sx[a] = 1;
+    m.nex[0] = 2;
+    m.en[1] = 2;
+    m.ek[4] = A_LOCAL;
+    m.ev[4] = 0;
+    m.eop[5] = OP_SUB;
+    m.ek[5] = A_CONST;
+    m.ev[5] = 255;
+    const closed = close_block(&m, 0, l, false);
+    assert(closed);
+    const ret = emit(&m, 0, S_RET);
+    m.sx[ret] = 2;
+    m.en[2] = 2;
+    m.ek[8] = A_LOCAL;
+    m.ev[8] = 0;
+    m.eop[9] = OP_SHRV;
+    m.ek[9] = A_PARAM;
+    m.ev[9] = 1;
+    settle(&m, 0, false);
+    assert(m.fv[0] == 240);
+    var o = out_empty();
+    render_case(&m, &o);
+    assert(line_is(&o, 0, "; t27b fuzz case -- seed 1 case 2 (gHashTag/t27#6442)", 53));
+    assert(line_is(&o, 1, "module FuzzCase;", 16));
+    assert(line_is(&o, 3, "fn f0(p0: i8, p1: i8) -> i8 {", 29));
+    assert(line_is(&o, 4, "    var v0: i8 = (p0 ^ p1);", 27));
+    assert(line_is(&o, 6, "    while (k1 < 2) {", 20));
+    assert(line_is(&o, 7, "        v0 = (v0 - (-1));", 25));
+    assert(line_is(&o, 8, "        k1 += 1;", 16));
+    assert(line_is(&o, 10, "    return (v0 >> (p1 & 7));", 28));
+    assert(line_is(&o, 13, "test f0_expect_pass {", 21));
+    assert(line_is(&o, 14, "    const checksum: i8 = f0((-127 - 1), 3);", 43));
+    assert(line_is(&o, 15, "    assert_eq(checksum, (-16));", 31));
+}
+
+test kept_trap_checksum_is_the_wrapped_value {
+    var m = module_empty(1, 2);
+    m.nfn = 1;
+    m.fty[0] = 0;
+    m.fnp[0] = 1;
+    m.farg[0] = 200;
+    const d0 = emit(&m, 0, S_DECL);
+    m.sx[d0] = first_expr(&m, 0);
+    const ret = emit(&m, 0, S_RET);
+    m.sx[ret] = 1;
+    m.nex[0] = 2;
+    m.en[1] = 2;
+    m.ek[4] = A_LOCAL;
+    m.ev[4] = 0;
+    m.eop[5] = OP_ADD;
+    m.ek[5] = A_CONST;
+    m.ev[5] = 100;
+    settle(&m, 0, true);
+    assert(m.ftrap[0] == 1);
+    assert(m.fv[0] == 44);
+    assert(m.eop[5] == OP_ADD);
+    assert(case_ok(&m));
+    var n = module_empty(1, 2);
+    n.nfn = 1;
+    n.fty[0] = 0;
+    n.fnp[0] = 1;
+    n.farg[0] = 200;
+    const e0 = emit(&n, 0, S_DECL);
+    n.sx[e0] = first_expr(&n, 0);
+    const r2 = emit(&n, 0, S_RET);
+    n.sx[r2] = 1;
+    n.nex[0] = 2;
+    n.en[1] = 2;
+    n.ek[4] = A_LOCAL;
+    n.ev[4] = 0;
+    n.eop[5] = OP_ADD;
+    n.ek[5] = A_CONST;
+    n.ev[5] = 100;
+    settle(&n, 0, false);
+    assert(n.ftrap[0] == 0);
+    assert(n.eop[5] == OP_ADDW);
+    assert(n.fv[0] == 44);
+}
+
+invariant op_codes_pair_checked_with_wrapping {
+    assert(OP_ADD + 3 == OP_ADDW);
+    assert(OP_SUB + 3 == OP_SUBW);
+    assert(OP_MUL + 3 == OP_MULW);
+    assert(OP_SHLV < OP_DIV);
+    assert(MAX_ST * MAX_FN == 96);
+    assert(MAX_EX * MAX_FN * MAX_AT == 768);
+}

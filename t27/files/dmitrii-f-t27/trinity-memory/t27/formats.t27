@@ -1,0 +1,1546 @@
+// External ternary weight-packing formats: reference decoders and encoders.
+// Each layout restates the upstream source pinned in specs/formats/ (llama.cpp,
+// the PrismML fork, bitnet.cpp, Hugging Face transformers, MLX, ONNX Runtime;
+// commits and file blobs in specs/formats/upstream.lock.json).
+// Decoders emit one i32 per weight: the stored code minus the format's zero
+// point, so -1, 0 and +1 are ternary and anything else is reported, never
+// hidden. Scales are returned as raw bit patterns. Caller-owned buffers, no
+// allocation; input and output ranges must not overlap.
+// Status classes (specs/formats/OWNERS.md): a negative return rejects the
+// input; conditions that upstream readers accept silently are counted as
+// flags (TF_FLAG_*) and never change a decoded value.
+module TrinityMemoryFormats {
+    const TF_ERR_FORMAT: i32 = -50;
+    const TF_ERR_LENGTH: i32 = -51;
+    const TF_ERR_CAPACITY: i32 = -52;
+    const TF_ERR_CODE: i32 = -53;
+    const TF_ERR_PADDING: i32 = -54;
+    const TF_ERR_TRUNCATED: i32 = -55;
+    const TF_ERR_CONTAINER: i32 = -56;
+    const TF_ERR_NOT_FOUND: i32 = -57;
+    const TF_ERR_SCALE_NONFINITE: i32 = -58;
+    const TF_ERR_TYPE_AMBIGUOUS: i32 = -59;
+    const TF_ERR_LAYOUT_UNSUPPORTED: i32 = -60;
+    const TF_ERR_MISALIGNED: i32 = -61;
+    const TF_ERR_EXTENT: i32 = -62;
+
+    // Flag slots of a caller-owned []i64 of TF_FLAG_COUNT entries.
+    const TF_FLAG_OUTSIDE_TERNARY: usize = 0;
+    const TF_FLAG_NONCANONICAL_BASE3: usize = 1;
+    const TF_FLAG_SCALE_NEGATIVE: usize = 2;
+    const TF_FLAG_SCALE_ZERO: usize = 3;
+    const TF_FLAG_TRAILER_NONZERO: usize = 4;
+    const TF_FLAG_PADDING_NONZERO: usize = 5;
+    const TF_FLAG_AFFINE_NOT_TERNARY: usize = 6;
+    const TF_FLAG_COUNT: usize = 7;
+
+    // Block formats: one fp16 scale per block, codes inside the block.
+    const TF_TQ1_0: i32 = 1;   // llama.cpp, ggml type 34
+    const TF_TQ2_0: i32 = 2;   // llama.cpp, ggml type 35
+    const TF_Q2_0: i32 = 3;    // llama.cpp, ggml type 42
+    const TF_Q1_0: i32 = 4;    // llama.cpp, ggml type 41 (binary, +-1)
+    const TF_PQ2_0: i32 = 5;   // PrismML fork, ggml type 142
+    const TF_PTQ1_0: i32 = 6;  // PrismML fork, ggml type 143
+    // Tensor formats: layout depends on the whole tensor shape.
+    const TF_I2_S: i32 = 7;       // bitnet.cpp, ggml type 36, f32 scale per tensor
+    const TF_HF_PACKED: i32 = 8;  // transformers BitNet uint8, stride N/4 along dim 0
+    const TF_LINEAR2: i32 = 9;    // MLX 2-bit words (and any row-linear 2-bit layout)
+    const TF_ONNX2: i32 = 10;     // ONNX Runtime MatMulNBits bits=2, per-block zero points
+
+    // ---- little-endian helpers -------------------------------------------------
+    fn tf_read_u16(data: []u8, offset: usize) -> u32 {
+        return (data[offset] as u32) | ((data[offset + 1] as u32) << 8);
+    }
+
+    fn tf_read_u32(data: []u8, offset: usize) -> u32 {
+        var value: u32 = 0;
+        var i: usize = 0;
+        while (i < 4) { value = value | ((data[offset + i] as u32) << (8 * i)); i = i + 1; }
+        return value;
+    }
+
+    fn tf_read_u64(data: []u8, offset: usize) -> u64 {
+        var value: u64 = 0;
+        var i: usize = 0;
+        while (i < 8) { value = value | ((data[offset + i] as u64) << (8 * i)); i = i + 1; }
+        return value;
+    }
+
+    // ---- scale words ----------------------------------------------------------
+    // Exact binary values: multiplying by 2.0 or 0.5 never rounds.
+    fn tf_pow2(exponent: i32) -> f64 {
+        var value: f64 = 1.0;
+        var e: i32 = exponent;
+        while (e > 0) { value = value * 2.0; e = e - 1; }
+        while (e < 0) { value = value * 0.5; e = e + 1; }
+        return value;
+    }
+
+    fn tf_f16_finite(bits: u32) -> bool { return ((bits >> 10) & 31) != 31; }
+
+    fn tf_f16_value(bits: u32) -> f64 {
+        var exponent: i32 = ((bits >> 10) & 31) as i32;
+        var mantissa: u32 = bits & 1023;
+        var value: f64 = 0.0;
+        if (exponent == 0) { value = (mantissa as f64) * tf_pow2(-24); }
+        else { value = ((mantissa + 1024) as f64) * tf_pow2(exponent - 25); }
+        if (((bits >> 15) & 1) != 0) { value = 0.0 - value; }
+        return value;
+    }
+
+    fn tf_f32_finite(bits: u32) -> bool { return ((bits >> 23) & 255) != 255; }
+
+    fn tf_f32_value(bits: u32) -> f64 {
+        var exponent: i32 = ((bits >> 23) & 255) as i32;
+        var mantissa: u32 = bits & 8388607;
+        var value: f64 = 0.0;
+        if (exponent == 0) { value = (mantissa as f64) * tf_pow2(-149); }
+        else { value = ((mantissa + 8388608) as f64) * tf_pow2(exponent - 150); }
+        if (((bits >> 31) & 1) != 0) { value = 0.0 - value; }
+        return value;
+    }
+
+    // bfloat16 is the upper half of a binary32 word.
+    fn tf_bf16_value(bits: u32) -> f64 { return tf_f32_value((bits & 65535) << 16); }
+
+    // Class of one scale word of `kind` (TF_KIND_F16, _BF16, _F32; 16-bit
+    // kinds use the low half of the word): 0 positive, 1 zero of either sign,
+    // 2 negative, or TF_ERR_SCALE_NONFINITE for NaN and infinity.
+    fn tf_scale_class(word: u32, kind: i32) -> i32 {
+        var exponent: u32 = 0;
+        var top: u32 = 255;
+        var magnitude: u32 = 0;
+        var sign: u32 = 0;
+        if (kind == TF_KIND_F16) {
+            exponent = (word >> 10) & 31; top = 31;
+            magnitude = word & 32767; sign = (word >> 15) & 1;
+        } else {
+            if (kind == TF_KIND_BF16) {
+                exponent = (word >> 7) & 255;
+                magnitude = word & 32767; sign = (word >> 15) & 1;
+            } else {
+                exponent = (word >> 23) & 255;
+                magnitude = word & 2147483647; sign = (word >> 31) & 1;
+            }
+        }
+        if (exponent == top) { return TF_ERR_SCALE_NONFINITE; }
+        if (magnitude == 0) { return 1; }
+        if (sign != 0) { return 2; }
+        return 0;
+    }
+
+    // Validates `count` scale words before counting anything: the first NaN or
+    // infinity returns TF_ERR_SCALE_NONFINITE and leaves `flags` unchanged.
+    // Otherwise adds the zero and negative words to their flag slots.
+    fn tf_scales_check(words: []u32, count: usize, kind: i32, flags: []i64) -> i64 {
+        var i: usize = 0;
+        while (i < count) {
+            if (tf_scale_class(words[i], kind) < 0) { return TF_ERR_SCALE_NONFINITE as i64; }
+            i = i + 1;
+        }
+        i = 0;
+        while (i < count) {
+            var sclass: i32 = tf_scale_class(words[i], kind);
+            if (sclass == 1) { flags[TF_FLAG_SCALE_ZERO] = flags[TF_FLAG_SCALE_ZERO] + 1; }
+            if (sclass == 2) { flags[TF_FLAG_SCALE_NEGATIVE] = flags[TF_FLAG_SCALE_NEGATIVE] + 1; }
+            i = i + 1;
+        }
+        return 0;
+    }
+
+    fn tf_flags_clear(flags: []i64) -> void {
+        var i: usize = 0;
+        while (i < TF_FLAG_COUNT) { flags[i] = 0; i = i + 1; }
+    }
+
+    // ---- block geometry -------------------------------------------------------
+    fn tf_block_elements(format: i32) -> usize {
+        if (format == TF_TQ1_0 || format == TF_TQ2_0) { return 256; }
+        if (format == TF_Q2_0) { return 64; }
+        if (format == TF_Q1_0 || format == TF_PQ2_0 || format == TF_PTQ1_0) { return 128; }
+        return 0;
+    }
+
+    fn tf_block_bytes(format: i32) -> usize {
+        if (format == TF_TQ1_0) { return 54; }
+        if (format == TF_TQ2_0) { return 66; }
+        if (format == TF_Q2_0 || format == TF_Q1_0) { return 18; }
+        if (format == TF_PQ2_0) { return 34; }
+        if (format == TF_PTQ1_0) { return 28; }
+        return 0;
+    }
+
+    // Byte offset of the block's fp16 scale: first in Q*, last in TQ*/PTQ*.
+    fn tf_scale_offset(format: i32) -> usize {
+        if (format == TF_TQ1_0) { return 52; }
+        if (format == TF_TQ2_0) { return 64; }
+        if (format == TF_PTQ1_0) { return 26; }
+        return 0;
+    }
+
+    // Our identifier for a ggml tensor type in a GGUF file, given the file's
+    // namespace markers: `prism` (a key starting "prism.") and `bitnet`
+    // (general.architecture "bitnet-b1.58", or any tensor of type 36 or 38).
+    // Ids 34, 35 and 41 mean the same layout in all three namespaces. 36 is
+    // I2_S and 38 TL1 only in bitnet.cpp; 42 is Q2_0 (group 64) in ggml-org
+    // and PrismML but TL2 in bitnet.cpp; 142 and 143 exist only in PrismML.
+    // An id whose meaning differs between two marked namespaces is
+    // TF_ERR_TYPE_AMBIGUOUS; TL1 and TL2 are TF_ERR_LAYOUT_UNSUPPORTED (no
+    // storage contract); 0 when the id is not a ternary layout.
+    fn tf_format_of_gguf(ggml_type: u32, prism: bool, bitnet: bool) -> i32 {
+        if (ggml_type == 34) { return TF_TQ1_0; }
+        if (ggml_type == 35) { return TF_TQ2_0; }
+        if (ggml_type == 41) { return TF_Q1_0; }
+        if (ggml_type == 36 || ggml_type == 38 || ggml_type == 42 || ggml_type == 142 || ggml_type == 143) {
+            if (prism && bitnet) { return TF_ERR_TYPE_AMBIGUOUS; }
+        }
+        if (ggml_type == 36) {
+            if (bitnet) { return TF_I2_S; }
+            return 0;
+        }
+        if (ggml_type == 38) {
+            if (bitnet) { return TF_ERR_LAYOUT_UNSUPPORTED; }
+            return 0;
+        }
+        if (ggml_type == 42) {
+            if (bitnet) { return TF_ERR_LAYOUT_UNSUPPORTED; }
+            return TF_Q2_0;
+        }
+        if (prism && ggml_type == 142) { return TF_PQ2_0; }
+        if (prism && ggml_type == 143) { return TF_PTQ1_0; }
+        return 0;
+    }
+
+    // The id alone: types 36 and 38 carry the bitnet.cpp marker themselves.
+    // Rejections map to 0. Readers of whole files use tf_gguf_check.
+    fn tf_format_of_ggml(ggml_type: u32, prism: bool) -> i32 {
+        var format: i32 = tf_format_of_gguf(ggml_type, prism, ggml_type == 36 || ggml_type == 38);
+        if (format < 0) { return 0; }
+        return format;
+    }
+
+    // ---- base-3 layouts (TQ1_0, PTQ1_0) ---------------------------------------
+    // Five trits per byte, most significant digit first, stored as the ceiling
+    // of q * 256 / 243. `wide` is the width of the first stage in bytes: 32 for
+    // TQ1_0 (256 weights), 16 for PTQ1_0 (128 weights). Stages: `wide` bytes of
+    // five digits, wide/2 bytes of five digits, wide/8 bytes of four digits.
+    fn tf_b3_byte(e: usize, wide: usize) -> usize {
+        var first: usize = 5 * wide;
+        var half: usize = wide / 2;
+        var second: usize = first + 5 * half;
+        if (e < first) { return e % wide; }
+        if (e < second) { return wide + (e - first) % half; }
+        return wide + half + (e - second) % (wide / 8);
+    }
+
+    fn tf_b3_digit(e: usize, wide: usize) -> usize {
+        var first: usize = 5 * wide;
+        var half: usize = wide / 2;
+        var second: usize = first + 5 * half;
+        if (e < first) { return e / wide; }
+        if (e < second) { return (e - first) / half; }
+        return (e - second) / (wide / 8);
+    }
+
+    // ggml: q = (byte * 3^n) mod 256; digit = (q * 3) >> 8.
+    fn tf_b3_value(byte: u32, digit: usize) -> i32 {
+        var q: u32 = byte;
+        var n: usize = 0;
+        while (n < digit) { q = (q * 3) & 255; n = n + 1; }
+        var trit: u32 = (q * 3) >> 8;
+        return (trit as i32) - 1;
+    }
+
+    fn tf_b3_wide(format: i32) -> usize {
+        if (format == TF_TQ1_0) { return 32; }
+        return 16;
+    }
+
+    // ---- block decode ---------------------------------------------------------
+    fn tf_block_value(format: i32, data: []u8, base: usize, e: usize) -> i32 {
+        if (format == TF_TQ1_0 || format == TF_PTQ1_0) {
+            var wide: usize = tf_b3_wide(format);
+            return tf_b3_value(data[base + tf_b3_byte(e, wide)] as u32, tf_b3_digit(e, wide));
+        }
+        if (format == TF_TQ2_0) {
+            var tq: u32 = data[base + 32 * (e / 128) + e % 32] as u32;
+            var tcode: u32 = (tq >> (2 * ((e % 128) / 32))) & 3;
+            return (tcode as i32) - 1;
+        }
+        if (format == TF_Q1_0) {
+            var bits: u32 = data[base + 2 + e / 8] as u32;
+            if (((bits >> (e % 8)) & 1) != 0) { return 1; }
+            return -1;
+        }
+        // Q2_0 and PQ2_0: scale first, then codes in element order, low bits first.
+        var packed: u32 = data[base + 2 + e / 4] as u32;
+        var code: u32 = (packed >> (2 * (e % 4))) & 3;
+        return (code as i32) - 1;
+    }
+
+    // The fifth (least significant) digit of a qh byte is padding: the
+    // quantizers multiply the four-digit group by 3 before the ceiling rule,
+    // so they always write 0 there, and the dequantizers read digits 0..3 only.
+    fn tf_b3_padding_nonzero(byte: u32) -> bool { return tf_b3_value(byte, 4) != -1; }
+
+    // Shape and scale checks shared by the block readers, in this order:
+    // FORMAT, LENGTH (count not whole blocks, size not count's blocks), then
+    // SCALE_NONFINITE for the first block whose fp16 d is NaN or infinite
+    // (ggml_validate_row_data), then PADDING for the first TQ1_0 or PTQ1_0 qh
+    // byte whose padding digit is not 0. Returns the block count.
+    fn tf_blocks_valid(format: i32, data: []u8, size: usize, count: usize) -> i64 {
+        var per: usize = tf_block_elements(format);
+        if (per == 0) { return TF_ERR_FORMAT as i64; }
+        if (count % per != 0) { return TF_ERR_LENGTH as i64; }
+        var blocks: usize = count / per;
+        var bytes: usize = tf_block_bytes(format);
+        if (size % bytes != 0 || size / bytes != blocks) { return TF_ERR_LENGTH as i64; }
+        var b: usize = 0;
+        while (b < blocks) {
+            var word: u32 = tf_read_u16(data, b * bytes + tf_scale_offset(format));
+            if (tf_scale_class(word, TF_KIND_F16) < 0) { return TF_ERR_SCALE_NONFINITE as i64; }
+            b = b + 1;
+        }
+        if (format == TF_TQ1_0 || format == TF_PTQ1_0) {
+            var wide: usize = tf_b3_wide(format);
+            var qh: usize = wide + wide / 2;
+            var p: usize = 0;
+            while (p < blocks * (wide / 8)) {
+                var at: usize = (p / (wide / 8)) * bytes + qh + p % (wide / 8);
+                if (tf_b3_padding_nonzero(data[at] as u32)) { return TF_ERR_PADDING as i64; }
+                p = p + 1;
+            }
+        }
+        return blocks as i64;
+    }
+
+    // Decodes `count` weights (a whole number of blocks) into `values` and one
+    // raw fp16 word per block into `scales`. Returns how many weights fall
+    // outside {-1, 0, +1} (the +2 code of the 2-bit layouts), or an error:
+    // tf_blocks_valid's, with CAPACITY checked after LENGTH and before the
+    // scales and the padding. Nothing is written on error.
+    fn tf_decode_blocks(format: i32, data: []u8, size: usize, count: usize,
+                        values: []i32, value_capacity: usize,
+                        scales: []u32, scale_capacity: usize) -> i64 {
+        var per: usize = tf_block_elements(format);
+        if (per == 0) { return TF_ERR_FORMAT as i64; }
+        if (count % per != 0) { return TF_ERR_LENGTH as i64; }
+        var blocks: usize = count / per;
+        var bytes: usize = tf_block_bytes(format);
+        if (size % bytes != 0 || size / bytes != blocks) { return TF_ERR_LENGTH as i64; }
+        if (count > value_capacity || blocks > scale_capacity) { return TF_ERR_CAPACITY as i64; }
+        var valid: i64 = tf_blocks_valid(format, data, size, count);
+        if (valid < 0) { return valid; }
+        var outside: i64 = 0;
+        var b: usize = 0;
+        while (b < blocks) {
+            var base: usize = b * bytes;
+            scales[b] = tf_read_u16(data, base + tf_scale_offset(format));
+            var e: usize = 0;
+            while (e < per) {
+                var value: i32 = tf_block_value(format, data, base, e);
+                if (value > 1) { outside = outside + 1; }
+                values[b * per + e] = value;
+                e = e + 1;
+            }
+            b = b + 1;
+        }
+        return outside;
+    }
+
+    // A base-3 byte is canonical when the upstream quantizer can write it: it
+    // equals the ceiling rule applied to the digits it decodes to. qs bytes
+    // carry five digits; qh bytes carry four, and the quantizer multiplies
+    // their value by 3 once more (the fifth digit is always 0). 13 of the 256
+    // qs values and 175 of the 256 qh values are not canonical. 170 of those
+    // qh values have a nonzero padding digit and are rejected (TF_ERR_PADDING);
+    // the other 5 qh values (1, 20, 99, 178, 197) and the 13 qs values decode
+    // like some canonical byte, so upstream accepts them silently.
+    fn tf_b3_canonical(byte: u32, digits: usize) -> bool {
+        var q: u32 = 0;
+        var n: usize = 0;
+        while (n < digits) { q = q * 3 + ((tf_b3_value(byte, n) + 1) as u32); n = n + 1; }
+        if (digits == 4) { q = q * 3; }
+        return (q * 256 + 242) / 243 == byte;
+    }
+
+    // Flags of `count` weights in a block format (flags holds TF_FLAG_COUNT
+    // slots, cleared first): outside_ternary (2-bit code 3), noncanonical_base3
+    // (TQ1_0, PTQ1_0 bytes whose padding digit is 0), scale_zero and
+    // scale_negative (fp16 d). Returns 0 or tf_blocks_valid's rejection, with
+    // `flags` left cleared.
+    fn tf_block_flags(format: i32, data: []u8, size: usize, count: usize, flags: []i64) -> i64 {
+        tf_flags_clear(flags);
+        var valid: i64 = tf_blocks_valid(format, data, size, count);
+        if (valid < 0) { return valid; }
+        var blocks: usize = valid as usize;
+        var per: usize = tf_block_elements(format);
+        var bytes: usize = tf_block_bytes(format);
+        var b: usize = 0;
+        while (b < blocks) {
+            var base: usize = b * bytes;
+            var sclass: i32 = tf_scale_class(tf_read_u16(data, base + tf_scale_offset(format)), TF_KIND_F16);
+            if (sclass == 1) { flags[TF_FLAG_SCALE_ZERO] = flags[TF_FLAG_SCALE_ZERO] + 1; }
+            if (sclass == 2) { flags[TF_FLAG_SCALE_NEGATIVE] = flags[TF_FLAG_SCALE_NEGATIVE] + 1; }
+            var e: usize = 0;
+            while (e < per) {
+                if (tf_block_value(format, data, base, e) > 1) {
+                    flags[TF_FLAG_OUTSIDE_TERNARY] = flags[TF_FLAG_OUTSIDE_TERNARY] + 1;
+                }
+                e = e + 1;
+            }
+            if (format == TF_TQ1_0 || format == TF_PTQ1_0) {
+                var wide: usize = tf_b3_wide(format);
+                var five: usize = wide + wide / 2;
+                var j: usize = 0;
+                while (j < five + wide / 8) {
+                    var digits: usize = 5;
+                    if (j >= five) { digits = 4; }
+                    if (!tf_b3_canonical(data[base + j] as u32, digits)) {
+                        flags[TF_FLAG_NONCANONICAL_BASE3] = flags[TF_FLAG_NONCANONICAL_BASE3] + 1;
+                    }
+                    j = j + 1;
+                }
+            }
+            b = b + 1;
+        }
+        return 0;
+    }
+
+    fn tf_code_allowed(format: i32, value: i32) -> bool {
+        if (format == TF_Q1_0) { return value == 1 || value == -1; }
+        if (format == TF_TQ1_0 || format == TF_PTQ1_0) { return value >= -1 && value <= 1; }
+        return value >= -1 && value <= 2;
+    }
+
+    // Inverse of tf_decode_blocks. Base-3 bytes use ggml's ceiling rule, so
+    // the output is byte-identical to the upstream quantizer for the same codes.
+    fn tf_encode_blocks(format: i32, values: []i32, count: usize,
+                        scales: []u32, scale_count: usize,
+                        out: []u8, capacity: usize) -> i64 {
+        var per: usize = tf_block_elements(format);
+        if (per == 0) { return TF_ERR_FORMAT as i64; }
+        if (count % per != 0) { return TF_ERR_LENGTH as i64; }
+        var blocks: usize = count / per;
+        var bytes: usize = tf_block_bytes(format);
+        if (scale_count != blocks) { return TF_ERR_LENGTH as i64; }
+        if (blocks > capacity / bytes) { return TF_ERR_CAPACITY as i64; }
+        var i: usize = 0;
+        while (i < count) {
+            if (!tf_code_allowed(format, values[i])) { return TF_ERR_CODE as i64; }
+            i = i + 1;
+        }
+        var b: usize = 0;
+        while (b < blocks) {
+            var base: usize = b * bytes;
+            var k: usize = 0;
+            while (k < bytes) { out[base + k] = 0; k = k + 1; }
+            var scale_at: usize = base + tf_scale_offset(format);
+            out[scale_at] = (scales[b] & 255) as u8;
+            out[scale_at + 1] = ((scales[b] >> 8) & 255) as u8;
+            if (format == TF_TQ1_0 || format == TF_PTQ1_0) {
+                tf_encode_b3(values, b * per, tf_b3_wide(format), out, base);
+            } else {
+                var e: usize = 0;
+                while (e < per) {
+                    var code: u32 = (values[b * per + e] + 1) as u32;
+                    if (format == TF_TQ2_0) {
+                        var at: usize = base + 32 * (e / 128) + e % 32;
+                        out[at] = ((out[at] as u32) | (code << (2 * ((e % 128) / 32)))) as u8;
+                    } else {
+                        if (format == TF_Q1_0) {
+                            if (values[b * per + e] == 1) {
+                                var bit_at: usize = base + 2 + e / 8;
+                                out[bit_at] = ((out[bit_at] as u32) | ((1 as u32) << (e % 8))) as u8;
+                            }
+                        } else {
+                            var pair_at: usize = base + 2 + e / 4;
+                            out[pair_at] = ((out[pair_at] as u32) | (code << (2 * (e % 4)))) as u8;
+                        }
+                    }
+                    e = e + 1;
+                }
+            }
+            b = b + 1;
+        }
+        return (blocks * bytes) as i64;
+    }
+
+    // Packs one base-3 block. Each byte gathers the digits that decode from it;
+    // four-digit bytes are multiplied by 3 once more, as ggml does.
+    fn tf_encode_b3(values: []i32, first: usize, wide: usize, out: []u8, base: usize) -> void {
+        var per: usize = 5 * wide + 5 * (wide / 2) + 4 * (wide / 8);
+        var q: [52]u32 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        var e: usize = 0;
+        while (e < per) {
+            var digit: usize = tf_b3_digit(e, wide);
+            var weight: u32 = 1;
+            var n: usize = digit;
+            while (n < 4) { weight = weight * 3; n = n + 1; }
+            var byte: usize = tf_b3_byte(e, wide);
+            q[byte] = q[byte] + ((values[first + e] + 1) as u32) * weight;
+            e = e + 1;
+        }
+        var stored: usize = wide + wide / 2 + wide / 8;
+        var j: usize = 0;
+        while (j < stored) {
+            out[base + j] = ((q[j] * 256 + 242) / 243) as u8;
+            j = j + 1;
+        }
+    }
+
+    // ---- I2_S (bitnet.cpp) ----------------------------------------------------
+    // The x86 ACT_PARALLEL layout (include/gemm-config.h defines ACT_PARALLEL;
+    // the pinned build's readers, dequantize_row_i2_s and the GEMM of
+    // ggml-cpu-i2s.c, and the Python converter's writer use it): n weights in
+    // 128-weight blocks of 32 bytes; byte p of block b holds weights 128b+p,
+    // +32, +64, +96 at bit 6, 4, 2, 0. Then
+    // one little-endian f32 scale at byte n/4 and a 28-byte trailer (see
+    // tf_i2s_trailer_nonzero). Codes 0, 1, 2 mean -1, 0, +1. The quantizers
+    // never write code 3, and bitnet.cpp's readers disagree on it at the pin:
+    // dequantize_row_i2_s (to_float and get_rows) maps it to 0, while the
+    // mul_mat kernels multiply the raw code and subtract the activation sum,
+    // so there it acts as +2. It is reported as code - 1 = +2, like the other
+    // 2-bit layouts, and counted as outside. The ARM (QK 64) and 1x4
+    // row-interleaved layouts, and the four consecutive weights per byte that
+    // the submodule's own quantize_i2_s writes, store the same codes in other
+    // bytes; their bytes are valid here and decode to other weights.
+    fn tf_i2s_bytes(count: usize) -> usize { return count / 4 + 32; }
+
+    // LENGTH (count 0 or not whole blocks, size not n/4 + 32), CAPACITY, then
+    // SCALE_NONFINITE for a NaN or infinite f32 scale. Nothing is written on
+    // error.
+    fn tf_decode_i2s(data: []u8, size: usize, count: usize, values: []i32, value_capacity: usize,
+                     scale: []u32) -> i64 {
+        if (count == 0 || count % 128 != 0) { return TF_ERR_LENGTH as i64; }
+        if (size != tf_i2s_bytes(count)) { return TF_ERR_LENGTH as i64; }
+        if (count > value_capacity) { return TF_ERR_CAPACITY as i64; }
+        var word: u32 = tf_read_u32(data, count / 4);
+        if (tf_scale_class(word, TF_KIND_F32) < 0) { return TF_ERR_SCALE_NONFINITE as i64; }
+        var outside: i64 = 0;
+        var e: usize = 0;
+        while (e < count) {
+            var within: usize = e % 128;
+            var byte: u32 = data[32 * (e / 128) + within % 32] as u32;
+            var code: u32 = (byte >> (6 - 2 * (within / 32))) & 3;
+            if (code == 3) { outside = outside + 1; }
+            values[e] = (code as i32) - 1;
+            e = e + 1;
+        }
+        scale[0] = word;
+        return outside;
+    }
+
+    // Nonzero bytes among the 28 that follow the scale. The dequantizer never
+    // reads them; bitnet.cpp's Python converter writes zeros, while its C
+    // quantize_i2_s leaves whatever the reused output buffer held.
+    fn tf_i2s_trailer_nonzero(data: []u8, size: usize, count: usize) -> i64 {
+        if (count == 0 || count % 128 != 0 || size != tf_i2s_bytes(count)) { return TF_ERR_LENGTH as i64; }
+        var nonzero: i64 = 0;
+        var pad: usize = count / 4 + 4;
+        while (pad < size) {
+            if (data[pad] != 0) { nonzero = nonzero + 1; }
+            pad = pad + 1;
+        }
+        return nonzero;
+    }
+
+    // Flags of an I2_S tensor (cleared first): outside_ternary (code 3),
+    // scale_zero or scale_negative (the f32 scale), trailer_nonzero (bytes).
+    // Returns 0 or tf_decode_i2s's rejection, without CAPACITY.
+    fn tf_i2s_flags(data: []u8, size: usize, count: usize, flags: []i64) -> i64 {
+        tf_flags_clear(flags);
+        if (count == 0 || count % 128 != 0 || size != tf_i2s_bytes(count)) { return TF_ERR_LENGTH as i64; }
+        var word: u32 = tf_read_u32(data, count / 4);
+        var sclass: i32 = tf_scale_class(word, TF_KIND_F32);
+        if (sclass < 0) { return TF_ERR_SCALE_NONFINITE as i64; }
+        if (sclass == 1) { flags[TF_FLAG_SCALE_ZERO] = 1; }
+        if (sclass == 2) { flags[TF_FLAG_SCALE_NEGATIVE] = 1; }
+        var p: usize = 0;
+        while (p < count / 4) {
+            var byte: u32 = data[p] as u32;
+            var slot: u32 = 0;
+            while (slot < 4) {
+                if (((byte >> (2 * slot)) & 3) == 3) {
+                    flags[TF_FLAG_OUTSIDE_TERNARY] = flags[TF_FLAG_OUTSIDE_TERNARY] + 1;
+                }
+                slot = slot + 1;
+            }
+            p = p + 1;
+        }
+        flags[TF_FLAG_TRAILER_NONZERO] = tf_i2s_trailer_nonzero(data, size, count);
+        return 0;
+    }
+
+    fn tf_encode_i2s(values: []i32, count: usize, scale: u32, out: []u8, capacity: usize) -> i64 {
+        if (count == 0 || count % 128 != 0) { return TF_ERR_LENGTH as i64; }
+        var size: usize = tf_i2s_bytes(count);
+        if (capacity < size) { return TF_ERR_CAPACITY as i64; }
+        var check: usize = 0;
+        while (check < count) {
+            if (values[check] < -1 || values[check] > 1) { return TF_ERR_CODE as i64; }
+            check = check + 1;
+        }
+        var i: usize = 0;
+        while (i < size) { out[i] = 0; i = i + 1; }
+        var e: usize = 0;
+        while (e < count) {
+            var within: usize = e % 128;
+            var at: usize = 32 * (e / 128) + within % 32;
+            var code: u32 = (values[e] + 1) as u32;
+            out[at] = ((out[at] as u32) | (code << (6 - 2 * (within / 32)))) as u8;
+            e = e + 1;
+        }
+        var k: usize = 0;
+        while (k < 4) { out[count / 4 + k] = ((scale >> (8 * k)) & 255) as u8; k = k + 1; }
+        return size as i64;
+    }
+
+    // ---- Hugging Face transformers BitNet packed weights ----------------------
+    // T[rows, cols] packed along dim 0 into uint8 [rows/4, cols]: byte [r][k]
+    // holds T[r + s*rows/4][k] + 1 at bits 2s, low bits first. Code 3 (+2)
+    // is reported, not rejected.
+    fn tf_decode_hf_packed(data: []u8, size: usize, rows: usize, cols: usize,
+                           values: []i32, value_capacity: usize) -> i64 {
+        if (rows == 0 || cols == 0 || rows % 4 != 0) { return TF_ERR_LENGTH as i64; }
+        var stride: usize = rows / 4;
+        if (size / cols != stride || size % cols != 0) { return TF_ERR_LENGTH as i64; }
+        if (rows > value_capacity / cols) { return TF_ERR_CAPACITY as i64; }
+        var outside: i64 = 0;
+        var i: usize = 0;
+        while (i < rows) {
+            var slot: usize = i / stride;
+            var r: usize = i % stride;
+            var k: usize = 0;
+            while (k < cols) {
+                var code: u32 = ((data[r * cols + k] as u32) >> (2 * slot)) & 3;
+                var value: i32 = (code as i32) - 1;
+                if (value > 1) { outside = outside + 1; }
+                values[i * cols + k] = value;
+                k = k + 1;
+            }
+            i = i + 1;
+        }
+        return outside;
+    }
+
+    fn tf_encode_hf_packed(values: []i32, rows: usize, cols: usize, out: []u8, capacity: usize) -> i64 {
+        if (rows == 0 || cols == 0 || rows % 4 != 0) { return TF_ERR_LENGTH as i64; }
+        var stride: usize = rows / 4;
+        if (stride > capacity / cols) { return TF_ERR_CAPACITY as i64; }
+        var size: usize = stride * cols;
+        var check: usize = 0;
+        while (check < rows * cols) {
+            if (values[check] < -1 || values[check] > 1) { return TF_ERR_CODE as i64; }
+            check = check + 1;
+        }
+        var z: usize = 0;
+        while (z < size) { out[z] = 0; z = z + 1; }
+        var i: usize = 0;
+        while (i < rows) {
+            var k: usize = 0;
+            while (k < cols) {
+                var value: i32 = values[i * cols + k];
+                var at: usize = (i % stride) * cols + k;
+                out[at] = ((out[at] as u32) | (((value + 1) as u32) << (2 * (i / stride)))) as u8;
+                k = k + 1;
+            }
+            i = i + 1;
+        }
+        return size as i64;
+    }
+
+    // ---- Linear 2-bit rows ------------------------------------------------------
+    // Row n starts at n * row_bytes; weight k sits in byte k/4 at bits 2(k%4),
+    // low bits first (MLX: uint32 words little-endian, 16 codes per word; ONNX:
+    // blocks of bs weights, rows padded to whole blocks). value = code -
+    // zero_point for every weight: MLX's ternary convention bias = -scale is
+    // zero_point 1; ONNX's default zero point for bits=2 is 2. tf_decode_mlx2
+    // and tf_decode_onnx2 (per-block zero points) add each format's rules.
+    fn tf_decode_linear2(data: []u8, size: usize, rows: usize, cols: usize, row_bytes: usize,
+                         zero_point: i32, values: []i32, value_capacity: usize) -> i64 {
+        if (rows == 0 || cols == 0 || row_bytes < (cols + 3) / 4) { return TF_ERR_LENGTH as i64; }
+        if (size / row_bytes != rows || size % row_bytes != 0) { return TF_ERR_LENGTH as i64; }
+        if (rows > value_capacity / cols) { return TF_ERR_CAPACITY as i64; }
+        var outside: i64 = 0;
+        var n: usize = 0;
+        while (n < rows) {
+            var k: usize = 0;
+            while (k < cols) {
+                var code: u32 = ((data[n * row_bytes + k / 4] as u32) >> (2 * (k % 4))) & 3;
+                var value: i32 = (code as i32) - zero_point;
+                if (value < -1 || value > 1) { outside = outside + 1; }
+                values[n * cols + k] = value;
+                k = k + 1;
+            }
+            n = n + 1;
+        }
+        return outside;
+    }
+
+    fn tf_encode_linear2(values: []i32, rows: usize, cols: usize, row_bytes: usize,
+                         zero_point: i32, out: []u8, capacity: usize) -> i64 {
+        if (rows == 0 || cols == 0 || row_bytes < (cols + 3) / 4) { return TF_ERR_LENGTH as i64; }
+        if (rows > capacity / row_bytes) { return TF_ERR_CAPACITY as i64; }
+        var size: usize = rows * row_bytes;
+        var check: usize = 0;
+        while (check < rows * cols) {
+            var shifted: i32 = values[check] + zero_point;
+            if (shifted < 0 || shifted > 3) { return TF_ERR_CODE as i64; }
+            check = check + 1;
+        }
+        var z: usize = 0;
+        while (z < size) { out[z] = 0; z = z + 1; }
+        var n: usize = 0;
+        while (n < rows) {
+            var k: usize = 0;
+            while (k < cols) {
+                var code: i32 = values[n * cols + k] + zero_point;
+                var at: usize = n * row_bytes + k / 4;
+                out[at] = ((out[at] as u32) | ((code as u32) << (2 * (k % 4)))) as u8;
+                k = k + 1;
+            }
+            n = n + 1;
+        }
+        return size as i64;
+    }
+
+    // ---- MLX 2-bit affine (ml-explore/mlx mlx/ops.cpp) ------------------------
+    // w: uint32 [rows, cols/16]; code k of a row sits in bits 2(k%16) of word
+    // k/16, which little-endian puts in byte k/4 at bits 2(k%4). scales and
+    // biases: [rows, cols/group], group 32, 64 or 128; value = scale*q + bias.
+    // A group is ternary exactly when bias == -scale; its trit is then q - 1
+    // (zero point 1) and code 3 is +2.
+    fn tf_mlx2_group_valid(cols: usize, group: usize) -> bool {
+        if (group != 32 && group != 64 && group != 128) { return false; }
+        return cols % group == 0;
+    }
+
+    fn tf_decode_mlx2(data: []u8, size: usize, rows: usize, cols: usize, group: usize,
+                      values: []i32, value_capacity: usize) -> i64 {
+        if (rows == 0 || cols == 0 || !tf_mlx2_group_valid(cols, group)) { return TF_ERR_LENGTH as i64; }
+        return tf_decode_linear2(data, size, rows, cols, cols / 4, 1, values, value_capacity);
+    }
+
+    fn tf_encode_mlx2(values: []i32, rows: usize, cols: usize, group: usize, out: []u8, capacity: usize) -> i64 {
+        if (rows == 0 || cols == 0 || !tf_mlx2_group_valid(cols, group)) { return TF_ERR_LENGTH as i64; }
+        return tf_encode_linear2(values, rows, cols, cols / 4, 1, out, capacity);
+    }
+
+    // Scales and biases of `count` groups, both of `kind`. A NaN or infinite
+    // scale or bias returns TF_ERR_SCALE_NONFINITE before anything is counted;
+    // otherwise adds scale_zero and scale_negative (scales only; a bias may
+    // have either sign) and affine_not_ternary (bias != -scale) to `flags`.
+    fn tf_affine_check(scales: []u32, biases: []u32, count: usize, kind: i32, flags: []i64) -> i64 {
+        var i: usize = 0;
+        while (i < count) {
+            if (tf_scale_class(scales[i], kind) < 0 || tf_scale_class(biases[i], kind) < 0) {
+                return TF_ERR_SCALE_NONFINITE as i64;
+            }
+            i = i + 1;
+        }
+        var status: i64 = tf_scales_check(scales, count, kind, flags);
+        if (status < 0) { return status; }
+        flags[TF_FLAG_AFFINE_NOT_TERNARY] = flags[TF_FLAG_AFFINE_NOT_TERNARY] + tf_affine_not_ternary(scales, biases, count, kind);
+        return 0;
+    }
+
+    // ---- ONNX Runtime com.microsoft.MatMulNBits, bits = 2 ---------------------
+    // B: uint8 (N, k_blocks, block_size/4) with k_blocks = ceil(K/block_size):
+    // weight (n, k) sits in byte n*k_blocks*block_size/4 + k/4 at bits 2(k%4).
+    // zero_points: absent (zp_size 0; every block uses 2^(bits-1) = 2) or
+    // packed uint8 (N, ceil(k_blocks/4)): block b of row n in byte
+    // n*ceil(k_blocks/4) + b/4 at bits 2(b%4). value = code - zero point, so
+    // under the default code 0 is -2. Codes at k >= K in the last block are
+    // padding. block_size is a power of two, at least 16.
+    fn tf_onnx2_geometry(n: usize, k: usize, block_size: usize) -> bool {
+        if (n == 0 || k == 0 || block_size < 16) { return false; }
+        return (block_size & (block_size - 1)) == 0;
+    }
+
+    fn tf_onnx2_row_bytes(k: usize, block_size: usize) -> usize {
+        return ((k + block_size - 1) / block_size) * (block_size / 4);
+    }
+
+    fn tf_onnx2_zp_row(k: usize, block_size: usize) -> usize {
+        return ((k + block_size - 1) / block_size + 3) / 4;
+    }
+
+    fn tf_onnx2_zero_point(zero_points: []u8, zp_size: usize, n: usize, b: usize, zp_row: usize) -> i32 {
+        if (zp_size == 0) { return 2; }
+        var byte: u32 = zero_points[n * zp_row + b / 4] as u32;
+        return ((byte >> (2 * (b % 4))) & 3) as i32;
+    }
+
+    // LENGTH when the geometry is invalid, size is not N rows of whole blocks,
+    // or zp_size is neither 0 nor N*ceil(k_blocks/4).
+    fn tf_onnx2_valid(size: usize, n: usize, k: usize, block_size: usize, zp_size: usize) -> i64 {
+        if (!tf_onnx2_geometry(n, k, block_size)) { return TF_ERR_LENGTH as i64; }
+        var row: usize = tf_onnx2_row_bytes(k, block_size);
+        if (size % row != 0 || size / row != n) { return TF_ERR_LENGTH as i64; }
+        var zp_row: usize = tf_onnx2_zp_row(k, block_size);
+        if (zp_size != 0 && (zp_size % zp_row != 0 || zp_size / zp_row != n)) { return TF_ERR_LENGTH as i64; }
+        return 0;
+    }
+
+    // Decodes N*K weights, row n first. Returns the count outside {-1, 0, +1}.
+    fn tf_decode_onnx2(data: []u8, size: usize, n: usize, k: usize, block_size: usize,
+                       zero_points: []u8, zp_size: usize, values: []i32, value_capacity: usize) -> i64 {
+        var valid: i64 = tf_onnx2_valid(size, n, k, block_size, zp_size);
+        if (valid < 0) { return valid; }
+        if (n > value_capacity / k) { return TF_ERR_CAPACITY as i64; }
+        var row: usize = tf_onnx2_row_bytes(k, block_size);
+        var zp_row: usize = tf_onnx2_zp_row(k, block_size);
+        var outside: i64 = 0;
+        var r: usize = 0;
+        while (r < n) {
+            var c: usize = 0;
+            while (c < k) {
+                var code: u32 = ((data[r * row + c / 4] as u32) >> (2 * (c % 4))) & 3;
+                var value: i32 = (code as i32) - tf_onnx2_zero_point(zero_points, zp_size, r, c / block_size, zp_row);
+                if (value < -1 || value > 1) { outside = outside + 1; }
+                values[r * k + c] = value;
+                c = c + 1;
+            }
+            r = r + 1;
+        }
+        return outside;
+    }
+
+    // Inverse of tf_decode_onnx2; padding codes are written as 0. CODE when a
+    // value plus its block's zero point leaves 0..3. Nothing is written on error.
+    fn tf_encode_onnx2(values: []i32, n: usize, k: usize, block_size: usize,
+                       zero_points: []u8, zp_size: usize, out: []u8, capacity: usize) -> i64 {
+        if (!tf_onnx2_geometry(n, k, block_size)) { return TF_ERR_LENGTH as i64; }
+        var row: usize = tf_onnx2_row_bytes(k, block_size);
+        var zp_row: usize = tf_onnx2_zp_row(k, block_size);
+        if (zp_size != 0 && (zp_size % zp_row != 0 || zp_size / zp_row != n)) { return TF_ERR_LENGTH as i64; }
+        if (n > capacity / row) { return TF_ERR_CAPACITY as i64; }
+        var r: usize = 0;
+        while (r < n) {
+            var c: usize = 0;
+            while (c < k) {
+                var code: i32 = values[r * k + c] + tf_onnx2_zero_point(zero_points, zp_size, r, c / block_size, zp_row);
+                if (code < 0 || code > 3) { return TF_ERR_CODE as i64; }
+                c = c + 1;
+            }
+            r = r + 1;
+        }
+        var z: usize = 0;
+        while (z < n * row) { out[z] = 0; z = z + 1; }
+        r = 0;
+        while (r < n) {
+            var c2: usize = 0;
+            while (c2 < k) {
+                var code2: i32 = values[r * k + c2] + tf_onnx2_zero_point(zero_points, zp_size, r, c2 / block_size, zp_row);
+                var at: usize = r * row + c2 / 4;
+                out[at] = ((out[at] as u32) | ((code2 as u32) << (2 * (c2 % 4)))) as u8;
+                c2 = c2 + 1;
+            }
+            r = r + 1;
+        }
+        return (n * row) as i64;
+    }
+
+    // Nonzero codes in the padding of each row (k >= K in the last block).
+    // ONNX Runtime never reads them, and its quantizer can leave earlier codes
+    // there (q4_dq.cpp), so this is a flag, not a rejection.
+    fn tf_onnx2_padding_nonzero(data: []u8, size: usize, n: usize, k: usize, block_size: usize) -> i64 {
+        var valid: i64 = tf_onnx2_valid(size, n, k, block_size, 0);
+        if (valid < 0) { return valid; }
+        var row: usize = tf_onnx2_row_bytes(k, block_size);
+        var nonzero: i64 = 0;
+        var r: usize = 0;
+        while (r < n) {
+            var c: usize = k;
+            while (c < row * 4) {
+                if ((((data[r * row + c / 4] as u32) >> (2 * (c % 4))) & 3) != 0) { nonzero = nonzero + 1; }
+                c = c + 1;
+            }
+            r = r + 1;
+        }
+        return nonzero;
+    }
+
+    // ---- GGUF v3 tensor lookup ------------------------------------------------
+    struct TFTensorInfo {
+        tensor_type: u32,
+        dims: u32,
+        d0: u64,
+        d1: u64,
+        d2: u64,
+        d3: u64,
+        data_start: u64,
+        offset: u64,
+        alignment: u64,
+        needed: u64,
+        prism: bool,
+        name_at: u64,
+        name_size: u64,
+        tensors: u64,
+        bitnet: bool,
+        next_offset: u64,
+        has_next: bool,
+        prev_end: u64,
+        has_prev: bool,
+    }
+
+    fn tf_same(data: []u8, at: usize, size: usize, text: []u8, text_size: usize) -> bool {
+        if (size != text_size) { return false; }
+        var i: usize = 0;
+        while (i < size) {
+            if (data[at + i] != text[i]) { return false; }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    fn tf_same_text(data: []u8, at: usize, size: usize, text: str, text_size: usize) -> bool {
+        if (size != text_size) { return false; }
+        var i: usize = 0;
+        while (i < size) {
+            if (data[at + i] != (text[i] as u8)) { return false; }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    fn tf_gguf_scalar_size(vtype: u32) -> u64 {
+        if (vtype == 0 || vtype == 1 || vtype == 7) { return 1; }
+        if (vtype == 2 || vtype == 3) { return 2; }
+        if (vtype == 4 || vtype == 5 || vtype == 6) { return 4; }
+        if (vtype == 10 || vtype == 11 || vtype == 12) { return 8; }
+        return 0;
+    }
+
+    // Returns the position after one value, or an error; info.needed records
+    // the least prefix length that would let the walk continue.
+    fn tf_gguf_skip(data: []u8, size: usize, pos: u64, vtype: u32, info: *TFTensorInfo) -> i64 {
+        var fixed: u64 = tf_gguf_scalar_size(vtype);
+        if (fixed != 0) {
+            if (pos + fixed > (size as u64)) { info.needed = pos + fixed; return TF_ERR_TRUNCATED as i64; }
+            return (pos + fixed) as i64;
+        }
+        if (vtype == 8) {
+            if (pos + 8 > (size as u64)) { info.needed = pos + 8; return TF_ERR_TRUNCATED as i64; }
+            var length: u64 = tf_read_u64(data, pos as usize);
+            if (length > 0x7fffffffffff) { return TF_ERR_CONTAINER as i64; }
+            if (pos + 8 + length > (size as u64)) { info.needed = pos + 8 + length; return TF_ERR_TRUNCATED as i64; }
+            return (pos + 8 + length) as i64;
+        }
+        if (vtype == 9) {
+            if (pos + 12 > (size as u64)) { info.needed = pos + 12; return TF_ERR_TRUNCATED as i64; }
+            var element: u32 = tf_read_u32(data, pos as usize);
+            var count: u64 = tf_read_u64(data, (pos + 4) as usize);
+            var at: u64 = pos + 12;
+            var width: u64 = tf_gguf_scalar_size(element);
+            if (width != 0) {
+                if (count > 0x7fffffffffff / width) { return TF_ERR_CONTAINER as i64; }
+                if (at + count * width > (size as u64)) { info.needed = at + count * width; return TF_ERR_TRUNCATED as i64; }
+                return (at + count * width) as i64;
+            }
+            if (element != 8) { return TF_ERR_CONTAINER as i64; }
+            var i: u64 = 0;
+            while (i < count) {
+                var next: i64 = tf_gguf_skip(data, size, at, 8, info);
+                if (next < 0) { return next; }
+                at = next as u64;
+                i = i + 1;
+            }
+            return at as i64;
+        }
+        return TF_ERR_CONTAINER as i64;
+    }
+
+    // Walks a GGUF v3 prefix and fills `info` for tensor `name`: its ggml type,
+    // dims (ne[0] first, the contiguous one), and the absolute byte offset
+    // data_start + offset. Returns 0, TF_ERR_NOT_FOUND, TF_ERR_TRUNCATED (read
+    // at least info.needed bytes and retry) or TF_ERR_CONTAINER. It also sets
+    // the namespace markers info.prism and info.bitnet (tf_format_of_gguf) and
+    // the extent bounds, taken over the other tensor records that hold at
+    // least one weight: info.has_next when such a record's offset is at or
+    // above this one's, and info.next_offset, the least such offset (an offset
+    // equal to this one's means the two tensors overlap); info.has_prev when a
+    // record of known byte size (tf_gguf_record_bytes) begins below this
+    // one's offset, and info.prev_end, the greatest end offset among them.
+    // A zero-weight record holds no bytes (ggml_nbytes is 0), so the next
+    // record may share its offset.
+    fn tf_gguf_find(data: []u8, size: usize, name: []u8, name_size: usize, info: *TFTensorInfo) -> i32 {
+        return tf_gguf_select(data, size, name, name_size, 0, false, info);
+    }
+
+    // The index-th tensor record (0-based) of a GGUF prefix; its name is at
+    // data[info.name_at .. info.name_at + info.name_size).
+    fn tf_gguf_nth(data: []u8, size: usize, index: u64, info: *TFTensorInfo) -> i32 {
+        return tf_gguf_select(data, size, data, 0, index, true, info);
+    }
+
+    fn tf_gguf_select(data: []u8, size: usize, name: []u8, name_size: usize, index: u64, by_index: bool,
+                      info: *TFTensorInfo) -> i32 {
+        info.needed = 24; info.alignment = 32; info.prism = false; info.dims = 0;
+        info.name_at = 0; info.name_size = 0; info.tensors = 0;
+        info.bitnet = false; info.next_offset = 0; info.has_next = false; info.offset = 0; info.tensor_type = 0;
+        info.prev_end = 0; info.has_prev = false;
+        info.d0 = 1; info.d1 = 1; info.d2 = 1; info.d3 = 1;
+        if (size < 24) { return TF_ERR_TRUNCATED; }
+        if (tf_read_u32(data, 0) != 0x46554747 || tf_read_u32(data, 4) != 3) { return TF_ERR_CONTAINER; }
+        var tensors: u64 = tf_read_u64(data, 8);
+        var keys: u64 = tf_read_u64(data, 16);
+        info.tensors = tensors;
+        var pos: u64 = 24;
+        var k: u64 = 0;
+        while (k < keys) {
+            if (pos + 8 > (size as u64)) { info.needed = pos + 8; return TF_ERR_TRUNCATED; }
+            var key_size: u64 = tf_read_u64(data, pos as usize);
+            if (key_size > 65535) { return TF_ERR_CONTAINER; }
+            if (pos + 12 + key_size > (size as u64)) { info.needed = pos + 12 + key_size; return TF_ERR_TRUNCATED; }
+            var key_at: usize = (pos + 8) as usize;
+            var vtype: u32 = tf_read_u32(data, (pos + 8 + key_size) as usize);
+            var value_at: u64 = pos + 12 + key_size;
+            if (vtype == 4 && tf_same_text(data, key_at, key_size as usize, "general.alignment", 17)) {
+                if (value_at + 4 > (size as u64)) { info.needed = value_at + 4; return TF_ERR_TRUNCATED; }
+                var alignment: u64 = tf_read_u32(data, value_at as usize) as u64;
+                if (alignment == 0 || (alignment & (alignment - 1)) != 0) { return TF_ERR_CONTAINER; }
+                info.alignment = alignment;
+            }
+            if (key_size > 5 && tf_same_text(data, key_at, 6, "prism.", 6)) { info.prism = true; }
+            var next: i64 = tf_gguf_skip(data, size, value_at, vtype, info);
+            if (next < 0) { return next as i32; }
+            // bitnet.cpp's converter names its architecture "bitnet-b1.58";
+            // ggml-org llama.cpp has no such architecture (src/llama-arch.cpp).
+            if (vtype == 8 && tf_same_text(data, key_at, key_size as usize, "general.architecture", 20)) {
+                var arch_size: u64 = tf_read_u64(data, value_at as usize);
+                if (tf_same_text(data, (value_at + 8) as usize, arch_size as usize, "bitnet-b1.58", 12)) {
+                    info.bitnet = true;
+                }
+            }
+            pos = next as u64;
+            k = k + 1;
+        }
+        var found: bool = false;
+        var found_at: u64 = 0;
+        var records: u64 = pos;
+        var t: u64 = 0;
+        while (t < tensors) {
+            if (pos + 8 > (size as u64)) { info.needed = pos + 8; return TF_ERR_TRUNCATED; }
+            var length: u64 = tf_read_u64(data, pos as usize);
+            if (length > 65535) { return TF_ERR_CONTAINER; }
+            if (pos + 12 + length > (size as u64)) { info.needed = pos + 12 + length; return TF_ERR_TRUNCATED; }
+            var dims: u32 = tf_read_u32(data, (pos + 8 + length) as usize);
+            if (dims == 0 || dims > 4) { return TF_ERR_CONTAINER; }
+            var record_end: u64 = pos + 12 + length + 8 * (dims as u64) + 12;
+            if (record_end > (size as u64)) { info.needed = record_end; return TF_ERR_TRUNCATED; }
+            var record_type: u32 = tf_read_u32(data, (pos + 12 + length + 8 * (dims as u64)) as usize);
+            if (record_type == 36 || record_type == 38) { info.bitnet = true; }
+            var hit: bool = false;
+            if (by_index) { hit = t == index; }
+            else { hit = tf_same(data, (pos + 8) as usize, length as usize, name, name_size); }
+            if (!found && hit) {
+                found = true;
+                found_at = t;
+                info.name_at = pos + 8;
+                info.name_size = length;
+                var dim_at: usize = (pos + 12 + length) as usize;
+                info.dims = dims;
+                info.d0 = tf_read_u64(data, dim_at);
+                if (dims > 1) { info.d1 = tf_read_u64(data, dim_at + 8); }
+                if (dims > 2) { info.d2 = tf_read_u64(data, dim_at + 16); }
+                if (dims > 3) { info.d3 = tf_read_u64(data, dim_at + 24); }
+                var type_at: usize = dim_at + 8 * (dims as usize);
+                info.tensor_type = tf_read_u32(data, type_at);
+                info.offset = tf_read_u64(data, type_at + 4);
+            }
+            pos = record_end;
+            t = t + 1;
+        }
+        var start: u64 = ((pos + info.alignment - 1) / info.alignment) * info.alignment;
+        info.data_start = start;
+        info.needed = start;
+        if (!found) { return TF_ERR_NOT_FOUND; }
+        // Second walk over the complete records: among the other records
+        // that hold at least one weight, the least offset at or above this
+        // tensor's bounds its extent from above, and the greatest end of a
+        // record of known size that begins below it bounds it from below.
+        var top: u64 = 0xffffffffffffffff;
+        var walk: u64 = records;
+        var u: u64 = 0;
+        while (u < tensors) {
+            var u_length: u64 = tf_read_u64(data, walk as usize);
+            var u_dims: u64 = tf_read_u32(data, (walk + 8 + u_length) as usize) as u64;
+            var u_dim_at: u64 = walk + 12 + u_length;
+            var u_type: u32 = tf_read_u32(data, (u_dim_at + 8 * u_dims) as usize);
+            var u_offset: u64 = tf_read_u64(data, (u_dim_at + 8 * u_dims + 4) as usize);
+            var e0: u64 = tf_read_u64(data, u_dim_at as usize);
+            var e1: u64 = 1;
+            var e2: u64 = 1;
+            var e3: u64 = 1;
+            if (u_dims > 1) { e1 = tf_read_u64(data, (u_dim_at + 8) as usize); }
+            if (u_dims > 2) { e2 = tf_read_u64(data, (u_dim_at + 16) as usize); }
+            if (u_dims > 3) { e3 = tf_read_u64(data, (u_dim_at + 24) as usize); }
+            var weights: u64 = tf_gguf_elements(e0, e1, e2, e3);
+            if (u != found_at && weights != 0 && u_offset >= info.offset
+                && (!info.has_next || u_offset < info.next_offset)) {
+                info.has_next = true;
+                info.next_offset = u_offset;
+            }
+            if (u != found_at && weights != 0 && u_offset < info.offset) {
+                var u_bytes: u64 = tf_gguf_record_bytes(u_type, info.prism, info.bitnet, e0, e1, e2, e3);
+                var u_end: u64 = top;
+                if (u_offset <= top - u_bytes) { u_end = u_offset + u_bytes; }
+                if (u_bytes != 0 && (!info.has_prev || u_end > info.prev_end)) {
+                    info.has_prev = true;
+                    info.prev_end = u_end;
+                }
+            }
+            walk = u_dim_at + 8 * u_dims + 12;
+            u = u + 1;
+        }
+        return 0;
+    }
+
+    // a * b, or 2^64 - 1 when the product does not fit.
+    fn tf_times(a: u64, b: u64) -> u64 {
+        var top: u64 = 0xffffffffffffffff;
+        if (b != 0 && a > top / b) { return top; }
+        return a * b;
+    }
+
+    // Weights of a GGUF tensor record with dims ne0..ne3 (1 beyond its
+    // n_dims), or 2^64 - 1 when gguf.cpp refuses the count: every ne must be a
+    // non-negative int64, and a nonzero product must stay below INT64_MAX,
+    // tested as gguf.cpp tests it (INT64_MAX / ne1 <= ne0, and so on).
+    fn tf_gguf_elements(ne0: u64, ne1: u64, ne2: u64, ne3: u64) -> u64 {
+        var top: u64 = 0xffffffffffffffff;
+        var most: u64 = 0x7fffffffffffffff;
+        if (ne0 > most || ne1 > most || ne2 > most || ne3 > most) { return top; }
+        if (ne0 == 0 || ne1 == 0 || ne2 == 0 || ne3 == 0) { return 0; }
+        if (most / ne1 <= ne0) { return top; }
+        if (most / ne2 <= ne0 * ne1) { return top; }
+        if (most / ne3 <= ne0 * ne1 * ne2) { return top; }
+        return ne0 * ne1 * ne2 * ne3;
+    }
+
+    // Weights in a GGUF tensor record; 2^64 - 1 when gguf.cpp refuses the count.
+    fn tf_tensor_elements(info: *TFTensorInfo) -> u64 {
+        return tf_gguf_elements(info.d0, info.d1, info.d2, info.d3);
+    }
+
+    // Stored bytes of `count` weights with rows of ne0 in one of our ternary
+    // layouts; 0 when ne0 is not whole blocks or the format has no blocks.
+    fn tf_gguf_format_bytes(format: i32, ne0: u64, count: u64) -> u64 {
+        if (format == TF_I2_S) { return count / 4 + 32; }
+        var per: u64 = tf_block_elements(format) as u64;
+        if (per == 0 || ne0 % per != 0) { return 0; }
+        return (count / per) * (tf_block_bytes(format) as u64);
+    }
+
+    // Stored bytes of a GGUF tensor in one of our ternary layouts, 0 otherwise
+    // (including types that tf_format_of_gguf rejects).
+    fn tf_gguf_tensor_bytes(info: *TFTensorInfo) -> u64 {
+        var format: i32 = tf_format_of_gguf(info.tensor_type, info.prism, info.bitnet);
+        if (format <= 0) { return 0; }
+        return tf_gguf_format_bytes(format, info.d0, tf_tensor_elements(info));
+    }
+
+    // Byte size of any tensor record whose size the reader knows: our ternary
+    // layouts under the file's namespace markers, and F32 (type 0), F16 (1)
+    // and BF16 (30). 0 for other types, zero weights or a refused count.
+    fn tf_gguf_record_bytes(tensor_type: u32, prism: bool, bitnet: bool,
+                            ne0: u64, ne1: u64, ne2: u64, ne3: u64) -> u64 {
+        var count: u64 = tf_gguf_elements(ne0, ne1, ne2, ne3);
+        var top: u64 = 0xffffffffffffffff;
+        if (count == 0 || count == top) { return 0; }
+        if (tensor_type == 0) { return tf_times(count, 4); }
+        if (tensor_type == 1 || tensor_type == 30) { return tf_times(count, 2); }
+        var format: i32 = tf_format_of_gguf(tensor_type, prism, bitnet);
+        if (format <= 0) { return 0; }
+        return tf_gguf_format_bytes(format, ne0, count);
+    }
+
+    // Checks one tensor record found by tf_gguf_find or tf_gguf_nth in a file
+    // of `file_size` bytes, in this order: the type id under the file's
+    // namespace markers (TYPE_AMBIGUOUS, LAYOUT_UNSUPPORTED), the offset
+    // against general.alignment (MISALIGNED), for a ternary layout the row
+    // length (LENGTH when ne[0] is not whole blocks or gguf.cpp refuses the
+    // weight count) and the extent: EXTENT when its bytes reach the offset of
+    // another record at or above its own, when it begins inside a record of
+    // known size below it (a shifted or overlapping record), or when its bytes
+    // run past the end of the file (a truncated file). gguf.cpp is stricter:
+    // every offset must equal the padded end of the previous record. Returns
+    // our format id, or 0 for a type that is not a ternary layout.
+    fn tf_gguf_check(info: *TFTensorInfo, file_size: u64) -> i32 {
+        var format: i32 = tf_format_of_gguf(info.tensor_type, info.prism, info.bitnet);
+        if (format < 0) { return format; }
+        if (info.offset % info.alignment != 0) { return TF_ERR_MISALIGNED; }
+        if (format == 0) { return 0; }
+        var top: u64 = 0xffffffffffffffff;
+        if (tf_tensor_elements(info) == top) { return TF_ERR_LENGTH; }
+        var bytes: u64 = tf_gguf_tensor_bytes(info);
+        if (bytes == 0) { return TF_ERR_LENGTH; }
+        if (info.has_next && info.next_offset - info.offset < bytes) { return TF_ERR_EXTENT; }
+        if (info.has_prev && info.prev_end > info.offset) { return TF_ERR_EXTENT; }
+        if (info.data_start > file_size || file_size - info.data_start < info.offset) { return TF_ERR_EXTENT; }
+        if (file_size - info.data_start - info.offset < bytes) { return TF_ERR_EXTENT; }
+        return format;
+    }
+
+    // ---- BitNet b1.58 absmean ternarization from bf16 master weights -------
+    // transformers WeightQuant: s = 1 / max(mean|w|, 1e-5); t = clamp(round(w*s), -1, 1)
+    // with round half to even, so exactly +-0.5 rounds to 0. The mean is taken
+    // here in f64; torch reduces in f32, so an element whose |w*s| lies within
+    // `margin` of 0.5 may round differently there and is counted as a boundary
+    // element. result[0] = mean|w|, result[1] = s. Returns the boundary count.
+    fn tf_absmean_bf16(data: []u8, count: usize, margin: f64, values: []i32, value_capacity: usize,
+                       result: []f64) -> i64 {
+        if (count == 0) { return TF_ERR_LENGTH as i64; }
+        if (count > value_capacity) { return TF_ERR_CAPACITY as i64; }
+        var sum: f64 = 0.0;
+        var i: usize = 0;
+        while (i < count) {
+            var bits: u32 = tf_read_u16(data, 2 * i);
+            if (!tf_f32_finite(bits << 16)) { return TF_ERR_CODE as i64; }
+            var w: f64 = tf_bf16_value(bits);
+            if (w < 0.0) { w = 0.0 - w; }
+            sum = sum + w;
+            i = i + 1;
+        }
+        var mean: f64 = sum / (count as f64);
+        var clamped: f64 = mean;
+        if (clamped < 0.00001) { clamped = 0.00001; }
+        var s: f64 = 1.0 / clamped;
+        result[0] = mean;
+        result[1] = s;
+        var boundary: i64 = 0;
+        var j: usize = 0;
+        while (j < count) {
+            var x: f64 = tf_bf16_value(tf_read_u16(data, 2 * j)) * s;
+            var magnitude: f64 = x;
+            if (magnitude < 0.0) { magnitude = 0.0 - magnitude; }
+            var gap: f64 = magnitude - 0.5;
+            if (gap < 0.0) { gap = 0.0 - gap; }
+            if (gap <= margin) { boundary = boundary + 1; }
+            var t: i32 = 0;
+            if (x > 0.5) { t = 1; }
+            if (x < -0.5) { t = -1; }
+            values[j] = t;
+            j = j + 1;
+        }
+        return boundary;
+    }
+
+    // Number of positions where a and b differ; first[0] is the first one or -1.
+    fn tf_mismatches(a: []i32, b: []i32, count: usize, first: []i64) -> i64 {
+        var total: i64 = 0;
+        first[0] = -1;
+        var i: usize = 0;
+        while (i < count) {
+            if (a[i] != b[i]) {
+                if (total == 0) { first[0] = i as i64; }
+                total = total + 1;
+            }
+            i = i + 1;
+        }
+        return total;
+    }
+
+    // ---- scale words across formats -----------------------------------------
+    const TF_KIND_F16: i32 = 1;
+    const TF_KIND_BF16: i32 = 2;
+    const TF_KIND_F32: i32 = 3;
+
+    fn tf_scale_value(word: u32, kind: i32) -> f64 {
+        if (kind == TF_KIND_F16) { return tf_f16_value(word); }
+        if (kind == TF_KIND_BF16) { return tf_bf16_value(word); }
+        return tf_f32_value(word);
+    }
+
+    // Compares two scale layouts over the same `weights` weights: scale a[i]
+    // covers a_group consecutive weights, b[j] covers b_group. Values are
+    // compared exactly after widening to f64. Returns the number of weights
+    // whose two scales differ; first[0] is the first such weight or -1.
+    fn tf_compare_scales(a: []u32, a_count: usize, a_kind: i32, a_group: usize,
+                         b: []u32, b_count: usize, b_kind: i32, b_group: usize,
+                         weights: usize, first: []i64) -> i64 {
+        first[0] = -1;
+        if (a_group == 0 || b_group == 0) { return TF_ERR_LENGTH as i64; }
+        if ((weights + a_group - 1) / a_group > a_count || (weights + b_group - 1) / b_group > b_count) {
+            return TF_ERR_LENGTH as i64;
+        }
+        var step: usize = a_group;
+        if (b_group < step) { step = b_group; }
+        var differing: i64 = 0;
+        var w: usize = 0;
+        while (w < weights) {
+            var left: f64 = tf_scale_value(a[w / a_group], a_kind);
+            var right: f64 = tf_scale_value(b[w / b_group], b_kind);
+            var span: usize = step;
+            if (w + span > weights) { span = weights - w; }
+            if (left != right) {
+                if (differing == 0) { first[0] = w as i64; }
+                differing = differing + (span as i64);
+            }
+            w = w + step;
+        }
+        return differing;
+    }
+
+    // MLX affine groups store a ternary weight as scale*q + bias with codes
+    // q in {0, 1, 2}; that is ternary exactly when bias == -scale. Returns the
+    // number of groups where it is not.
+    fn tf_affine_not_ternary(scales: []u32, biases: []u32, count: usize, kind: i32) -> i64 {
+        var bad: i64 = 0;
+        var i: usize = 0;
+        while (i < count) {
+            var scale: f64 = tf_scale_value(scales[i], kind);
+            var bias: f64 = tf_scale_value(biases[i], kind);
+            if (bias != 0.0 - scale) { bad = bad + 1; }
+            i = i + 1;
+        }
+        return bad;
+    }
+
+    // Reads `count` little-endian 16- or 32-bit words (width 2 or 4).
+    fn tf_words(data: []u8, size: usize, width: usize, out: []u32, count: usize) -> i64 {
+        if ((width != 2 && width != 4) || size != count * width) { return TF_ERR_LENGTH as i64; }
+        var i: usize = 0;
+        while (i < count) {
+            if (width == 2) { out[i] = tf_read_u16(data, 2 * i); }
+            else { out[i] = tf_read_u32(data, 4 * i); }
+            i = i + 1;
+        }
+        return count as i64;
+    }
+
+    // ---- safetensors tensor lookup --------------------------------------------
+    // u64 little-endian header length N, N bytes of JSON, then data. Fills the
+    // dtype text and its width in bits (0 for a dtype the pinned safetensors
+    // does not define), up to four dims, the absolute [begin, end) byte range
+    // and the extent bounds over the other tensors of nonzero size: has_next
+    // when one begins at or above `begin`, next_begin the least such absolute
+    // begin; has_prev when one begins below `begin`, prev_end the greatest
+    // absolute end among those, or the start of the data section (8 + N) when
+    // none does.
+    struct TFSafeInfo {
+        dtype: []u8,
+        dtype_size: usize,
+        dims: usize,
+        d0: u64,
+        d1: u64,
+        d2: u64,
+        d3: u64,
+        begin: u64,
+        end: u64,
+        needed: u64,
+        dtype_bits: u64,
+        next_begin: u64,
+        has_next: bool,
+        prev_end: u64,
+        has_prev: bool,
+    }
+
+    // Bits per element of a safetensors dtype (safetensors/src/tensor.rs
+    // Dtype::bitsize); 0 when the name is not a dtype there.
+    fn tf_safetensors_dtype_bits(dtype: []u8, size: usize) -> u64 {
+        if (tf_same_text(dtype, 0, size, "F4", 2)) { return 4; }
+        if (tf_same_text(dtype, 0, size, "F6_E3M2", 7) || tf_same_text(dtype, 0, size, "F6_E2M3", 7)) { return 6; }
+        if (tf_same_text(dtype, 0, size, "BOOL", 4) || tf_same_text(dtype, 0, size, "U8", 2)
+            || tf_same_text(dtype, 0, size, "I8", 2) || tf_same_text(dtype, 0, size, "F8_E5M2", 7)
+            || tf_same_text(dtype, 0, size, "F8_E4M3", 7) || tf_same_text(dtype, 0, size, "F8_E8M0", 7)
+            || tf_same_text(dtype, 0, size, "F8_E4M3FNUZ", 11) || tf_same_text(dtype, 0, size, "F8_E5M2FNUZ", 11)) {
+            return 8;
+        }
+        if (tf_same_text(dtype, 0, size, "I16", 3) || tf_same_text(dtype, 0, size, "U16", 3)
+            || tf_same_text(dtype, 0, size, "F16", 3) || tf_same_text(dtype, 0, size, "BF16", 4)) {
+            return 16;
+        }
+        if (tf_same_text(dtype, 0, size, "I32", 3) || tf_same_text(dtype, 0, size, "U32", 3)
+            || tf_same_text(dtype, 0, size, "F32", 3)) {
+            return 32;
+        }
+        if (tf_same_text(dtype, 0, size, "I64", 3) || tf_same_text(dtype, 0, size, "U64", 3)
+            || tf_same_text(dtype, 0, size, "F64", 3) || tf_same_text(dtype, 0, size, "C64", 3)) {
+            return 64;
+        }
+        return 0;
+    }
+
+    // The [begin, end) pair of a "data_offsets" array, relative to the data
+    // section: 0, or TF_ERR_CONTAINER unless it is two non-negative integers
+    // with end >= begin.
+    fn tf_safetensors_range(tokens: []TMJsonToken, token_count: usize, offsets: i64, pair: []u64) -> i32 {
+        if (offsets < 0 || (offsets as u64) >= (token_count as u64)) { return TF_ERR_CONTAINER; }
+        if (tokens[offsets as usize].kind != TM_JSON_ARRAY) { return TF_ERR_CONTAINER; }
+        var first: i64 = tokens[offsets as usize].first;
+        if (first < 0) { return TF_ERR_CONTAINER; }
+        var second: i64 = tokens[first as usize].next;
+        if (second < 0 || tokens[second as usize].next >= 0) { return TF_ERR_CONTAINER; }
+        if (tokens[first as usize].kind != TM_JSON_INTEGER || tokens[second as usize].kind != TM_JSON_INTEGER) {
+            return TF_ERR_CONTAINER;
+        }
+        if (tokens[first as usize].negative || tokens[second as usize].negative) { return TF_ERR_CONTAINER; }
+        pair[0] = tokens[first as usize].uinteger;
+        pair[1] = tokens[second as usize].uinteger;
+        if (pair[1] < pair[0]) { return TF_ERR_CONTAINER; }
+        return 0;
+    }
+
+    // Value of member `key` of JSON object `object`: -1 when absent, -2 when malformed.
+    fn tf_json_member(tokens: []TMJsonToken, token_count: usize, object: i64, key: str, key_size: usize) -> i64 {
+        if (object < 0 || (object as u64) >= (token_count as u64)) { return -2; }
+        if (tokens[object as usize].kind != TM_JSON_OBJECT) { return -2; }
+        var child: i64 = tokens[object as usize].first;
+        var visited: usize = 0;
+        while (child >= 0) {
+            if ((child as u64) >= (token_count as u64) || visited >= token_count) { return -2; }
+            var node: usize = child as usize;
+            if (tokens[node].kind != TM_JSON_STRING) { return -2; }
+            if (tf_same_text(tokens[node].text, 0, tokens[node].text_size, key, key_size)) {
+                var value: i64 = tokens[node].first;
+                if (value < 0 || (value as u64) >= (token_count as u64)) { return -2; }
+                return value;
+            }
+            child = tokens[node].next; visited = visited + 1;
+        }
+        return -1;
+    }
+
+    fn tf_safetensors_find(data: []u8, size: usize, name: []u8, name_size: usize,
+                           tokens: []TMJsonToken, token_capacity: usize,
+                           arena: []u8, arena_capacity: usize, info: *TFSafeInfo) -> i32 {
+        info.needed = 8; info.dims = 0; info.dtype_size = 0; info.dtype_bits = 0;
+        info.d0 = 1; info.d1 = 1; info.d2 = 1; info.d3 = 1;
+        info.next_begin = 0; info.has_next = false; info.prev_end = 0; info.has_prev = false;
+        info.begin = 0; info.end = 0;
+        if (size < 8) { return TF_ERR_TRUNCATED; }
+        var header: u64 = tf_read_u64(data, 0);
+        if (header > 100000000) { return TF_ERR_CONTAINER; }
+        info.needed = 8 + header;
+        if (8 + header > (size as u64)) { return TF_ERR_TRUNCATED; }
+        var result: TMJsonResult = TMJsonResult{ .root = 0, .token_count = 0, .arena_used = 0 };
+        var parsed: i32 = tm_json_parse(&data[8], header as usize, tokens, token_capacity,
+                                        arena, arena_capacity, 8, &result);
+        if (parsed != 0) { return TF_ERR_CONTAINER; }
+        var entry: i64 = tm_json_field(tokens, result.token_count, result.root, name, name_size);
+        if (entry == -1) { return TF_ERR_NOT_FOUND; }
+        if (entry < 0) { return TF_ERR_CONTAINER; }
+        var dtype: i64 = tf_json_member(tokens, result.token_count, entry, "dtype", 5);
+        var shape: i64 = tf_json_member(tokens, result.token_count, entry, "shape", 5);
+        var offsets: i64 = tf_json_member(tokens, result.token_count, entry, "data_offsets", 12);
+        if (dtype < 0 || shape < 0 || offsets < 0) { return TF_ERR_CONTAINER; }
+        if (tokens[dtype as usize].kind != TM_JSON_STRING) { return TF_ERR_CONTAINER; }
+        info.dtype = tokens[dtype as usize].text;
+        info.dtype_size = tokens[dtype as usize].text_size;
+        info.dtype_bits = tf_safetensors_dtype_bits(info.dtype, info.dtype_size);
+        if (tokens[shape as usize].kind != TM_JSON_ARRAY) { return TF_ERR_CONTAINER; }
+        var dim: i64 = tokens[shape as usize].first;
+        var count: usize = 0;
+        while (dim >= 0) {
+            if (tokens[dim as usize].kind != TM_JSON_INTEGER || tokens[dim as usize].negative) { return TF_ERR_CONTAINER; }
+            if (count >= 4) { return TF_ERR_CONTAINER; }
+            var extent: u64 = tokens[dim as usize].uinteger;
+            if (count == 0) { info.d0 = extent; }
+            if (count == 1) { info.d1 = extent; }
+            if (count == 2) { info.d2 = extent; }
+            if (count == 3) { info.d3 = extent; }
+            count = count + 1;
+            dim = tokens[dim as usize].next;
+        }
+        info.dims = count;
+        var pair: [2]u64 = [0, 0];
+        var ranged: i32 = tf_safetensors_range(tokens, result.token_count, offsets, pair);
+        if (ranged < 0) { return ranged; }
+        var begin: u64 = pair[0];
+        var end: u64 = pair[1];
+        // Absolute offsets are 8 + header + data_offsets. EXTENT when that
+        // sum does not fit in 64 bits, for this entry or any other: such an
+        // entry lies past the end of every file (safetensors rejects it too,
+        // since the tensors must tile the data section from 0).
+        var room: u64 = 0xffffffffffffffff - 8 - header;
+        if (end > room) { return TF_ERR_EXTENT; }
+        // Every other tensor entry (not __metadata__) of nonzero size: the
+        // least begin at or above this one's bounds the extent from above,
+        // the greatest end of those beginning below it bounds it from below.
+        var member: i64 = tokens[result.root as usize].first;
+        var visited: usize = 0;
+        while (member >= 0) {
+            if ((member as u64) >= (result.token_count as u64) || visited >= result.token_count) { return TF_ERR_CONTAINER; }
+            var key: usize = member as usize;
+            if (tokens[key].kind != TM_JSON_STRING) { return TF_ERR_CONTAINER; }
+            var value: i64 = tokens[key].first;
+            if (value != entry && !tf_same_text(tokens[key].text, 0, tokens[key].text_size, "__metadata__", 12)) {
+                var other: i64 = tf_json_member(tokens, result.token_count, value, "data_offsets", 12);
+                if (other < 0) { return TF_ERR_CONTAINER; }
+                var other_pair: [2]u64 = [0, 0];
+                var other_ranged: i32 = tf_safetensors_range(tokens, result.token_count, other, other_pair);
+                if (other_ranged < 0) { return other_ranged; }
+                if (other_pair[1] > room) { return TF_ERR_EXTENT; }
+                if (other_pair[1] > other_pair[0] && other_pair[0] >= begin
+                    && (!info.has_next || 8 + header + other_pair[0] < info.next_begin)) {
+                    info.has_next = true;
+                    info.next_begin = 8 + header + other_pair[0];
+                }
+                if (other_pair[1] > other_pair[0] && other_pair[0] < begin
+                    && (!info.has_prev || 8 + header + other_pair[1] > info.prev_end)) {
+                    info.has_prev = true;
+                    info.prev_end = 8 + header + other_pair[1];
+                }
+            }
+            member = tokens[key].next;
+            visited = visited + 1;
+        }
+        if (!info.has_prev) { info.prev_end = 8 + header; }
+        info.begin = 8 + header + begin;
+        info.end = 8 + header + end;
+        info.needed = info.end;
+        return 0;
+    }
+
+    // Checks a tensor found by tf_safetensors_find in a file of `file_size`
+    // bytes, as safetensors' Metadata::validate and read_metadata do:
+    // CONTAINER for a dtype the pinned safetensors does not define, LENGTH when
+    // numel * dtype width in bits does not fit in 64 bits (as a GGUF weight
+    // count that gguf.cpp refuses) or is not whole bytes, EXTENT when
+    // end - begin is not numel * dtype width, or when this tensor does not
+    // tile with its neighbours: it must begin at prev_end (the end of the
+    // tensor before it, or the start of the data section) and end at
+    // next_begin, or at the end of the file when no tensor follows. That
+    // rejects overlap, a gap before or after it, and bytes past the end of the
+    // file or after the last tensor. safetensors is stricter only in scope:
+    // it requires the whole data section to tile (tensor.rs:627-661,
+    // :419-421), while this check looks at the tensor it reads and its two
+    // neighbours.
+    fn tf_safetensors_check(info: *TFSafeInfo, file_size: u64) -> i32 {
+        if (info.dtype_bits == 0) { return TF_ERR_CONTAINER; }
+        // Dimensions beyond info.dims are 1.
+        var bits: u64 = tf_times(tf_times(tf_times(tf_times(info.dtype_bits, info.d0), info.d1), info.d2), info.d3);
+        var top: u64 = 0xffffffffffffffff;
+        if (bits == top) { return TF_ERR_LENGTH; }
+        if (bits % 8 != 0) { return TF_ERR_LENGTH; }
+        if (info.end - info.begin != bits / 8) { return TF_ERR_EXTENT; }
+        if (info.end > file_size) { return TF_ERR_EXTENT; }
+        if (info.prev_end != info.begin) { return TF_ERR_EXTENT; }
+        if (info.has_next && info.end != info.next_begin) { return TF_ERR_EXTENT; }
+        if (!info.has_next && info.end != file_size) { return TF_ERR_EXTENT; }
+        return 0;
+    }
+}
+
+test tf_worked_examples_q1_q2 {
+    // Worked examples derived from the pinned llama.cpp sources.
+    var q1: [18]u8 = [0, 52, 165, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    var v1: [128]i32 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    var s1: [1]u32 = [0];
+    assert(tf_decode_blocks(4, q1, 18, 128, v1, 128, s1, 1) == 0);
+    assert(s1[0] == 13312);
+    assert(v1[0] == 1);
+    assert(v1[1] == -1);
+    assert(v1[4] == -1);
+    assert(v1[5] == 1);
+    assert(v1[8] == 1);
+    assert(v1[9] == 1);
+    assert(v1[10] == -1);
+}

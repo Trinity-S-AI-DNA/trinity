@@ -1,0 +1,423 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/queen/app.t27 -- the Queen as a GitHub App any repository can install
+; Owner, 2026-10-08 (translated): people or agents install our app on a repository and get the Queen's
+; work for free; that is how CodeRabbit won its users, and ours must be better. The app is t27-bees
+; (tools/bees/manifest.json), today a private reviewer identity on the owner's own repositories. This
+; card is what it does once GitHub sends it events: which event becomes which reaction, how the free
+; tier is bounded, and how one pull request head is reviewed exactly once.
+; The supervisor (gHashTag/BrowserOS trios/agent-server) receives the webhooks, verifies their
+; HMAC-SHA256 signature, and runs these functions as code generated from this card (`t27c gen-c`, then
+; `zig cc --target=wasm32-wasi`); GitHub I/O, the signature and the model call are its own.
+; Not here, on purpose: running a stranger's code. A review reads the diff through the API; nothing
+; from an installed repository is checked out or executed with a credential in reach (the container
+; already refuses bees a push credential for the same reason).
+; ASCII only (L3).
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module QueenApp;
+
+/// What GitHub sent, reduced to what the Queen distinguishes. The supervisor maps the webhook's
+/// `X-GitHub-Event` and its `action` onto one of these; anything else is GE_OTHER.
+pub const GE_INSTALLED : u8 = 0;
+pub const GE_UNINSTALLED : u8 = 1;
+pub const GE_REPOS_ADDED : u8 = 2;
+pub const GE_REPOS_REMOVED : u8 = 3;
+pub const GE_PR_OPENED : u8 = 4;
+pub const GE_PR_PUSHED : u8 = 5;
+pub const GE_PR_READY : u8 = 6;
+pub const GE_PR_CLOSED : u8 = 7;
+pub const GE_COMMENT : u8 = 8;
+pub const GE_OTHER : u8 = 9;
+pub const APP_EVENTS : u8 = 10;
+
+/// The webhook as the supervisor hands it over: "<X-GitHub-Event>.<action>". Entry n of EVENT_PAIRS
+/// is GE code EVENT_CODES[n]. A reopened pull request is an opened one; a suspended installation is
+/// an uninstalled one until it is unsuspended. Anything not listed is GE_OTHER.
+pub const EVENT_PAIRS : str = "installation.created,installation.unsuspend,installation.deleted,installation.suspend,installation_repositories.added,installation_repositories.removed,pull_request.opened,pull_request.reopened,pull_request.synchronize,pull_request.ready_for_review,pull_request.closed,issue_comment.created,$";
+pub const EVENT_CODES : [12]u8 = [0, 0, 1, 1, 2, 3, 4, 4, 5, 6, 7, 8];
+
+/// What the Queen does about it.
+///   REGISTER    remember the installation's repositories (they may now be served)
+///   UNREGISTER  forget them, and every pending review in them
+///   REVIEW      review the pull request's head (one review per head: review_key)
+///   FORGET      a closed pull request: drop its pending review
+///   COMMAND     a person asked something in a comment (command_of)
+///   QUOTA       the free tier is spent for today: say so once, review nothing
+///   IGNORE      nothing to do
+pub const AR_IGNORE : u8 = 0;
+pub const AR_REGISTER : u8 = 1;
+pub const AR_UNREGISTER : u8 = 2;
+pub const AR_REVIEW : u8 = 3;
+pub const AR_FORGET : u8 = 4;
+pub const AR_COMMAND : u8 = 5;
+pub const AR_QUOTA : u8 = 6;
+
+/// The reaction to one event. `from_a_bot`: the sender is a bot -- the app itself above all, so the
+/// Queen never answers her own comment; `served`: the repository is registered (an installation
+/// chose it); `paused`: a person paused this pull request (`@t27-bees pause`); `draft`: the pull
+/// request is a draft (reviewed when it is marked ready); `reviews_left`: today's free reviews left
+/// for the installation (free_reviews_left).
+/// A pause stops reviews and nothing else. Were it to unserve the pull request, the comment
+/// `@t27-bees resume` would itself be ignored and the pause could never be undone (#7697).
+pub fn app_reaction(event: u8, from_a_bot: bool, served: bool, paused: bool, draft: bool, reviews_left: u32) -> u8 {
+    if (event == GE_INSTALLED) { return AR_REGISTER; }
+    if (event == GE_REPOS_ADDED) { return AR_REGISTER; }
+    if (event == GE_UNINSTALLED) { return AR_UNREGISTER; }
+    if (event == GE_REPOS_REMOVED) { return AR_UNREGISTER; }
+    if (from_a_bot) { return AR_IGNORE; }
+    if (served == false) { return AR_IGNORE; }
+    if (event == GE_PR_CLOSED) { return AR_FORGET; }
+    if (event == GE_COMMENT) { return AR_COMMAND; }
+    if (event == GE_PR_OPENED or event == GE_PR_PUSHED or event == GE_PR_READY) {
+        if (paused) { return AR_IGNORE; }
+        if (draft) { return AR_IGNORE; }
+        if (reviews_left == 0) { return AR_QUOTA; }
+        return AR_REVIEW;
+    }
+    return AR_IGNORE;
+}
+
+/// The free tier. Free for every repository, as CodeRabbit is for open source -- the install is the
+/// whole sales funnel, and a reviewer that stops working on day two loses the repository. Bounded
+/// per installation per day, so one busy account cannot spend the swarm's model quota for everyone.
+/// A public repository gets more: its pull requests are where other people see the Queen work.
+pub const FREE_REVIEWS_PUBLIC : u32 = 200;
+pub const FREE_REVIEWS_PRIVATE : u32 = 30;
+
+/// (`used_today >= cap` mutated to `>` is equivalent: at equality both answer 0.)
+pub fn free_reviews_left(public_repo: bool, used_today: u32) -> u32 {
+    var cap : u32 = FREE_REVIEWS_PRIVATE;
+    if (public_repo) { cap = FREE_REVIEWS_PUBLIC; }
+    if (used_today >= cap) { return 0; }
+    return cap - used_today;
+}
+
+/// A diff larger than this is summarized, not reviewed line by line: a review the model cannot read
+/// whole is a review that invents what it did not read.
+pub const MAX_REVIEW_LINES : u32 = 4000;
+
+pub const DEPTH_FULL : u8 = 0;
+pub const DEPTH_SUMMARY : u8 = 1;
+
+pub fn review_depth(changed_lines: u32) -> u8 {
+    if (changed_lines > MAX_REVIEW_LINES) { return DEPTH_SUMMARY; }
+    return DEPTH_FULL;
+}
+
+/// One review per pull request head. The key is what the review comment carries as a hidden marker,
+/// so the effects journal (control.t27 section 7, EK_COMMENT) can look it up after a restart and a
+/// redelivered webhook (GitHub retries) never reviews the same head twice.
+pub fn review_wanted(already_reviewed_this_head: bool, asked_again: bool) -> bool {
+    if (asked_again) { return true; }
+    return already_reviewed_this_head == false;
+}
+
+/// Commands a person writes in a pull request comment, after the app's mention.
+///   review   review the head again, even if it was reviewed
+///   summary  write only the summary
+///   help     list the commands
+///   pause    stop reviewing this pull request; resume undoes it
+pub const C_NONE : u8 = 0;
+pub const C_REVIEW : u8 = 1;
+pub const C_SUMMARY : u8 = 2;
+pub const C_HELP : u8 = 3;
+pub const C_PAUSE : u8 = 4;
+pub const C_RESUME : u8 = 5;
+
+/// The mention a command follows, and the command words, as '$'-terminated comma lists walked byte by
+/// byte (specs/policy/own_language.t27). Index in COMMAND_WORDS + 1 = the command code.
+pub const MENTION : str = "@t27-bees$";
+pub const COMMAND_WORDS : str = "review,summary,help,pause,resume,$";
+pub const LIST_END : u8 = 36;
+pub const LIST_SEP : u8 = 44;
+
+/// Does text[at..] start with list's first entry (the mention, up to its '$')?
+pub fn mentions_at(mention: []const u8, text: []const u8, len: usize, at: usize) -> bool {
+    var i : usize = 0;
+    while (mention[i] != LIST_END) {
+        if (at + i >= len) { return false; }
+        if (text[at + i] != mention[i]) { return false; }
+        i += 1;
+    }
+    return true;
+}
+
+/// The length of the mention, up to its '$'.
+pub fn mention_len(mention: []const u8) -> usize {
+    var i : usize = 0;
+    while (mention[i] != LIST_END) { i += 1; }
+    return i;
+}
+
+/// The word after a mention, starting at `from`: spaces, then one of COMMAND_WORDS ending at a space,
+/// a newline or the end. An unknown word is C_NONE.
+pub fn word_after(text: []const u8, len: usize, from: usize) -> u8 {
+    var k : usize = from;
+    while (k < len and text[k] == ' ') { k += 1; }
+    var i : usize = 0;
+    var code : u8 = 1;
+    while (COMMAND_WORDS[i] != LIST_END) {
+        var j : usize = k;
+        var ok : bool = true;
+        while (COMMAND_WORDS[i] != LIST_SEP and COMMAND_WORDS[i] != LIST_END) {
+            if (j >= len) {
+                ok = false;
+            } else {
+                if (text[j] != COMMAND_WORDS[i]) { ok = false; }
+            }
+            j += 1;
+            i += 1;
+        }
+        if (ok) {
+            if (j >= len) { return code; }
+            if (text[j] == ' ' or text[j] == 10 or text[j] == 13) { return code; }
+        }
+        if (COMMAND_WORDS[i] == LIST_SEP) { i += 1; }
+        code += 1;
+    }
+    return C_NONE;
+}
+
+/// The command in a comment: the word after the first mention. No mention is C_NONE: the Queen
+/// answers what she was asked and nothing she was not. (Mutating `at < len` to `at <= len` is an
+/// equivalent mutant: at `at == len` mentions_at refuses at once, its first bound check.)
+pub fn command_of(text: []const u8, len: usize) -> u8 {
+    var at : usize = 0;
+    while (at < len) {
+        if (mentions_at(MENTION, text, len, at)) {
+            return word_after(text, len, at + mention_len(MENTION));
+        }
+        at += 1;
+    }
+    return C_NONE;
+}
+
+/// The GE code of one webhook: the entry of EVENT_PAIRS equal to pair[0..len], whole. GitHub sends
+/// issue_comment for an issue and for a pull request alike; only the second is a command, so
+/// `on_a_pull_request` false turns GE_COMMENT into GE_OTHER.
+pub fn app_event_of(pair: []const u8, len: usize, on_a_pull_request: bool) -> u8 {
+    var i : usize = 0;
+    var n : usize = 0;
+    while (EVENT_PAIRS[i] != LIST_END) {
+        var j : usize = 0;
+        var ok : bool = true;
+        while (EVENT_PAIRS[i] != LIST_SEP and EVENT_PAIRS[i] != LIST_END) {
+            if (j >= len) {
+                ok = false;
+            } else {
+                if (pair[j] != EVENT_PAIRS[i]) { ok = false; }
+            }
+            j += 1;
+            i += 1;
+        }
+        if (ok and j == len) {
+            if (EVENT_CODES[n] == GE_COMMENT and on_a_pull_request == false) { return GE_OTHER; }
+            return EVENT_CODES[n];
+        }
+        if (EVENT_PAIRS[i] == LIST_SEP) { i += 1; }
+        n += 1;
+    }
+    return GE_OTHER;
+}
+
+/// The webhook is the fast path, not the only one. Every APP_RECONCILE_SECONDS the supervisor lists
+/// the app's installations and their repositories (an install whose webhook was lost is still
+/// served), and every APP_POLL_SECONDS it reads each served repository's open pull requests and new
+/// comments. A pull request that has not moved since its repository was registered is not swept:
+/// installing the app is not a request to review a backlog (`@t27-bees review` asks for one).
+pub const APP_RECONCILE_SECONDS : u32 = 600;
+pub const APP_POLL_SECONDS : u32 = 180;
+/// Reviews written per round. A model call takes up to two minutes; the round has other work.
+pub const APP_REVIEWS_PER_ROUND : u32 = 2;
+
+/// The hidden marker every review carries, followed by "<owner>/<repo>#<pr>@<head sha>". It is the key
+/// of the review's effect (control.t27 section 7, EK_COMMENT): after a restart the supervisor finds
+/// the marker on the pull request instead of posting the review again.
+pub const REVIEW_MARKER : str = "t27-bees:review:";
+
+/// What is checked is posted apart from what is opined. Before the model reads the diff, every
+/// changed .t27 file (at most MAX_COMPILER_CHECKS of them) is run through the t27 compiler at the
+/// pull request's head, and the compiler's answer is posted as a checked fact. The compiler only
+/// reads the text (t27c parse, parse-complete, typecheck, in a process with an empty environment);
+/// nothing from the repository is generated, built or run, so nothing it says is a test result.
+/// A typecheck that passes is not a pass when the parser discarded tokens to get there:
+/// `t27c typecheck` answers ok on the English sentence "the cat sat on the mat", so discarded tokens
+/// make a file broken on their own. And a pass says the file is well formed, not that it is right:
+/// the typechecker does not resolve every name (measured 2026-10-08: `return y;` with no `y` passes).
+pub const V_CLEAN : u8 = 0;
+pub const V_BROKEN : u8 = 1;
+pub const MAX_COMPILER_CHECKS : u32 = 10;
+pub const T27_SUFFIX : str = ".t27$";
+
+pub fn compiler_verdict(typecheck_ok: bool, errors: u32, discarded: u32) -> u8 {
+    if (typecheck_ok == false) { return V_BROKEN; }
+    if (errors > 0) { return V_BROKEN; }
+    if (discarded > 0) { return V_BROKEN; }
+    return V_CLEAN;
+}
+
+/// Is path[0..len] a t27 source, by its suffix? (T27_SUFFIX up to its '$'.)
+pub fn is_t27_path(path: []const u8, len: usize) -> bool {
+    var n : usize = mention_len(T27_SUFFIX);
+    if (len < n) { return false; }
+    var i : usize = 0;
+    while (i < n) {
+        if (path[len - n + i] != T27_SUFFIX[i]) { return false; }
+        i += 1;
+    }
+    return true;
+}
+
+/// What `@t27-bees help` answers, one line per command, in C_REVIEW .. C_RESUME order.
+pub const COMMAND_HELP : [5]str = [
+    "review -- review this pull request's head again, even if it was reviewed",
+    "summary -- write only the summary",
+    "help -- list these commands",
+    "pause -- stop reviewing this pull request",
+    "resume -- review it again from the next push",
+];
+
+test an_install_registers_and_an_uninstall_forgets {
+    assert app_reaction(GE_INSTALLED, false, false, false, false, 0) == AR_REGISTER;
+    assert app_reaction(GE_REPOS_ADDED, true, false, false, false, 0) == AR_REGISTER;
+    assert app_reaction(GE_UNINSTALLED, false, true, false, false, 9) == AR_UNREGISTER;
+    assert app_reaction(GE_REPOS_REMOVED, false, true, false, false, 9) == AR_UNREGISTER;
+}
+
+test a_pull_request_is_reviewed_once_it_is_ready {
+    assert app_reaction(GE_PR_OPENED, false, true, false, false, 5) == AR_REVIEW;
+    assert app_reaction(GE_PR_PUSHED, false, true, false, false, 5) == AR_REVIEW;
+    assert app_reaction(GE_PR_READY, false, true, false, false, 5) == AR_REVIEW;
+    assert app_reaction(GE_PR_OPENED, false, true, false, true, 5) == AR_IGNORE;
+    assert app_reaction(GE_PR_CLOSED, false, true, false, false, 5) == AR_FORGET;
+    assert app_reaction(GE_COMMENT, false, true, false, false, 0) == AR_COMMAND;
+}
+
+test a_pause_stops_reviews_and_nothing_else {
+    assert app_reaction(GE_PR_PUSHED, false, true, true, false, 5) == AR_IGNORE;
+    assert app_reaction(GE_PR_OPENED, false, true, true, false, 5) == AR_IGNORE;
+    assert app_reaction(GE_PR_READY, false, true, true, false, 5) == AR_IGNORE;
+    // the comment that would resume it is still heard, and closing still forgets
+    assert app_reaction(GE_COMMENT, false, true, true, false, 5) == AR_COMMAND;
+    assert app_reaction(GE_PR_CLOSED, false, true, true, false, 5) == AR_FORGET;
+    // a pause on a spent free tier is still a pause, not a quota notice
+    assert app_reaction(GE_PR_PUSHED, false, true, true, false, 0) == AR_IGNORE;
+}
+
+test the_queen_never_answers_herself_or_a_stranger_repo {
+    assert app_reaction(GE_PR_OPENED, true, true, false, false, 5) == AR_IGNORE;
+    assert app_reaction(GE_COMMENT, true, true, false, false, 5) == AR_IGNORE;
+    assert app_reaction(GE_PR_OPENED, false, false, false, false, 5) == AR_IGNORE;
+    assert app_reaction(GE_OTHER, false, true, false, false, 5) == AR_IGNORE;
+    assert app_reaction(APP_EVENTS, false, true, false, false, 5) == AR_IGNORE;
+}
+
+test the_free_tier_is_bounded_per_day {
+    assert app_reaction(GE_PR_OPENED, false, true, false, false, 0) == AR_QUOTA;
+    assert free_reviews_left(true, 0) == FREE_REVIEWS_PUBLIC;
+    assert free_reviews_left(false, 0) == FREE_REVIEWS_PRIVATE;
+    assert free_reviews_left(false, FREE_REVIEWS_PRIVATE - 1) == 1;
+    assert free_reviews_left(false, FREE_REVIEWS_PRIVATE) == 0;
+    assert free_reviews_left(true, FREE_REVIEWS_PUBLIC + 5) == 0;
+}
+
+test a_huge_diff_is_summarized_not_invented {
+    assert review_depth(MAX_REVIEW_LINES) == DEPTH_FULL;
+    assert review_depth(MAX_REVIEW_LINES + 1) == DEPTH_SUMMARY;
+    assert review_depth(0) == DEPTH_FULL;
+}
+
+test one_review_per_head_unless_asked_again {
+    assert review_wanted(false, false) == true;
+    assert review_wanted(true, false) == false;
+    assert review_wanted(true, true) == true;
+}
+
+test a_comment_command_is_read_after_the_mention {
+    assert command_of("@t27-bees review", 16) == C_REVIEW;
+    assert command_of("please @t27-bees   summary now", 30) == C_SUMMARY;
+    assert command_of("@t27-bees help\nthanks", 21) == C_HELP;
+    assert command_of("@t27-bees pause", 15) == C_PAUSE;
+    assert command_of("@t27-bees resume", 16) == C_RESUME;
+    // no mention, an unknown word, or a word that only starts like a command
+    assert command_of("review", 6) == C_NONE;
+    assert command_of("@t27-bees dance", 15) == C_NONE;
+    assert command_of("@t27-bees reviewer", 18) == C_NONE;
+    assert command_of("@t27-bee review", 15) == C_NONE;
+    assert command_of("", 0) == C_NONE;
+    // the text ends inside the mention, or in the spaces after it: nothing is read past the end
+    assert command_of("ask @t27-be", 11) == C_NONE;
+    assert command_of("@t27-bees   ", 12) == C_NONE;
+    assert command_of("@t27-bees", 9) == C_NONE;
+}
+
+test a_webhook_is_read_by_its_event_and_action {
+    assert app_event_of("installation.created", 20, false) == GE_INSTALLED;
+    assert app_event_of("installation.unsuspend", 22, false) == GE_INSTALLED;
+    assert app_event_of("installation.deleted", 20, false) == GE_UNINSTALLED;
+    assert app_event_of("installation.suspend", 20, false) == GE_UNINSTALLED;
+    assert app_event_of("installation_repositories.added", 31, false) == GE_REPOS_ADDED;
+    assert app_event_of("installation_repositories.removed", 33, false) == GE_REPOS_REMOVED;
+    assert app_event_of("pull_request.opened", 19, false) == GE_PR_OPENED;
+    assert app_event_of("pull_request.reopened", 21, false) == GE_PR_OPENED;
+    assert app_event_of("pull_request.synchronize", 24, false) == GE_PR_PUSHED;
+    assert app_event_of("pull_request.ready_for_review", 29, false) == GE_PR_READY;
+    assert app_event_of("pull_request.closed", 19, false) == GE_PR_CLOSED;
+    assert app_event_of("issue_comment.created", 21, true) == GE_COMMENT;
+}
+
+test a_webhook_not_listed_is_other {
+    // a comment on an issue, not on a pull request
+    assert app_event_of("issue_comment.created", 21, false) == GE_OTHER;
+    // an action the Queen does not act on, and an event she does not know
+    assert app_event_of("pull_request.labeled", 20, true) == GE_OTHER;
+    assert app_event_of("issue_comment.edited", 20, true) == GE_OTHER;
+    assert app_event_of("push", 4, true) == GE_OTHER;
+    assert app_event_of("", 0, true) == GE_OTHER;
+    // the whole entry must match: a prefix of it, or it with more after, is another pair
+    assert app_event_of("pull_request.open", 17, false) == GE_OTHER;
+    assert app_event_of("pull_request.openedx", 20, false) == GE_OTHER;
+    // the length bounds the read: only "pull_request.closed" of the longer text is the pair
+    assert app_event_of("pull_request.closed.extra", 19, false) == GE_PR_CLOSED;
+}
+
+test the_compiler_is_the_judge_of_a_t27_file {
+    assert compiler_verdict(true, 0, 0) == V_CLEAN;
+    assert compiler_verdict(false, 0, 0) == V_BROKEN;
+    assert compiler_verdict(true, 2, 0) == V_BROKEN;
+    // ok from the typechecker, but the parser threw tokens away to get there
+    assert compiler_verdict(true, 0, 3) == V_BROKEN;
+}
+
+test only_a_t27_file_goes_to_the_compiler {
+    assert is_t27_path("specs/queen/app.t27", 19) == true;
+    assert is_t27_path("a.t27", 5) == true;
+    assert is_t27_path(".t27", 4) == true;
+    assert is_t27_path("t27", 3) == false;
+    assert is_t27_path("specs/queen/app.t27.md", 22) == false;
+    assert is_t27_path("specs/queen/app.t28", 19) == false;
+    assert is_t27_path("specs/queen/appxt27", 19) == false;
+    assert is_t27_path("README.md", 9) == false;
+    // the length bounds the read: the first 19 bytes of a longer name are the path
+    assert is_t27_path("specs/queen/app.t27.md", 19) == true;
+}
+
+invariant every_event_pair_has_a_code {
+    assert EVENT_CODES[0] == GE_INSTALLED and EVENT_CODES[3] == GE_UNINSTALLED;
+    assert EVENT_CODES[7] == GE_PR_OPENED and EVENT_CODES[11] == GE_COMMENT;
+    assert APP_POLL_SECONDS < APP_RECONCILE_SECONDS;
+    assert APP_REVIEWS_PER_ROUND > 0;
+}
+
+invariant the_app_codes_never_move {
+    assert GE_INSTALLED == 0 and GE_OTHER == 9 and APP_EVENTS == 10;
+    assert AR_IGNORE == 0 and AR_REGISTER == 1 and AR_UNREGISTER == 2 and AR_REVIEW == 3;
+    assert AR_FORGET == 4 and AR_COMMAND == 5 and AR_QUOTA == 6;
+    assert C_NONE == 0 and C_REVIEW == 1 and C_SUMMARY == 2 and C_HELP == 3 and C_PAUSE == 4;
+    assert C_RESUME == 5;
+}
+
+invariant the_free_tier_favours_public_work {
+    assert FREE_REVIEWS_PUBLIC > FREE_REVIEWS_PRIVATE;
+    assert FREE_REVIEWS_PRIVATE > 0;
+}

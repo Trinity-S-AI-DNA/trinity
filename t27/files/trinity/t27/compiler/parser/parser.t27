@@ -1,0 +1,499 @@
+; parser.t27 — Parser for TRI-27 Assembly
+; Builds AST from tokens produced by lexer
+
+use lexer
+use ast
+
+; Parser state
+struct Parser {
+    tokens : []Token
+    pos : u32
+    current : Token
+    context : CompilerContext
+}
+
+; Create new parser
+fn Parser.new(tokens : []Token, source_file : string) -> Parser {
+    let p = Parser {
+        tokens: tokens,
+        pos: 0,
+        current: Token { type: TokenType.EOF, text: "", value: 0, line: 0, column: 0, source_file: source_file },
+        context: CompilerContext {
+            ast_root: Program { node_type: NodeType.Program, line: 1, column: 1, source_file: source_file,
+                             constants: [], data_section: DataSection {}, code_section: CodeSection {},
+                             exports: [], imports: [] },
+            symbol_table: SymbolTable.new(null),
+            errors: [],
+            warnings: [],
+            current_phase: CompilationPhase.Parsing
+        }
+    };
+    if p.tokens.len() > 0 {
+        p.current = p.tokens[0];
+    }
+    return p;
+}
+
+; Advance to next token
+fn Parser.advance() -> Token {
+    let prev = self.current;
+    self.pos = self.pos + 1;
+    if self.pos < self.tokens.len() {
+        self.current = self.tokens[self.pos];
+    } else {
+        self.current = Token { type: TokenType.EOF, text: "", value: 0, line: 0, column: 0, source_file: self.context.ast_root.source_file };
+    }
+    return prev;
+}
+
+; Peek at next token
+fn Parser.peek() -> Token {
+    if self.pos + 1 < self.tokens.len() {
+        return self.tokens[self.pos + 1];
+    }
+    return Token { type: TokenType.EOF, text: "", value: 0, line: 0, column: 0, source_file: self.context.ast_root.source_file };
+}
+
+; Check if current token matches expected type
+fn Parser.check(token_type : TokenType) -> bool {
+    return self.current.type == token_type;
+}
+
+; Consume token if it matches, otherwise error
+fn Parser.consume(token_type : TokenType, error_msg : string) -> Token {
+    if self.check(token_type) {
+        return self.advance();
+    }
+    self.context.add_error(error_msg, self.current.line, self.current.column);
+    return self.current;
+}
+
+; Expect token type without consuming
+fn Parser.expect(token_type : TokenType, error_msg : string) {
+    if !self.check(token_type) {
+        self.context.add_error(error_msg, self.current.line, self.current.column);
+    }
+}
+
+; Skip newlines
+fn Parser.skip_newlines() {
+    while self.check(TokenType.Newline) {
+        self.advance();
+    }
+}
+
+; Match any of the given token types
+fn Parser.match(types : []TokenType) -> bool {
+    for t in types {
+        if self.check(t) {
+            return true;
+        }
+    }
+    return false;
+}
+
+; Parse entire program
+fn Parser.parse_program() -> Program {
+    self.skip_newlines();
+
+    ; Parse constants (.const declarations)
+    while self.check(TokenType.Const) or self.check(TokenType.Dot) {
+        self.parse_const_def();
+        self.skip_newlines();
+    }
+
+    ; Parse data section
+    if self.match([TokenType.Data]) {
+        self.parse_data_section();
+        self.skip_newlines();
+    }
+
+    ; Parse code section
+    if self.match([TokenType.Code]) {
+        self.parse_code_section();
+    }
+
+    return self.context.ast_root;
+}
+
+; Parse constant definition
+fn Parser.parse_const_def() -> ConstDef {
+    let dot_token = Token { type: TokenType.Dot, text: ".", value: 0, line: 0, column: 0, source_file: "" };
+
+    ; Optional . prefix
+    if self.check(TokenType.Dot) {
+        dot_token = self.advance();
+    }
+
+    let const_token = self.consume(TokenType.Const, "Expected 'const' keyword");
+    let name = self.consume(TokenType.Identifier, "Expected constant name");
+    let value = self.consume(TokenType.Integer, "Expected integer value for constant");
+
+    let const_def = ConstDef {
+        node_type: NodeType.ConstDef,
+        line: dot_token.line,
+        column: dot_token.column,
+        source_file: self.context.ast_root.source_file,
+        name: name.text,
+        value: value.value
+    };
+
+    ; Add to AST
+    self.context.ast_root.constants.push(const_def);
+
+    ; Add to symbol table
+    let symbol = Symbol {
+        name: name.text,
+        node: ast_node_from_const(const_def),
+        scope: "global",
+        is_exported: true,
+        is_defined: true
+    };
+    self.context.symbol_table.add(symbol);
+
+    return const_def;
+}
+
+; Parse data section
+fn Parser.parse_data_section() -> DataSection {
+    let data_token = self.advance();  ; Consume 'data'
+    self.skip_newlines();
+
+    let data_section = DataSection {
+        node_type: NodeType.DataSection,
+        line: data_token.line,
+        column: data_token.column,
+        source_file: self.context.ast_root.source_file,
+        declarations: []
+    };
+
+    ; Parse data declarations until .code or EOF
+    while !self.check(TokenType.Code) and !self.check(TokenType.EOF) {
+        self.skip_newlines();
+
+        ; Check for label
+        let label = "";
+        if self.check(TokenType.Identifier) and self.peek().type == TokenType.Colon {
+            let label_token = self.advance();
+            label = label_token.text;
+            self.consume(TokenType.Colon, "Expected colon after label");
+            self.skip_newlines();
+        }
+
+        ; Parse directive
+        if self.match([TokenType.Dot]) {
+            self.advance();  ; Consume '.'
+
+            if self.match([TokenType.DWord]) {
+                self.parse_dword(label, &data_section);
+            } else if self.match([TokenType.DSpace]) {
+                self.parse_dspace(label, &data_section);
+            } else if self.match([TokenType.DTrit]) {
+                self.parse_dtrit(label, &data_section);
+            }
+        }
+
+        self.skip_newlines();
+    }
+
+    self.context.ast_root.data_section = data_section;
+    return data_section;
+}
+
+; Parse .dword declaration
+fn Parser.parse_dword(label : string, section : DataSection) {
+    let dword_token = self.advance();  ; Consume 'dword'
+    let value = self.consume(TokenType.Integer, "Expected integer for .dword");
+
+    let decl = DataDecl {
+        node_type: NodeType.DWord,
+        line: dword_token.line,
+        column: dword_token.column,
+        source_file: self.context.ast_root.source_file,
+        size: 32,  ; 4 bytes
+        initial_value: value.value,
+        label: label
+    };
+
+    section.declarations.push(decl);
+}
+
+; Parse .dspace declaration
+fn Parser.parse_dspace(label : string, section : DataSection) {
+    let dspace_token = self.advance();  ; Consume 'dspace'
+    let value = self.consume(TokenType.Integer, "Expected integer for .dspace");
+
+    let decl = DataDecl {
+        node_type: NodeType.DSpace,
+        line: dspace_token.line,
+        column: dspace_token.column,
+        source_file: self.context.ast_root.source_file,
+        size: 32,  ; 4 bytes
+        initial_value: value.value,
+        label: label
+    };
+
+    section.declarations.push(decl);
+}
+
+; Parse .dtrit declaration
+fn Parser.parse_dtrit(label : string, section : DataSection) {
+    let dtrit_token = self.advance();  ; Consume 'dtrit'
+    let value = self.consume(TokenType.Integer, "Expected integer for .dtrit");
+
+    let decl = DataDecl {
+        node_type: NodeType.DTrit,
+        line: dtrit_token.line,
+        column: dtrit_token.column,
+        source_file: self.context.ast_root.source_file,
+        size: 2,  ; 2 bits per trit
+        initial_value: value.value,
+        label: label
+    };
+
+    section.declarations.push(decl);
+}
+
+; Parse code section
+fn Parser.parse_code_section() -> CodeSection {
+    let code_token = self.advance();  ; Consume 'code'
+    self.skip_newlines();
+
+    let code_section = CodeSection {
+        node_type: NodeType.CodeSection,
+        line: code_token.line,
+        column: code_token.column,
+        source_file: self.context.ast_root.source_file,
+        instructions: [],
+        labels: map.new()
+    };
+
+    ; Parse instructions until EOF
+    while !self.check(TokenType.EOF) {
+        self.skip_newlines();
+
+        ; Check for label
+        if self.check(TokenType.Identifier) and self.peek().type == TokenType.Colon {
+            let label_token = self.advance();
+            let label_name = label_token.text;
+            self.consume(TokenType.Colon, "Expected colon after label");
+
+            ; Record label position
+            code_section.labels.put(label_name, code_section.instructions.len() as u32);
+
+            ; Add to symbol table
+            let symbol = Symbol {
+                name: label_name,
+                node: ast_node_from_label(label_token),
+                scope: "code",
+                is_exported: false,
+                is_defined: true
+            };
+            self.context.symbol_table.add(symbol);
+
+            self.skip_newlines();
+            continue;
+        }
+
+        ; Parse instruction
+        if self.check(TokenType.Identifier) {
+            let inst = self.parse_instruction();
+            if inst != null {
+                code_section.instructions.push(inst);
+            }
+        }
+
+        self.skip_newlines();
+    }
+
+    self.context.ast_root.code_section = code_section;
+    return code_section;
+}
+
+; Parse single instruction
+fn Parser.parse_instruction() -> Instruction? {
+    let opcode_token = self.current;
+    let opcode = self.get_opcode(opcode_token.text);
+
+    if opcode == null {
+        self.context.add_error("Unknown instruction: " + opcode_token.text, opcode_token.line, opcode_token.column);
+        self.advance();
+        return null;
+    }
+
+    self.advance();  ; Consume opcode
+
+    let operands : []Operand = [];
+
+    ; Parse operands
+    if !self.check(TokenType.Semicolon) and !self.check(TokenType.Newline) and !self.check(TokenType.EOF) {
+        let operand = self.parse_operand();
+        if operand != null {
+            operands.push(operand);
+        }
+
+        ; Parse comma-separated operands
+        while self.check(TokenType.Comma) {
+            self.advance();
+            self.skip_newlines();
+            operand = self.parse_operand();
+            if operand != null {
+                operands.push(operand);
+            }
+        }
+    }
+
+    ; Optional comment
+    if self.check(TokenType.Semicolon) {
+        ; Skip to end of line
+        while !self.check(TokenType.Newline) and !self.check(TokenType.EOF) {
+            self.advance();
+        }
+    }
+
+    return Instruction {
+        node_type: NodeType.Instruction,
+        line: opcode_token.line,
+        column: opcode_token.column,
+        source_file: self.context.ast_root.source_file,
+        opcode: opcode,
+        operands: operands
+    };
+}
+
+; Parse operand
+fn Parser.parse_operand() -> Operand? {
+    self.skip_newlines();
+
+    ; Register (r0-r26)
+    if self.check(TokenType.Reg) {
+        let reg_token = self.advance();
+        return RegOperand {
+            node_type: NodeType.Reg,
+            line: reg_token.line,
+            column: reg_token.column,
+            source_file: self.context.ast_root.source_file,
+            operand_type: OperandType.Register,
+            reg_num: reg_token.value as u8
+        };
+    }
+
+    ; Immediate (#value)
+    if self.check(TokenType.Hash) {
+        self.advance();  ; Consume '#'
+        let value_token = self.consume(TokenType.Integer, "Expected integer after '#'");
+        return ImmOperand {
+            node_type: NodeType.Imm,
+            line: value_token.line,
+            column: value_token.column,
+            source_file: self.context.ast_root.source_file,
+            operand_type: OperandType.Immediate,
+            value: value_token.value
+        };
+    }
+
+    ; Label reference
+    if self.check(TokenType.Identifier) {
+        let label_token = self.advance();
+        return LabelOperand {
+            node_type: NodeType.Label,
+            line: label_token.line,
+            column: label_token.column,
+            source_file: self.context.ast_root.source_file,
+            operand_type: OperandType.LabelRef,
+            label_name: label_token.text
+        };
+    }
+
+    ; Memory reference [reg] or [reg + offset]
+    if self.check(TokenType.LBracket) {
+        self.advance();  ; Consume '['
+        self.skip_newlines();
+
+        let base_reg = 0 as u8;
+        let offset : i16 = 0;
+
+        if self.check(TokenType.Reg) {
+            let reg_token = self.advance();
+            base_reg = reg_token.value as u8;
+        }
+
+        self.skip_newlines();
+
+        ; Check for offset
+        if self.match([TokenType.Plus, TokenType.Minus]) {
+            let op = self.advance();
+            let value_token = self.consume(TokenType.Integer, "Expected integer offset");
+            if op.type == TokenType.Plus {
+                offset = value_token.value as i16;
+            } else {
+                offset = -(value_token.value as i16);
+            }
+        }
+
+        self.consume(TokenType.RBracket, "Expected ']'");
+
+        return MemOperand {
+            node_type: NodeType.Mem,
+            line: 0,  ; TODO: track properly
+            column: 0,
+            source_file: self.context.ast_root.source_file,
+            operand_type: OperandType.Memory,
+            base_reg: base_reg,
+            offset: offset
+        };
+    }
+
+    self.context.add_error("Expected register, immediate, label, or memory reference", self.current.line, self.current.column);
+    return null;
+}
+
+; Get opcode from mnemonic
+fn Parser.get_opcode(mnemonic : string) -> Opcode? {
+    let upper = mnemonic.to_upper_case();
+
+    if upper == "MOV" { return Opcode.MOV; }
+    if upper == "JZ" { return Opcode.JZ; }
+    if upper == "JNZ" { return Opcode.JNZ; }
+    if upper == "JMP" { return Opcode.JMP; }
+    if upper == "MUL" { return Opcode.MUL; }
+    if upper == "ADD" { return Opcode.ADD; }
+    if upper == "SUB" { return Opcode.SUB; }
+    if upper == "BIND" { return Opcode.BIND; }
+    if upper == "BUNDLE" { return Opcode.BUNDLE; }
+    if upper == "HALT" { return Opcode.HALT; }
+
+    return null;
+}
+
+; Main parsing entry point
+fn parse(source : string, source_file : string) -> CompilerContext {
+    ; Tokenize
+    let tokens = tokenize(source, source_file);
+
+    ; Parse
+    let parser = Parser.new(tokens, source_file);
+    let program = parser.parse_program();
+
+    return parser.context;
+}
+
+; Helper: create AST node from const def
+fn ast_node_from_const(const_def : ConstDef) -> ASTNode {
+    return ASTNode {
+        node_type: NodeType.ConstDef,
+        line: const_def.line,
+        column: const_def.column,
+        source_file: const_def.source_file
+    };
+}
+
+; Helper: create AST node from label token
+fn ast_node_from_label(token : Token) -> ASTNode {
+    return ASTNode {
+        node_type: NodeType.Label,
+        line: token.line,
+        column: token.column,
+        source_file: token.source_file
+    };
+}

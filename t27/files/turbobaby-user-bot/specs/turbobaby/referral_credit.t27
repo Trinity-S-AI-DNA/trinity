@@ -1,0 +1,651 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/turbobaby/referral_credit.t27 -- what an invited friend's rental earns the inviter
+; This contract owns the referral credit the owner decided on 2026-09-26 (R3): the rate, the
+; rounding, the base it is taken on, who is creditable, the holds a customer may place on it, how
+; a hold is settled or paid out by hand, and the structure of the THB ledger that records every
+; movement. It owns no edge, no code and no status of the referral graph: turbobaby/referral-program
+; owns those and supplies the edge this credit is read from. It owns no order money: the order's
+; total, its PromptPay amount and its deposit are turbobaby/order-money's, turbobaby/commerce's and
+; turbobaby/deposit-tiers', and this file records only that the credit touches none of them.
+; --
+; THE OWNER'S WORDS, 2026-09-26, in translation (the Russian is verbatim in DECISIONS.md, "R1-R3,
+; the owner's answers of 2026-09-26", and in src/trios/referral_credit.rs): "it must be credited
+; only for someone who rented, a 10% discount"; "the inviter can take it as a discount on a rental
+; or as money"; of the referral bonus points, "remove them, only the 10% discount"; and he
+; confirmed the rule: when an invited friend completes a rental, the inviter is credited 10% of
+; that rental's amount, excluding the deposit and delivery, "for each rental of the friend"; the
+; inviter may spend it on their own rental or ask for a payout, which a manager makes by hand; the
+; friend gets nothing. Asked the same day whether the 10% is taken before or after the referral
+; balance the friend applied to that rental, he answered "after the discount -- 250" (the net base
+; as built; OWNER_BASE_ANSWER_* below).
+; --
+; WHY A LEDGER OF ITS OWN (measured 2026-09-26 at e39221e). Three facts decide it.
+; 1. THE SERVER NEVER KNOWS A RENTAL'S AMOUNT. check_full_subtotal in src/api/orders.rs prices a
+;    bike line at 0 (D11), so a bike-only order stores subtotal = total = 0, and
+;    BikeDeal::BikeRental's rate_thb_day is optional and never multiplied. So the 10% base can
+;    only be a figure a manager records: BASE_IS_RECORDED_BY_A_MANAGER.
+; 2. NO SHIPPED CLIENT CREATES A RENTAL ORDER: the cart kinds are the old catalogue's, book_block
+;    answers NotWired, and turbobaby/order-presentation's CHECKOUT_BIKE_LINE_KEY_COUNT is 0. So a
+;    hook in order completion would have nothing to compute, and the credit is born only when a
+;    manager records a completed rental (POST /api/admin/referral-credit/rentals).
+; 3. LOYALTY POINTS CANNOT PAY A RENTAL: bonus_used is bounded by a subtotal of 0, and a payout
+;    from the points balance would pay out cashback. So the credit is a THB ledger apart from the
+;    points (migration 089), whose balance is the sum of its rows and is stored nowhere, so it
+;    cannot drift -- the defect turbobaby/loyalty-ledger measures in the points balance.
+; --
+; WHAT THIS FILE NEVER DOES. It restates no edge rule: the self edge, first touch and the
+; confirmation are turbobaby/referral-program's, and the credit's own refusals (a self edge, an
+; edge newer than the order, a customer from before the edge) are declared here as refusals of a
+; CREDIT, not of an edge. It restates no identity proof: turbobaby/request-identity owns the
+; gates, and this file counts which of its six routes stands behind which. It restates no notice:
+; the admins' notice of a new request is operator-facing text, and turbobaby/notification-queue's
+; queue carries none of it. It declares no customer sentence beyond the five the operator worded
+; on 2026-09-26, and lists the eight it would have needed. No account id, no handle and no amount
+; of any real person appears. It is ASCII; the owner's Russian is quoted where the code lives.
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module turbobaby-referral-credit;
+
+pub const KIND : str = "contract";
+pub const ID : str = "turbobaby/referral-credit";
+pub const NAME : str = "TurboBaby referral credit: 10% of an invited friend's rentals, in THB";
+pub const WORLD : str = "gHashTag/turbobaby-user-bot";
+pub const MEASURED_AT : str = "2026-09-26";
+
+; Where each rule below is implemented. The core is compiled for the host and for wasm32, so the
+; server, the admin screen and the customer page run one arithmetic (D15).
+pub const IMPLEMENTATION_CORE : str = "src/trios/referral_credit.rs";
+pub const IMPLEMENTATION_DB : str = "src/db/referral_credit.rs";
+pub const IMPLEMENTATION_API : str = "src/api/referral_credit.rs";
+pub const MIGRATION : str = "migrations/089_referral_credit.sql";
+pub const REGRESSION_WITNESS : str = "tests/integration_referral_credit.rs";
+pub const WIRING_WITNESS : str = "tests/referral_credit_wiring.rs";
+
+; --- The owner, and the rate ----------------------------------------------------------------------
+pub const OWNER_R3_DECIDED_AT : str = "2026-09-26";
+pub const OWNER_R3_WORDS : str = "Credited only for someone who rented, a 10% discount. The inviter can take it as a discount on a rental or as money. The referral bonus points: remove them, only the 10% discount. 10% of each completed rental of the invited friend, without deposit and delivery, for each rental of the friend; spent on a rental or paid out by a manager by hand; the friend gets nothing.";
+; Bound by gate 3 to REFERRAL_CREDIT_PERCENT in the core, to 089's credit CHECK, and to the rule
+; sentence in both bot locales (src/locales.rs); since the integration of 2026-09-26 also to the
+; Mini App's rule sentence in both tables (T_REFERRAL_SUBTITLE in src/trios/i18n.rs).
+pub const CREDIT_PERCENT : u8 = 10;
+pub const CREDIT_ROUNDS_DOWN_TO_WHOLE_BAHT : bool = true;
+pub const BASE_EXCLUDES_DEPOSIT : bool = true;
+pub const BASE_EXCLUDES_DELIVERY : bool = true;
+; 10% of the cash the shop took, so the referral balance the FRIEND applied to the same rental is
+; taken off the base first. The operator built it so and asked; the owner confirmed it on
+; 2026-09-26 (the block below). Until then this line read "the owner may prefer the gross charge".
+pub const BASE_IS_NET_OF_THE_APPLIED_REFERRAL_BALANCE : bool = true;
+pub const BASE_IS_RECORDED_BY_A_MANAGER : bool = true;
+pub const BASE_IS_COMPUTED_FROM_A_RATE : bool = false;
+; THE BASE, ANSWERED BY THE OWNER ON 2026-09-26. Open question 1 of the DECISIONS.md entry "R1-R3,
+; the owner's answers of 2026-09-26" asked whether the 10% is taken on the rental charge net of the
+; referral balance the friend applied to that same rental (as built), or on the gross charge. The
+; owner answered the same day; the Russian is verbatim in DECISIONS.md, "The base of the 10% and
+; the referral top list, the owner's answers of 2026-09-26". In translation: "after the discount --
+; 250". The discount is the friend's own referral balance applied to the rental (the owner calls
+; the credit a discount in R3's words), and 250 is the credit of the example the question carried,
+; which this repository does not keep, so no assertion here restates it. So the net base is the
+; owner's decision and no longer the operator's reading: credit_for_rental
+; (IMPLEMENTATION_CORE) and record_rental (IMPLEMENTATION_DB) already compute it, and nothing in
+; the code changed with the answer.
+pub const OWNER_BASE_ANSWER_AT : str = "2026-09-26";
+pub const OWNER_BASE_ANSWER_WORDS : str = "After the discount -- 250";
+pub const BASE_IS_THE_OWNERS_DECISION : bool = true;
+pub const BASE_QUESTION_IS_OPEN : bool = false;
+pub const BASE_ANSWER_CHANGED_THE_CODE : bool = false;
+; = MAX_ORDER_TOTAL in validate_create_order and 089's BETWEEN; gate 3 binds all three copies.
+pub const MAX_RENTAL_AMOUNT_THB : u32 = 100000000;
+
+; --- Who is credited --------------------------------------------------------------------------------
+; Every recorded rental credits: "for each rental of the friend". No cap, no expiry, no minimum.
+pub const CREDITED_PER_RECORDED_RENTAL : bool = true;
+pub const CREDITED_ON_FIRST_ORDER_ONLY : bool = false;
+pub const LEVELS_CREDITED : u8 = 1;
+pub const FRIEND_IS_CREDITED : bool = false;
+; The four refusals, checked in this order by creditable_inviter in the core. A self edge is the
+; 007 backfill's; an edge after the order and a customer from before the edge are attributions a
+; /start ref_ link could add to an old customer, because the bot records an edge with no
+; new-user check.
+pub const SELF_EDGE_IS_CREDITED : bool = false;
+pub const EDGE_AFTER_ORDER_IS_CREDITED : bool = false;
+pub const EXISTING_CUSTOMER_IS_CREDITED : bool = false;
+pub const RECORDER_MAY_BE_THE_INVITER : bool = false;
+; The recorder guard reads both identities check_admin answers with (the review of 2026-09-26;
+; until then it ran only for an admin named by Telegram, so a password record of an admin's own
+; friend credited that admin). check_admin answers the recorder's own id when Telegram names him,
+; and 0 for the shared password token, a principal that names nobody (turbobaby/request-identity,
+; PASSWORD_STEP_PRINCIPAL_IS_A_SENTINEL); initData that fails the strict check beside the token is
+; answered with 0 as well. A named recorder is refused when he is the inviter. A password record is
+; refused when the inviter is on ADMIN_IDS, since any listed admin may be the one holding the
+; password. Both are 422 recorder_is_inviter and write nothing (recorder_refused below).
+; STILL OPEN: a person who knows the password and is not on ADMIN_IDS can record the rentals of a
+; friend he invited, and his record stores recorded_by = 0, which names nobody. The code cannot
+; tell him from a manager; closing it means refusing the password token on this route, which would
+; also refuse an admin whose WebView fails the strict check. That is the owner's call (DECISIONS.md).
+pub const RECORDER_GUARD_REFUSES_A_NAMED_INVITER : bool = true;
+pub const RECORDER_GUARD_REFUSES_A_PASSWORD_RECORD_OF_A_LISTED_ADMINS_FRIEND : bool = true;
+pub const RECORDER_GUARD_COVERS_A_PASSWORD_HOLDER_OFF_THE_ADMIN_LIST : bool = false;
+pub const PASSWORD_RECORD_NAMES_ITS_RECORDER : bool = false;
+; Bound by gate 3: the one read of the admin list in IMPLEMENTATION_DB (recorder_is_the_inviter),
+; and the one call in IMPLEMENTATION_API that hands the ledger check_admin's answer with the list.
+pub const RECORDER_GUARD_ADMIN_LIST_READS : u8 = 1;
+pub const RECORDER_GUARD_ADMIN_LIST_HANDED_TO_THE_RECORD : u8 = 1;
+pub const RECORDER_GUARD_WITNESS : str = "tests/integration_referral_credit.rs a_password_record_of_a_listed_admins_friend_is_refused";
+pub const RECORDER_GUARD_FIXED_AT : str = "2026-09-26";
+; No retroactive credit: an order created before 089 was applied is refused (409).
+pub const ORDER_BEFORE_PROGRAM_IS_CREDITED : bool = false;
+pub const REFUSAL_NO_EDGE : u8 = 1;
+pub const REFUSAL_SELF_EDGE : u8 = 2;
+pub const REFUSAL_EDGE_AFTER_ORDER : u8 = 3;
+pub const REFUSAL_EXISTING_CUSTOMER : u8 = 4;
+
+; --- The ledger ----------------------------------------------------------------------------------------
+; Each list is bound by gate 3 to 089's CHECK and to the core's const, element by element.
+pub const LEDGER_KINDS : [5]str = ["accrual", "accrual_reversal", "redeem", "redeem_reversal", "payout"];
+pub const REQUEST_KINDS : [2]str = ["payout", "redeem"];
+pub const REQUEST_STATUSES : [4]str = ["open", "applied", "paid", "declined"];
+pub const BALANCE_IS_A_STORED_COLUMN : bool = false;
+pub const HOLD_IS_DERIVED : bool = true;
+; 089's partial unique index on open requests, bound by gate 3.
+pub const OPEN_REQUESTS_PER_PERSON_MAX : u8 = 1;
+pub const PARTIAL_PAYOUT : bool = false;
+
+; --- Money movement, and the order's money -----------------------------------------------------------
+; Nothing in either credit module calls a bank, PromptPay, Stars or an invoice. A payout is made by
+; a manager by hand and only recorded here; a redemption comes off the cash taken at the office.
+pub const MONEY_MOVES_AUTOMATICALLY : bool = false;
+pub const PAYOUT_IS_MADE_BY_HAND : bool = true;
+pub const ORDER_TOTAL_IS_TOUCHED : bool = false;
+pub const PROMPTPAY_AMOUNT_IS_TOUCHED : bool = false;
+pub const DEPOSIT_IS_TOUCHED : bool = false;
+pub const ZERO_TOTAL_QR_REFUSAL_UNCHANGED : bool = true;
+; Bound by gate 3: src/api/orders.rs names none of the credit's tables or modules.
+pub const ORDER_MONEY_PATH_MENTIONS : u8 = 0;
+
+; --- Reversal ------------------------------------------------------------------------------------------
+; The one path that un-completes an order is the bot's reject (CallbackAction::RejectOrder); it
+; reverses an order-linked record in its own transaction, fail-closed. Every other correction is
+; a manager's whole reversal plus a new record. Bound by gate 3 (one call site in src/).
+pub const AUTOMATIC_REVERSAL_SITES : u8 = 1;
+pub const REVERSAL_IS_WHOLE : bool = true;
+pub const BALANCE_MAY_GO_NEGATIVE : bool = true;
+pub const NEGATIVE_BALANCE_IS_COLLECTED : bool = false;
+; No approved sentence explains a debt, so a customer is shown 0 (shown_balance); the API still
+; returns the signed figure.
+pub const NEGATIVE_BALANCE_SHOWN_AS_ZERO : bool = true;
+
+; --- Routes ---------------------------------------------------------------------------------------------
+; src/api/referral_credit.rs, all bound by gate 3: two customer routes behind the owner check and
+; the blocked check, four admin routes behind check_admin, none ungated. No route takes the strict
+; initData gate: a request moves no money, and the reconstructed-initData cohort relies on the
+; owner check's lenient fallback (turbobaby/request-identity).
+pub const ROUTE_COUNT : u8 = 6;
+pub const OWNER_GATED_ROUTE_COUNT : u8 = 2;
+pub const ADMIN_GATED_ROUTE_COUNT : u8 = 4;
+pub const UNGATED_ROUTE_COUNT : u8 = 0;
+pub const STRICT_GATE_SITES : u8 = 0;
+
+; --- Privacy ----------------------------------------------------------------------------------------------
+; A customer is sent the balance, the hold, what is available and the one open request: no entry,
+; no friend id, no order id. A FINDING, not a fix: an inviter with a single friend can still read
+; that friend's spend off the balance (10% of it), and nothing here hides it.
+pub const CUSTOMER_RESPONSE_CARRIES_ENTRIES : bool = false;
+pub const BALANCE_REVEALS_A_SINGLE_FRIENDS_SPEND : bool = true;
+
+; --- What the code may not name, and how it reads ----------------------------------------------------
+; All four bound by gate 3 as zero-count rows with a witness.
+pub const POINTS_TOKENS_IN_THE_CREDIT_MODULE : u8 = 0;
+pub const CREDIT_TOKENS_IN_THE_LOYALTY_ROUTES : u8 = 0;
+pub const MUTATING_STATEMENTS_IN_THE_MIGRATION : u8 = 0;
+pub const FAIL_OPEN_READS : u8 = 0;
+; pg_advisory_xact_lock(hashtext(namespace), hashtext(tid)): the two-int4 key space, which
+; PostgreSQL keeps apart from the one-bigint space create_order locks in. One person lock per
+; transaction; the order row first, the person second, referral rows third.
+pub const LOCK_NAMESPACE : str = "referral_credit";
+pub const LOCK_KEY_SPACE_IS_TWO_INT4 : bool = true;
+pub const PERSON_LOCKS_PER_TRANSACTION_MAX : u8 = 1;
+
+; --- Copy --------------------------------------------------------------------------------------------------
+; The five customer strings the operator worded on 2026-09-26 under R3, by key. Nothing else
+; customer-facing was written; the eight below were needed and are left out.
+pub const COPY_KEYS : [5]str = ["referral.balance", "referral.apply_to_rental", "referral.request_payout", "referral.payout_requested", "referral.subtitle"];
+pub const COPY_WORDED_BY : str = "operator 2026-09-26";
+pub const COPY_NEEDED_AND_NOT_WORDED : [8]str = [
+  "a confirmation sentence after the apply-to-rental request",
+  "notices to the inviter on an accrual, a payout or a decline",
+  "a friend-facing share text",
+  "labels for history rows",
+  "wording for a negative balance",
+  "specific sentences for the 409 and 422 refusals",
+  "an empty state for the invitees panel",
+  "a sentence saying the milestone ladder ended",
+];
+; INTEGRATED 2026-09-26 (t27/round5: the server lane, then the client lane, both merged). The
+; client lane retired seven keys whose copy promised points, a ladder or an amount per friend, each
+; line of src/trios/i18n.rs replaced by one line. turbobaby/locale-policy counts them
+; (KEYS_DELETED_2026_09_26_R3) and left their names to this file; the unit test named below holds
+; them absent from the declarations and from both tables. The client lane also met a ninth sentence
+; it would have needed and left out, like the eight above: why both buttons are inactive while
+; nothing is available.
+pub const COPY_KEYS_RETIRED_2026_09_26 : [7]str = [
+  "referral.invitees.empty",
+  "referral.milestone.title",
+  "referral.milestone.subtitle",
+  "referral.milestone.awarded",
+  "referral.share_text",
+  "referral.stat.bonus",
+  "profile.earn_per_ref",
+];
+pub const COPY_KEYS_RETIRED_WITNESS : str = "src/trios/i18n.rs the_referral_keys_r3_retired_stay_retired";
+pub const COPY_NEEDED_AND_NOT_WORDED_FOUND_BY_THE_CLIENT_LANE : [1]str = [
+  "a sentence saying why both buttons are inactive while nothing is available",
+];
+; The API's one shape. Both lanes compile against the wire types of IMPLEMENTATION_CORE, so a field
+; cannot drift between the server and the Mini App. The path, the verb, the type a route answers
+; with and the type a screen parses, the body a screen sends and the field names the server's
+; hand-written parsers read are strings and choices, and no compiler compares them. Since the
+; integration, API_SHAPE_WITNESS reads both sides against one table of the six routes, and the
+; in-crate test named by API_SHAPE_BODY_WITNESS runs each shared body, serialized as a screen
+; serializes it, through the server's parser. Eight planted drifts (a client path, a parsed type, a
+; verb on each side, a field name, an answer type, a resolve action, a swapped body) each turned
+; the witness red; tests/ui_endpoints_exist.rs, which only asks that a fetched path is served, went
+; green with the merge.
+pub const API_SHAPE_WITNESS : str = "tests/referral_credit_api_shape_wiring.rs";
+pub const API_SHAPE_BODY_WITNESS : str = "src/api/referral_credit.rs the_bodies_the_screens_serialize_are_what_the_parsers_read";
+pub const CLIENT_WIRING_WITNESS : str = "tests/referral_credit_client_wiring.rs";
+pub const CLIENT_CALLED_ROUTE_COUNT : u8 = 6;
+pub const API_SHAPE_PINNED_AT : str = "2026-09-26";
+
+; --- Reuse edges, named by ID ------------------------------------------------------------------------------
+pub const REUSES_REFERRAL_PROGRAM_ID : str = "turbobaby/referral-program";
+pub const REUSES_LOYALTY_LEDGER_ID : str = "turbobaby/loyalty-ledger";
+pub const REUSES_ORDER_MONEY_ID : str = "turbobaby/order-money";
+pub const REUSES_ORDER_STATUS_ID : str = "turbobaby/order-status";
+pub const REUSES_COMMERCE_ID : str = "turbobaby/commerce";
+pub const REUSES_REQUEST_IDENTITY_ID : str = "turbobaby/request-identity";
+pub const REUSES_MARKET_ID : str = "turbobaby/market";
+pub const REUSES_DEPOSIT_TIERS_ID : str = "turbobaby/deposit-tiers";
+pub const REUSES_NOTIFICATION_QUEUE_ID : str = "turbobaby/notification-queue";
+pub const REUSE_EDGE_COUNT : u8 = 9;
+pub const REUSE_EDGES : [9]str = [
+  "turbobaby/referral-program",
+  "turbobaby/loyalty-ledger",
+  "turbobaby/order-money",
+  "turbobaby/order-status",
+  "turbobaby/commerce",
+  "turbobaby/request-identity",
+  "turbobaby/market",
+  "turbobaby/deposit-tiers",
+  "turbobaby/notification-queue",
+];
+pub const REFERRAL_PROGRAM_SUPPLIES : str = "the edge: who invited whom (referral_events, first touch, any status), and its confirmation, which a creditable record performs with no money of its own.";
+pub const LOYALTY_LEDGER_SUPPLIES : str = "the points ledger this credit is kept apart from, and the drift finding that is why no balance column exists here.";
+pub const ORDER_MONEY_SUPPLIES : str = "the order total, bonus_used and MAX_ORDER_TOTAL, which bounds a recorded rental; the credit writes none of them.";
+pub const ORDER_STATUS_SUPPLIES : str = "the completed status a linked order must hold, and the bot reject that is the one path un-completing an order.";
+pub const COMMERCE_SUPPLIES : str = "the PromptPay amount and its zero-total refusal, both unchanged.";
+pub const REQUEST_IDENTITY_SUPPLIES : str = "check_owner, check_not_blocked and check_admin, which stand behind the six routes.";
+pub const MARKET_SUPPLIES : str = "the THB market and format_baht, in which the balance is shown.";
+pub const DEPOSIT_TIERS_SUPPLIES : str = "the deposit a rental charge excludes by definition.";
+pub const NOTIFICATION_QUEUE_SUPPLIES : str = "the referrer notices this credit does NOT queue: no accrual, payout or decline notice was worded.";
+
+; --- Functions, mirroring src/trios/referral_credit.rs over integers ---------------------------------------
+pub fn rental_is_valid(rental: u32) bool {
+  return rental >= 1 and rental <= MAX_RENTAL_AMOUNT_THB;
+}
+
+; floor(CREDIT_PERCENT% of (rental - applied)); 0 when the rental is invalid or applied exceeds it.
+pub fn credit(rental: u32, applied: u32) u32 {
+  if (!rental_is_valid(rental)) {
+    return 0;
+  }
+  if (applied > rental) {
+    return 0;
+  }
+  return (rental - applied) * CREDIT_PERCENT / 100;
+}
+
+pub fn available(balance: i64, held: i64) i64 {
+  // the hold never counts below zero, and neither does what is left
+  var hold : i64 = held;
+  if (hold < 0) {
+    hold = 0;
+  }
+  if (balance - hold < 0) {
+    return 0;
+  }
+  return balance - hold;
+}
+
+pub fn shown_balance(balance: i64) i64 {
+  if (balance < 0) {
+    return 0;
+  }
+  return balance;
+}
+
+; The least of the hold, the rental and the balance, never below zero.
+pub fn applied(hold: i64, rental: i64, balance: i64) i64 {
+  var least : i64 = hold;
+  if (rental < least) {
+    least = rental;
+  }
+  if (balance < least) {
+    least = balance;
+  }
+  if (least < 0) {
+    return 0;
+  }
+  return least;
+}
+
+; 0 when creditable, else the first refusal in the fixed order.
+pub fn first_refusal(no_edge: bool, self_edge: bool, edge_after_order: bool, existing_customer: bool) u8 {
+  if (no_edge) {
+    return REFUSAL_NO_EDGE;
+  }
+  if (self_edge) {
+    return REFUSAL_SELF_EDGE;
+  }
+  if (edge_after_order) {
+    return REFUSAL_EDGE_AFTER_ORDER;
+  }
+  if (existing_customer) {
+    return REFUSAL_EXISTING_CUSTOMER;
+  }
+  return 0;
+}
+
+pub fn creditable(no_edge: bool, self_edge: bool, edge_after_order: bool, existing_customer: bool) bool {
+  return first_refusal(no_edge, self_edge, edge_after_order, existing_customer) == 0;
+}
+
+; A record that neither credits nor settles anything is refused and writes nothing.
+pub fn record_is_admitted(is_creditable: bool, applied_thb: i64) bool {
+  return is_creditable or applied_thb > 0;
+}
+
+; A record that would credit its own recorder is refused. A named recorder is compared with the
+; inviter; the password token, which names nobody, with the admin list.
+pub fn recorder_refused(recorder_is_named: bool, recorder_is_the_inviter: bool, inviter_is_a_listed_admin: bool) bool {
+  if (recorder_is_named) {
+    return recorder_is_the_inviter;
+  }
+  return inviter_is_a_listed_admin;
+}
+
+pub const REQUEST_OPENED : u8 = 0;
+pub const REQUEST_ALREADY_OPEN : u8 = 1;
+pub const REQUEST_REFUSED_OTHER_KIND_OPEN : u8 = 2;
+pub const REQUEST_REFUSED_NOTHING_AVAILABLE : u8 = 3;
+
+pub fn request_admitted(open_same: bool, open_other: bool, available_thb: i64) u8 {
+  if (open_same) {
+    return REQUEST_ALREADY_OPEN;
+  }
+  if (open_other) {
+    return REQUEST_REFUSED_OTHER_KIND_OPEN;
+  }
+  if (available_thb < 1) {
+    return REQUEST_REFUSED_NOTHING_AVAILABLE;
+  }
+  return REQUEST_OPENED;
+}
+
+; Paid only on an open payout, and never above the ledger.
+pub fn paid_admitted(status_open: bool, is_payout: bool, balance: i64, amount: i64) bool {
+  return status_open and is_payout and balance >= amount and amount > 0;
+}
+
+; Two friends' recorded rentals, for the tests below: three records of one friend (the last one
+; too small to credit a whole baht), and two of another.
+pub const EXAMPLE_RENTALS_OF_ONE_FRIEND : [4]u32 = [1000, 2005, 9, 0];
+pub const EXAMPLE_RENTALS_OF_ANOTHER : [4]u32 = [1239, 1239, 0, 0];
+
+; What a friend's recorded rentals earn the inviter in all, record by record.
+pub fn credits_for_rentals(rentals: [4]u32, count: u8) u32 {
+  var total : u32 = 0;
+  var i : u8 = 0;
+  while (i < count) {
+    // one record, one credit: "for each rental of the friend"
+    total += credit(rentals[i], 0);
+    i += @as(u8, 1);
+  }
+  return total;
+}
+
+; --- Tests ----------------------------------------------------------------------------------------------------
+
+test this_file_owns_its_own_identity {
+  assert ID == "turbobaby/referral-credit";
+  assert KIND == "contract";
+  assert MEASURED_AT == "2026-09-26";
+  assert OWNER_R3_DECIDED_AT == MEASURED_AT;
+  assert IMPLEMENTATION_CORE == "src/trios/referral_credit.rs";
+  assert MIGRATION == "migrations/089_referral_credit.sql";
+}
+
+test the_credit_rounds_down_to_whole_baht {
+  assert credit(1239, 0) == 123;
+  assert credit(1234, 0) == 123;
+  assert credit(10, 0) == 1;
+  assert credit(9, 0) == 0;
+  assert credit(1000, 300) == 70;
+  assert credit(1005, 5) == 100;
+  assert credit(MAX_RENTAL_AMOUNT_THB, 0) == 10000000;
+  assert credit(0, 0) == 0;
+  assert credit(MAX_RENTAL_AMOUNT_THB + 1, 0) == 0;
+  assert credit(100, 101) == 0;
+  assert CREDIT_PERCENT == 10;
+  assert CREDIT_ROUNDS_DOWN_TO_WHOLE_BAHT == true;
+}
+
+test the_base_is_the_managers_net_rental_charge {
+  assert BASE_EXCLUDES_DEPOSIT == true;
+  assert BASE_EXCLUDES_DELIVERY == true;
+  assert BASE_IS_NET_OF_THE_APPLIED_REFERRAL_BALANCE == true;
+  assert BASE_IS_RECORDED_BY_A_MANAGER == true;
+  assert BASE_IS_COMPUTED_FROM_A_RATE == false;
+  assert rental_is_valid(1) == true;
+  assert rental_is_valid(MAX_RENTAL_AMOUNT_THB) == true;
+  assert rental_is_valid(0) == false;
+  assert rental_is_valid(MAX_RENTAL_AMOUNT_THB + 1) == false;
+}
+
+test every_recorded_rental_credits_and_only_the_inviter {
+  assert CREDITED_PER_RECORDED_RENTAL == true;
+  assert CREDITED_ON_FIRST_ORDER_ONLY == false;
+  assert LEVELS_CREDITED == 1;
+  assert FRIEND_IS_CREDITED == false;
+  assert credits_for_rentals(EXAMPLE_RENTALS_OF_ONE_FRIEND, 3) == 300;
+  assert credits_for_rentals(EXAMPLE_RENTALS_OF_ANOTHER, 2) == 246;
+  assert credits_for_rentals(EXAMPLE_RENTALS_OF_ANOTHER, 0) == 0;
+}
+
+test the_refusals_come_in_their_fixed_order {
+  assert creditable(false, false, false, false) == true;
+  assert first_refusal(true, true, true, true) == REFUSAL_NO_EDGE;
+  assert first_refusal(false, true, true, true) == REFUSAL_SELF_EDGE;
+  assert first_refusal(false, false, true, true) == REFUSAL_EDGE_AFTER_ORDER;
+  assert first_refusal(false, false, false, true) == REFUSAL_EXISTING_CUSTOMER;
+  assert SELF_EDGE_IS_CREDITED == false;
+  assert EDGE_AFTER_ORDER_IS_CREDITED == false;
+  assert EXISTING_CUSTOMER_IS_CREDITED == false;
+  assert RECORDER_MAY_BE_THE_INVITER == false;
+  assert ORDER_BEFORE_PROGRAM_IS_CREDITED == false;
+  assert record_is_admitted(false, 0) == false;
+  assert record_is_admitted(false, 200) == true;
+  assert record_is_admitted(true, 0) == true;
+}
+
+test holds_are_derived_and_never_negative {
+  assert available(450, 0) == 450;
+  assert available(450, 450) == 0;
+  assert available(450, 200) == 250;
+  assert available(-120, 0) == 0;
+  assert available(100, -50) == 100;
+  assert shown_balance(-120) == 0;
+  assert shown_balance(450) == 450;
+  assert applied(200, 1000, 250) == 200;
+  assert applied(500, 300, 500) == 300;
+  assert applied(500, 1000, -40) == 0;
+  assert credit(1000, 200) == 80;
+  assert credit(300, 300) == 0;
+  assert BALANCE_IS_A_STORED_COLUMN == false;
+  assert HOLD_IS_DERIVED == true;
+}
+
+test one_open_request_per_person_and_no_partial_payout {
+  assert OPEN_REQUESTS_PER_PERSON_MAX == 1;
+  assert request_admitted(false, false, 123) == REQUEST_OPENED;
+  assert request_admitted(true, false, 0) == REQUEST_ALREADY_OPEN;
+  assert request_admitted(false, true, 123) == REQUEST_REFUSED_OTHER_KIND_OPEN;
+  assert request_admitted(false, false, 0) == REQUEST_REFUSED_NOTHING_AVAILABLE;
+  assert PARTIAL_PAYOUT == false;
+  assert paid_admitted(true, true, 123, 123) == true;
+  assert paid_admitted(true, true, 0, 123) == false;
+  assert paid_admitted(true, false, 123, 123) == false;
+  assert paid_admitted(false, true, 123, 123) == false;
+}
+
+test the_kind_lists_are_the_migrations {
+  assert LEDGER_KINDS.len == 5;
+  assert LEDGER_KINDS[0] == "accrual";
+  assert LEDGER_KINDS[4] == "payout";
+  assert REQUEST_KINDS[0] == "payout";
+  assert REQUEST_KINDS[1] == "redeem";
+  assert REQUEST_STATUSES.len == 4;
+  assert REQUEST_STATUSES[0] == "open";
+}
+
+test nothing_moves_money_and_the_order_is_untouched {
+  assert MONEY_MOVES_AUTOMATICALLY == false;
+  assert PAYOUT_IS_MADE_BY_HAND == true;
+  assert ORDER_TOTAL_IS_TOUCHED == false;
+  assert PROMPTPAY_AMOUNT_IS_TOUCHED == false;
+  assert DEPOSIT_IS_TOUCHED == false;
+  assert ZERO_TOTAL_QR_REFUSAL_UNCHANGED == true;
+  assert ORDER_MONEY_PATH_MENTIONS == 0;
+}
+
+test reversal_is_whole_and_a_debt_is_never_collected {
+  assert AUTOMATIC_REVERSAL_SITES == 1;
+  assert REVERSAL_IS_WHOLE == true;
+  assert BALANCE_MAY_GO_NEGATIVE == true;
+  assert NEGATIVE_BALANCE_IS_COLLECTED == false;
+  assert NEGATIVE_BALANCE_SHOWN_AS_ZERO == true;
+  assert available(-123, 0) == 0;
+}
+
+test six_routes_each_behind_a_gate {
+  assert ROUTE_COUNT == 6;
+  assert OWNER_GATED_ROUTE_COUNT + ADMIN_GATED_ROUTE_COUNT + UNGATED_ROUTE_COUNT == ROUTE_COUNT;
+  assert UNGATED_ROUTE_COUNT == 0;
+  assert STRICT_GATE_SITES == 0;
+  assert CUSTOMER_RESPONSE_CARRIES_ENTRIES == false;
+  assert BALANCE_REVEALS_A_SINGLE_FRIENDS_SPEND == true;
+}
+
+test the_code_keeps_points_and_credit_apart {
+  assert POINTS_TOKENS_IN_THE_CREDIT_MODULE == 0;
+  assert CREDIT_TOKENS_IN_THE_LOYALTY_ROUTES == 0;
+  assert MUTATING_STATEMENTS_IN_THE_MIGRATION == 0;
+  assert FAIL_OPEN_READS == 0;
+  assert LOCK_NAMESPACE == "referral_credit";
+  assert LOCK_KEY_SPACE_IS_TWO_INT4 == true;
+  assert PERSON_LOCKS_PER_TRANSACTION_MAX == 1;
+}
+
+test the_copy_is_the_operators_and_what_was_missing_is_listed {
+  assert COPY_KEYS.len == 5;
+  assert COPY_KEYS[0] == "referral.balance";
+  assert COPY_KEYS[4] == "referral.subtitle";
+  assert COPY_WORDED_BY == "operator 2026-09-26";
+  assert COPY_NEEDED_AND_NOT_WORDED.len == 8;
+}
+
+test the_nine_reuse_edges_are_named_by_id_and_none_is_this_file {
+  assert REUSE_EDGE_COUNT == 9;
+  assert REUSE_EDGES[0] == REUSES_REFERRAL_PROGRAM_ID;
+  assert REUSE_EDGES[1] == REUSES_LOYALTY_LEDGER_ID;
+  assert REUSE_EDGES[2] == REUSES_ORDER_MONEY_ID;
+  assert REUSE_EDGES[3] == REUSES_ORDER_STATUS_ID;
+  assert REUSE_EDGES[4] == REUSES_COMMERCE_ID;
+  assert REUSE_EDGES[5] == REUSES_REQUEST_IDENTITY_ID;
+  assert REUSE_EDGES[6] == REUSES_MARKET_ID;
+  assert REUSE_EDGES[7] == REUSES_DEPOSIT_TIERS_ID;
+  assert REUSE_EDGES[8] == REUSES_NOTIFICATION_QUEUE_ID;
+  assert REUSES_REFERRAL_PROGRAM_ID != ID;
+}
+
+test the_integration_pins_one_shape_and_names_the_retired_keys {
+  assert API_SHAPE_WITNESS == "tests/referral_credit_api_shape_wiring.rs";
+  assert API_SHAPE_WITNESS != WIRING_WITNESS;
+  assert CLIENT_WIRING_WITNESS != WIRING_WITNESS;
+  assert CLIENT_CALLED_ROUTE_COUNT == ROUTE_COUNT;
+  assert API_SHAPE_PINNED_AT == OWNER_R3_DECIDED_AT;
+  assert COPY_KEYS_RETIRED_2026_09_26.len == 7;
+  assert COPY_KEYS_RETIRED_2026_09_26[0] == "referral.invitees.empty";
+  assert COPY_KEYS_RETIRED_2026_09_26[6] == "profile.earn_per_ref";
+  assert COPY_KEYS_RETIRED_2026_09_26[5] != COPY_KEYS[0];
+  assert COPY_NEEDED_AND_NOT_WORDED_FOUND_BY_THE_CLIENT_LANE.len == 1;
+  assert COPY_NEEDED_AND_NOT_WORDED.len + COPY_NEEDED_AND_NOT_WORDED_FOUND_BY_THE_CLIENT_LANE.len == 9;
+}
+
+test the_recorder_guard_reads_both_admin_identities {
+  assert RECORDER_MAY_BE_THE_INVITER == false;
+  assert RECORDER_GUARD_REFUSES_A_NAMED_INVITER == true;
+  assert RECORDER_GUARD_REFUSES_A_PASSWORD_RECORD_OF_A_LISTED_ADMINS_FRIEND == true;
+  assert recorder_refused(true, true, true) == true;
+  assert recorder_refused(true, false, true) == false;
+  assert recorder_refused(true, false, false) == false;
+  assert recorder_refused(false, false, true) == true;
+  assert recorder_refused(false, false, false) == false;
+  assert RECORDER_GUARD_COVERS_A_PASSWORD_HOLDER_OFF_THE_ADMIN_LIST == false;
+  assert PASSWORD_RECORD_NAMES_ITS_RECORDER == false;
+  assert RECORDER_GUARD_ADMIN_LIST_READS == 1;
+  assert RECORDER_GUARD_ADMIN_LIST_HANDED_TO_THE_RECORD == 1;
+  assert RECORDER_GUARD_WITNESS != API_SHAPE_WITNESS;
+  assert RECORDER_GUARD_FIXED_AT == OWNER_R3_DECIDED_AT;
+}
+
+test the_owner_chose_the_net_base {
+  assert OWNER_BASE_ANSWER_AT == OWNER_R3_DECIDED_AT;
+  assert OWNER_BASE_ANSWER_WORDS == "After the discount -- 250";
+  assert BASE_IS_NET_OF_THE_APPLIED_REFERRAL_BALANCE == true;
+  assert BASE_IS_THE_OWNERS_DECISION == true;
+  assert BASE_QUESTION_IS_OPEN == false;
+  assert BASE_ANSWER_CHANGED_THE_CODE == false;
+  assert credit(1000, 0) == 100;
+  assert credit(1000, 300) == 70;
+  assert credit(1000, 300) < credit(1000, 0);
+  assert credit(1000, 1000) == 0;
+}
+
+; --- Invariants -----------------------------------------------------------------------------------------
+
+invariant the_credit_never_exceeds_the_owners_rate
+  assert credit(1239, 0) * 100 <= 1239 * CREDIT_PERCENT and 1239 * CREDIT_PERCENT - credit(1239, 0) * 100 < 100 and credit(1000, 300) * 100 <= (1000 - 300) * CREDIT_PERCENT and (1000 - 300) * CREDIT_PERCENT - credit(1000, 300) * 100 < 100
+
+invariant the_friend_is_credited_nothing
+  assert FRIEND_IS_CREDITED == false and LEVELS_CREDITED == 1
+
+invariant no_path_moves_points_into_this_ledger
+  assert POINTS_TOKENS_IN_THE_CREDIT_MODULE == 0 and CREDIT_TOKENS_IN_THE_LOYALTY_ROUTES == 0 and BALANCE_IS_A_STORED_COLUMN == false
+
+invariant a_payout_never_overdraws
+  assert paid_admitted(true, true, 122, 123) == false and PARTIAL_PAYOUT == false and MONEY_MOVES_AUTOMATICALLY == false
+
+invariant one_live_record_per_order
+  assert AUTOMATIC_REVERSAL_SITES == 1 and REVERSAL_IS_WHOLE == true and ORDER_BEFORE_PROGRAM_IS_CREDITED == false
+
+invariant a_negative_balance_is_shown_as_nothing_and_blocks_a_request
+  assert shown_balance(-1) == 0 and request_admitted(false, false, available(-1, 0)) == REQUEST_REFUSED_NOTHING_AVAILABLE
+
+invariant the_order_money_path_is_untouched
+  assert ORDER_MONEY_PATH_MENTIONS == 0 and ORDER_TOTAL_IS_TOUCHED == false and PROMPTPAY_AMOUNT_IS_TOUCHED == false and DEPOSIT_IS_TOUCHED == false
+
+invariant no_admin_credits_himself_under_either_identity
+  assert RECORDER_MAY_BE_THE_INVITER == false and recorder_refused(true, true, false) == true and recorder_refused(false, false, true) == true
+
+invariant the_base_is_the_owners_net_charge
+  assert BASE_IS_NET_OF_THE_APPLIED_REFERRAL_BALANCE == true and BASE_IS_THE_OWNERS_DECISION == true and BASE_QUESTION_IS_OPEN == false and credit(1000, 300) < credit(1000, 0)

@@ -1,0 +1,258 @@
+// TRI-NET A2A agent card: what a node ADVERTISES it can compute, so a requester
+// routes a task only to a host that hosts its (format-family, width). Without this,
+// tri_a2a knows a skill's family (skill_family) but nothing checks a HOST actually
+// serves it -- a GF-T16 task could be sent to a GF16-only node and silently fail.
+//
+// The card packs two masks into one u32 (no allocation, fits a heartbeat body):
+//   card = (family_mask << 16) | width_mask
+// family_mask: bit f set means format family f is hosted (bit 0 = GF binary,
+//   bit 1 = GF-T ternary; matches tri_compute_receipt FMT_GF_BINARY / FMT_GFT).
+// width_mask: GF widths are powers of two (4,8,16,..,1024), so each width IS its
+//   own bit -- the mask is just the OR of hosted widths, and "hosts width w" is a
+//   single AND. This is the outward ring layer above tri_a2a's family demux.
+
+module TriA2ACard {
+    use base::types;
+
+    // Format families (MUST match tri_compute_receipt / tri_compute_gfvalid).
+    const FMT_GF_BINARY: u32 = 0;   // GF4..GF1024, binary exponent
+    const FMT_GFT: u32 = 1;         // GF-T ladder, balanced-ternary exponent
+
+    // Skill-id high bytes (from tri_a2a): high byte = family+width label.
+    const HI_GF16: u32 = 0x16;      // GF16 binary, width 16
+    const HI_GFT16: u32 = 0xA6;     // GF-T16, width 16
+    const HI_GFT8: u32 = 0xA8;      // GF-T8, width 8
+    const HI_GFT4: u32 = 0xA4;      // GF-T4, width 4 (bottom rung)
+    const HI_GFT32: u32 = 0xA5;     // GF-T32, width 32
+    const HI_GFT64: u32 = 0xA3;     // GF-T64, width 64
+    const HI_GFT128: u32 = 0xA2;    // GF-T128, width 128
+
+    // The bit a format family occupies in the family mask (1 << family).
+    fn family_bit(family: u32) -> u32 {
+        return 1 << family;
+    }
+
+    // Build a card from a family mask and a width mask.
+    fn make_card(family_mask: u32, width_mask: u32) -> u32 {
+        return (family_mask << 16) | (width_mask & 0xFFFF);
+    }
+
+    // Extract the two masks.
+    fn card_families(card: u32) -> u32 {
+        return card >> 16;
+    }
+    fn card_widths(card: u32) -> u32 {
+        return card & 0xFFFF;
+    }
+
+    // Does the card advertise this format family?
+    fn hosts_family(card: u32, family: u32) -> bool {
+        return (card_families(card) & family_bit(family)) != 0;
+    }
+
+    // Does the card advertise this GF width? (widths are powers of two = single bits)
+    fn hosts_width(card: u32, width: u32) -> bool {
+        return (card_widths(card) & width) != 0;
+    }
+
+    // The routing decision: a host can serve a task requiring (family, width) iff it
+    // advertises BOTH. This is what a requester checks before sending a taskAssign.
+    fn can_serve(card: u32, family: u32, width: u32) -> bool {
+        if (hosts_family(card, family)) {
+            return hosts_width(card, width);
+        } else {
+            return card != card;
+        }
+    }
+
+    // --- Bind to real skill ids: derive (family, width) from a skill's high byte,
+    // so a node can check a concrete advertised/assigned skill against a card.
+
+    fn skill_hi(skill: u32) -> u32 {
+        return (skill >> 8) & 0xFF;
+    }
+
+    // Format family a skill implies: every GF-T high byte (0xA2..0xA8) is FMT_GFT; the
+    // binary GF16 high byte (0x16) is FMT_GF_BINARY. Covers the WHOLE ratified ladder
+    // GF-T4..128 (tri_a2a hosts all of them) -- an earlier version knew only GF-T8/16, so
+    // a GF-T32/64/128 skill was mis-classed as binary and mis-routed.
+    fn skill_card_family(skill: u32) -> u32 {
+        if (skill_hi(skill) == HI_GFT4)   { return FMT_GFT; }
+        if (skill_hi(skill) == HI_GFT8)   { return FMT_GFT; }
+        if (skill_hi(skill) == HI_GFT16)  { return FMT_GFT; }
+        if (skill_hi(skill) == HI_GFT32)  { return FMT_GFT; }
+        if (skill_hi(skill) == HI_GFT64)  { return FMT_GFT; }
+        if (skill_hi(skill) == HI_GFT128) { return FMT_GFT; }
+        return FMT_GF_BINARY;
+    }
+
+    // GF width a skill implies, across the whole ladder (each rung's high byte -> its
+    // width). Binary GF16 (0x16) defaults to width 16. Earlier this returned 16 for every
+    // rung but GF-T8, silently mis-routing GF-T32/64/128 tasks to width-16 hosts.
+    fn skill_card_width(skill: u32) -> u32 {
+        if (skill_hi(skill) == HI_GFT4)   { return 4; }
+        if (skill_hi(skill) == HI_GFT8)   { return 8; }
+        if (skill_hi(skill) == HI_GFT32)  { return 32; }
+        if (skill_hi(skill) == HI_GFT64)  { return 64; }
+        if (skill_hi(skill) == HI_GFT128) { return 128; }
+        return 16;
+    }
+
+    // Can this host serve this concrete skill id?
+    fn can_serve_skill(card: u32, skill: u32) -> bool {
+        return can_serve(card, skill_card_family(skill), skill_card_width(skill));
+    }
+
+    // --- Operation advertisement. A host that serves a (family, width) may still not
+    // host every OP: a GF16-mul-only node must not receive a GF16-add task. Advertise
+    // the hosted ops in the card's high byte (bits 24+), so a requester matches
+    // op+format+width before routing. Ops match tri_compute_receipt: ADD 0x10, MUL
+    // 0x11; their bit is 1 << (op & 0xF) -> ADD bit 0, MUL bit 1.
+    const GF_OP_ADD: u32 = 0x10;
+    const GF_OP_MUL: u32 = 0x11;
+
+    fn op_bit(op: u32) -> u32 {
+        return 1 << (op & 0xF);
+    }
+
+    // A card that also advertises hosted ops (op_mask in bits 24+). make_card cards
+    // advertise NO ops (op byte 0); use this to host operations.
+    fn make_card_ops(family_mask: u32, width_mask: u32, op_mask: u32) -> u32 {
+        return (op_mask << 24) | (family_mask << 16) | (width_mask & 0xFFFF);
+    }
+
+    fn card_ops(card: u32) -> u32 {
+        return (card >> 24) & 0xFF;
+    }
+
+    fn hosts_op(card: u32, op: u32) -> bool {
+        return (card_ops(card) & op_bit(op)) != 0;
+    }
+
+    // The full routing decision: a host can serve a task requiring (family, width, op)
+    // iff it advertises all three.
+    fn can_serve_op(card: u32, family: u32, width: u32, op: u32) -> bool {
+        if (can_serve(card, family, width)) {
+            return hosts_op(card, op);
+        } else {
+            return card != card;
+        }
+    }
+
+    // Route a concrete skill id, op included: the skill's low byte is its op.
+    fn skill_op_suffix(skill: u32) -> u32 {
+        return skill & 0xFF;
+    }
+    fn can_serve_skill_op(card: u32, skill: u32) -> bool {
+        if (can_serve_skill(card, skill)) {
+            return hosts_op(card, skill_op_suffix(skill));
+        } else {
+            return card != card;
+        }
+    }
+
+    // ---- Tests / invariants ----
+
+    // A GF-T16-only host (family GF-T, width 16) serves GF-T16 but NOT GF16 or GF-T8.
+    test gft16_host_routing {
+        c = make_card(family_bit(FMT_GFT), 16);
+        assert(can_serve(c, FMT_GFT, 16) == true, "GF-T16 host serves a GF-T16 task");
+        assert(can_serve(c, FMT_GF_BINARY, 16) == false, "GF-T16 host rejects a binary GF16 task (family)");
+        assert(can_serve(c, FMT_GFT, 8) == false, "GF-T16 host rejects a GF-T8 task (width)");
+    }
+
+    // A multi-width binary host (GF16 + GF32) serves both binary widths, no GF-T.
+    test binary_multiwidth_host {
+        c = make_card(family_bit(FMT_GF_BINARY), 16 | 32);
+        assert(can_serve(c, FMT_GF_BINARY, 16) == true, "serves GF16");
+        assert(can_serve(c, FMT_GF_BINARY, 32) == true, "serves GF32");
+        assert(can_serve(c, FMT_GF_BINARY, 8) == false, "does not serve GF8 (not advertised)");
+        assert(can_serve(c, FMT_GFT, 16) == false, "does not serve any GF-T");
+    }
+
+    // A dual-family host (advertises both families, widths 8 and 16) serves all four.
+    test dual_family_host {
+        c = make_card(family_bit(FMT_GF_BINARY) | family_bit(FMT_GFT), 8 | 16);
+        assert(can_serve(c, FMT_GF_BINARY, 16) == true, "GF16 ok");
+        assert(can_serve(c, FMT_GFT, 16) == true, "GF-T16 ok");
+        assert(can_serve(c, FMT_GFT, 8) == true, "GF-T8 ok");
+        assert(can_serve(c, FMT_GF_BINARY, 32) == false, "GF32 not advertised");
+    }
+
+    // Routing by concrete skill id matches the family/width derivation.
+    test route_by_skill_id {
+        gft = make_card(family_bit(FMT_GFT), 8 | 16);
+        assert(can_serve_skill(gft, 0xA611) == true, "GF-T16 mul routes to a GF-T host");
+        assert(can_serve_skill(gft, 0xA811) == true, "GF-T8 mul routes to a GF-T host");
+        assert(can_serve_skill(gft, 0x1611) == false, "binary GF16 mul does NOT route to a GF-T-only host");
+    }
+
+    // The card routes the WHOLE ratified ladder (GF-T4..128), matching tri_a2a's hosting.
+    // Each rung's skill decodes to (FMT_GFT, its width); before this fix GF-T32/64/128 were
+    // mis-classed as binary GF16, so routing silently broke.
+    test gft_ladder_card_routing {
+        assert(skill_card_family(0xA411) == FMT_GFT, "GF-T4 is FMT_GFT");
+        assert(skill_card_width(0xA411) == 4, "GF-T4 width 4");
+        assert(skill_card_family(0xA511) == FMT_GFT, "GF-T32 is FMT_GFT (was mis-classed binary)");
+        assert(skill_card_width(0xA511) == 32, "GF-T32 width 32 (was mis-routed to 16)");
+        assert(skill_card_family(0xA311) == FMT_GFT, "GF-T64 is FMT_GFT");
+        assert(skill_card_width(0xA311) == 64, "GF-T64 width 64");
+        assert(skill_card_width(0xA211) == 128, "GF-T128 width 128");
+        // A full-ladder host serves every rung.
+        full = make_card(family_bit(FMT_GFT), 4 | 8 | 16 | 32 | 64 | 128);
+        assert(can_serve_skill(full, 0xA411) == true, "full-ladder host serves GF-T4");
+        assert(can_serve_skill(full, 0xA511) == true, "full-ladder host serves GF-T32");
+        assert(can_serve_skill(full, 0xA311) == true, "full-ladder host serves GF-T64");
+        assert(can_serve_skill(full, 0xA211) == true, "full-ladder host serves GF-T128");
+        // A GF-T16-only host must NOT serve a GF-T64 task (correct rejection, not silent mis-route).
+        gft16 = make_card(family_bit(FMT_GFT), 16);
+        assert(can_serve_skill(gft16, 0xA311) == false, "a GF-T16-only host rejects a GF-T64 task");
+        assert(can_serve_skill(gft16, 0xA611) == true, "but still serves GF-T16");
+        // The bug's real bite: a BINARY GF16 host used to WRONGLY accept a GF-T64 task
+        // (mis-classed binary width-16). Now GF-T64 is FMT_GFT/width-64 -> a binary host rejects it.
+        bin16 = make_card(family_bit(FMT_GF_BINARY), 16 | 64);
+        assert(can_serve_skill(bin16, 0xA311) == false, "a binary-GF host does NOT serve a GF-T64 task (bug fixed)");
+        assert(can_serve_skill(bin16, 0x1611) == true, "binary GF16 still serves its own binary skill");
+    }
+
+    // A GF-T16 host that hosts ONLY multiply serves a mul task but rejects an add
+    // task -- op advertisement, not just (family, width).
+    test op_advertisement {
+        let mulonly: u32 = make_card_ops(family_bit(FMT_GFT), 16, op_bit(GF_OP_MUL));
+        assert(hosts_op(mulonly, GF_OP_MUL) == true, "hosts mul");
+        assert(hosts_op(mulonly, GF_OP_ADD) == false, "does NOT host add");
+        assert(can_serve_op(mulonly, FMT_GFT, 16, GF_OP_MUL) == true, "GF-T16 mul served");
+        assert(can_serve_op(mulonly, FMT_GFT, 16, GF_OP_ADD) == false, "GF-T16 add NOT served (op)");
+        assert(can_serve_op(mulonly, FMT_GF_BINARY, 16, GF_OP_MUL) == false, "wrong family still rejected");
+    }
+
+    // Routing a concrete skill id checks the op too: a mul-only host takes
+    // SKILL_GFT16_MUL (0xA611) but not SKILL_GFT16_ADD (0xA610).
+    test route_skill_with_op {
+        let both: u32 = make_card_ops(family_bit(FMT_GFT), 8 | 16, op_bit(GF_OP_MUL) | op_bit(GF_OP_ADD));
+        assert(can_serve_skill_op(both, 0xA611) == true, "hosts GF-T16 mul");
+        assert(can_serve_skill_op(both, 0xA610) == true, "hosts GF-T16 add");
+        let mulonly: u32 = make_card_ops(family_bit(FMT_GFT), 16, op_bit(GF_OP_MUL));
+        assert(can_serve_skill_op(mulonly, 0xA611) == true, "mul-only takes the mul skill");
+        assert(can_serve_skill_op(mulonly, 0xA610) == false, "mul-only rejects the add skill");
+    }
+
+    // Op-routing composes with the full-ladder family/width fix: skill_op_suffix reads the
+    // op from the skill's low byte (rung-independent), so a mul-only host on ANY rung takes
+    // that rung's mul and rejects its add, at GF-T4..128 -- previously exercised only at GF-T16.
+    test gft_ladder_op_routing {
+        // A GF-T64 mul-only host: takes GF-T64 mul (0xA311), rejects GF-T64 add (0xA310).
+        let m64: u32 = make_card_ops(family_bit(FMT_GFT), 64, op_bit(GF_OP_MUL));
+        assert(can_serve_skill_op(m64, 0xA311) == true, "GF-T64 mul-only takes GF-T64 mul");
+        assert(can_serve_skill_op(m64, 0xA310) == false, "GF-T64 mul-only rejects GF-T64 add");
+        // A full-ladder both-op host handles ops on every rung.
+        let full: u32 = make_card_ops(family_bit(FMT_GFT), 4 | 8 | 16 | 32 | 64 | 128, op_bit(GF_OP_MUL) | op_bit(GF_OP_ADD));
+        assert(can_serve_skill_op(full, 0xA411) == true, "GF-T4 mul");
+        assert(can_serve_skill_op(full, 0xA410) == true, "GF-T4 add");
+        assert(can_serve_skill_op(full, 0xA511) == true, "GF-T32 mul");
+        assert(can_serve_skill_op(full, 0xA211) == true, "GF-T128 mul");
+        // Right op but WRONG rung is still rejected: a GF-T4-only host declines a GF-T64 mul.
+        let m4: u32 = make_card_ops(family_bit(FMT_GFT), 4, op_bit(GF_OP_MUL) | op_bit(GF_OP_ADD));
+        assert(can_serve_skill_op(m4, 0xA311) == false, "GF-T4-only host rejects a GF-T64 mul (wrong rung)");
+    }
+}

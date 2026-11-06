@@ -1,0 +1,231 @@
+// SPDX-License-Identifier: Apache-2.0
+// Issue: https://github.com/dmitrii-f-t27/trinity-memory/issues/125
+// Coverage: https://github.com/dmitrii-f-t27/trinity-memory/issues/29
+// Coverage: https://github.com/dmitrii-f-t27/trinity-memory/issues/30
+// Coverage: https://github.com/dmitrii-f-t27/trinity-memory/issues/34
+// specs/formats/onnx.t27 -- ONNX Runtime com.microsoft.MatMulNBits with bits = 2
+// Restates upstream microsoft/onnxruntime@2b758bc652dc122fbbbc033664ffca69991a7e63:
+// docs/ContribOperators.md:3756-3830 (MatMulNBits: :3762 dequantized_weight =
+// (quantized_weight - zero_point) * scale; :3767 block_size a power of two,
+// at least 16; :3787 bits 2, 4 or 8; :3800 B uint8 (N, k_blocks, blob_size),
+// k_blocks = ceil(K / block_size), blob_size = block_size * bits / 8; :3802
+// scales (N, k_blocks); :3804 zero_points packed uint8 (N, ceil(k_blocks *
+// bits / 8)) or unpacked floats, default 2^(bits - 1));
+// onnxruntime/core/mlas/lib/q4_dq.cpp:323 (kMid = 2^(bits - 1)), :331 (four
+// 2-bit codes per byte), :416 (element idx of a byte at bits bits*idx),
+// :434-435 (a column of K weights is padded to whole blocks), :619-637
+// (dequantize: packed zero point of block b at element b % 4 of byte b / 4,
+// default kMid, v = (vi - zp) * scale); onnxruntime/contrib_ops/cpu/quantization/
+// matmul_nbits.cc:144 (nbits 2, 4 or 8), :1227-1237 (bits 2 dequantization).
+// Weight (n, k) sits in byte n*k_blocks*block_size/4 + k/4 at bits 2(k%4).
+// Under the default zero point 2 the codes 0, 1, 2, 3 are -2, -1, 0, +1, so a
+// ternary tensor never uses code 0 and code 0 is outside ternary. Codes at
+// k >= K in the last block are padding that ONNX Runtime does not read.
+// Unpacked (floating-point) zero points are not a ternary storage contract
+// here: the reader states packed zero points only.
+// phi^2 + 1/phi^2 = 3 | TRINITY
+module TrinityFormatsOnnxSpec {
+    pub const TFS_ONNX_ERR_LENGTH: i32 = -51;
+    pub const TFS_ONNX_ERR_CAPACITY: i32 = -52;
+    pub const TFS_ONNX_ERR_CODE: i32 = -53;
+    pub const TFS_ONNX_ERR_SCALE_NONFINITE: i32 = -58;
+    pub const TFS_ONNX_FLAG_OUTSIDE_TERNARY: u32 = 0;
+    pub const TFS_ONNX_FLAG_SCALE_NEGATIVE: u32 = 2;
+    pub const TFS_ONNX_FLAG_SCALE_ZERO: u32 = 3;
+    pub const TFS_ONNX_FLAG_PADDING_NONZERO: u32 = 5;
+
+    pub const TFS_ONNX_NBITS2: i32 = 10;
+    pub const TFS_ONNX_BITS: u32 = 2;
+    pub const TFS_ONNX_DEFAULT_ZERO_POINT: u32 = 2;
+    pub const TFS_ONNX_MIN_BLOCK: u32 = 16;
+    pub const TFS_ONNX_CODES_PER_BYTE: u32 = 4;
+    pub const TFS_ONNX_KIND_F16: i32 = 1;
+    pub const TFS_ONNX_KIND_BF16: i32 = 2;
+    pub const TFS_ONNX_KIND_F32: i32 = 3;
+    // A worked size: K = 4096, block 128, f16 scales, no zero points.
+    pub const TFS_ONNX_EXAMPLE_K: u32 = 4096;
+    pub const TFS_ONNX_EXAMPLE_BLOCK: u32 = 128;
+    pub const TFS_ONNX_EXAMPLE_ROW_BITS: u32 = 8704;
+
+    pub fn tfs_onnx_geometry(n: usize, k: usize, block_size: usize) -> bool {
+        if (n == 0 || k == 0 || block_size < 16) { return false; }
+        var p: usize = 16;
+        while (p < block_size) { p = p * 2; }
+        return p == block_size;
+    }
+
+    pub fn tfs_onnx_blocks(k: usize, block_size: usize) -> usize { return (k + block_size - 1) / block_size; }
+
+    pub fn tfs_onnx_row_bytes(k: usize, block_size: usize) -> usize {
+        return tfs_onnx_blocks(k, block_size) * (block_size * 2 / 8);
+    }
+
+    pub fn tfs_onnx_zp_row_bytes(k: usize, block_size: usize) -> usize {
+        return (tfs_onnx_blocks(k, block_size) * 2 + 7) / 8;
+    }
+
+    // Zero point of block b of row n: 2 without zero points, else element b % 4
+    // of byte n*zp_row + b/4.
+    pub fn tfs_onnx_zero_point(zero_points: []u8, zp_size: usize, zp_row: usize, n: usize, b: usize) -> i32 {
+        if (zp_size == 0) { return TFS_ONNX_DEFAULT_ZERO_POINT as i32; }
+        return (((zero_points[n * zp_row + b / 4] as u32) >> (2 * (b % 4))) & 3) as i32;
+    }
+
+    // LENGTH (geometry, size != N*row_bytes, zp_size neither 0 nor N*zp_row).
+    pub fn tfs_onnx_validate(size: usize, n: usize, k: usize, block_size: usize, zp_size: usize) -> i64 {
+        if (!tfs_onnx_geometry(n, k, block_size)) { return TFS_ONNX_ERR_LENGTH as i64; }
+        if (size != n * tfs_onnx_row_bytes(k, block_size)) { return TFS_ONNX_ERR_LENGTH as i64; }
+        if (zp_size != 0 && zp_size != n * tfs_onnx_zp_row_bytes(k, block_size)) { return TFS_ONNX_ERR_LENGTH as i64; }
+        return 0;
+    }
+
+    // value = code - zero point; returns the count outside {-1, 0, +1}.
+    pub fn tfs_onnx_decode(data: []u8, size: usize, n: usize, k: usize, block_size: usize,
+                           zero_points: []u8, zp_size: usize, values: []i32, value_capacity: usize) -> i64 {
+        var status: i64 = tfs_onnx_validate(size, n, k, block_size, zp_size);
+        if (status < 0) { return status; }
+        if (n * k > value_capacity) { return TFS_ONNX_ERR_CAPACITY as i64; }
+        var row: usize = tfs_onnx_row_bytes(k, block_size);
+        var zp_row: usize = tfs_onnx_zp_row_bytes(k, block_size);
+        var outside: i64 = 0;
+        var r: usize = 0;
+        while (r < n) {
+            var b: usize = 0;
+            while (b < tfs_onnx_blocks(k, block_size)) {
+                var zp: i32 = tfs_onnx_zero_point(zero_points, zp_size, zp_row, r, b);
+                var i: usize = 0;
+                while (i < block_size && b * block_size + i < k) {
+                    var c: usize = b * block_size + i;
+                    var code: i32 = ((((data[r * row + c / 4] as u32) >> (2 * (c % 4))) & 3) as i32);
+                    var v: i32 = code - zp;
+                    if (v < -1 || v > 1) { outside = outside + 1; }
+                    values[r * k + c] = v;
+                    i = i + 1;
+                }
+                b = b + 1;
+            }
+            r = r + 1;
+        }
+        return outside;
+    }
+
+    // Writes code = value + zero point, zero padding; LENGTH, CAPACITY and
+    // CODE (a code outside 0..3) before anything is written.
+    pub fn tfs_onnx_encode(values: []i32, n: usize, k: usize, block_size: usize,
+                           zero_points: []u8, zp_size: usize, out: []u8, capacity: usize) -> i64 {
+        if (!tfs_onnx_geometry(n, k, block_size)) { return TFS_ONNX_ERR_LENGTH as i64; }
+        var zp_row: usize = tfs_onnx_zp_row_bytes(k, block_size);
+        if (zp_size != 0 && zp_size != n * zp_row) { return TFS_ONNX_ERR_LENGTH as i64; }
+        var row: usize = tfs_onnx_row_bytes(k, block_size);
+        if (n * row > capacity) { return TFS_ONNX_ERR_CAPACITY as i64; }
+        var r: usize = 0;
+        while (r < n) {
+            var c: usize = 0;
+            while (c < k) {
+                var code: i32 = values[r * k + c] + tfs_onnx_zero_point(zero_points, zp_size, zp_row, r, c / block_size);
+                if (code < 0 || code > 3) { return TFS_ONNX_ERR_CODE as i64; }
+                c = c + 1;
+            }
+            r = r + 1;
+        }
+        var z: usize = 0;
+        while (z < n * row) { out[z] = 0; z = z + 1; }
+        r = 0;
+        while (r < n) {
+            var c2: usize = 0;
+            while (c2 < k) {
+                var code2: u32 = (values[r * k + c2] + tfs_onnx_zero_point(zero_points, zp_size, zp_row, r, c2 / block_size)) as u32;
+                out[r * row + c2 / 4] = ((out[r * row + c2 / 4] as u32) | (code2 << (2 * (c2 % 4)))) as u8;
+                c2 = c2 + 1;
+            }
+            r = r + 1;
+        }
+        return (n * row) as i64;
+    }
+
+    // Nonzero padding codes (k >= K in each row's last block).
+    pub fn tfs_onnx_padding_nonzero(data: []u8, size: usize, n: usize, k: usize, block_size: usize) -> i64 {
+        var status: i64 = tfs_onnx_validate(size, n, k, block_size, 0);
+        if (status < 0) { return status; }
+        var row: usize = tfs_onnx_row_bytes(k, block_size);
+        var count: i64 = 0;
+        var r: usize = 0;
+        while (r < n) {
+            var c: usize = k;
+            while (c < tfs_onnx_blocks(k, block_size) * block_size) {
+                if ((((data[r * row + c / 4] as u32) >> (2 * (c % 4))) & 3) != 0) { count = count + 1; }
+                c = c + 1;
+            }
+            r = r + 1;
+        }
+        return count;
+    }
+
+    // One scale of kind F16, BF16 or F32: 0 positive, 1 zero, 2 negative,
+    // ERR_SCALE_NONFINITE.
+    pub fn tfs_onnx_scale_class(word: u32, kind: i32) -> i32 {
+        var top: u32 = 0x7c00;
+        var sign: u32 = 0x8000;
+        if (kind == TFS_ONNX_KIND_BF16) { top = 0x7f80; }
+        if (kind == TFS_ONNX_KIND_F32) { top = 0x7f800000; sign = 0x80000000; }
+        if ((word & top) == top) { return TFS_ONNX_ERR_SCALE_NONFINITE; }
+        if ((word & (sign - 1)) == 0) { return 1; }
+        if ((word & sign) != 0) { return 2; }
+        return 0;
+    }
+
+    // Stored bits of one row: codes with padding, one scale per block, and
+    // the packed zero points when present.
+    pub fn tfs_onnx_row_bits(k: usize, block_size: usize, scale_bits: usize, with_zero_points: bool) -> usize {
+        var bits: usize = 8 * tfs_onnx_row_bytes(k, block_size) + tfs_onnx_blocks(k, block_size) * scale_bits;
+        if (with_zero_points) { bits = bits + 8 * tfs_onnx_zp_row_bytes(k, block_size); }
+        return bits;
+    }
+
+    invariant onnx_four_codes_per_byte { assert TFS_ONNX_CODES_PER_BYTE * TFS_ONNX_BITS == 8 && TFS_ONNX_DEFAULT_ZERO_POINT == 2; }
+    invariant onnx_example_is_17_8_bits_per_weight { assert TFS_ONNX_EXAMPLE_ROW_BITS == TFS_ONNX_EXAMPLE_K * 2 + (TFS_ONNX_EXAMPLE_K / TFS_ONNX_EXAMPLE_BLOCK) * 16 && TFS_ONNX_EXAMPLE_ROW_BITS * 8 == 17 * TFS_ONNX_EXAMPLE_K; }
+
+    test "onnx default zero point shifts every code by two" {
+        var t: [4]i32 = [1, 0, -1, 1];
+        var row: [4]u8;
+        var none: [1]u8 = [0];
+        assert tfs_onnx_encode(t, 1, 4, 16, none, 0, row, 4) == 4;
+        assert row[0] == 219 && row[1] == 0 && row[3] == 0;
+        var v: [4]i32;
+        assert tfs_onnx_decode(row, 4, 1, 4, 16, none, 0, v, 4) == 0;
+        assert v[0] == 1 && v[1] == 0 && v[2] == -1 && v[3] == 1;
+        row[0] = 0;
+        assert tfs_onnx_decode(row, 4, 1, 4, 16, none, 0, v, 4) == 4 && v[0] == -2;
+        assert tfs_onnx_padding_nonzero(row, 4, 1, 4, 16) == 0;
+        row[3] = 64;
+        assert tfs_onnx_padding_nonzero(row, 4, 1, 4, 16) == 1;
+    }
+    test "onnx packed zero points per block" {
+        // K = 40, block 16: 3 blocks, 12 bytes per row, one zero-point byte.
+        var zp: [1]u8 = [22];
+        var t: [40]i32;
+        var i: usize = 0;
+        while (i < 40) { t[i] = 0; i = i + 1; }
+        t[0] = 1; t[16] = -1; t[39] = 1;
+        var row: [12]u8;
+        assert tfs_onnx_encode(t, 1, 40, 16, zp, 1, row, 12) == 12;
+        assert row[0] == 171 && row[4] == 84 && row[8] == 85 && row[9] == 149 && row[10] == 0;
+        var v: [40]i32;
+        assert tfs_onnx_decode(row, 12, 1, 40, 16, zp, 1, v, 40) == 0;
+        assert v[0] == 1 && v[16] == -1 && v[39] == 1 && v[20] == 0;
+        assert tfs_onnx_decode(row, 12, 1, 40, 16, zp, 2, v, 40) == TFS_ONNX_ERR_LENGTH;
+        assert tfs_onnx_decode(row, 12, 1, 40, 24, zp, 1, v, 40) == TFS_ONNX_ERR_LENGTH;
+        assert tfs_onnx_decode(row, 11, 1, 40, 16, zp, 1, v, 40) == TFS_ONNX_ERR_LENGTH;
+        assert tfs_onnx_decode(row, 12, 1, 40, 16, zp, 1, v, 39) == TFS_ONNX_ERR_CAPACITY;
+        t[3] = -3;
+        assert tfs_onnx_encode(t, 1, 40, 16, zp, 1, row, 12) == TFS_ONNX_ERR_CODE;
+    }
+    test "onnx scale classes and row bits" {
+        assert tfs_onnx_scale_class(15360, TFS_ONNX_KIND_F16) == 0 && tfs_onnx_scale_class(32256, TFS_ONNX_KIND_F16) == TFS_ONNX_ERR_SCALE_NONFINITE;
+        assert tfs_onnx_scale_class(2139095040, TFS_ONNX_KIND_F32) == TFS_ONNX_ERR_SCALE_NONFINITE && tfs_onnx_scale_class(2147483648, TFS_ONNX_KIND_F32) == 1;
+        assert tfs_onnx_scale_class(48000, TFS_ONNX_KIND_BF16) == 2;
+        assert tfs_onnx_row_bits(4096, 128, 16, false) == 8704;
+        assert tfs_onnx_row_bits(40, 16, 16, true) == 96 + 48 + 8;
+        assert tfs_onnx_geometry(1, 1, 16) && !tfs_onnx_geometry(1, 1, 8) && !tfs_onnx_geometry(1, 1, 48) && !tfs_onnx_geometry(0, 1, 16);
+    }
+}

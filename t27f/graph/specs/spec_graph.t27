@@ -1,0 +1,1072 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/t27f/spec_graph.t27 -- the T27F spec graph IR: what a .t27 file becomes before T27F draws
+; it (RFC gHashTag/trinity#1649, epic gHashTag/trinity#1648, tracked in gHashTag/t27#10020).
+; T27F is the visual spec of .t27; the definition lives in .claude/skills/t27f/SKILL.md, "What T27F
+; is". This file is its core: one spec -> one graph -> many views. Every view (architecture, data
+; flow, dependencies, tests) is a projection of the same graph, and the graph is read from the
+; spec's source, never drawn by hand.
+; What this file decides, deterministically and without a language model:
+;   - the vocabulary: node kinds, edge kinds and inference labels, as u8 codes with name tables;
+;   - the records: a node carries kind, label, name and a source span; an edge carries kind,
+;     endpoints, label and the source line it was read from;
+;   - validation: validate_graph() returns GRAPH_OK or the first rule a graph breaks, and
+;     first_bad_node() / first_bad_edge() name the record that broke it;
+;   - source mapping both ways: a node has a span, and node_at_line() finds the node of a line;
+;   - which ui_plan widget (specs/t27f/ui_plan.t27) draws a node, so a renderer never picks one.
+; Inference labels, from strongest to weakest (RFC #1649, "Parsing and inference levels"):
+;   EXACT     present in the spec's source as written (a declaration, a call, a `use`);
+;   DERIVED   computed from EXACT facts by a rule stated here (tested_by is calls read backwards);
+;   SUGGESTED a model's explanation; drawn as plain text, always with the source lines it explains;
+;   UNKNOWN   cannot be read from the source; drawn alone, with no edge into or out of it.
+; Not claimed here: t27c has no graph export yet, so no graph is generated from a spec; the fixture
+; below is read by hand. No renderer draws a graph, there is no graph diff, and node kinds finer
+; than a top-level declaration (steps, branches, operators, parameters) are not in IR version 1.
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module t27f_spec_graph;
+
+use t27f::ui_plan::UiPlan;
+use t27f::ui_plan::blank_plan;
+use t27f::ui_plan::validate_plan;
+use t27f::ui_plan::first_bad_slot;
+use t27f::ui_plan::catalog_widget;
+use t27f::ui_plan::bit;
+use t27f::ui_plan::PLAN_OK;
+use t27f::ui_plan::ERR_BINDING_KIND;
+use t27f::ui_plan::WIDGET_HONEYCOMB_CARD;
+use t27f::ui_plan::WIDGET_FORMULA_VIEW;
+use t27f::ui_plan::WIDGET_METRICS_TABLE;
+use t27f::ui_plan::WIDGET_RUN_BUTTON;
+use t27f::ui_plan::WIDGET_TEXT_BLOCK;
+use t27f::ui_plan::WIDGET_SOURCE;
+use t27f::ui_plan::SOURCE_NONE;
+use t27f::ui_plan::SOURCE_SPEC;
+use t27f::ui_plan::SOURCE_FORMULA;
+use t27f::ui_plan::SOURCE_METRICS;
+use t27f::ui_plan::PROP_TITLE;
+use t27f::ui_plan::PROP_SPEC_PATH;
+use t27f::ui_plan::PROP_FORMULA_ID;
+use t27f::ui_plan::PROP_CAPTION;
+use t27f::ui_plan::ACTION_NONE;
+use t27f::ui_plan::ACTION_OPEN_SPEC;
+use t27f::ui_plan::ACTION_RUN_TESTS;
+use t27f::ui_plan::CAP_READ_SPECS;
+use t27f::ui_plan::CAP_RUN_LAB;
+
+/// The IR version a graph names. Any other version is refused.
+pub const GRAPH_IR_VERSION : u32 = 1;
+
+/// Node kinds. IR version 1 has one node per top-level declaration, plus OPAQUE for a region the
+/// source names but this IR cannot read into.
+pub const NODE_MODULE : u8 = 0;
+pub const NODE_CONST : u8 = 1;
+pub const NODE_FN : u8 = 2;
+pub const NODE_TEST : u8 = 3;
+pub const NODE_INVARIANT : u8 = 4;
+pub const NODE_BENCH : u8 = 5;
+pub const NODE_USE : u8 = 6;
+pub const NODE_OPAQUE : u8 = 7;
+pub const NODE_KINDS : u8 = 8;
+pub const NODE_KIND_NAMES : [8]str = ["module", "const", "fn", "test", "invariant", "bench", "use", "opaque"];
+
+/// Edge kinds, read from -> to:
+///   CALLS      from a fn, test, invariant or bench to the fn it calls;
+///   USES       from a module or a body to the const or `use` it names (module -> use is the
+///              `use` statement itself);
+///   TESTED_BY  from a fn to the test, invariant or bench that calls it; DERIVED from CALLS;
+///   CONSTRAINS from an invariant to the const or fn its asserts are about;
+///   DATA_FLOW  from a value (const, fn result, import, opaque region) to a body whose result it
+///              reaches.
+pub const EDGE_CALLS : u8 = 0;
+pub const EDGE_USES : u8 = 1;
+pub const EDGE_TESTED_BY : u8 = 2;
+pub const EDGE_CONSTRAINS : u8 = 3;
+pub const EDGE_DATA_FLOW : u8 = 4;
+pub const EDGE_KINDS : u8 = 5;
+pub const EDGE_KIND_NAMES : [5]str = ["calls", "uses", "tested_by", "constrains", "data_flow"];
+
+/// Inference labels. A smaller code is a stronger claim; an edge is never stronger than either
+/// of its endpoints.
+pub const LABEL_EXACT : u8 = 0;
+pub const LABEL_DERIVED : u8 = 1;
+pub const LABEL_SUGGESTED : u8 = 2;
+pub const LABEL_UNKNOWN : u8 = 3;
+pub const LABEL_KINDS : u8 = 4;
+pub const LABEL_NAMES : [4]str = ["exact", "derived", "suggested", "unknown"];
+
+/// The code a name lookup returns for a name that is not in its table.
+pub const NO_CODE : u8 = 255;
+
+/// Which node kinds each edge kind may start and end at, as masks of node-kind bits, indexed by
+/// edge kind. The invariant edge_masks_are_spelled_right rebuilds each one from the named kinds.
+/// From: calls fn+test+invariant+bench; uses module+fn+test+invariant+bench; tested_by fn;
+/// constrains invariant; data_flow const+fn+use+opaque.
+pub const EDGE_FROM_KINDS : [5]u32 = [60, 61, 4, 16, 198];
+/// To: calls fn; uses const+use; tested_by test+invariant+bench; constrains const+fn;
+/// data_flow fn+test+invariant+bench+opaque.
+pub const EDGE_TO_KINDS : [5]u32 = [4, 66, 56, 6, 188];
+
+/// Capacity. Line 0 means "no source line": a span with line_start 0 is no span.
+/// Measured 2026-10-18 on the Railway lab, over the 2204 specs/**/*.t27 files of gHashTag/t27
+/// master (t27#10173 tree): top-level declarations per spec (nodes) p50 20, p90 66, p95 96,
+/// p98 183, p99 436, max 678. Call/use/constrain edges, read through the exporter on an 86-spec
+/// stratified sample: p50 at most 12, p95 at most 128 (82 of 86 specs), 85 of 86 at most 192, the
+/// largest between 193 and 256. The caps cover the node p98 and the edge p95. Node and edge
+/// endpoints are u8 and NO_INDEX is 255, so both caps must stay below 255; MAX_EDGES is the
+/// largest edge count that does, MAX_NODES is the 192 that covers p98 under the same
+/// limit. A larger graph is refused, never truncated (validate_graph).
+pub const MAX_NODES : u32 = 192;
+pub const MAX_EDGES : u32 = 254;
+pub const MEASURED_NODES_P95 : u32 = 96;
+pub const MEASURED_EDGES_P95 : u32 = 128;
+pub const NO_LINE : u32 = 0;
+pub const NO_INDEX : u32 = 255;
+
+/// Validation verdicts. validate_graph checks graph-level rules in this order, then each node in
+/// index order, then each edge in index order, and returns the first rule broken.
+pub const GRAPH_OK : u8 = 0;
+pub const ERR_GRAPH_VERSION : u8 = 1;
+pub const ERR_SPEC_PATH : u8 = 2;
+pub const ERR_TOO_MANY_NODES : u8 = 3;
+pub const ERR_TOO_MANY_EDGES : u8 = 4;
+pub const ERR_MODULE : u8 = 5;
+pub const ERR_NODE_KIND : u8 = 6;
+pub const ERR_LABEL : u8 = 7;
+pub const ERR_NODE_NAME : u8 = 8;
+pub const ERR_SPAN_ORDER : u8 = 9;
+pub const ERR_SPAN_OUTSIDE : u8 = 10;
+pub const ERR_SPAN_MISSING : u8 = 11;
+pub const ERR_EDGE_KIND : u8 = 12;
+pub const ERR_EDGE_DANGLING : u8 = 13;
+pub const ERR_EDGE_ENDPOINT_KIND : u8 = 14;
+pub const ERR_EDGE_UNKNOWN_NODE : u8 = 15;
+pub const ERR_EDGE_LABEL : u8 = 16;
+pub const ERR_EDGE_LINE : u8 = 17;
+pub const ERR_DUPLICATE_EDGE : u8 = 18;
+pub const VERDICT_KINDS : u8 = 19;
+
+/// One spec graph. Node arrays are indexed by node number, edge arrays by edge number; entries at
+/// or past node_count / edge_count are not read. Node 0 is the module and spans the whole file.
+/// Spans are 1-based, inclusive source lines of the file at spec_path.
+pub struct SpecGraph {
+    ir_version: u32,
+    spec_path: str,
+    line_count: u32,
+    node_count: u32,
+    node_kind: [192]u8,
+    node_label: [192]u8,
+    node_name: [192]str,
+    line_start: [192]u32,
+    line_end: [192]u32,
+    edge_count: u32,
+    edge_kind: [254]u8,
+    edge_from: [254]u8,
+    edge_to: [254]u8,
+    edge_label: [254]u8,
+    edge_line: [254]u32,
+}
+
+/// One node read out of a graph: the record a node inspector shows.
+pub struct SpecGraphNode {
+    kind: u8,
+    label: u8,
+    name: str,
+    line_start: u32,
+    line_end: u32,
+}
+
+pub fn kind_bit(k: u8) -> u32 {
+    return (1 as u32) << (k as u32);
+}
+
+pub fn valid_node_kind(k: u8) -> bool {
+    return k < NODE_KINDS;
+}
+
+pub fn valid_edge_kind(k: u8) -> bool {
+    return k < EDGE_KINDS;
+}
+
+pub fn valid_label(l: u8) -> bool {
+    return l < LABEL_KINDS;
+}
+
+/// The code of a node kind asked for by name, or NO_CODE.
+pub fn node_kind_id(name: str) -> u8 {
+    var i : u32 = 0;
+    while (i < (NODE_KINDS as u32)) {
+        if (NODE_KIND_NAMES[i as usize] == name) { return i as u8; }
+        i = i + 1;
+    }
+    return NO_CODE;
+}
+
+pub fn edge_kind_id(name: str) -> u8 {
+    var i : u32 = 0;
+    while (i < (EDGE_KINDS as u32)) {
+        if (EDGE_KIND_NAMES[i as usize] == name) { return i as u8; }
+        i = i + 1;
+    }
+    return NO_CODE;
+}
+
+pub fn label_id(name: str) -> u8 {
+    var i : u32 = 0;
+    while (i < (LABEL_KINDS as u32)) {
+        if (LABEL_NAMES[i as usize] == name) { return i as u8; }
+        i = i + 1;
+    }
+    return NO_CODE;
+}
+
+/// Every name in the three tables maps back to its own code.
+pub fn name_tables_round_trip() -> bool {
+    var k : u32 = 0;
+    while (k < (NODE_KINDS as u32)) {
+        if (node_kind_id(NODE_KIND_NAMES[k as usize]) != (k as u8)) { return false; }
+        k = k + 1;
+    }
+    var e : u32 = 0;
+    while (e < (EDGE_KINDS as u32)) {
+        if (edge_kind_id(EDGE_KIND_NAMES[e as usize]) != (e as u8)) { return false; }
+        e = e + 1;
+    }
+    var l : u32 = 0;
+    while (l < (LABEL_KINDS as u32)) {
+        if (label_id(LABEL_NAMES[l as usize]) != (l as u8)) { return false; }
+        l = l + 1;
+    }
+    return true;
+}
+
+/// Node n has a span and the span holds `line`.
+pub fn span_holds(g: SpecGraph, n: u32, line: u32) -> bool {
+    let k : usize = n as usize;
+    if (g.line_start[k] == NO_LINE) { return false; }
+    return g.line_start[k] <= line and line <= g.line_end[k];
+}
+
+/// The rules one node must meet, in order: a known kind, a known label, a name, an ordered span
+/// inside the file, a span when it is EXACT or SUGGESTED, and only node 0 may be the module.
+pub fn validate_node(g: SpecGraph, n: u32) -> u8 {
+    let k : usize = n as usize;
+    if (valid_node_kind(g.node_kind[k]) == false) { return ERR_NODE_KIND; }
+    if (valid_label(g.node_label[k]) == false) { return ERR_LABEL; }
+    if (g.node_name[k] == "") { return ERR_NODE_NAME; }
+    let s : u32 = g.line_start[k];
+    let e : u32 = g.line_end[k];
+    if (s > e) { return ERR_SPAN_ORDER; }
+    if (s == NO_LINE and e != NO_LINE) { return ERR_SPAN_ORDER; }
+    if (e > g.line_count) { return ERR_SPAN_OUTSIDE; }
+    let l : u8 = g.node_label[k];
+    if (s == NO_LINE and (l == LABEL_EXACT or l == LABEL_SUGGESTED)) { return ERR_SPAN_MISSING; }
+    if (n > 0 and g.node_kind[k] == NODE_MODULE) { return ERR_MODULE; }
+    return GRAPH_OK;
+}
+
+/// The rules one edge must meet, in order: a known kind; both endpoints exist; their kinds are
+/// allowed for the edge kind; neither is UNKNOWN; a label that is not UNKNOWN and no stronger than
+/// either endpoint; a source line inside an endpoint's span (required unless the edge is
+/// DERIVED); and no earlier edge with the same kind and endpoints.
+pub fn validate_edge(g: SpecGraph, j: u32) -> u8 {
+    let k : usize = j as usize;
+    let ek : u8 = g.edge_kind[k];
+    if (valid_edge_kind(ek) == false) { return ERR_EDGE_KIND; }
+    let f : u32 = g.edge_from[k] as u32;
+    let t : u32 = g.edge_to[k] as u32;
+    if (f >= g.node_count or t >= g.node_count) { return ERR_EDGE_DANGLING; }
+    let fk : u8 = g.node_kind[f as usize];
+    let tk : u8 = g.node_kind[t as usize];
+    if ((EDGE_FROM_KINDS[ek as usize] & kind_bit(fk)) == 0) { return ERR_EDGE_ENDPOINT_KIND; }
+    if ((EDGE_TO_KINDS[ek as usize] & kind_bit(tk)) == 0) { return ERR_EDGE_ENDPOINT_KIND; }
+    let fl : u8 = g.node_label[f as usize];
+    let tl : u8 = g.node_label[t as usize];
+    if (fl == LABEL_UNKNOWN or tl == LABEL_UNKNOWN) { return ERR_EDGE_UNKNOWN_NODE; }
+    let el : u8 = g.edge_label[k];
+    if (el >= LABEL_UNKNOWN) { return ERR_EDGE_LABEL; }
+    if (el < fl or el < tl) { return ERR_EDGE_LABEL; }
+    let line : u32 = g.edge_line[k];
+    if (line == NO_LINE) {
+        if (el != LABEL_DERIVED) { return ERR_EDGE_LINE; }
+    } else {
+        if (span_holds(g, f, line) == false and span_holds(g, t, line) == false) { return ERR_EDGE_LINE; }
+    }
+    var i : u32 = 0;
+    while (i < j) {
+        let m : usize = i as usize;
+        if (g.edge_kind[m] == ek and g.edge_from[m] == g.edge_from[k] and g.edge_to[m] == g.edge_to[k]) { return ERR_DUPLICATE_EDGE; }
+        i = i + 1;
+    }
+    return GRAPH_OK;
+}
+
+/// Graph-level rules, before any node is read: version, a spec path and a line count, capacity,
+/// and a module at node 0 whose span is the whole file.
+pub fn validate_graph_header(g: SpecGraph) -> u8 {
+    if (g.ir_version != GRAPH_IR_VERSION) { return ERR_GRAPH_VERSION; }
+    if (g.spec_path == "" or g.line_count == 0) { return ERR_SPEC_PATH; }
+    if (g.node_count > MAX_NODES) { return ERR_TOO_MANY_NODES; }
+    if (g.edge_count > MAX_EDGES) { return ERR_TOO_MANY_EDGES; }
+    if (g.node_count == 0) { return ERR_MODULE; }
+    if (g.node_kind[0] != NODE_MODULE) { return ERR_MODULE; }
+    if (g.line_start[0] != 1 or g.line_end[0] != g.line_count) { return ERR_MODULE; }
+    return GRAPH_OK;
+}
+
+/// GRAPH_OK, or the first rule the graph breaks.
+pub fn validate_graph(g: SpecGraph) -> u8 {
+    let h : u8 = validate_graph_header(g);
+    if (h != GRAPH_OK) { return h; }
+    var n : u32 = 0;
+    while (n < g.node_count) {
+        let v : u8 = validate_node(g, n);
+        if (v != GRAPH_OK) { return v; }
+        n = n + 1;
+    }
+    var j : u32 = 0;
+    while (j < g.edge_count) {
+        let w : u8 = validate_edge(g, j);
+        if (w != GRAPH_OK) { return w; }
+        j = j + 1;
+    }
+    return GRAPH_OK;
+}
+
+/// The first node that breaks a rule, or NO_INDEX when the header fails or no node does.
+pub fn first_bad_node(g: SpecGraph) -> u32 {
+    if (validate_graph_header(g) != GRAPH_OK) { return NO_INDEX; }
+    var n : u32 = 0;
+    while (n < g.node_count) {
+        if (validate_node(g, n) != GRAPH_OK) { return n; }
+        n = n + 1;
+    }
+    return NO_INDEX;
+}
+
+/// The first edge that breaks a rule, or NO_INDEX when the header or a node fails or no edge does.
+pub fn first_bad_edge(g: SpecGraph) -> u32 {
+    if (validate_graph_header(g) != GRAPH_OK) { return NO_INDEX; }
+    if (first_bad_node(g) != NO_INDEX) { return NO_INDEX; }
+    var j : u32 = 0;
+    while (j < g.edge_count) {
+        if (validate_edge(g, j) != GRAPH_OK) { return j; }
+        j = j + 1;
+    }
+    return NO_INDEX;
+}
+
+/// Node -> source: the record of node n, span included.
+pub fn node_at(g: SpecGraph, n: u32) -> SpecGraphNode {
+    let k : usize = n as usize;
+    return SpecGraphNode { kind: g.node_kind[k], label: g.node_label[k], name: g.node_name[k], line_start: g.line_start[k], line_end: g.line_end[k] };
+}
+
+/// Source -> node: the innermost node whose span holds `line` (the shortest span; on a tie, the
+/// lower node number), or NO_INDEX when no node does. A comment line inside the file belongs to
+/// the module.
+pub fn node_at_line(g: SpecGraph, line: u32) -> u32 {
+    var best : u32 = NO_INDEX;
+    var best_len : u32 = 0;
+    var n : u32 = 0;
+    while (n < g.node_count) {
+        if (span_holds(g, n, line)) {
+            let len : u32 = g.line_end[n as usize] - g.line_start[n as usize];
+            if (best == NO_INDEX or len < best_len) {
+                best = n;
+                best_len = len;
+            }
+        }
+        n = n + 1;
+    }
+    return best;
+}
+
+pub fn count_node_kind(g: SpecGraph, k: u8) -> u32 {
+    var c : u32 = 0;
+    var n : u32 = 0;
+    while (n < g.node_count) {
+        if (g.node_kind[n as usize] == k) { c = c + 1; }
+        n = n + 1;
+    }
+    return c;
+}
+
+pub fn count_node_label(g: SpecGraph, l: u8) -> u32 {
+    var c : u32 = 0;
+    var n : u32 = 0;
+    while (n < g.node_count) {
+        if (g.node_label[n as usize] == l) { c = c + 1; }
+        n = n + 1;
+    }
+    return c;
+}
+
+pub fn count_edge_kind(g: SpecGraph, k: u8) -> u32 {
+    var c : u32 = 0;
+    var j : u32 = 0;
+    while (j < g.edge_count) {
+        if (g.edge_kind[j as usize] == k) { c = c + 1; }
+        j = j + 1;
+    }
+    return c;
+}
+
+pub fn count_edge_label(g: SpecGraph, l: u8) -> u32 {
+    var c : u32 = 0;
+    var j : u32 = 0;
+    while (j < g.edge_count) {
+        if (g.edge_label[j as usize] == l) { c = c + 1; }
+        j = j + 1;
+    }
+    return c;
+}
+
+/// There is an edge of kind k from f to t.
+pub fn has_edge(g: SpecGraph, k: u8, f: u32, t: u32) -> bool {
+    var j : u32 = 0;
+    while (j < g.edge_count) {
+        let m : usize = j as usize;
+        if (g.edge_kind[m] == k and (g.edge_from[m] as u32) == f and (g.edge_to[m] as u32) == t) { return true; }
+        j = j + 1;
+    }
+    return false;
+}
+
+/// How many tests, invariants and benches exercise node n (its TESTED_BY edges).
+pub fn tests_of(g: SpecGraph, n: u32) -> u32 {
+    var c : u32 = 0;
+    var j : u32 = 0;
+    while (j < g.edge_count) {
+        let m : usize = j as usize;
+        if (g.edge_kind[m] == EDGE_TESTED_BY and (g.edge_from[m] as u32) == n) { c = c + 1; }
+        j = j + 1;
+    }
+    return c;
+}
+
+/// The DERIVED rule for TESTED_BY: fn f is tested by t exactly when t is a test, invariant or
+/// bench that CALLS f. True when the graph's TESTED_BY edges are that set and nothing else.
+pub fn tested_by_matches_calls(g: SpecGraph) -> bool {
+    let checkers : u32 = kind_bit(NODE_TEST) | kind_bit(NODE_INVARIANT) | kind_bit(NODE_BENCH);
+    var j : u32 = 0;
+    while (j < g.edge_count) {
+        let m : usize = j as usize;
+        let f : u32 = g.edge_from[m] as u32;
+        let t : u32 = g.edge_to[m] as u32;
+        if (g.edge_kind[m] == EDGE_TESTED_BY) {
+            if (has_edge(g, EDGE_CALLS, t, f) == false) { return false; }
+        }
+        if (g.edge_kind[m] == EDGE_CALLS and (kind_bit(g.node_kind[f as usize]) & checkers) != 0) {
+            if (has_edge(g, EDGE_TESTED_BY, t, f) == false) { return false; }
+        }
+        j = j + 1;
+    }
+    return true;
+}
+
+/// The fns no test, invariant or bench exercises.
+pub fn untested_fns(g: SpecGraph) -> u32 {
+    var c : u32 = 0;
+    var n : u32 = 0;
+    while (n < g.node_count) {
+        if (g.node_kind[n as usize] == NODE_FN and tests_of(g, n) == 0) { c = c + 1; }
+        n = n + 1;
+    }
+    return c;
+}
+
+/// The ui_plan widget that draws a node. A SUGGESTED or UNKNOWN node is drawn as plain text, never
+/// as a widget that presents a verified property (a formula, a run button, a metrics table): ui_plan
+/// IR version 1 has no way to badge a widget as a guess, so a guess gets no such widget.
+pub fn node_widget(kind: u8, label: u8) -> u8 {
+    if (valid_label(label) == false or label == LABEL_SUGGESTED or label == LABEL_UNKNOWN) { return WIDGET_TEXT_BLOCK; }
+    if (kind == NODE_MODULE or kind == NODE_USE) { return WIDGET_HONEYCOMB_CARD; }
+    if (kind == NODE_CONST or kind == NODE_FN) { return WIDGET_FORMULA_VIEW; }
+    if (kind == NODE_TEST or kind == NODE_INVARIANT) { return WIDGET_RUN_BUTTON; }
+    if (kind == NODE_BENCH) { return WIDGET_METRICS_TABLE; }
+    return WIDGET_TEXT_BLOCK;
+}
+
+/// The ui_plan source kind a node's widget binds to, read from the ui_plan catalog. Source refs:
+/// SOURCE_SPEC is the spec path (for a `use`, the imported spec); SOURCE_FORMULA is
+/// "<spec path>#<node name>", the form ui_plan's own fixture uses; SOURCE_METRICS is a results
+/// file the host declares, which the graph does not name.
+pub fn node_source_kind(kind: u8, label: u8) -> u8 {
+    return WIDGET_SOURCE[node_widget(kind, label) as usize];
+}
+
+/// Every (kind, label) pair, including out-of-range ones, binds to a catalog widget.
+pub fn all_bindings_trusted() -> bool {
+    var k : u32 = 0;
+    while (k <= (NODE_KINDS as u32)) {
+        var l : u32 = 0;
+        while (l <= (LABEL_KINDS as u32)) {
+            if (catalog_widget(node_widget(k as u8, l as u8)) == false) { return false; }
+            l = l + 1;
+        }
+        k = k + 1;
+    }
+    return true;
+}
+
+/// An empty graph of the current version: no path, no nodes, no edges.
+pub fn blank_graph() -> SpecGraph {
+    return SpecGraph {
+        ir_version: GRAPH_IR_VERSION, spec_path: "", line_count: 0, node_count: 0,
+        node_kind: [0; 192], node_label: [0; 192],
+        node_name: [
+            "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
+            "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
+            "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
+            "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
+            "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
+            "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
+            "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
+            "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
+            "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
+            "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
+            "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
+            "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", ""
+        ],
+        line_start: [0; 192], line_end: [0; 192],
+        edge_count: 0, edge_kind: [0; 254], edge_from: [0; 254], edge_to: [0; 254], edge_label: [0; 254], edge_line: [0; 254]
+    };
+}
+
+/// g with one more node. Past MAX_NODES the node is dropped and node_count still counts it, so
+/// validate_graph_header refuses the graph instead of silently losing a node.
+pub fn with_node(g: SpecGraph, kind: u8, label: u8, name: str, s: u32, e: u32) -> SpecGraph {
+    var h : SpecGraph = g;
+    if (h.node_count < MAX_NODES) {
+        let k : usize = h.node_count as usize;
+        h.node_kind[k] = kind;
+        h.node_label[k] = label;
+        h.node_name[k] = name;
+        h.line_start[k] = s;
+        h.line_end[k] = e;
+    }
+    h.node_count = h.node_count + 1;
+    return h;
+}
+
+/// g with one more edge, under the same capacity rule as with_node.
+pub fn with_edge(g: SpecGraph, kind: u8, f: u8, t: u8, label: u8, line: u32) -> SpecGraph {
+    var h : SpecGraph = g;
+    if (h.edge_count < MAX_EDGES) {
+        let k : usize = h.edge_count as usize;
+        h.edge_kind[k] = kind;
+        h.edge_from[k] = f;
+        h.edge_to[k] = t;
+        h.edge_label[k] = label;
+        h.edge_line[k] = line;
+    }
+    h.edge_count = h.edge_count + 1;
+    return h;
+}
+
+/// The fixture: the graph of specs/tutorial/08_modules_and_arrays.t27 at gHashTag/t27 commit
+/// 2f395025f (93 lines, sha256 c291e925d9dabef8b72b5a64aef153a2126c0b0b43d67bc08b1b2d7eaa98039a),
+/// read by hand. Every top-level declaration is a node; every span and edge line is a line of
+/// that file. Node numbers: 0 module, 1 use, 2-3 consts, 4 scaled_width, 5-7 consts,
+/// 8 power_of_two, 9 bias_for_width, 10-12 tests, 13 invariant, 14 std.testing.
+pub fn tutorial_08_graph() -> SpecGraph {
+    var g : SpecGraph = blank_graph();
+    g.spec_path = "specs/tutorial/08_modules_and_arrays.t27";
+    g.line_count = 93;
+    // `module tutorial-08-modules;` is line 11; the module node spans the file.
+    g = with_node(g, NODE_MODULE, LABEL_EXACT, "tutorial-08-modules", 1, 93);
+    g = with_node(g, NODE_USE, LABEL_EXACT, "base::types", 22, 22);
+    g = with_node(g, NODE_CONST, LABEL_EXACT, "EXPORTED_WIDTH", 32, 32);
+    g = with_node(g, NODE_CONST, LABEL_EXACT, "INTERNAL_SCALE", 35, 35);
+    g = with_node(g, NODE_FN, LABEL_EXACT, "scaled_width", 37, 39);
+    g = with_node(g, NODE_CONST, LABEL_EXACT, "TRIT_VALUES", 54, 54);
+    g = with_node(g, NODE_CONST, LABEL_EXACT, "POWERS_OF_TWO", 56, 56);
+    g = with_node(g, NODE_CONST, LABEL_EXACT, "EXPONENT_BIAS", 58, 58);
+    g = with_node(g, NODE_FN, LABEL_EXACT, "power_of_two", 66, 68);
+    g = with_node(g, NODE_FN, LABEL_EXACT, "bias_for_width", 70, 72);
+    g = with_node(g, NODE_TEST, LABEL_EXACT, "the power table matches its own definition", 78, 81);
+    g = with_node(g, NODE_TEST, LABEL_EXACT, "bias table carries the four standard widths", 83, 86);
+    g = with_node(g, NODE_TEST, LABEL_EXACT, "a private constant is still usable inside its own module", 88, 90);
+    g = with_node(g, NODE_INVARIANT, LABEL_EXACT, "exported_width_is_a_power_of_two", 92, 93);
+    // The tests call std.testing.expectEqual (lines 79-89). No `use` in the file declares std and
+    // it is not a corpus spec, so what it is cannot be read from this source.
+    g = with_node(g, NODE_OPAQUE, LABEL_UNKNOWN, "std.testing", 79, 89);
+    // The `use` statement (line 22).
+    g = with_edge(g, EDGE_USES, 0, 1, LABEL_EXACT, 22);
+    // Names in function bodies (lines 38, 67, 71).
+    g = with_edge(g, EDGE_USES, 4, 2, LABEL_EXACT, 38);
+    g = with_edge(g, EDGE_USES, 4, 3, LABEL_EXACT, 38);
+    g = with_edge(g, EDGE_USES, 8, 6, LABEL_EXACT, 67);
+    g = with_edge(g, EDGE_USES, 9, 7, LABEL_EXACT, 71);
+    // The named values are operands of each return expression, so they reach the result.
+    g = with_edge(g, EDGE_DATA_FLOW, 2, 4, LABEL_DERIVED, 38);
+    g = with_edge(g, EDGE_DATA_FLOW, 3, 4, LABEL_DERIVED, 38);
+    g = with_edge(g, EDGE_DATA_FLOW, 6, 8, LABEL_DERIVED, 67);
+    g = with_edge(g, EDGE_DATA_FLOW, 7, 9, LABEL_DERIVED, 71);
+    // Calls from test bodies (first call lines 79, 84, 89).
+    g = with_edge(g, EDGE_CALLS, 10, 8, LABEL_EXACT, 79);
+    g = with_edge(g, EDGE_CALLS, 11, 9, LABEL_EXACT, 84);
+    g = with_edge(g, EDGE_CALLS, 12, 4, LABEL_EXACT, 89);
+    // TESTED_BY is the calls above read backwards; it has no line of its own.
+    g = with_edge(g, EDGE_TESTED_BY, 8, 10, LABEL_DERIVED, NO_LINE);
+    g = with_edge(g, EDGE_TESTED_BY, 9, 11, LABEL_DERIVED, NO_LINE);
+    g = with_edge(g, EDGE_TESTED_BY, 4, 12, LABEL_DERIVED, NO_LINE);
+    // `assert EXPORTED_WIDTH == 16` (line 93).
+    g = with_edge(g, EDGE_CONSTRAINS, 13, 2, LABEL_EXACT, 93);
+    return g;
+}
+
+/// The fixture with a model's explanation added: node 15, "table lookup step", over the two
+/// indexing functions (lines 66-72), and the suggested flow of POWERS_OF_TWO into it (line 67).
+pub fn with_suggestion() -> SpecGraph {
+    var g : SpecGraph = tutorial_08_graph();
+    g = with_node(g, NODE_OPAQUE, LABEL_SUGGESTED, "table lookup step", 66, 72);
+    g = with_edge(g, EDGE_DATA_FLOW, 6, 15, LABEL_SUGGESTED, 67);
+    return g;
+}
+
+/// A UI plan for the fixture, every widget picked by node_widget: the module card (node 0), the
+/// formula view of power_of_two (node 8) and the run button of its test (node 10).
+pub fn tutorial_08_plan() -> UiPlan {
+    let g : SpecGraph = tutorial_08_graph();
+    var p : UiPlan = blank_plan();
+    p.intent = "Show the graph of tutorial lesson 08";
+    p.title = "Tutorial 08 spec graph";
+    p.granted = bit(CAP_READ_SPECS) | bit(CAP_RUN_LAB);
+    p.source_count = 2;
+    p.source_kind[0] = SOURCE_SPEC;
+    p.source_ref[0] = g.spec_path;
+    p.source_kind[1] = SOURCE_FORMULA;
+    p.source_ref[1] = "specs/tutorial/08_modules_and_arrays.t27#power_of_two";
+    p.widget_count = 3;
+    p.widget[0] = node_widget(g.node_kind[0], g.node_label[0]);
+    p.props[0] = bit(PROP_TITLE) | bit(PROP_SPEC_PATH);
+    p.binding[0] = 1;
+    p.action[0] = ACTION_OPEN_SPEC;
+    p.span[0] = 6;
+    p.label[0] = g.node_name[0];
+    p.widget[1] = node_widget(g.node_kind[8], g.node_label[8]);
+    p.props[1] = bit(PROP_TITLE) | bit(PROP_FORMULA_ID);
+    p.binding[1] = 2;
+    p.action[1] = ACTION_NONE;
+    p.col[1] = 6;
+    p.span[1] = 6;
+    p.label[1] = g.node_name[8];
+    p.widget[2] = node_widget(g.node_kind[10], g.node_label[10]);
+    p.props[2] = bit(PROP_TITLE) | bit(PROP_SPEC_PATH);
+    p.binding[2] = 1;
+    p.action[2] = ACTION_RUN_TESTS;
+    p.row[2] = 1;
+    p.span[2] = 4;
+    p.label[2] = g.node_name[10];
+    return p;
+}
+
+test name_tables_map_names_to_codes {
+    assert node_kind_id("module") == NODE_MODULE;
+    assert node_kind_id("fn") == NODE_FN;
+    assert node_kind_id("opaque") == NODE_OPAQUE;
+    assert edge_kind_id("tested_by") == EDGE_TESTED_BY;
+    assert edge_kind_id("data_flow") == EDGE_DATA_FLOW;
+    assert label_id("suggested") == LABEL_SUGGESTED;
+    assert label_id("unknown") == LABEL_UNKNOWN;
+    // names outside the tables, and a different spelling, are not codes
+    assert node_kind_id("step") == NO_CODE;
+    assert node_kind_id("Fn") == NO_CODE;
+    assert edge_kind_id("control_flow") == NO_CODE;
+    assert label_id("verified") == NO_CODE;
+    assert name_tables_round_trip();
+    assert valid_node_kind(NODE_OPAQUE);
+    assert valid_node_kind(NODE_KINDS) == false;
+    assert valid_edge_kind(EDGE_KINDS) == false;
+    assert valid_label(LABEL_UNKNOWN);
+    assert valid_label(LABEL_KINDS) == false;
+}
+
+test fixture_graph_is_valid {
+    let g : SpecGraph = tutorial_08_graph();
+    assert validate_graph(g) == GRAPH_OK;
+    assert first_bad_node(g) == NO_INDEX;
+    assert first_bad_edge(g) == NO_INDEX;
+    assert g.node_count == 15;
+    assert g.edge_count == 16;
+    // one node per top-level declaration of the file, plus the opaque region
+    assert count_node_kind(g, NODE_MODULE) == 1;
+    assert count_node_kind(g, NODE_USE) == 1;
+    assert count_node_kind(g, NODE_CONST) == 5;
+    assert count_node_kind(g, NODE_FN) == 3;
+    assert count_node_kind(g, NODE_TEST) == 3;
+    assert count_node_kind(g, NODE_INVARIANT) == 1;
+    assert count_node_kind(g, NODE_BENCH) == 0;
+    assert count_node_kind(g, NODE_OPAQUE) == 1;
+    assert count_node_label(g, LABEL_EXACT) == 14;
+    assert count_node_label(g, LABEL_UNKNOWN) == 1;
+    assert count_edge_kind(g, EDGE_USES) == 5;
+    assert count_edge_kind(g, EDGE_DATA_FLOW) == 4;
+    assert count_edge_kind(g, EDGE_CALLS) == 3;
+    assert count_edge_kind(g, EDGE_TESTED_BY) == 3;
+    assert count_edge_kind(g, EDGE_CONSTRAINS) == 1;
+    assert count_edge_label(g, LABEL_EXACT) == 9;
+    assert count_edge_label(g, LABEL_DERIVED) == 7;
+    assert count_edge_label(g, LABEL_SUGGESTED) == 0;
+}
+
+test header_rules_come_first {
+    var v : SpecGraph = tutorial_08_graph();
+    v.ir_version = GRAPH_IR_VERSION + 1;
+    assert validate_graph(v) == ERR_GRAPH_VERSION;
+    var p : SpecGraph = tutorial_08_graph();
+    p.spec_path = "";
+    assert validate_graph(p) == ERR_SPEC_PATH;
+    var c : SpecGraph = tutorial_08_graph();
+    c.line_count = 0;
+    assert validate_graph(c) == ERR_SPEC_PATH;
+    assert validate_graph(blank_graph()) == ERR_SPEC_PATH;
+    var e : SpecGraph = blank_graph();
+    e.spec_path = "specs/x.t27";
+    e.line_count = 1;
+    assert validate_graph(e) == ERR_MODULE;
+    // node 0 must be the module, and its span must be the whole file
+    var m : SpecGraph = tutorial_08_graph();
+    m.node_kind[0] = NODE_CONST;
+    assert validate_graph(m) == ERR_MODULE;
+    var s : SpecGraph = tutorial_08_graph();
+    s.line_start[0] = 11;
+    assert validate_graph(s) == ERR_MODULE;
+    assert first_bad_node(s) == NO_INDEX;
+    var f : SpecGraph = tutorial_08_graph();
+    f.line_count = 94;
+    assert validate_graph(f) == ERR_MODULE;
+    // a second module is a node rule, reported at that node
+    var d : SpecGraph = tutorial_08_graph();
+    d.node_kind[5] = NODE_MODULE;
+    assert validate_graph(d) == ERR_MODULE;
+    assert first_bad_node(d) == 5;
+}
+
+test capacity_is_refused_not_truncated {
+    var g : SpecGraph = tutorial_08_graph();
+    while (g.node_count < MAX_NODES + 1) {
+        g = with_node(g, NODE_CONST, LABEL_DERIVED, "extra", NO_LINE, NO_LINE);
+    }
+    // MAX_NODES + 1 nodes declared, MAX_NODES stored: the graph is refused, not cut short
+    assert g.node_count == MAX_NODES + 1;
+    assert validate_graph(g) == ERR_TOO_MANY_NODES;
+    var h : SpecGraph = tutorial_08_graph();
+    while (h.edge_count < MAX_EDGES + 1) {
+        h = with_edge(h, EDGE_TESTED_BY, 9, 13, LABEL_DERIVED, NO_LINE);
+    }
+    assert h.edge_count == MAX_EDGES + 1;
+    assert validate_graph(h) == ERR_TOO_MANY_EDGES;
+}
+
+test a_graph_exactly_at_capacity_is_valid {
+    // 16 fns and 16 tests after the fixture's 15 nodes, then consts up to MAX_NODES; every
+    // test calls every fn, so the CALLS edges are distinct (a repeated edge is a duplicate)
+    var g : SpecGraph = tutorial_08_graph();
+    var a : u32 = 0;
+    while (a < 16) {
+        g = with_node(g, NODE_FN, LABEL_EXACT, "f", 1, 1);
+        a = a + 1;
+    }
+    a = 0;
+    while (a < 16) {
+        g = with_node(g, NODE_TEST, LABEL_EXACT, "t", 1, 1);
+        a = a + 1;
+    }
+    while (g.node_count < MAX_NODES) {
+        g = with_node(g, NODE_CONST, LABEL_EXACT, "extra", 1, 1);
+    }
+    var t : u32 = 0;
+    while (t < 16) {
+        var f : u32 = 0;
+        while (f < 16) {
+            if (g.edge_count < MAX_EDGES) {
+                g = with_edge(g, EDGE_CALLS, (31 + t) as u8, (15 + f) as u8, LABEL_EXACT, 1);
+            }
+            f = f + 1;
+        }
+        t = t + 1;
+    }
+    assert g.node_count == MAX_NODES;
+    assert g.edge_count == MAX_EDGES;
+    assert validate_graph(g) == GRAPH_OK;
+    // the last stored node and edge are real cells, not clipped
+    assert g.node_kind[MAX_NODES as usize - 1] == NODE_CONST;
+    assert g.edge_kind[MAX_EDGES as usize - 1] == EDGE_CALLS;
+    // negative control: one more edge or node makes the same graph refused
+    assert validate_graph(with_edge(g, EDGE_CALLS, 31, 15, LABEL_EXACT, 1)) == ERR_TOO_MANY_EDGES;
+    assert validate_graph(with_node(g, NODE_CONST, LABEL_EXACT, "extra", 1, 1)) == ERR_TOO_MANY_NODES;
+}
+
+test node_rules {
+    var k : SpecGraph = tutorial_08_graph();
+    k.node_kind[3] = NODE_KINDS;
+    assert validate_graph(k) == ERR_NODE_KIND;
+    assert first_bad_node(k) == 3;
+    var l : SpecGraph = tutorial_08_graph();
+    l.node_label[7] = LABEL_KINDS;
+    assert validate_graph(l) == ERR_LABEL;
+    assert first_bad_node(l) == 7;
+    var n : SpecGraph = tutorial_08_graph();
+    n.node_name[9] = "";
+    assert validate_graph(n) == ERR_NODE_NAME;
+    // span order: start after end, or an end with no start
+    var o : SpecGraph = tutorial_08_graph();
+    o.line_start[4] = 40;
+    assert validate_graph(o) == ERR_SPAN_ORDER;
+    assert first_bad_node(o) == 4;
+    var z : SpecGraph = tutorial_08_graph();
+    z.line_start[4] = NO_LINE;
+    assert validate_graph(z) == ERR_SPAN_ORDER;
+    var x : SpecGraph = tutorial_08_graph();
+    x.line_end[13] = 94;
+    assert validate_graph(x) == ERR_SPAN_OUTSIDE;
+    assert first_bad_node(x) == 13;
+    // an EXACT node is in the source, so it has a span
+    var m : SpecGraph = tutorial_08_graph();
+    m.line_start[5] = NO_LINE;
+    m.line_end[5] = NO_LINE;
+    assert validate_graph(m) == ERR_SPAN_MISSING;
+    assert first_bad_node(m) == 5;
+    // a DERIVED or UNKNOWN node may have none
+    m.node_label[5] = LABEL_DERIVED;
+    assert validate_graph(m) == GRAPH_OK;
+    var u : SpecGraph = tutorial_08_graph();
+    u.line_start[14] = NO_LINE;
+    u.line_end[14] = NO_LINE;
+    assert validate_graph(u) == GRAPH_OK;
+}
+
+test suggested_node_needs_a_span {
+    let g : SpecGraph = with_suggestion();
+    assert validate_graph(g) == GRAPH_OK;
+    assert count_node_label(g, LABEL_SUGGESTED) == 1;
+    assert count_edge_label(g, LABEL_SUGGESTED) == 1;
+    // without the lines it explains, a guess is refused
+    var s : SpecGraph = with_suggestion();
+    s.line_start[15] = NO_LINE;
+    s.line_end[15] = NO_LINE;
+    assert validate_graph(s) == ERR_SPAN_MISSING;
+    assert first_bad_node(s) == 15;
+    // an edge into a guess is a guess: it may not be labelled EXACT or DERIVED
+    var e : SpecGraph = with_suggestion();
+    e.edge_label[16] = LABEL_EXACT;
+    assert validate_graph(e) == ERR_EDGE_LABEL;
+    assert first_bad_edge(e) == 16;
+    e.edge_label[16] = LABEL_DERIVED;
+    assert validate_graph(e) == ERR_EDGE_LABEL;
+    // and a suggested edge carries its source line too
+    var l : SpecGraph = with_suggestion();
+    l.edge_line[16] = NO_LINE;
+    assert validate_graph(l) == ERR_EDGE_LINE;
+}
+
+test unknown_node_draws_no_edges {
+    let g : SpecGraph = tutorial_08_graph();
+    var a : SpecGraph = with_edge(g, EDGE_DATA_FLOW, 14, 10, LABEL_DERIVED, 79);
+    assert validate_graph(a) == ERR_EDGE_UNKNOWN_NODE;
+    assert first_bad_edge(a) == 16;
+    var b : SpecGraph = with_edge(g, EDGE_DATA_FLOW, 6, 14, LABEL_SUGGESTED, 79);
+    assert validate_graph(b) == ERR_EDGE_UNKNOWN_NODE;
+    // the rule is about the label: the same edge from a DERIVED region is drawn
+    a.node_label[14] = LABEL_DERIVED;
+    assert validate_graph(a) == GRAPH_OK;
+}
+
+test edge_endpoints_must_exist_and_fit {
+    let g : SpecGraph = tutorial_08_graph();
+    assert validate_graph(with_edge(g, EDGE_CALLS, 10, 15, LABEL_EXACT, 79)) == ERR_EDGE_DANGLING;
+    assert validate_graph(with_edge(g, EDGE_CALLS, 255, 8, LABEL_EXACT, 79)) == ERR_EDGE_DANGLING;
+    assert validate_graph(with_edge(g, EDGE_KINDS, 10, 8, LABEL_EXACT, 79)) == ERR_EDGE_KIND;
+    // calls end at a fn, never at a const
+    assert validate_graph(with_edge(g, EDGE_CALLS, 10, 6, LABEL_EXACT, 79)) == ERR_EDGE_ENDPOINT_KIND;
+    // tested_by starts at a fn; constrains starts at an invariant
+    assert validate_graph(with_edge(g, EDGE_TESTED_BY, 10, 8, LABEL_DERIVED, NO_LINE)) == ERR_EDGE_ENDPOINT_KIND;
+    assert validate_graph(with_edge(g, EDGE_CONSTRAINS, 10, 6, LABEL_EXACT, 79)) == ERR_EDGE_ENDPOINT_KIND;
+    // a module uses an import, but does not call it
+    assert validate_graph(with_edge(g, EDGE_CALLS, 0, 1, LABEL_EXACT, 22)) == ERR_EDGE_ENDPOINT_KIND;
+    var w : SpecGraph = tutorial_08_graph();
+    w.edge_to[9] = 7;
+    assert validate_graph(w) == ERR_EDGE_ENDPOINT_KIND;
+    assert first_bad_edge(w) == 9;
+}
+
+test edge_labels_lines_and_duplicates {
+    let g : SpecGraph = tutorial_08_graph();
+    // an edge is drawn or it is not: UNKNOWN is not an edge label
+    var u : SpecGraph = tutorial_08_graph();
+    u.edge_label[0] = LABEL_UNKNOWN;
+    assert validate_graph(u) == ERR_EDGE_LABEL;
+    assert first_bad_edge(u) == 0;
+    // an EXACT edge is read from a line, so it names one
+    var t : SpecGraph = tutorial_08_graph();
+    t.edge_label[12] = LABEL_EXACT;
+    assert validate_graph(t) == ERR_EDGE_LINE;
+    assert first_bad_edge(t) == 12;
+    // that line lies in one of its endpoints: line 50 is a comment between them
+    var o : SpecGraph = tutorial_08_graph();
+    o.edge_line[1] = 50;
+    assert validate_graph(o) == ERR_EDGE_LINE;
+    // a line in the target's span counts (data_flow 2 -> 4 is read at line 38, inside node 4)
+    assert span_holds(g, 2, 38) == false;
+    assert span_holds(g, 4, 38);
+    // an EXACT edge may not touch a DERIVED node
+    var d : SpecGraph = tutorial_08_graph();
+    d.node_label[6] = LABEL_DERIVED;
+    assert validate_graph(d) == ERR_EDGE_LABEL;
+    assert first_bad_edge(d) == 3;
+    // the same kind and endpoints twice is one edge drawn twice
+    assert validate_graph(with_edge(g, EDGE_USES, 4, 2, LABEL_EXACT, 38)) == ERR_DUPLICATE_EDGE;
+    // the same endpoints under another kind is a different edge
+    assert has_edge(g, EDGE_USES, 4, 2);
+    assert has_edge(g, EDGE_DATA_FLOW, 2, 4);
+    assert has_edge(g, EDGE_DATA_FLOW, 4, 2) == false;
+}
+
+test source_mapping_goes_both_ways {
+    let g : SpecGraph = tutorial_08_graph();
+    // line -> node: the innermost span wins
+    assert node_at_line(g, 67) == 8;
+    assert node_at_line(g, 93) == 13;
+    assert node_at_line(g, 22) == 1;
+    // line 79 is in test 10 (78-81) and in std.testing (79-89); the shorter span wins
+    assert node_at_line(g, 79) == 10;
+    assert node_at_line(g, 87) == 14;
+    // a comment line belongs to the module; no line 0, nothing past the file
+    assert node_at_line(g, 50) == 0;
+    assert node_at_line(g, 0) == NO_INDEX;
+    assert node_at_line(g, 94) == NO_INDEX;
+    // node -> line, and back to the same node, for every declaration
+    var n : u32 = 1;
+    var back : u32 = 0;
+    while (n < 14) {
+        let r : SpecGraphNode = node_at(g, n);
+        if (node_at_line(g, r.line_start) == n and node_at_line(g, r.line_end) == n) { back = back + 1; }
+        n = n + 1;
+    }
+    assert back == 13;
+    let p : SpecGraphNode = node_at(g, 8);
+    assert p.kind == NODE_FN;
+    assert p.label == LABEL_EXACT;
+    assert p.name == "power_of_two";
+    assert p.line_start == 66;
+    assert p.line_end == 68;
+}
+
+test tested_by_is_derived_from_calls {
+    let g : SpecGraph = tutorial_08_graph();
+    assert tested_by_matches_calls(g);
+    assert tests_of(g, 8) == 1;
+    assert tests_of(g, 4) == 1;
+    // TRIT_VALUES is declared and never read: no edge, no test
+    assert tests_of(g, 5) == 0;
+    assert untested_fns(g) == 0;
+    // drop one TESTED_BY edge: the derivation no longer holds and a fn is untested
+    var m : SpecGraph = tutorial_08_graph();
+    m.edge_count = 15;
+    m.edge_kind[14] = EDGE_CONSTRAINS;
+    m.edge_from[14] = 13;
+    m.edge_to[14] = 2;
+    m.edge_label[14] = LABEL_EXACT;
+    m.edge_line[14] = 93;
+    assert tested_by_matches_calls(m) == false;
+    assert untested_fns(m) == 1;
+    // a TESTED_BY edge with no call behind it is not derived either
+    var x : SpecGraph = with_edge(g, EDGE_TESTED_BY, 9, 10, LABEL_DERIVED, NO_LINE);
+    assert validate_graph(x) == GRAPH_OK;
+    assert tested_by_matches_calls(x) == false;
+}
+
+test nodes_bind_to_trusted_widgets {
+    assert node_widget(NODE_MODULE, LABEL_EXACT) == WIDGET_HONEYCOMB_CARD;
+    assert node_widget(NODE_USE, LABEL_DERIVED) == WIDGET_HONEYCOMB_CARD;
+    assert node_widget(NODE_FN, LABEL_EXACT) == WIDGET_FORMULA_VIEW;
+    assert node_widget(NODE_CONST, LABEL_EXACT) == WIDGET_FORMULA_VIEW;
+    assert node_widget(NODE_TEST, LABEL_EXACT) == WIDGET_RUN_BUTTON;
+    assert node_widget(NODE_INVARIANT, LABEL_EXACT) == WIDGET_RUN_BUTTON;
+    assert node_widget(NODE_BENCH, LABEL_EXACT) == WIDGET_METRICS_TABLE;
+    assert node_widget(NODE_OPAQUE, LABEL_EXACT) == WIDGET_TEXT_BLOCK;
+    // a guess and an unknown are drawn as text, whatever their kind
+    assert node_widget(NODE_FN, LABEL_SUGGESTED) == WIDGET_TEXT_BLOCK;
+    assert node_widget(NODE_TEST, LABEL_UNKNOWN) == WIDGET_TEXT_BLOCK;
+    assert node_widget(NODE_KINDS, LABEL_EXACT) == WIDGET_TEXT_BLOCK;
+    assert node_source_kind(NODE_FN, LABEL_EXACT) == SOURCE_FORMULA;
+    assert node_source_kind(NODE_TEST, LABEL_EXACT) == SOURCE_SPEC;
+    assert node_source_kind(NODE_BENCH, LABEL_EXACT) == SOURCE_METRICS;
+    assert node_source_kind(NODE_FN, LABEL_SUGGESTED) == SOURCE_NONE;
+    // a plan whose widgets were picked from the fixture passes ui_plan's own gate
+    let p : UiPlan = tutorial_08_plan();
+    assert validate_plan(p) == PLAN_OK;
+    assert p.widget[1] == WIDGET_FORMULA_VIEW;
+    assert p.source_kind[(p.binding[1] - 1) as usize] == node_source_kind(NODE_FN, LABEL_EXACT);
+    // if node 8 were a guess, its widget would be text, and text takes no binding
+    var q : UiPlan = tutorial_08_plan();
+    q.widget[1] = node_widget(NODE_FN, LABEL_SUGGESTED);
+    q.props[1] = bit(PROP_CAPTION);
+    assert validate_plan(q) == ERR_BINDING_KIND;
+    assert first_bad_slot(q) == 1;
+    q.binding[1] = 0;
+    assert validate_plan(q) == PLAN_OK;
+}
+
+test first_broken_rule_is_reported {
+    // a node defect and an edge defect: the node is reported, and no edge is named
+    var g : SpecGraph = tutorial_08_graph();
+    g.edge_line[1] = 50;
+    g.node_name[12] = "";
+    assert validate_graph(g) == ERR_NODE_NAME;
+    assert first_bad_node(g) == 12;
+    assert first_bad_edge(g) == NO_INDEX;
+    // fix the node: the edge comes next
+    g.node_name[12] = "a private constant is still usable inside its own module";
+    assert validate_graph(g) == ERR_EDGE_LINE;
+    assert first_bad_edge(g) == 1;
+    // a header defect hides both
+    g.ir_version = 0;
+    assert validate_graph(g) == ERR_GRAPH_VERSION;
+    assert first_bad_node(g) == NO_INDEX;
+    assert first_bad_edge(g) == NO_INDEX;
+}
+
+invariant name_tables_cover_every_code {
+    assert name_tables_round_trip();
+    assert node_kind_id(NODE_KIND_NAMES[NODE_OPAQUE as usize]) == NODE_OPAQUE;
+    assert edge_kind_id(EDGE_KIND_NAMES[EDGE_DATA_FLOW as usize]) == EDGE_DATA_FLOW;
+}
+
+invariant edge_masks_are_spelled_right {
+    let bodies : u32 = kind_bit(NODE_FN) | kind_bit(NODE_TEST) | kind_bit(NODE_INVARIANT) | kind_bit(NODE_BENCH);
+    assert EDGE_FROM_KINDS[EDGE_CALLS as usize] == bodies;
+    assert EDGE_TO_KINDS[EDGE_CALLS as usize] == kind_bit(NODE_FN);
+    assert EDGE_FROM_KINDS[EDGE_USES as usize] == kind_bit(NODE_MODULE) | bodies;
+    assert EDGE_TO_KINDS[EDGE_USES as usize] == kind_bit(NODE_CONST) | kind_bit(NODE_USE);
+    assert EDGE_FROM_KINDS[EDGE_TESTED_BY as usize] == kind_bit(NODE_FN);
+    assert EDGE_TO_KINDS[EDGE_TESTED_BY as usize] == kind_bit(NODE_TEST) | kind_bit(NODE_INVARIANT) | kind_bit(NODE_BENCH);
+    assert EDGE_FROM_KINDS[EDGE_CONSTRAINS as usize] == kind_bit(NODE_INVARIANT);
+    assert EDGE_TO_KINDS[EDGE_CONSTRAINS as usize] == kind_bit(NODE_CONST) | kind_bit(NODE_FN);
+    assert EDGE_FROM_KINDS[EDGE_DATA_FLOW as usize] == kind_bit(NODE_CONST) | kind_bit(NODE_FN) | kind_bit(NODE_USE) | kind_bit(NODE_OPAQUE);
+    assert EDGE_TO_KINDS[EDGE_DATA_FLOW as usize] == bodies | kind_bit(NODE_OPAQUE);
+}
+
+invariant every_node_binds_to_a_catalog_widget {
+    assert all_bindings_trusted();
+}
+
+invariant the_fixture_stays_valid {
+    assert validate_graph(tutorial_08_graph()) == GRAPH_OK;
+    assert validate_graph(with_suggestion()) == GRAPH_OK;
+    assert tested_by_matches_calls(tutorial_08_graph());
+}
+
+invariant reserved_codes_stay_outside {
+    assert NO_CODE >= NODE_KINDS;
+    assert NO_CODE >= EDGE_KINDS;
+    assert NO_CODE >= LABEL_KINDS;
+    assert MAX_NODES < NO_INDEX;
+    assert MAX_EDGES < NO_INDEX;
+    assert MAX_NODES >= MEASURED_NODES_P95;
+    assert MAX_EDGES >= MEASURED_EDGES_P95;
+    assert (NODE_KINDS as u32) < 32;
+    assert ERR_DUPLICATE_EDGE + 1 == VERDICT_KINDS;
+}

@@ -1,0 +1,229 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/automation/meeting-reminders.t27 -- meetings the person makes by talking to the
+// agent, online or in a place, and the agent reminding them in Telegram before each one
+// and asking afterwards how it went.
+// Host: 999-multibots-telegraf apps/vibee-editor/render/src/agent/meetings.ts (the tools
+//       meeting_create, meeting_list, meeting_update, meeting_cancel, meeting_answer, the
+//       reminder sweep and the card), registered in src/agent/tools.ts; the tick lives in
+//       render-server.ts; the calendar file is served at /api/meeting/ics.
+// Consumer: the bot src/navigation/registerCommands.ts relays a tap on an `mtg:` button
+//       to meeting_answer AS THE PERSON WHO PRESSED IT (src/services/meetingAnswer.ts,
+//       the render's /mcp door over the server key, telegram_id = the presser).
+// Telegram features used (Bot API 9.5 and later, checked 2026-10-01):
+//       a `tg-time` entity (unix + format "wDT", and "r" for "in 15 minutes"), so every
+//       reader sees the time in their OWN time zone and the card never names one;
+//       InlineKeyboardButton.style (success / primary / danger) for I'm coming / later /
+//       cancel; copy_text for an online meeting's link.
+// Law lineage: render rounds.ts and setinterval-counts-the-process (the pace lives in the
+//       database, the tick only asks it), mail-push (one outward act per tap, the tap is
+//       the gate), browser approvals (`bap:` -- the bot holds nothing between the card
+//       and the press).
+// Privacy: a meeting is the caller's own. Every read and write is scoped by the
+//       caller's telegram_id, which comes from the door and never from arguments; a tap
+//       is honoured only from the meeting's owner; the calendar file is reachable only
+//       through a token of its own, never the tap token.
+// v1, 2026-10-01: first cut. Reminders before the start, a snooze that cannot land
+//       after the start, a follow-up after the end, a calendar file.
+// v2, 2026-10-03: "later" is idempotent. A second press while a snooze is still pending
+//       adds nothing -- so a relay that lost the answer may put the buttons back, and a
+//       double tap or a retried tap does not ring twice ten minutes from now.
+// Claim status: RUN_LIVE is false until a real reminder has reached a real chat.
+// phi^2 + 1/phi^2 = 3 | TRINITY
+
+module automation::meeting_reminders {
+
+    pub const KIND : str = "automation";
+    pub const ID : str = "meeting-reminders";
+    pub const REPO : str = "999-multibots-telegraf";
+    pub const VERSION : u8 = 2;
+
+    // ---- The doors ------------------------------------------------------------------
+    pub const TOOL_CREATE : str = "meeting_create";
+    pub const TOOL_LIST : str = "meeting_list";
+    pub const TOOL_UPDATE : str = "meeting_update";
+    pub const TOOL_CANCEL : str = "meeting_cancel";
+    pub const TOOL_ANSWER : str = "meeting_answer";  // the bot's relay of a tap
+    pub const ICS_PATH : str = "/api/meeting/ics";  // the only door without a session
+
+    // ---- The store ------------------------------------------------------------------
+    pub const TABLE : str = "agent_meetings";
+    pub const REMINDERS_TABLE : str = "agent_meeting_reminders";
+    pub const MAX_UPCOMING : u16 = 200;  // per person; a calendar, not a log
+    pub const TITLE_MAX : u16 = 200;
+    pub const PLACE_MAX : u16 = 300;
+    pub const URL_MAX : u16 = 500;
+    pub const NOTES_MAX : u16 = 2000;
+    pub const MAX_AHEAD_DAYS : u16 = 366;  // a year and a day: next year's same date fits
+
+    // ---- Duration -------------------------------------------------------------------
+    pub const DURATION_DEFAULT_MIN : u16 = 60;
+    pub const DURATION_MIN_MIN : u16 = 5;
+    pub const DURATION_MAX_MIN : u16 = 720;
+
+    // ---- Reminders ------------------------------------------------------------------
+    pub const REMIND_DAY_MIN : u32 = 1440;  // the default three: a day before,
+    pub const REMIND_HOUR_MIN : u32 = 60;  // an hour before,
+    pub const REMIND_SOON_MIN : u32 = 10;  // and ten minutes before
+    pub const MAX_REMINDERS : u8 = 3;  // a fourth reminder is noise, not care
+    pub const REMIND_FLOOR_MIN : u32 = 5;  // closer than this, the person is already walking
+    pub const REMIND_CEIL_MIN : u32 = 10080;  // a week ahead at most
+    pub const SNOOZE_MIN : u32 = 10;  // "later" = ten minutes, never past the start
+    pub const SNOOZES_PENDING_MAX : u8 = 1;  // a second "later" while one waits adds none
+    pub const FOLLOWUP_AFTER_END_MIN : u32 = 5;  // the proactive half: how did it go?
+
+    // ---- The sweep ------------------------------------------------------------------
+    pub const TICK_S : u16 = 60;  // the tick only asks the database what is due
+    pub const FIRST_TICK_S : u16 = 90;  // a settling deploy is not swept
+    pub const CLAIM_PER_TICK : u8 = 20;  // the rest is due again one tick later
+    pub const MARK_BEFORE_SEND : bool = true;  // at most once: a reminder twice is worse
+                                               // than a reminder a minute late
+    pub const LATE_STILL_SENDS : bool = true;  // a tick lost to a deploy sends late,
+                                               // as long as the meeting has not begun
+
+    // ---- The tap --------------------------------------------------------------------
+    pub const CALLBACK_PREFIX : str = "mtg:";
+    pub const CALLBACK_MAX_BYTES : u8 = 64;  // Telegram's limit on callback_data
+    pub const TOKEN_BYTES : u8 = 16;  // base64url: 22 characters
+    pub const TOKEN_CHARS : u8 = 22;
+    pub const LONGEST_ACTION_CHARS : u8 = 6;  // "cancel" -- the others are shorter
+    pub const OWNER_ONLY : bool = true;  // a tap from anyone else changes nothing
+
+    // ---- Not claimed ----------------------------------------------------------------
+    pub const RUN_LIVE : bool = false;
+
+    // A reminder offset is honoured only inside the floor and the ceiling.
+    fn offset_ok(minutes: u32) -> bool {
+        return minutes >= REMIND_FLOOR_MIN && minutes <= REMIND_CEIL_MIN;
+    }
+
+    // A reminder is scheduled only if it still lies in the future when the meeting
+    // is made or moved: a reminder for a moment already past would fire at once and
+    // say "in a day" about a meeting an hour away.
+    fn schedules(now_s: u64, starts_s: u64, minutes: u32) -> bool {
+        let lead : u64 = minutes * 60;
+        return starts_s > now_s + lead;
+    }
+
+    // A reminder before the meeting fires once it is due and only while the meeting
+    // has not begun. Late is allowed (a lost tick); after the start is not.
+    fn fires_before(now_s: u64, fire_s: u64, starts_s: u64) -> bool {
+        return fire_s <= now_s && now_s < starts_s;
+    }
+
+    // "Later" is allowed only if ten more minutes still land before the start.
+    fn snooze_allowed(now_s: u64, starts_s: u64) -> bool {
+        let lead : u64 = SNOOZE_MIN * 60;
+        return now_s + lead < starts_s;
+    }
+
+    // "Later" adds a reminder only when none of its own is still waiting. The answer is
+    // the same either way ("I'll remind you in ten minutes" -- true, the first one will),
+    // so a press the relay could not confirm is safe to press again.
+    fn snooze_adds(pending_snoozes: u8) -> bool {
+        return pending_snoozes < SNOOZES_PENDING_MAX;
+    }
+
+    // The follow-up asks how it went: after the end, and never for a cancelled one.
+    fn follows_up(now_s: u64, ends_s: u64, cancelled: bool) -> bool {
+        let after : u64 = FOLLOWUP_AFTER_END_MIN * 60;
+        return !cancelled && now_s >= ends_s + after;
+    }
+
+    // A tap changes a meeting only when the presser owns it and the token matches.
+    fn may_answer(presser_is_owner: bool, token_matches: bool) -> bool {
+        return presser_is_owner && token_matches;
+    }
+
+    // A duration is clamped, not refused: "a quick call" with no length is an hour.
+    fn duration(minutes: u16) -> u16 {
+        if minutes == 0 {
+            return DURATION_DEFAULT_MIN;
+        }
+        if minutes < DURATION_MIN_MIN {
+            return DURATION_MIN_MIN;
+        }
+        if minutes > DURATION_MAX_MIN {
+            return DURATION_MAX_MIN;
+        }
+        return minutes;
+    }
+
+    test "reminders sit between the floor and the ceiling" {
+        assert(offset_ok(REMIND_DAY_MIN));
+        assert(offset_ok(REMIND_HOUR_MIN));
+        assert(offset_ok(REMIND_SOON_MIN));
+        assert(offset_ok(REMIND_FLOOR_MIN));
+        assert(offset_ok(REMIND_CEIL_MIN));
+        assert(!offset_ok(REMIND_FLOOR_MIN - 1));
+        assert(!offset_ok(REMIND_CEIL_MIN + 1));
+        assert(MAX_REMINDERS == 3);
+    }
+
+    test "a reminder for a moment already past is not scheduled" {
+        assert(schedules(0, 7200, 60));
+        assert(!schedules(0, 3600, 60));
+        assert(!schedules(0, 3000, 60));
+        assert(!schedules(1000, 3600, 1440));
+    }
+
+    test "a reminder may be late but never after the start" {
+        assert(fires_before(100, 100, 200));
+        assert(fires_before(150, 100, 200));
+        assert(!fires_before(99, 100, 200));
+        assert(!fires_before(200, 100, 200));
+        assert(!fires_before(500, 100, 200));
+        assert(LATE_STILL_SENDS);
+        assert(MARK_BEFORE_SEND);
+    }
+
+    test "later never lands after the start" {
+        assert(snooze_allowed(0, 601));
+        assert(!snooze_allowed(0, 600));
+        assert(!snooze_allowed(0, 10));
+        assert(SNOOZE_MIN == 10);
+    }
+
+    test "a second later never doubles the reminder" {
+        assert(snooze_adds(0));
+        assert(!snooze_adds(1));
+        assert(!snooze_adds(2));
+        assert(SNOOZES_PENDING_MAX == 1);
+    }
+
+    test "the follow-up comes after the end, and never for a cancelled meeting" {
+        assert(follows_up(1300, 1000, false));
+        assert(!follows_up(1299, 1000, false));
+        assert(!follows_up(5000, 1000, true));
+    }
+
+    test "only the owner's tap counts" {
+        assert(may_answer(true, true));
+        assert(!may_answer(false, true));
+        assert(!may_answer(true, false));
+        assert(!may_answer(false, false));
+        assert(OWNER_ONLY);
+    }
+
+    test "the longest button still fits Telegram's callback limit" {
+        assert(TOKEN_CHARS >= TOKEN_BYTES);
+        assert(4 + LONGEST_ACTION_CHARS + 1 + TOKEN_CHARS <= CALLBACK_MAX_BYTES);
+    }
+
+    test "a duration is clamped, not refused" {
+        assert(duration(0) == 60);
+        assert(duration(1) == 5);
+        assert(duration(45) == 45);
+        assert(duration(5000) == 720);
+    }
+
+    test "the sweep is a cheap tick over a bounded claim" {
+        assert(TICK_S == 60);
+        assert(FIRST_TICK_S >= TICK_S);
+        assert(CLAIM_PER_TICK >= 1);
+        assert(MAX_UPCOMING >= 1);
+        assert(MAX_AHEAD_DAYS >= 365);
+        assert(!RUN_LIVE);
+    }
+}
+
+// phi^2 + 1/phi^2 = 3 | TRINITY

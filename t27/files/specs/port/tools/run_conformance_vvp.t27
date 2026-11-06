@@ -1,0 +1,284 @@
+// SPDX-License-Identifier: Apache-2.0
+// t27/specs/port/tools/run_conformance_vvp.t27
+// Port of tools/run_conformance_vvp.py to t27
+
+// What this spec covers, said rather than left to be inferred.
+//
+// The Python builds a Verilog testbench, hands it to iverilog, runs the
+// result under vvp, and returns an exit code. The building and the running
+// are the runtime's; the DECISIONS are this tool's whole subject, and they
+// are what is written down here:
+//
+//   - which of five messages is printed, because three of the exits are 2
+//     and two are 1, so the code alone cannot say which branch spoke;
+//   - that an absent simulator is not a failed vector set (T117);
+//   - that zero executed cases is a failure and not a vacuous pass (T67).
+//
+// NOT covered: the testbench text itself, and the vector file it is rendered
+// from. Both are strings assembled from a corpus on disk, and a spec that
+// asserted them would be asserting a fixture, not a rule.
+
+module port::run_conformance_vvp {
+    // Three exit codes, and the second and third are not interchangeable.
+    // 0 is a run that passed. 1 is a run that happened and went wrong. 2 is a
+    // run that never happened at all -- bad arguments, an unknown module, or
+    // no simulator on PATH.
+    const EXIT_PASS  : i32 = 0;
+    const EXIT_FAIL  : i32 = 1;
+    const EXIT_UNRUN : i32 = 2;
+
+    // The registry, v1. One module, and anything else is refused rather than
+    // attempted.
+    const REGISTRY_MODULE  : str = "spi";
+    const REGISTRY_TOP     : str = "SPI_Master";
+    const REGISTRY_VECTORS : str = "conformance/fpga_spi.json";
+
+    // `main` needs the program name, the module and the generated .v; the
+    // workdir is optional and defaults to /tmp.
+    const MIN_ARGC : u32 = 3;
+
+    // The message each branch prints. The self-check in the Python asserts
+    // the exit code AND the marker, precisely because the codes collide.
+    const MARK_USAGE   : str = "usage: run_conformance_vvp.py";
+    const MARK_UNKNOWN : str = "not in the executed-vector registry";
+    const MARK_ABSENT  : str = "NOTHING WAS EXECUTED";
+    const MARK_BUILD   : str = "TB BUILD FAILED";
+    const MARK_PASS    : str = "CONFORMANCE OK";
+
+    // What the surrounding system did when asked. Every field is something
+    // the runtime observes and this spec only reasons about.
+    pub struct Env {
+        have_iverilog: bool,
+        build_ok: bool,
+        have_vvp: bool,
+        // Whether the simulator's own output carried the CONFORMANCE OK line.
+        sim_said_pass: bool,
+        sim_rc: i32,
+    }
+
+    // An exit code together with how many cases actually ran. The count is
+    // carried rather than discarded because the final verdict depends on it.
+    pub struct Run {
+        rc: i32,
+        executed: u32,
+    }
+
+    // ------------------------------------------------------------------
+    // The prescaler encoding, which is the one piece of arithmetic here
+    // ------------------------------------------------------------------
+
+    // How many bits it takes to write `v`. Zero takes none, which is what
+    // Python's int.bit_length() says too.
+    pub fn bit_width(v: u32) i32 {
+        var n : i32 = 0;
+        var x : u32 = v;
+        while (x > 0) {
+            n = n + 1;
+            x = x >> 1;
+        }
+        return n;
+    }
+
+    // The code the SPI prescaler takes for a given divisor: the divisor is a
+    // power of two and the register holds log2 of it, less two.
+    //
+    // Signed on purpose. The register's domain is divisors of 4 and up; a
+    // divisor of 1 or 2 yields a negative code, and returning it says so
+    // rather than wrapping into a large positive one that reads as valid.
+    pub fn prescaler_code(divisor: u32) i32 {
+        return bit_width(divisor) - 2;
+    }
+
+    // ------------------------------------------------------------------
+    // The verdicts
+    // ------------------------------------------------------------------
+
+    // What a simulation that actually ran earns. Both conditions are
+    // required: a simulator can exit 0 having printed nothing, and it can
+    // print the passing line and then exit non-zero.
+    pub fn sim_verdict(said_pass: bool, sim_rc: i32) i32 {
+        if (said_pass && sim_rc == EXIT_PASS) {
+            return EXIT_PASS;
+        }
+        return EXIT_FAIL;
+    }
+
+    // One module's run, from the state of the world around it.
+    //
+    // T117, and the ordering is the point: a missing simulator is reported
+    // before anything is judged, and it resets `executed` to zero, because a
+    // count of cases that were never executed is not a count.
+    pub fn run_module(env: Env, executed: u32) Run {
+        if (!env.have_iverilog) {
+            return Run { rc: EXIT_UNRUN, executed: 0 };
+        }
+        if (!env.build_ok) {
+            return Run { rc: EXIT_FAIL, executed: executed };
+        }
+        if (!env.have_vvp) {
+            return Run { rc: EXIT_UNRUN, executed: 0 };
+        }
+        return Run { rc: sim_verdict(env.sim_said_pass, env.sim_rc), executed: executed };
+    }
+
+    // T67: zero executed cases is a FAILURE, not a pass.
+    //
+    // A testbench with no cases prints "all executed cases passed" -- true
+    // over the empty set, and indistinguishable from a real run. Emptying a
+    // vector file once made this whole job green end to end while the vectors
+    // it names had ceased to exist.
+    pub fn final_verdict(rc: i32, executed: u32) i32 {
+        if (rc == EXIT_PASS && executed == 0) {
+            return EXIT_FAIL;
+        }
+        return rc;
+    }
+
+    pub fn known_module(name: str) bool {
+        return name == REGISTRY_MODULE;
+    }
+
+    // The whole program's exit code.
+    pub fn main_verdict(argc: u32, name: str, env: Env, executed: u32) i32 {
+        if (argc < MIN_ARGC) {
+            return EXIT_UNRUN;
+        }
+        if (!known_module(name)) {
+            return EXIT_UNRUN;
+        }
+        const r = run_module(env, executed);
+        return final_verdict(r.rc, r.executed);
+    }
+
+    // Which message the run printed. Three branches exit 2 and two exit 1,
+    // so this is the only thing that distinguishes them -- which is why the
+    // Python's self-check asserts the marker and not just the code.
+    pub fn marker(argc: u32, name: str, env: Env, executed: u32) str {
+        if (argc < MIN_ARGC) {
+            return MARK_USAGE;
+        }
+        if (!known_module(name)) {
+            return MARK_UNKNOWN;
+        }
+        if (!env.have_iverilog) {
+            return MARK_ABSENT;
+        }
+        if (!env.build_ok) {
+            return MARK_BUILD;
+        }
+        if (!env.have_vvp) {
+            return MARK_ABSENT;
+        }
+        if (sim_verdict(env.sim_said_pass, env.sim_rc) == EXIT_PASS && executed == 0) {
+            return MARK_ABSENT;
+        }
+        if (sim_verdict(env.sim_said_pass, env.sim_rc) == EXIT_PASS) {
+            return MARK_PASS;
+        }
+        return MARK_BUILD;
+    }
+
+    // ------------------------------------------------------------------
+    // The runtime's side: building, running, reading. Not this spec's.
+    // ------------------------------------------------------------------
+
+    pub fn render_testbench(top: str, body: str) str {
+        undefined;
+    }
+
+    pub fn build_testbench(verilog_path: str, tb_path: str, out_path: str) bool {
+        undefined;
+    }
+
+    pub fn run_vvp(vvp_path: str) Env {
+        undefined;
+    }
+
+    // ==================================================================
+    // Tests
+    // ==================================================================
+
+    test "the prescaler register holds log2 of the divisor, less two"
+        // A divisor of 4 is three bits wide, so the code is 1 -- the case the
+        // Python's own test pins.
+        assert(prescaler_code(4) == 1);
+        assert(prescaler_code(8) == 2);
+        assert(prescaler_code(16) == 3);
+        assert(prescaler_code(256) == 7);
+        // Below the register's domain the code goes negative, which is a
+        // visible wrong answer rather than a large plausible one.
+        assert(prescaler_code(2) == 0);
+        assert(prescaler_code(1) == -1);
+        assert(bit_width(0) == 0);
+
+    test "a simulation passes only if it said so AND exited zero"
+        assert(sim_verdict(true, 0) == EXIT_PASS);
+        // Exited clean having printed nothing.
+        assert(sim_verdict(false, 0) == EXIT_FAIL);
+        // Printed the passing line and then died.
+        assert(sim_verdict(true, 1) == EXIT_FAIL);
+        assert(sim_verdict(false, 1) == EXIT_FAIL);
+
+    test "an absent simulator is not a failed vector set"
+        // T117. This is the distinction the exit codes exist to draw: 2 is
+        // "nothing ran", 1 is "something ran and was wrong".
+        const no_iverilog = Env { have_iverilog: false, build_ok: true, have_vvp: true, sim_said_pass: true, sim_rc: 0 };
+        assert(run_module(no_iverilog, 12).rc == EXIT_UNRUN);
+        // And the case count is reset, because cases that never ran are not
+        // executed cases however many the vector file held.
+        assert(run_module(no_iverilog, 12).executed == 0);
+
+        const no_vvp = Env { have_iverilog: true, build_ok: true, have_vvp: false, sim_said_pass: true, sim_rc: 0 };
+        assert(run_module(no_vvp, 12).rc == EXIT_UNRUN);
+        assert(run_module(no_vvp, 12).executed == 0);
+
+        // A build failure is the other thing: the simulator was there and the
+        // RTL would not compile, so it is a 1 and the count stands.
+        const bad_rtl = Env { have_iverilog: true, build_ok: false, have_vvp: true, sim_said_pass: false, sim_rc: 0 };
+        assert(run_module(bad_rtl, 12).rc == EXIT_FAIL);
+        assert(run_module(bad_rtl, 12).executed == 12);
+
+    test "zero executed cases is a failure, not a vacuous pass"
+        // T67. "all executed cases passed" over an empty set is true and
+        // worthless, and it is exactly what an emptied vector file produces.
+        assert(final_verdict(EXIT_PASS, 0) == EXIT_FAIL);
+        assert(final_verdict(EXIT_PASS, 1) == EXIT_PASS);
+        // A run that already failed is not re-judged by its count.
+        assert(final_verdict(EXIT_FAIL, 0) == EXIT_FAIL);
+        assert(final_verdict(EXIT_UNRUN, 0) == EXIT_UNRUN);
+
+    test "the registry refuses what it does not know rather than attempting it"
+        assert(known_module(REGISTRY_MODULE));
+        assert(!known_module("not_a_real_module"));
+        const ok_env = Env { have_iverilog: true, build_ok: true, have_vvp: true, sim_said_pass: true, sim_rc: 0 };
+        assert(main_verdict(3, "not_a_real_module", ok_env, 0) == EXIT_UNRUN);
+        // Too few arguments is usage, and usage is not a pass.
+        assert(main_verdict(1, REGISTRY_MODULE, ok_env, 12) == EXIT_UNRUN);
+        assert(main_verdict(2, REGISTRY_MODULE, ok_env, 12) == EXIT_UNRUN);
+        // A whole good run.
+        assert(main_verdict(3, REGISTRY_MODULE, ok_env, 12) == EXIT_PASS);
+        // The same good run over no cases at all is a failure.
+        assert(main_verdict(3, REGISTRY_MODULE, ok_env, 0) == EXIT_FAIL);
+
+    test "each branch says its own name, because the exit codes collide"
+        const ok_env = Env { have_iverilog: true, build_ok: true, have_vvp: true, sim_said_pass: true, sim_rc: 0 };
+        const no_sim = Env { have_iverilog: false, build_ok: true, have_vvp: true, sim_said_pass: true, sim_rc: 0 };
+        const bad_rtl = Env { have_iverilog: true, build_ok: false, have_vvp: true, sim_said_pass: false, sim_rc: 0 };
+
+        // Three different branches, all exit 2, all distinguishable by text.
+        assert(main_verdict(1, REGISTRY_MODULE, ok_env, 12) == EXIT_UNRUN);
+        assert(main_verdict(3, "nope", ok_env, 12) == EXIT_UNRUN);
+        assert(main_verdict(3, REGISTRY_MODULE, no_sim, 12) == EXIT_UNRUN);
+        assert(marker(1, REGISTRY_MODULE, ok_env, 12) == MARK_USAGE);
+        assert(marker(3, "nope", ok_env, 12) == MARK_UNKNOWN);
+        assert(marker(3, REGISTRY_MODULE, no_sim, 12) == MARK_ABSENT);
+
+        // Two different branches, both exit 1.
+        assert(main_verdict(3, REGISTRY_MODULE, bad_rtl, 12) == EXIT_FAIL);
+        assert(main_verdict(3, REGISTRY_MODULE, ok_env, 0) == EXIT_FAIL);
+        assert(marker(3, REGISTRY_MODULE, bad_rtl, 12) == MARK_BUILD);
+        assert(marker(3, REGISTRY_MODULE, ok_env, 0) == MARK_ABSENT);
+
+        // And the passing path names itself too.
+        assert(marker(3, REGISTRY_MODULE, ok_env, 12) == MARK_PASS);
+}

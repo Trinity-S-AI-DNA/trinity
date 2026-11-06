@@ -1,0 +1,362 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/verified/signed_receipt.t27 -- who wrote a receipt, and for which challenge. Epic
+; gHashTag/t27#6655, Round 3, item R3-1 (issue #7332). This file is the contract half: the tool
+; change that signs and checks receipts comes after it and changes no decision made here.
+; --
+; What already exists and is NOT restated here:
+; - specs/verified/receipt.t27 (#6943) owns the SHAPE of a receipt: six fields, fixed order,
+;   receipt_first_missing. A signature does not make an incomplete receipt complete, and an
+;   unsigned receipt is not incomplete -- the two judgments are separate and both are reported.
+; - specs/verified/run_record.t27 (#7061) owns whether a set of receipts is one verified run
+;   (count, completeness, agreement, producer). citable_at reads its answer; it never re-judges it.
+; - specs/verified/payout.t27 owns the ledger's spent-nonce set for billing. The nonce here is the
+;   VERIFIER's challenge for one run; it is not a billing nonce and does not feed the ledger.
+; --
+; Why (competitor comparison 2026-10-07, recorded on #7332): every serious verifiable-compute
+; system binds its receipt to an identity -- a TEE quote (Phala, NVIDIA CC), a staked operator key
+; (EigenAI, Gonka) or the proof itself (zkML) -- and the TEE systems bind it to a fresh challenge.
+; Until this rule, a t27 receipt was a file any editor could write, and a real PASS receipt could
+; be offered again for a later run.
+; --
+; The rule:
+; - Scheme: Ed25519 (RFC 8032), 32-byte public key, 64-byte signature.
+; - The signed message is the domain line RECEIPT_DOMAIN, then one line per signed field in
+;   SIGNED_FIELDS order, each `name=value` where value is the field's JSON text as the receipt
+;   stores it, every line ending in a newline. The nonce is a signed field: a signature that did
+;   not cover the nonce would let anyone staple a fresh nonce onto an old receipt.
+; - Judged in fixed order: the receipt is signed; its key is registered in the tree (KEY_DIR); the
+;   signature verifies over the message; and, only when the verifier issued a challenge, the
+;   receipt carries a nonce of at least NONCE_MIN_BYTES and that nonce is the challenge. The
+;   signature is judged before the nonce because an unverified nonce is just text.
+; - Levels: LEVEL_NONE (no authorship is established), LEVEL_AUTHOR (a registered key wrote these
+;   exact bytes; replayable), LEVEL_FRESH (and for this verifier's challenge). A run's level is
+;   its lowest receipt's level: one unsigned receipt makes the run unsigned.
+; - The honest ceiling: a host key proves which host's toolchain wrote the bytes. It does not
+;   prove that a given die computed the verdict, and no level here says so (DEVICE_ROOTED_LEVELS
+;   is 0). The die's DNA read live and signed is specs/verified/die_binding.t27 (R3-2): it NAMES
+;   the die, but the DNA is no secret, so it is still the signer's claim and roots nothing.
+; - The private key never lives inside the repository: the tool refuses a key path inside the
+;   repository root, ignored by git or not. Public keys are committed under KEY_DIR, named by
+;   KEY_ID_HEX_LEN hex characters of the SHA-256 of the public key.
+; - Receipts written before this rule (the R2-5 capstone) stay what they were: complete, citable
+;   at LEVEL_NONE, and claimed at no higher level.
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module VerifiedSignedReceipt;
+
+use verified::run_record;
+
+/// The signed message starts with this line, so a receipt signature can never be replayed as a
+/// signature over some other kind of t27 record.
+pub const RECEIPT_DOMAIN : str = "t27-receipt-v1";
+
+/// The signed fields, in message order: receipt.t27's six, then the run's spec and time, then the
+/// verifier's nonce. The key id and the signature are not signed fields: they are the envelope.
+pub const SIGNED_FIELDS : [9]str = ["device_record", "full_idcode", "verdict_word", "seal_hash", "seeds", "toolchain", "spec", "utc_unix", "nonce"];
+pub const SIGNED_FIELD_COUNT : u8 = 9;
+
+/// Ed25519 sizes (RFC 8032).
+pub const PUBLIC_KEY_BYTES : u8 = 32;
+pub const SIGNATURE_BYTES : u8 = 64;
+
+/// A nonce shorter than 128 bits is guessable in advance and so challenges nothing.
+pub const NONCE_MIN_BYTES : u8 = 16;
+
+/// Where public keys live in the tree, and how long a key id is (hex chars of SHA-256(pubkey)).
+pub const KEY_DIR : str = ".trinity/keys";
+pub const KEY_ID_HEX_LEN : u8 = 16;
+
+/// auth_first_missing() answers, in judgment order.
+pub const AUTH_MISSING_NONE : u8 = 0;
+pub const AUTH_UNSIGNED : u8 = 1;
+pub const AUTH_KEY_NOT_REGISTERED : u8 = 2;
+pub const AUTH_BAD_SIGNATURE : u8 = 3;
+pub const AUTH_NO_NONCE : u8 = 4;
+pub const AUTH_NONCE_NOT_CHALLENGE : u8 = 5;
+
+/// Authentication levels, lowest first, so a run's level is a minimum.
+pub const LEVEL_NONE : u8 = 0;
+pub const LEVEL_AUTHOR : u8 = 1;
+pub const LEVEL_FRESH : u8 = 2;
+
+/// Whether a nonce of this many bytes can be a challenge at all.
+pub fn nonce_long_enough(nonce_bytes: u8) -> bool {
+    return nonce_bytes >= NONCE_MIN_BYTES;
+}
+
+/// The first fact that keeps this receipt from being authenticated, or AUTH_MISSING_NONE. The
+/// nonce is judged only when the verifier issued a challenge, and only after the signature.
+pub fn auth_first_missing(signed: bool, key_registered: bool, signature_valid: bool, challenge_given: bool, nonce_bytes: u8, nonce_is_challenge: bool) -> u8 {
+    if (signed == false) { return AUTH_UNSIGNED; }
+    if (key_registered == false) { return AUTH_KEY_NOT_REGISTERED; }
+    if (signature_valid == false) { return AUTH_BAD_SIGNATURE; }
+    if (challenge_given) {
+        if (nonce_long_enough(nonce_bytes) == false) { return AUTH_NO_NONCE; }
+        if (nonce_is_challenge == false) { return AUTH_NONCE_NOT_CHALLENGE; }
+    }
+    return AUTH_MISSING_NONE;
+}
+
+/// The level one receipt reaches. Authorship fails on the first three codes; a genuine signature
+/// over a stale or missing nonce is still authorship, but it is not freshness.
+pub fn receipt_level(signed: bool, key_registered: bool, signature_valid: bool, challenge_given: bool, nonce_bytes: u8, nonce_is_challenge: bool) -> u8 {
+    var code : u8 = auth_first_missing(signed, key_registered, signature_valid, challenge_given, nonce_bytes, nonce_is_challenge);
+    if (code == AUTH_UNSIGNED) { return LEVEL_NONE; }
+    if (code == AUTH_KEY_NOT_REGISTERED) { return LEVEL_NONE; }
+    if (code == AUTH_BAD_SIGNATURE) { return LEVEL_NONE; }
+    if (challenge_given == false) { return LEVEL_AUTHOR; }
+    if (code == AUTH_MISSING_NONE) { return LEVEL_FRESH; }
+    return LEVEL_AUTHOR;
+}
+
+/// The starting value of a run's level fold: the highest level, so the first receipt sets it.
+pub fn run_level_start() -> u8 {
+    return LEVEL_FRESH;
+}
+
+/// Fold one receipt's level into the run's: the run is as authenticated as its weakest receipt.
+pub fn run_level_with(run_level: u8, next_receipt_level: u8) -> u8 {
+    if (next_receipt_level < run_level) { return next_receipt_level; }
+    return run_level;
+}
+
+/// May a verdict record cite this run at the level it requires? Completeness is run_record.t27's
+/// answer, passed through; the level only ever narrows what is citable.
+pub fn citable_at(run_code: u8, run_level: u8, required_level: u8) -> bool {
+    if (run_code != RUN_MISSING_NONE) { return false; }
+    return run_level >= required_level;
+}
+
+/// The honest ceiling: how many of the levels defined here are rooted in the device. None: a host
+/// signature names the host's toolchain, not the die that computed the word (that is R3-2).
+pub const DEVICE_ROOTED_LEVELS : u8 = 0;
+
+/// The tool may read a private key only from a path outside the repository root.
+pub fn private_key_path_allowed(inside_repo: bool) -> bool {
+    return inside_repo == false;
+}
+
+; --- The signed message, one line at a time ------------------------------------------------------
+; The tool asks for character k of each line and stops at the line's length; the bytes it signs
+; and verifies are exactly these. A field line is `name=value` and a newline, where value is the
+; field's JSON text as the receipt stores it (null when absent).
+
+pub const CH_NEWLINE : u32 = 10;
+pub const CH_EQUALS : u32 = 61;
+/// What a char-at function answers past the end of its line.
+pub const LINE_END : u32 = 256;
+
+/// The first line: RECEIPT_DOMAIN, then a newline.
+pub fn domain_line_len() -> u32 {
+    return (RECEIPT_DOMAIN.len as u32) + 1;
+}
+
+pub fn domain_line_char(k: u32) -> u32 {
+    if (k < (RECEIPT_DOMAIN.len as u32)) { return RECEIPT_DOMAIN[k] as u32; }
+    if (k == (RECEIPT_DOMAIN.len as u32)) { return CH_NEWLINE; }
+    return LINE_END;
+}
+
+/// One signed field's line: name, `=`, value, newline.
+pub fn field_line_len(name: string, value: string) -> u32 {
+    return (name.len as u32) + 1 + (value.len as u32) + 1;
+}
+
+pub fn field_line_char(name: string, value: string, k: u32) -> u32 {
+    var n : u32 = name.len as u32;
+    var v : u32 = value.len as u32;
+    if (k < n) { return name[k] as u32; }
+    if (k == n) { return CH_EQUALS; }
+    if (k < n + 1 + v) { return value[k - n - 1] as u32; }
+    if (k == n + 1 + v) { return CH_NEWLINE; }
+    return LINE_END;
+}
+
+; --- Hex: keys, signatures, nonces and key ids are written as lowercase hex ----------------------
+
+/// Not a hex digit (hex_digit_value's refusal).
+pub const HEX_NOT_A_DIGIT : u32 = 16;
+
+/// The lowercase hex digit for a nibble 0..15.
+pub fn hex_digit_char(nibble: u32) -> u32 {
+    if (nibble < 10) { return 48 + nibble; }
+    return 87 + nibble;
+}
+
+/// The value of a hex digit, either case; HEX_NOT_A_DIGIT for anything else.
+pub fn hex_digit_value(c: u32) -> u32 {
+    if (c >= 48) { if (c <= 57) { return c - 48; } }
+    if (c >= 97) { if (c <= 102) { return c - 87; } }
+    if (c >= 65) { if (c <= 70) { return c - 55; } }
+    return HEX_NOT_A_DIGIT;
+}
+
+/// A key id can name a file only under KEY_DIR: exactly KEY_ID_HEX_LEN hex digits, so no `/`,
+/// no `.` and no empty name can walk out of the directory.
+pub fn key_id_well_formed(id: string) -> bool {
+    if ((id.len as u32) != (KEY_ID_HEX_LEN as u32)) { return false; }
+    var k : u32 = 0;
+    while (k < (id.len as u32)) {
+        if (hex_digit_value(id[k] as u32) == HEX_NOT_A_DIGIT) { return false; }
+        k = k + 1;
+    }
+    return true;
+}
+
+test "a signed receipt from a registered key with a valid signature is authored" {
+    assert auth_first_missing(true, true, true, false, 0, false) == AUTH_MISSING_NONE;
+    assert receipt_level(true, true, true, false, 0, false) == LEVEL_AUTHOR;
+}
+
+test "with a challenge, the receipt that answers it is fresh" {
+    assert auth_first_missing(true, true, true, true, 16, true) == AUTH_MISSING_NONE;
+    assert receipt_level(true, true, true, true, 16, true) == LEVEL_FRESH;
+    assert receipt_level(true, true, true, true, 32, true) == 2;
+}
+
+test "each missing authentication fact names itself, in judgment order" {
+    assert auth_first_missing(false, false, false, true, 0, false) == 1;
+    assert auth_first_missing(true, false, false, true, 0, false) == 2;
+    assert auth_first_missing(true, true, false, true, 0, false) == 3;
+    assert auth_first_missing(true, true, true, true, 0, false) == 4;
+    assert auth_first_missing(true, true, true, true, 16, false) == 5;
+    assert auth_first_missing(true, true, true, true, 16, true) == 0;
+}
+
+test "the signature is judged before the nonce" {
+    // a forged receipt carrying the right nonce is still a forgery
+    assert auth_first_missing(true, true, false, true, 16, true) == AUTH_BAD_SIGNATURE;
+    assert receipt_level(true, true, false, true, 16, true) == LEVEL_NONE;
+}
+
+test "an unsigned or unregistered receipt establishes no authorship" {
+    assert receipt_level(false, true, true, false, 0, false) == LEVEL_NONE;
+    assert receipt_level(true, false, true, false, 0, false) == LEVEL_NONE;
+    assert receipt_level(true, true, false, false, 0, false) == LEVEL_NONE;
+    assert receipt_level(false, false, false, true, 16, true) == 0;
+}
+
+test "a genuine receipt replayed against a new challenge is authored but not fresh" {
+    assert auth_first_missing(true, true, true, true, 16, false) == AUTH_NONCE_NOT_CHALLENGE;
+    assert receipt_level(true, true, true, true, 16, false) == LEVEL_AUTHOR;
+    assert receipt_level(true, true, true, true, 16, false) == 1;
+}
+
+test "a nonce shorter than 128 bits challenges nothing" {
+    assert nonce_long_enough(16) == true;
+    assert nonce_long_enough(15) == false;
+    assert nonce_long_enough(0) == false;
+    assert auth_first_missing(true, true, true, true, 15, true) == AUTH_NO_NONCE;
+    assert receipt_level(true, true, true, true, 15, true) == LEVEL_AUTHOR;
+}
+
+test "without a challenge the nonce is not judged" {
+    assert auth_first_missing(true, true, true, false, 0, false) == AUTH_MISSING_NONE;
+    assert auth_first_missing(true, true, true, false, 16, false) == AUTH_MISSING_NONE;
+    // and freshness cannot be reached without a challenge to be fresh for
+    assert receipt_level(true, true, true, false, 16, true) == LEVEL_AUTHOR;
+}
+
+test "a run is as authenticated as its weakest receipt" {
+    assert run_level_start() == LEVEL_FRESH;
+    assert run_level_with(run_level_with(run_level_with(run_level_start(), 2), 2), 2) == LEVEL_FRESH;
+    assert run_level_with(run_level_with(run_level_with(run_level_start(), 2), 1), 2) == LEVEL_AUTHOR;
+    assert run_level_with(run_level_with(run_level_with(run_level_start(), 2), 2), 0) == LEVEL_NONE;
+    assert run_level_with(1, 2) == 1;
+    assert run_level_with(2, 1) == 1;
+    assert run_level_with(1, 1) == 1;
+}
+
+test "citability needs a complete run and the level the citation requires" {
+    assert citable_at(RUN_MISSING_NONE, LEVEL_FRESH, LEVEL_FRESH) == true;
+    assert citable_at(RUN_MISSING_NONE, LEVEL_AUTHOR, LEVEL_FRESH) == false;
+    assert citable_at(RUN_MISSING_NONE, LEVEL_AUTHOR, LEVEL_AUTHOR) == true;
+    // a signature never rescues an incomplete run
+    assert citable_at(RUN_TOO_FEW_RECEIPTS, LEVEL_FRESH, LEVEL_NONE) == false;
+    assert citable_at(RUN_PRODUCER_MISMATCH, LEVEL_FRESH, LEVEL_AUTHOR) == false;
+}
+
+test "receipts written before this rule stay citable at level none and no higher" {
+    assert citable_at(RUN_MISSING_NONE, LEVEL_NONE, LEVEL_NONE) == true;
+    assert citable_at(RUN_MISSING_NONE, LEVEL_NONE, LEVEL_AUTHOR) == false;
+}
+
+test "no level is device-rooted" {
+    assert DEVICE_ROOTED_LEVELS == 0;
+}
+
+test "a private key inside the repository is refused" {
+    assert private_key_path_allowed(true) == false;
+    assert private_key_path_allowed(false) == true;
+}
+
+test "the message and key sizes are the RFC 8032 ones" {
+    assert SIGNED_FIELD_COUNT == 9;
+    assert PUBLIC_KEY_BYTES == 32;
+    assert SIGNATURE_BYTES == 64;
+    assert NONCE_MIN_BYTES == 16;
+    assert KEY_ID_HEX_LEN == 16;
+}
+
+test "the levels are ordered so a run's level is a minimum" {
+    assert LEVEL_NONE == 0;
+    assert LEVEL_AUTHOR == 1;
+    assert LEVEL_FRESH == 2;
+    assert LEVEL_NONE < LEVEL_AUTHOR;
+    assert LEVEL_AUTHOR < LEVEL_FRESH;
+}
+
+test "the message starts with the domain line" {
+    assert domain_line_len() == 15;
+    assert domain_line_char(0) == 116;
+    assert domain_line_char(13) == 49;
+    assert domain_line_char(14) == CH_NEWLINE;
+    assert domain_line_char(15) == LINE_END;
+}
+
+test "a field line is name, equals, value, newline" {
+    assert field_line_len("seeds", "[7]") == 10;
+    assert field_line_char("seeds", "[7]", 0) == 115;
+    assert field_line_char("seeds", "[7]", 4) == 115;
+    assert field_line_char("seeds", "[7]", 5) == CH_EQUALS;
+    assert field_line_char("seeds", "[7]", 6) == 91;
+    assert field_line_char("seeds", "[7]", 8) == 93;
+    assert field_line_char("seeds", "[7]", 9) == CH_NEWLINE;
+    assert field_line_char("seeds", "[7]", 10) == LINE_END;
+}
+
+test "an absent nonce is signed as null" {
+    assert field_line_len("nonce", "null") == 11;
+    assert field_line_char("nonce", "null", 6) == 110;
+    assert field_line_char("nonce", "null", 9) == 108;
+    assert field_line_char("nonce", "null", 10) == CH_NEWLINE;
+}
+
+test "hex digits are lowercase going out and either case coming in" {
+    assert hex_digit_char(0) == 48;
+    assert hex_digit_char(9) == 57;
+    assert hex_digit_char(10) == 97;
+    assert hex_digit_char(15) == 102;
+    assert hex_digit_value(48) == 0;
+    assert hex_digit_value(57) == 9;
+    assert hex_digit_value(97) == 10;
+    assert hex_digit_value(102) == 15;
+    assert hex_digit_value(65) == 10;
+    assert hex_digit_value(70) == 15;
+    assert hex_digit_value(47) == HEX_NOT_A_DIGIT;
+    assert hex_digit_value(58) == HEX_NOT_A_DIGIT;
+    assert hex_digit_value(96) == HEX_NOT_A_DIGIT;
+    assert hex_digit_value(103) == HEX_NOT_A_DIGIT;
+    assert hex_digit_value(64) == HEX_NOT_A_DIGIT;
+    assert hex_digit_value(71) == HEX_NOT_A_DIGIT;
+}
+
+test "a key id is exactly sixteen hex digits" {
+    assert key_id_well_formed("0123456789abcdef") == true;
+    assert key_id_well_formed("0123456789ABCDEF") == true;
+    assert key_id_well_formed("0123456789abcde") == false;
+    assert key_id_well_formed("0123456789abcdef0") == false;
+    assert key_id_well_formed("../../../etc/pas") == false;
+    assert key_id_well_formed("0123456789abcdeg") == false;
+    assert key_id_well_formed("") == false;
+}

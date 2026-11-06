@@ -1,0 +1,1005 @@
+module TrinityFpgaDdr3LoaderT27;
+
+// The UART loader of issue #63 on the DDR3 build (part 2, docs/uart-loader.md,
+// "DDR3"): t27/rtl/fpga_uart_loader.t27 (part 1, block RAM) with four changes, and
+// otherwise the same frame parser, CRC, staging buffer, commit, read-back, responses,
+// baud change and port watchdog, line for line (tests/test_ddr3_loader.py compares the
+// two files and allows only the marked differences). It runs on UberDDR3's controller
+// clock (83.33 MHz on the AX7203); the store behind its write and read ports is the
+// Wishbone master t27/rtl/fpga_loader_wb.t27 on UberDDR3's user port (through the
+// arbiter t27/rtl/fpga_wb_arbiter.t27), wired by fpga/ax7203/ddr3/tms_ddr3_loader_ax7203.v.
+// The part-1 file is left as it was, so the block-RAM build keeps its netlist.
+//
+// [ddr3] 1. Calibration: loads and reads are refused with reason NOT_READY (9) until
+//   UberDDR3's o_calib_complete (`calib`) is high; the check comes after the frame's
+//   CRC matched, so the whole frame has been consumed and the parser stays in step.
+// [ddr3] 2. Protocol 3 (the H line and status line `config`): reason 9 and fourteen
+//   more status lines (STATUS_LINES 37): nak_not_ready; the calibration word
+//   (calib_complete << 24 | state << 16 | highest state << 8 | returns to IDLE,
+//   the status reporter's S-line layout, t27/rtl/fpga_ddr3_status.t27); the clocks
+//   since reset at the first calib_complete; the clocks since then with calib_complete
+//   low or a state other than 23 (DONE_CALIBRATE), counted every clock, so 0 means the
+//   calibration held at every clock since it completed; and the Wishbone master's and
+//   the arbiter's counters (inputs, docs/uart-loader.md).
+// [ddr3] 3. The block-RAM store is not in this module in either part; here the ports
+//   lead to the Wishbone master instead (wiring only).
+// [ddr3] 4. `port_give_up` (an output, one clock) says the port watchdog gave up during a
+//   commit or a read-back: the Wishbone master then drops the bytes of a word it has not
+//   written yet and the ack of a read still outstanding, whenever it comes, and gives the
+//   port back once nothing is outstanding (a block-RAM store never stalls, so part 1 has
+//   no use for it).
+//
+// Part 1's description of the protocol follows unchanged.
+// Host-to-board UART loader with per-chunk acknowledgement (issue #63). The frame
+// protocol is specified in docs/uart-loader.md; tools/uart_loader_protocol.py
+// states it in Python for the host tool and the tests.
+//
+// Input: the bytes of t27/rtl/fpga_uart_rx.t27 (rx_valid, rx_data, rx_ferr) enter
+// a FIFO of FIFO_DEPTH entries in block RAM; each entry is the byte, its framing
+// error and a gap mark (a byte before it was dropped because the FIFO was full).
+// The parser takes one entry every other clock while it is receiving and none
+// while it commits a chunk, reads chunks back or waits for the line emitter:
+// that is the backpressure. A response line is issued only when the emitter is
+// idle, so no response is ever overwritten or dropped; bytes that arrive
+// meanwhile wait in the FIFO, and only a FIFO overflow can lose a byte, which the
+// gap mark turns into an OVERFLOW nak of the frame it belonged to (or, when the
+// dropped bytes ended the frame, the timeout does).
+//
+// Frame, host to device (all integers little endian):
+//   A5 5A cmd seq addr[4] len[2] payload[len if cmd = 'L'] crc32[4]
+// crc32 is zlib's CRC-32 (poly 0xEDB88320, as t27/container.t27) over cmd .. the
+// last payload byte. While hunting, every byte other than A5 5A is ignored; an A5
+// followed by anything but 5A (or A5) is ignored as well. cmd:
+//   'L' load   len 1..MAX_LEN payload bytes into the store at addr (addr + len <= store size)
+//   'R' read   return len 1..MAX_LEN stored bytes from addr as one binary frame
+//   'S' status len 0: STATUS_LINES counter lines
+//   'B' baud   len 0, addr = new clocks per bit (MIN_DIV..MAX_DIV); after the ack
+//              line has left, receiver and transmitter change to it; unless a frame
+//              with a good CRC arrives within probation_clocks, they return to
+//              default_div (the host's escape if the new rate does not work). The
+//              first good frame at the new rate ends the probation: from then on only
+//              another 'B' frame or reset changes the rate. A 'B' frame back to
+//              default_div needs no confirmation and clears baud_sel.
+// A load's payload goes into the staging buffer (MAX_LEN bytes of block RAM) and
+// is committed into the store through the write port only after its CRC
+// matched: one byte per transfer (wr_valid, wr_addr, wr_data, wr_last; a
+// transfer happens on a clock with wr_valid and wr_ready), then the loader waits
+// for wr_idle (every write done) before it acknowledges. A load whose seq, addr,
+// len and crc equal the last committed load's is a duplicate (its ack was lost):
+// it is acknowledged again, reason DUP, and not committed. A read issues one
+// request per byte on the read port (rd_req, rd_addr; accepted on a clock with
+// rd_ready; the byte comes back with rd_valid) and sends
+//   A5 5A 'r' seq addr[4] len[2] data[len] crc32[4]
+// with the same CRC rule.
+// Port contract (what the store behind the ports must do): wr_idle is low from the
+// clock after an accepted transfer until that write is done (the loader samples it
+// on the next clock); rd_valid comes once per accepted request, in the accepting
+// clock or any later one, never before. Watchdog: a port that makes no progress for
+// timeout_clocks (wr_ready or wr_idle during a commit, rd_ready or rd_valid during a
+// read-back) ends the command with a PORT nak; a read-back already under way is
+// finished with zero bytes and a CRC that does not match, so the host's decoder stays
+// in step, and then the nak follows. After such a nak the port must not deliver a
+// answer to the abandoned request (the block-RAM store never stalls). The store behind both ports is
+// t27/rtl/fpga_loader_store.t27 (block RAM) here; a DDR3 Wishbone master can take
+// its place (docs/uart-loader.md, "DDR3").
+// Once a frame has started (A5 5A), a gap of timeout_clocks with no byte drops
+// it (a dropped byte, a host that stopped mid-frame, the glitch of a port that
+// opened).
+//
+// Response lines through t27/rtl/fpga_line_emitter.t27 (tag, a, b; b is 40 bits,
+// b = (check << 32) | v, check = low byte of the CRC-32 of tag, a[4], v[4]):
+//   H a=build_id  v=(PROTO << 24) | (log2 MAX_LEN << 16) | (log2 store size << 8) | log2 FIFO_DEPTH  (after reset)
+//   A a=resp_word(seq, reason OK or DUP)   v=(frames committed << 16) | naks, both mod 2^16
+//   N a=resp_word(seq, reason)            v=the same counts
+//   C a=(seq << 24) | (STATUS_LINES << 16) | index   v=counter (status_value)
+// resp_word = (seq << 24) | (reason << 20) | (command << 17) | (seq known << 16) | len.
+// Every statement of on_clock reads a variable before the same tick writes it,
+// so the C and the Verilog backends agree on the functions; the module as a whole
+// is checked in Icarus (tests/test_uart_loader.py).
+const P_HELLO: u32 = 0;
+const P_HUNT: u32 = 1;
+const P_SYNC1: u32 = 2;
+const P_HDR: u32 = 3;
+const P_PAYLOAD: u32 = 4;
+const P_CRC: u32 = 5;
+const P_HDR_CHECK: u32 = 6;
+const P_CHECK: u32 = 7;
+const P_NAK: u32 = 8;
+const P_RESP: u32 = 9;
+const P_RESP_WAIT: u32 = 10;
+const P_COMMIT_RD: u32 = 11;
+const P_COMMIT_SET: u32 = 12;
+const P_COMMIT_WR: u32 = 13;
+const P_COMMIT_DRAIN: u32 = 14;
+const P_RB_NEXT: u32 = 15;
+const P_RB_REQ: u32 = 16;
+const P_RB_RESP: u32 = 17;
+const P_RB_SEND: u32 = 18;
+const P_STATUS: u32 = 19;
+const P_BAUD: u32 = 20;
+
+const MAGIC0: u32 = 165;
+const MAGIC1: u32 = 90;
+const CMD_LOAD: u32 = 76;
+const CMD_READ: u32 = 82;
+const CMD_STATUS: u32 = 83;
+const CMD_BAUD: u32 = 66;
+const RESP_READ: u32 = 114;
+
+const R_OK: u32 = 0;
+const R_DUP: u32 = 1;
+const R_CRC: u32 = 2;
+const R_LENGTH: u32 = 3;
+const R_TIMEOUT: u32 = 4;
+const R_FRAMING: u32 = 5;
+const R_COMMAND: u32 = 6;
+const R_OVERFLOW: u32 = 7;
+const R_PORT: u32 = 8;
+const R_NOT_READY: u32 = 9;          // [ddr3]
+
+const TAG_H: u32 = 72;
+const TAG_A: u32 = 65;
+const TAG_N: u32 = 78;
+const TAG_C: u32 = 67;
+
+const PROTO: u32 = 3;                // [ddr3] 2 in part 1
+const MAX_LEN: u32 = 4096;
+const MAX_LEN_LOG2: u32 = 12;
+const STAGE_WORD_MASK: u32 = 1023;
+const FIFO_DEPTH: u32 = 1024;
+const FIFO_LOG2: u32 = 10;
+const FIFO_MASK: u32 = 1023;
+const PTR_MASK: u32 = 2047;
+const MIN_DIV: u32 = 16;
+const MAX_DIV: u32 = 65535;
+const STATUS_LINES: u32 = 37;        // [ddr3] 23 in part 1
+const ST_CLOCKS: u32 = 20;           // [ddr3] the status line `clocks`
+const DONE_CALIBRATE: u32 = 23;      // [ddr3]
+const RESP_SETTLE: u8 = 11;          // [ddr3] clocks P_RESP waits for the check byte pipeline
+const ALL_ONES: u32 = 4294967295;
+const CRC_POLY: u32 = 3988292384;
+
+// Receive FIFO and staging buffer (block RAM; the read registers take the array
+// word directly and have no reset value). The staging buffer holds four payload
+// bytes per 32-bit word, byte k of the chunk in bits 8 (k mod 4) + 7 .. 8 (k mod 4)
+// of word k / 4, so that it maps to the RAMB36 1K x 36 configuration: RAMB36 in the
+// narrower configurations lost every even byte on the board (docs/uart-loader.md).
+var fifo: [1024]u16;
+var fifo_rdata: u16;
+var staging: [1024]u32;
+var stage_rdata: u32;
+var stage_acc: u32 = 0;
+var wp: u32 = 0;
+var rp: u32 = 0;
+var gap_pending: bool = false;
+var fetched: bool = false;
+
+// Parser and the frame being received.
+var pstate: u8 = 0;                  // [ddr3] u8: narrower state compares (u32 in part 1)
+var hdr_i: u8 = 0;                   // [ddr3] u8
+var pay_i: u32 = 0;
+var crc_i: u8 = 0;                   // [ddr3] u8
+var crc: u32 = 0;
+var h_cmd: u32 = 0;
+var h_seq: u32 = 0;
+var seq_known: bool = false;
+var h_addr: u32 = 0;
+var h_len: u32 = 0;
+var h_crc: u32 = 0;
+var quiet: u32 = 0;
+var nak_reason: u32 = 0;
+
+// The last committed load (duplicate detection).
+var last_valid: bool = false;
+var last_seq: u32 = 0;
+var last_addr: u32 = 0;
+var last_len: u32 = 0;
+var last_crc: u32 = 0;
+
+// Commit, read-back and status.
+var ci: u32 = 0;
+var rb_k: u32 = 0;
+var rb_byte: u32 = 0;
+var tx_crc: u32 = 0;
+var st_i: u8 = 0;                    // [ddr3] u8
+var rb_fail: bool = false;
+var port_wait: u32 = 0;
+
+// Pending response line.
+var resp_tag: u32 = 0;
+var resp_a: u32 = 0;
+var resp_v: u32 = 0;
+var resp_counts: bool = false;
+var resp_after: u8 = 0;              // [ddr3] u8
+
+// Baud rate.
+var baud_sel: bool = false;
+var baud_custom: u32 = 0;
+var probation: bool = false;
+var prob_count: u32 = 0;
+
+// Counters.
+var clocks: u32 = 0;
+var fifo_overflows: u32 = 0;
+var fifo_hwm: u32 = 0;
+var ignored: u32 = 0;
+var frames_ok: u32 = 0;
+var frames_dup: u32 = 0;
+var naks: u32 = 0;
+var nak_crc: u32 = 0;
+var nak_length: u32 = 0;
+var nak_timeout: u32 = 0;
+var nak_framing: u32 = 0;
+var nak_command: u32 = 0;
+var nak_overflow: u32 = 0;
+var nak_port: u32 = 0;
+var bytes_committed: u32 = 0;
+var readbacks: u32 = 0;
+var baud_reverts: u32 = 0;
+var nak_not_ready: u32 = 0;          // [ddr3]
+
+// [ddr3] Calibration, watched every clock (UberDDR3 o_debug1[4:0], 0 IDLE, 23 DONE_CALIBRATE).
+var cal_prev: u32 = 0;
+var cal_top: u32 = 0;
+var cal_recals: u32 = 0;
+var cal_seen: bool = false;
+var cal_at: u32 = 0;
+var cal_lost: u32 = 0;
+
+// [ddr3] Timing: the header rules, the CRC compare and the duplicate compare are registered every
+// clock and read one clock after P_HDR_CHECK or P_CHECK is entered (settle_n), so that the
+// subtraction and the 32-bit compares are not in one path with the state update (83.33 MHz).
+var settle_n: u8 = 0;
+var cmd_known_q: bool = false;
+var hdr_good_q: bool = false;
+var crc_good_q: bool = false;
+var dup_q: bool = false;
+// [ddr3] More registered conditions, each read at least one clock after what it depends on last
+// changed: the timeouts (one clock later than part 1's, of 4 166 666), the last payload and
+// commit byte, the read-back frame's lengths and the response line's check byte. prob_count
+// is 0 outside a probation, so prob_over_q reads false in the first clock of a new one.
+var quiet_over_q: bool = false;
+var port_over_q: bool = false;
+var prob_over_q: bool = false;
+var pay_last_q: bool = false;
+var ci_last_q: bool = false;
+var rb_data_end_q: u32 = 0;
+var rb_end_q: u32 = 0;
+var resp_bits_q: u64 = 0;
+var status_q: u32 = 0;               // the status line of st_i (P_STATUS settles one clock)
+var clocks_at: u32 = 0;              // the clock count for the status line, taken when P_STATUS settles
+// The response line's check byte, one byte of CRC per clock: lc0 after the tag, lc1-lc4 after a,
+// lc5-lc8 after v; resp_bits_q is right RESP_SETTLE clocks after resp_* last changed.
+var lc0: u32 = 0;
+var lc1: u32 = 0;
+var lc2: u32 = 0;
+var lc3: u32 = 0;
+var lc4: u32 = 0;
+var lc5: u32 = 0;
+var lc6: u32 = 0;
+var lc7: u32 = 0;
+var lc8: u32 = 0;
+
+// Outputs: line emitter, raw transmitter bytes, write and read ports.
+var line_go: bool = false;
+var line_tag: u32 = 0;
+var line_a: u32 = 0;
+var line_b: u64 = 0;
+var tx_start: bool = false;
+var tx_byte: u32 = 0;
+var wr_valid: bool = false;
+var wr_addr: u32 = 0;
+var wr_data: u32 = 0;
+var wr_last: bool = false;
+var rd_req: bool = false;
+var rd_addr: u32 = 0;
+var port_give_up: bool = false;       // [ddr3] one clock: the loader gave up on the port (t27/rtl/fpga_loader_wb.t27)
+
+fn crc_byte(c: u32, b: u32) -> u32 {
+    var x: u32 = c ^ (b & 255);
+    var i: u32 = 0;
+    while (i < 8) {
+        if ((x & 1) != 0) { x = (x >> 1) ^ CRC_POLY; } else { x = x >> 1; }
+        i = i + 1;
+    }
+    return x;
+}
+
+// [ddr3] The same CRC-32 byte step as parity sums: output bit i is the parity of the state bits
+// and data bits of fixed masks (derived from crc_byte; tests/test_ddr3_loader.py checks the two
+// agree with zlib), so that synthesis builds a shallow XOR tree instead of eight conditional
+// steps in a row (the routed critical paths of the first netlists ran through such chains).
+fn parity32(x: u32) -> u32 {
+    var y: u32 = x ^ (x >> 16);
+    y = y ^ (y >> 8);
+    y = y ^ (y >> 4);
+    y = y ^ (y >> 2);
+    y = y ^ (y >> 1);
+    return y & 1;
+}
+
+fn crc_byte_par(c: u32, b: u32) -> u32 {
+    var d: u32 = b & 255;
+    var r: u32 = 0;
+    r = r | (parity32((c & 260) ^ (d & 4)) << 0);
+    r = r | (parity32((c & 521) ^ (d & 9)) << 1);
+    r = r | (parity32((c & 1043) ^ (d & 19)) << 2);
+    r = r | (parity32((c & 2086) ^ (d & 38)) << 3);
+    r = r | (parity32((c & 4173) ^ (d & 77)) << 4);
+    r = r | (parity32((c & 8346) ^ (d & 154)) << 5);
+    r = r | (parity32((c & 16432) ^ (d & 48)) << 6);
+    r = r | (parity32((c & 32865) ^ (d & 97)) << 7);
+    r = r | (parity32((c & 65730) ^ (d & 194)) << 8);
+    r = r | (parity32((c & 131200) ^ (d & 128)) << 9);
+    r = r | (parity32((c & 262148) ^ (d & 4)) << 10);
+    r = r | (parity32((c & 524296) ^ (d & 8)) << 11);
+    r = r | (parity32((c & 1048593) ^ (d & 17)) << 12);
+    r = r | (parity32((c & 2097187) ^ (d & 35)) << 13);
+    r = r | (parity32((c & 4194374) ^ (d & 70)) << 14);
+    r = r | (parity32((c & 8388748) ^ (d & 140)) << 15);
+    r = r | (parity32((c & 16777245) ^ (d & 29)) << 16);
+    r = r | (parity32((c & 33554491) ^ (d & 59)) << 17);
+    r = r | (parity32((c & 67108983) ^ (d & 119)) << 18);
+    r = r | (parity32((c & 134217966) ^ (d & 238)) << 19);
+    r = r | (parity32((c & 268435672) ^ (d & 216)) << 20);
+    r = r | (parity32((c & 536871092) ^ (d & 180)) << 21);
+    r = r | (parity32((c & 1073741932) ^ (d & 108)) << 22);
+    r = r | (parity32((c & 2147483864) ^ (d & 216)) << 23);
+    r = r | (parity32((c & 181) ^ (d & 181)) << 24);
+    r = r | (parity32((c & 111) ^ (d & 111)) << 25);
+    r = r | (parity32((c & 223) ^ (d & 223)) << 26);
+    r = r | (parity32((c & 186) ^ (d & 186)) << 27);
+    r = r | (parity32((c & 113) ^ (d & 113)) << 28);
+    r = r | (parity32((c & 227) ^ (d & 227)) << 29);
+    r = r | (parity32((c & 195) ^ (d & 195)) << 30);
+    r = r | (parity32((c & 130) ^ (d & 130)) << 31);
+    return r;
+}
+
+// Check byte of a response line: low byte of the CRC-32 of tag, a (4 bytes) and v (4 bytes).
+fn line_check(tag: u32, a: u32, v: u32) -> u32 {
+    var c: u32 = crc_byte(ALL_ONES, tag);
+    c = crc_byte(c, a);
+    c = crc_byte(c, a >> 8);
+    c = crc_byte(c, a >> 16);
+    c = crc_byte(c, a >> 24);
+    c = crc_byte(c, v);
+    c = crc_byte(c, v >> 8);
+    c = crc_byte(c, v >> 16);
+    c = crc_byte(c, v >> 24);
+    return (c ^ ALL_ONES) & 255;
+}
+
+fn line_bits(tag: u32, a: u32, v: u32) -> u64 {
+    var hi: u64 = line_check(tag, a, v) as u64;
+    return (hi << 32) | (v as u64);
+}
+
+fn cmd_index(cmd: u32) -> u32 {
+    if (cmd == CMD_LOAD) { return 1; }
+    if (cmd == CMD_READ) { return 2; }
+    if (cmd == CMD_STATUS) { return 3; }
+    if (cmd == CMD_BAUD) { return 4; }
+    return 0;
+}
+
+fn resp_word(seq: u32, known: bool, reason: u32, cmd: u32, len: u32) -> u32 {
+    var k: u32 = 0;
+    if (known) { k = 65536; }
+    return ((seq & 255) << 24) | ((reason & 15) << 20) | ((cmd_index(cmd) & 7) << 17) | k | (len & 65535);
+}
+
+fn pow2(n: u32) -> u32 {
+    var one: u32 = 1;
+    return one << n;
+}
+
+// Header rules: loads and reads 1..MAX_LEN bytes inside the store, status and baud
+// without a length, a baud divisor in MIN_DIV..MAX_DIV.
+fn header_ok(cmd: u32, addr: u32, len: u32, store: u32) -> bool {
+    if (cmd == CMD_LOAD || cmd == CMD_READ) {
+        if (len == 0 || len > MAX_LEN || addr >= store) { return false; }
+        var room: u32 = store - addr;
+        return len <= room;
+    }
+    if (cmd == CMD_BAUD) { return len == 0 && addr >= MIN_DIV && addr <= MAX_DIV; }
+    return len == 0;
+}
+
+fn fifo_entry(d: u32, fe: bool, gap: bool) -> u32 {
+    var e: u32 = d & 255;
+    if (fe) { e = e | 256; }
+    if (gap) { e = e | 512; }
+    return e;
+}
+
+// Byte k (0..9) of a read-back frame's header: A5 5A 'r' seq addr[4] len[2].
+fn rb_hdr_byte(k: u32, seq: u32, addr: u32, len: u32) -> u32 {
+    if (k == 0) { return MAGIC0; }
+    if (k == 1) { return MAGIC1; }
+    if (k == 2) { return RESP_READ; }
+    if (k == 3) { return seq & 255; }
+    if (k < 8) { return (addr >> ((k - 4) << 3)) & 255; }
+    return (len >> ((k - 8) << 3)) & 255;
+}
+
+fn pick(sel: bool, x: u32, y: u32) -> u32 {
+    if (sel) { return x; }
+    return y;
+}
+
+// Status line i (docs/uart-loader.md lists the names).
+fn status_value(i: u32, rx_bytes: u32, rx_ferrs: u32, rx_false: u32, ovf: u32, hwm: u32, ign: u32,
+                ok: u32, dup: u32, ncrc: u32, nlen: u32, ntmo: u32, nfrm: u32, ncmd: u32, novf: u32,
+                committed: u32, reads: u32, div: u32, reverts: u32, last: u32, config: u32, clk: u32,
+                build: u32, nport: u32) -> u32 {
+    if (i == 0) { return rx_bytes; }
+    if (i == 1) { return rx_ferrs; }
+    if (i == 2) { return rx_false; }
+    if (i == 3) { return ovf; }
+    if (i == 4) { return hwm; }
+    if (i == 5) { return ign; }
+    if (i == 6) { return ok; }
+    if (i == 7) { return dup; }
+    if (i == 8) { return ncrc; }
+    if (i == 9) { return nlen; }
+    if (i == 10) { return ntmo; }
+    if (i == 11) { return nfrm; }
+    if (i == 12) { return ncmd; }
+    if (i == 13) { return novf; }
+    if (i == 14) { return committed; }
+    if (i == 15) { return reads; }
+    if (i == 16) { return div; }
+    if (i == 17) { return reverts; }
+    if (i == 18) { return last; }
+    if (i == 19) { return config; }
+    if (i == 20) { return clk; }
+    if (i == 21) { return build; }
+    return nport;
+}
+
+// [ddr3] Status lines 23..36, after part 1's 23.
+fn status_ddr3(i: u32, nready: u32, cal: u32, cal_at_: u32, cal_lost_: u32, w_writes: u32, w_reads: u32,
+               w_hits: u32, w_dropped: u32, w_stray: u32, w_outst: u32, w_lat: u32, w_stalls: u32,
+               a_switches: u32, a_stray: u32) -> u32 {
+    if (i == 23) { return nready; }
+    if (i == 24) { return cal; }
+    if (i == 25) { return cal_at_; }
+    if (i == 26) { return cal_lost_; }
+    if (i == 27) { return w_writes; }
+    if (i == 28) { return w_reads; }
+    if (i == 29) { return w_hits; }
+    if (i == 30) { return w_dropped; }
+    if (i == 31) { return w_stray; }
+    if (i == 32) { return w_outst; }
+    if (i == 33) { return w_lat; }
+    if (i == 34) { return w_stalls; }
+    if (i == 35) { return a_switches; }
+    return a_stray;
+}
+
+// [ddr3] Status line i of the 37 as a balanced tree of 4:1 multiplexers on the bits of i
+// (status_value and status_ddr3 are if-chains, which synthesis kept as a deep priority chain;
+// tests/test_ddr3_loader.py checks the two agree).
+fn mux4(s: u32, a: u32, b: u32, c: u32, d: u32) -> u32 {
+    if ((s & 2) == 0) {
+        if ((s & 1) == 0) { return a; }
+        return b;
+    }
+    if ((s & 1) == 0) { return c; }
+    return d;
+}
+
+fn status_all(i: u32, v0: u32, v1: u32, v2: u32, v3: u32, v4: u32, v5: u32, v6: u32, v7: u32, v8: u32, v9: u32, v10: u32, v11: u32, v12: u32, v13: u32, v14: u32, v15: u32, v16: u32, v17: u32, v18: u32, v19: u32, v20: u32, v21: u32, v22: u32, v23: u32, v24: u32, v25: u32, v26: u32, v27: u32, v28: u32, v29: u32, v30: u32, v31: u32, v32: u32, v33: u32, v34: u32, v35: u32, v36: u32) -> u32 {
+    var q0: u32 = mux4((i >> 2) & 3, mux4(i & 3, v0, v1, v2, v3), mux4(i & 3, v4, v5, v6, v7), mux4(i & 3, v8, v9, v10, v11), mux4(i & 3, v12, v13, v14, v15));
+    var q1: u32 = mux4((i >> 2) & 3, mux4(i & 3, v16, v17, v18, v19), mux4(i & 3, v20, v21, v22, v23), mux4(i & 3, v24, v25, v26, v27), mux4(i & 3, v28, v29, v30, v31));
+    var q2: u32 = mux4((i >> 2) & 3, mux4(i & 3, v32, v33, v34, v35), mux4(i & 3, v36, 0, 0, 0), mux4(i & 3, 0, 0, 0, 0), mux4(i & 3, 0, 0, 0, 0));
+    return mux4((i >> 4) & 3, q0, q1, q2, 0);
+}
+
+// [ddr3] The calibration word: the S-line layout of t27/rtl/fpga_ddr3_status.t27.
+fn cal_word(calib: bool, state: u32, top: u32, n: u32) -> u32 {
+    var c: u32 = 0;
+    if (calib) { c = 1; }
+    return (c << 24) | ((state & 31) << 16) | ((top & 31) << 8) | (n & 255);
+}
+
+fn bump(n: u32) -> u32 {
+    if (n >= 255) { return 255; }
+    return n + 1;
+}
+
+// Module-level (combinational) values: gen-verilog declares an on_clock local
+// where it appears, which plain Verilog rejects, and a heavy function called
+// inside a branch slows yosys down, so they are computed here and selected below.
+var fifo_level: u32;
+var cur: u32;
+var cur_ferr: bool;
+var cur_gap: bool;
+var crc_next: u32;
+var stage_word: u32;
+var tx_crc_next: u32;
+var in_frame: bool;
+var waiting_byte: bool;
+var receiving: bool;
+var store_bytes: u32;
+var div_now: u32;
+var is_dup: bool;
+var config_word: u32;
+var line_value: u32;
+var resp_bits: u64;
+var last_word: u32;
+var rb_data_end: u32;
+var rb_end: u32;
+var any_nak: bool;
+var committed_any: bool;
+var port_state: bool;
+var port_expired: bool;
+var rb_crc_out: u32;
+var cal_now: u32;                    // [ddr3]
+var status_next: u32;                // [ddr3] status line st_i
+// [ddr3] The next values of the check byte pipeline (module level: evaluated when their inputs
+// change, which keeps the simulation fast; the registers lc0-lc8 take them every clock).
+var lcn0: u32;
+var lcn1: u32;
+var lcn2: u32;
+var lcn3: u32;
+var lcn4: u32;
+var lcn5: u32;
+var lcn6: u32;
+var lcn7: u32;
+var lcn8: u32;
+var needs_calib: bool;              // [ddr3]
+fifo_level = (wp - rp) & PTR_MASK;
+cur = (fifo_rdata as u32) & 255;
+cur_ferr = ((fifo_rdata as u32) & 256) != 0;
+cur_gap = ((fifo_rdata as u32) & 512) != 0;
+crc_next = crc_byte_par(crc, cur);   // [ddr3] crc_byte, as parity sums
+stage_word = pick((pay_i & 3) == 0, 0, stage_acc) | (cur << ((pay_i & 3) << 3));
+tx_crc_next = crc_byte_par(tx_crc, rb_byte);   // [ddr3] crc_byte, as parity sums
+in_frame = pstate == P_HDR || pstate == P_PAYLOAD || pstate == P_CRC;
+waiting_byte = in_frame || pstate == P_SYNC1;
+receiving = waiting_byte || pstate == P_HUNT;
+store_bytes = pow2(store_log2);
+div_now = pick(baud_sel, baud_custom, default_div);
+is_dup = last_valid && h_seq == last_seq && h_addr == last_addr && h_len == last_len && h_crc == last_crc;
+config_word = (PROTO << 24) | (MAX_LEN_LOG2 << 16) | ((store_log2 & 255) << 8) | FIFO_LOG2;
+line_value = pick(resp_counts, ((frames_ok & 65535) << 16) | (naks & 65535), resp_v);
+resp_bits = resp_bits_q;             // [ddr3] line_bits(...), pipelined (lc0-lc8)
+last_word = pick(last_valid, 256 | last_seq, last_seq);
+rb_data_end = rb_data_end_q;         // [ddr3] h_len + 10, registered
+rb_end = rb_end_q;                   // [ddr3] h_len + 14, registered
+any_nak = naks != 0;
+committed_any = frames_ok != 0;
+port_state = pstate == P_COMMIT_WR || pstate == P_COMMIT_DRAIN || pstate == P_RB_REQ || pstate == P_RB_RESP;
+port_expired = port_over_q;          // [ddr3] port_wait >= timeout_clocks, registered
+// The CRC a read-back frame ends with: bit 0 flipped when the watchdog cut the data short.
+rb_crc_out = tx_crc ^ pick(rb_fail, 4294967294, ALL_ONES);
+cal_now = cal_state & 31;                                     // [ddr3]
+lcn0 = crc_byte_par(ALL_ONES, resp_tag);                      // [ddr3]
+lcn1 = crc_byte_par(lc0, resp_a);
+lcn2 = crc_byte_par(lc1, resp_a >> 8);
+lcn3 = crc_byte_par(lc2, resp_a >> 16);
+lcn4 = crc_byte_par(lc3, resp_a >> 24);
+lcn5 = crc_byte_par(lc4, line_value);
+lcn6 = crc_byte_par(lc5, line_value >> 8);
+lcn7 = crc_byte_par(lc6, line_value >> 16);
+lcn8 = crc_byte_par(lc7, line_value >> 24);
+status_next = status_all(st_i, rx_bytes, rx_ferrs, rx_false, fifo_overflows, fifo_hwm, ignored,   // [ddr3]
+                         frames_ok, frames_dup, nak_crc, nak_length, nak_timeout, nak_framing, nak_command,
+                         nak_overflow, bytes_committed, readbacks, div_now, baud_reverts, last_word,
+                         config_word, clocks_at, build_id, nak_port, nak_not_ready,
+                         cal_word(calib, cal_now, cal_top, cal_recals), cal_at, cal_lost, wb_writes, wb_reads,
+                         wb_hits, wb_dropped, wb_stray, wb_max_outst, wb_rd_lat_max, wb_cmd_stalls, arb_switches,
+                         arb_stray);
+needs_calib = (h_cmd == CMD_LOAD || h_cmd == CMD_READ) && !calib; // [ddr3]
+
+fn on_clock(rx_valid: bool, rx_data: u32, rx_ferr: bool, rx_bytes: u32, rx_ferrs: u32, rx_false: u32,
+            line_idle: bool, tx_busy: bool, wr_ready: bool, wr_idle: bool,
+            rd_ready: bool, rd_valid: bool, rd_data: u32,
+            store_log2: u32, default_div: u32, timeout_clocks: u32, probation_clocks: u32, build_id: u32,
+            calib: bool, cal_state: u32, wb_writes: u32, wb_reads: u32, wb_hits: u32, wb_dropped: u32,
+            wb_stray: u32, wb_max_outst: u32, wb_rd_lat_max: u32, wb_cmd_stalls: u32, arb_switches: u32,
+            arb_stray: u32) {
+    // [ddr3] Calibration watch (cal_at: this clock's count, as the clocks counter below).
+    if (cal_now > cal_top) { cal_top = cal_now; }
+    if (cal_now == 0 && cal_prev != 0) { cal_recals = bump(cal_recals); }
+    cal_prev = cal_now;
+    if (calib && !cal_seen) {
+        cal_seen = true;
+        cal_at = clocks + 1;
+    }
+    if (cal_seen && (!calib || cal_now != DONE_CALIBRATE)) { cal_lost = cal_lost + 1; }
+    line_go = false;
+    tx_start = false;
+    port_give_up = false;                                // [ddr3]
+    clocks = clocks + 1;
+
+    // Receive FIFO, write side.
+    if (rx_valid) {
+        if (fifo_level == FIFO_DEPTH) {
+            fifo_overflows = fifo_overflows + 1;
+            gap_pending = true;
+        } else {
+            fifo[wp & FIFO_MASK] = fifo_entry(rx_data, rx_ferr, gap_pending) as u16;
+            wp = (wp + 1) & PTR_MASK;
+            gap_pending = false;
+        }
+    }
+    if (fifo_level > fifo_hwm) { fifo_hwm = fifo_level; }
+
+    // Inter-byte timeout: clocks without a byte while a frame is open.
+    if (waiting_byte && !fetched && fifo_level == 0) { quiet = quiet + 1; } else { quiet = 0; }
+    // Port watchdog: clocks spent waiting on the write or read port for one byte.
+    if (port_state) { port_wait = port_wait + 1; } else { port_wait = 0; }
+
+    // A new baud rate returns to the default unless a good frame confirms it.
+    if (probation) {
+        if (prob_over_q && pstate == P_HUNT && !fetched) {   // [ddr3] prob_count >= probation_clocks, registered
+            baud_sel = false;
+            probation = false;
+            prob_count = 0;                              // [ddr3] 0 outside a probation: prob_over_q reads it
+            baud_reverts = baud_reverts + 1;
+        } else {
+            prob_count = prob_count + 1;
+        }
+    }
+
+    if (pstate == P_HELLO) {
+        resp_tag = TAG_H;
+        resp_a = build_id;
+        resp_v = config_word;
+        resp_counts = false;
+        resp_after = P_HUNT;
+        pstate = P_RESP;
+    } else if (receiving) {
+        if (fetched) {
+            fetched = false;
+            if (in_frame && cur_gap) {
+                nak_reason = R_OVERFLOW;
+                pstate = P_NAK;
+            } else if (in_frame && cur_ferr) {
+                nak_reason = R_FRAMING;
+                pstate = P_NAK;
+            } else if (pstate == P_HUNT) {
+                if (cur == MAGIC0 && !cur_ferr) { pstate = P_SYNC1; } else { ignored = ignored + 1; }
+            } else if (pstate == P_SYNC1) {
+                if (cur == MAGIC1 && !cur_ferr && !cur_gap) {
+                    hdr_i = 0;
+                    crc = ALL_ONES;
+                    h_cmd = 0;
+                    h_seq = 0;
+                    seq_known = false;
+                    h_addr = 0;
+                    h_len = 0;
+                    pstate = P_HDR;
+                } else if (cur == MAGIC0 && !cur_ferr) {
+                    ignored = ignored + 1;
+                } else {
+                    ignored = ignored + 2;
+                    pstate = P_HUNT;
+                }
+            } else if (pstate == P_HDR) {
+                crc = crc_next;
+                if (hdr_i == 0) {
+                    h_cmd = cur;
+                } else if (hdr_i == 1) {
+                    h_seq = cur;
+                    seq_known = true;
+                } else if (hdr_i < 6) {
+                    h_addr = (h_addr >> 8) | (cur << 24);
+                } else {
+                    h_len = (h_len >> 8) | (cur << 8);
+                }
+                if (hdr_i == 7) { pstate = P_HDR_CHECK; } else { hdr_i = hdr_i + 1; }
+            } else if (pstate == P_PAYLOAD) {
+                // Bytes are gathered into a word; a word is written when it is full
+                // or the payload ends.
+                stage_acc = stage_word;
+                if ((pay_i & 3) == 3 || pay_last_q) {   // [ddr3] pay_i + 1 == h_len, registered
+                    staging[(pay_i >> 2) & STAGE_WORD_MASK] = stage_word;
+                }
+                crc = crc_next;
+                if (pay_last_q) {                    // [ddr3] pay_i + 1 == h_len, registered
+                    crc_i = 0;
+                    h_crc = 0;
+                    pstate = P_CRC;
+                } else {
+                    pay_i = pay_i + 1;
+                }
+            } else {
+                h_crc = (h_crc >> 8) | (cur << 24);
+                if (crc_i == 3) { pstate = P_CHECK; } else { crc_i = crc_i + 1; }
+            }
+        } else if (waiting_byte && quiet_over_q) {   // [ddr3] quiet >= timeout_clocks, registered
+            if (pstate == P_SYNC1) {
+                ignored = ignored + 1;
+                pstate = P_HUNT;
+            } else if (gap_pending) {
+                // The frame's last bytes were dropped by a full FIFO: no byte followed
+                // them to carry the gap mark.
+                nak_reason = R_OVERFLOW;
+                pstate = P_NAK;
+            } else {
+                nak_reason = R_TIMEOUT;
+                pstate = P_NAK;
+            }
+        } else if (fifo_level != 0) {
+            fifo_rdata = fifo[rp & FIFO_MASK];
+            rp = (rp + 1) & PTR_MASK;
+            fetched = true;
+        }
+    } else if (((pstate == P_HDR_CHECK || pstate == P_CHECK || pstate == P_STATUS) && settle_n == 0) || (pstate == P_RESP && settle_n < RESP_SETTLE)) {
+        settle_n = settle_n + 1;                         // [ddr3] the registered checks settle
+        clocks_at = clocks;                              // [ddr3] (status line `clocks`, sent from clocks_at)
+    } else if (pstate == P_HDR_CHECK) {
+        settle_n = 0;                                    // [ddr3]
+        if (!cmd_known_q) {                              // [ddr3] cmd_index(h_cmd) == 0
+            nak_reason = R_COMMAND;
+            pstate = P_NAK;
+        } else if (!hdr_good_q) {                        // [ddr3] header_ok(...), registered
+            nak_reason = R_LENGTH;
+            pstate = P_NAK;
+        } else if (h_cmd == CMD_LOAD) {
+            pay_i = 0;
+            pstate = P_PAYLOAD;
+        } else {
+            crc_i = 0;
+            h_crc = 0;
+            pstate = P_CRC;
+        }
+    } else if (pstate == P_CHECK) {
+        settle_n = 0;                                    // [ddr3]
+        if (!crc_good_q) {                               // [ddr3] (crc ^ ALL_ONES) != h_crc, registered
+            nak_reason = R_CRC;
+            pstate = P_NAK;
+        } else if (needs_calib) {
+            // [ddr3] Loads and reads wait for the calibration.
+            probation = false;
+            prob_count = 0;                              // [ddr3] 0 outside a probation (see the revert)
+            nak_reason = R_NOT_READY;
+            pstate = P_NAK;
+        } else {
+            probation = false;
+            prob_count = 0;                              // [ddr3] 0 outside a probation (see the revert)
+            if (h_cmd == CMD_LOAD) {
+                if (dup_q) {                             // [ddr3] is_dup, registered
+                    frames_dup = frames_dup + 1;
+                    resp_tag = TAG_A;
+                    resp_a = resp_word(h_seq, true, R_DUP, h_cmd, h_len);
+                    resp_counts = true;
+                    resp_after = P_HUNT;
+                    pstate = P_RESP;
+                } else {
+                    ci = 0;
+                    pstate = P_COMMIT_RD;
+                }
+            } else if (h_cmd == CMD_READ) {
+                rb_k = 0;
+                rb_fail = false;
+                tx_crc = ALL_ONES;
+                pstate = P_RB_NEXT;
+            } else if (h_cmd == CMD_STATUS) {
+                st_i = 0;
+                pstate = P_STATUS;
+            } else {
+                resp_tag = TAG_A;
+                resp_a = resp_word(h_seq, true, R_OK, h_cmd, h_len);
+                resp_counts = true;
+                resp_after = P_BAUD;
+                pstate = P_RESP;
+            }
+        }
+    } else if (pstate == P_NAK) {
+        naks = naks + 1;
+        if (nak_reason == R_CRC) { nak_crc = nak_crc + 1; }
+        if (nak_reason == R_LENGTH) { nak_length = nak_length + 1; }
+        if (nak_reason == R_TIMEOUT) { nak_timeout = nak_timeout + 1; }
+        if (nak_reason == R_FRAMING) { nak_framing = nak_framing + 1; }
+        if (nak_reason == R_COMMAND) { nak_command = nak_command + 1; }
+        if (nak_reason == R_OVERFLOW) { nak_overflow = nak_overflow + 1; }
+        if (nak_reason == R_PORT) { nak_port = nak_port + 1; }
+        if (nak_reason == R_NOT_READY) { nak_not_ready = nak_not_ready + 1; }   // [ddr3]
+        resp_tag = TAG_N;
+        resp_a = resp_word(h_seq, seq_known, nak_reason, h_cmd, h_len);
+        resp_counts = true;
+        resp_after = P_HUNT;
+        pstate = P_RESP;
+    } else if (pstate == P_RESP) {
+        if (line_idle) {
+            settle_n = 0;                                // [ddr3]
+            line_go = true;
+            line_tag = resp_tag;
+            line_a = resp_a;
+            line_b = resp_bits;
+            pstate = P_RESP_WAIT;
+        }
+    } else if (pstate == P_RESP_WAIT) {
+        pstate = resp_after;
+    } else if (pstate == P_COMMIT_RD) {
+        stage_rdata = staging[(ci >> 2) & STAGE_WORD_MASK];
+        pstate = P_COMMIT_SET;
+    } else if (pstate == P_COMMIT_SET) {
+        wr_valid = true;
+        wr_addr = h_addr + ci;
+        wr_data = (stage_rdata >> ((ci & 3) << 3)) & 255;
+        wr_last = ci_last_q;                     // [ddr3] ci + 1 == h_len, registered
+        pstate = P_COMMIT_WR;
+    } else if (pstate == P_COMMIT_WR) {
+        if (wr_ready) {
+            wr_valid = false;
+            if (wr_last) {
+                pstate = P_COMMIT_DRAIN;
+            } else {
+                ci = ci + 1;
+                pstate = P_COMMIT_RD;
+            }
+        } else if (port_expired) {
+            wr_valid = false;
+            port_give_up = true;                         // [ddr3] the master drops the unfinished word
+            nak_reason = R_PORT;
+            pstate = P_NAK;
+        }
+    } else if (pstate == P_COMMIT_DRAIN) {
+        if (!wr_idle && port_expired) {
+            port_give_up = true;                         // [ddr3] the master drops the unfinished word
+            nak_reason = R_PORT;
+            pstate = P_NAK;
+        } else if (wr_idle) {
+            frames_ok = frames_ok + 1;
+            bytes_committed = bytes_committed + h_len;
+            last_valid = true;
+            last_seq = h_seq;
+            last_addr = h_addr;
+            last_len = h_len;
+            last_crc = h_crc;
+            resp_tag = TAG_A;
+            resp_a = resp_word(h_seq, true, R_OK, h_cmd, h_len);
+            resp_counts = true;
+            resp_after = P_HUNT;
+            pstate = P_RESP;
+        }
+    } else if (pstate == P_RB_NEXT) {
+        if (rb_k < 10) {
+            rb_byte = rb_hdr_byte(rb_k, h_seq, h_addr, h_len);
+            pstate = P_RB_SEND;
+        } else if (rb_k < rb_data_end) {
+            if (rb_fail) {
+                rb_byte = 0;
+                pstate = P_RB_SEND;
+            } else {
+                rd_req = true;
+                rd_addr = h_addr + rb_k - 10;
+                pstate = P_RB_REQ;
+            }
+        } else if (rb_k < rb_end) {
+            rb_byte = (rb_crc_out >> ((rb_k - rb_data_end) << 3)) & 255;
+            pstate = P_RB_SEND;
+        } else if (rb_fail) {
+            nak_reason = R_PORT;
+            pstate = P_NAK;
+        } else {
+            readbacks = readbacks + 1;
+            pstate = P_HUNT;
+        }
+    } else if (pstate == P_RB_REQ) {
+        // rd_valid may come in the accepting clock itself (a memory without latency).
+        if (rd_valid) {
+            rd_req = false;
+            rb_byte = rd_data & 255;
+            pstate = P_RB_SEND;
+        } else if (rd_ready) {
+            rd_req = false;
+            pstate = P_RB_RESP;
+        } else if (port_expired) {
+            rd_req = false;
+            port_give_up = true;                         // [ddr3] nothing taken now; an earlier read stays dropped
+            rb_fail = true;
+            rb_byte = 0;
+            pstate = P_RB_SEND;
+        }
+    } else if (pstate == P_RB_RESP) {
+        if (rd_valid) {
+            rb_byte = rd_data & 255;
+            pstate = P_RB_SEND;
+        } else if (port_expired) {
+            port_give_up = true;                         // [ddr3] the read still waits: its ack is dropped
+            rb_fail = true;
+            rb_byte = 0;
+            pstate = P_RB_SEND;
+        }
+    } else if (pstate == P_RB_SEND) {
+        // The byte of two clocks ago has reached the transmitter by now (tx_busy).
+        if (!tx_busy && line_idle) {
+            tx_start = true;
+            tx_byte = rb_byte;
+            if (rb_k >= 2 && rb_k < rb_data_end) { tx_crc = tx_crc_next; }
+            rb_k = rb_k + 1;
+            pstate = P_RB_NEXT;
+        }
+    } else if (pstate == P_STATUS) {
+        settle_n = 0;                                    // [ddr3]
+        if (st_i == STATUS_LINES) {
+            pstate = P_HUNT;
+        } else {
+            resp_tag = TAG_C;
+            resp_a = ((h_seq & 255) << 24) | (STATUS_LINES << 16) | st_i;
+            // A multiplexer, not a heavy function; kept out of the module-level block
+            // because the clock counter changes every clock.
+            resp_v = status_q;                           // [ddr3] status_value / status_ddr3 of st_i, registered
+            // [ddr3] Line `clocks` from clocks_at, taken in the settle clock just before: status_q
+            // sampled it in that same clock, so it held the previous status line's count.
+            if (st_i == ST_CLOCKS) { resp_v = clocks_at; }
+            resp_counts = false;
+            resp_after = P_STATUS;
+            st_i = st_i + 1;
+            pstate = P_RESP;
+        }
+    } else if (pstate == P_BAUD) {
+        // The ack line has left the transmitter: change the rate.
+        // Back to the built-in divisor is no custom rate: no probation, baud_sel (LED 1) low.
+        if (line_idle && !tx_busy) {
+            baud_custom = h_addr;
+            baud_sel = h_addr != default_div;
+            probation = h_addr != default_div;
+            prob_count = 0;
+            pstate = P_HUNT;
+        }
+    }
+    // [ddr3] Registered checks (see `settle_n`), last, so every branch above reads the previous clock's.
+    cmd_known_q = cmd_index(h_cmd) != 0;
+    hdr_good_q = header_ok(h_cmd, h_addr, h_len, store_bytes);
+    crc_good_q = (crc ^ ALL_ONES) == h_crc;
+    dup_q = is_dup;
+    quiet_over_q = quiet >= timeout_clocks;
+    port_over_q = port_wait >= timeout_clocks;
+    prob_over_q = prob_count >= probation_clocks;
+    pay_last_q = pay_i + 1 == h_len;
+    ci_last_q = ci + 1 == h_len;
+    rb_data_end_q = h_len + 10;
+    rb_end_q = h_len + 14;
+    status_q = status_next;
+    lc0 = lcn0;
+    lc1 = lcn1;
+    lc2 = lcn2;
+    lc3 = lcn3;
+    lc4 = lcn4;
+    lc5 = lcn5;
+    lc6 = lcn6;
+    lc7 = lcn7;
+    lc8 = lcn8;
+    resp_bits_q = ((((lc8 ^ ALL_ONES) & 255) as u64) << 32) | (line_value as u64);
+}
+
+test crc_of_one_byte { assert_eq(crc_byte(4294967295, 97) ^ 4294967295, 3904355907); }
+test crc_check_value {
+    // CRC-32 of "123456789" is cbf43926.
+    var c: u32 = crc_byte(4294967295, 49);
+    c = crc_byte(c, 50); c = crc_byte(c, 51); c = crc_byte(c, 52); c = crc_byte(c, 53);
+    c = crc_byte(c, 54); c = crc_byte(c, 55); c = crc_byte(c, 56); c = crc_byte(c, 57);
+    assert_eq(c ^ 4294967295, 3421780262);
+}
+test response_word_layout {
+    assert_eq(resp_word(7, true, 2, 76, 4096), 119738368);
+    assert_eq(resp_word(255, false, 4, 0, 0), 4282384384);
+}
+test header_rules {
+    assert_eq(header_ok(76, 0, 4096, 262144), true);
+    assert_eq(header_ok(76, 0, 4097, 262144), false);
+    assert_eq(header_ok(76, 262143, 2, 262144), false);
+    assert_eq(header_ok(76, 262143, 1, 262144), true);
+    assert_eq(header_ok(82, 0, 0, 262144), false);
+    assert_eq(header_ok(83, 0, 0, 262144), true);
+    assert_eq(header_ok(66, 217, 0, 262144), true);
+    assert_eq(header_ok(66, 8, 0, 262144), false);
+}
+test readback_header { assert_eq(rb_hdr_byte(0, 1, 2, 3), 165); assert_eq(rb_hdr_byte(5, 0, 305419896, 0), 86); assert_eq(rb_hdr_byte(9, 0, 0, 4096), 16); }
+test fifo_entry_bits { assert_eq(fifo_entry(165, true, true), 933); assert_eq(fifo_entry(300, false, false), 44); }
+// [ddr3]
+test crc_as_parity_sums { assert_eq(crc_byte_par(4294967295, 97) ^ 4294967295, 3904355907); assert_eq(crc_byte_par(305419896, 171), crc_byte(305419896, 171)); }
+// [ddr3]
+test status_tree { assert_eq(mux4(2, 1, 2, 3, 4), 3); assert_eq(status_all(36, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36), 36); }
+// [ddr3]
+test ddr3_status_words { assert_eq(cal_word(true, 23, 23, 0), 18290432); assert_eq(status_ddr3(24, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14), 2); assert_eq(status_ddr3(36, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14), 14); assert_eq(bump(255), 255); }
+test staging_lanes { assert_eq(pick((5 & 3) == 0, 0, 170) | (187 << ((5 & 3) << 3)), 48042); assert_eq((48042 >> ((5 & 3) << 3)) & 255, 187); }
+endmodule

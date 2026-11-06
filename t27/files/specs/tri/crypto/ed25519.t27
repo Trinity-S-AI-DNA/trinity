@@ -1,0 +1,864 @@
+// SPDX-License-Identifier: Apache-2.0
+// t27/specs/tri/crypto/ed25519.t27
+// Ed25519 (RFC 8032 section 5.1, PureEdDSA): public key from a 32-byte
+// seed, sign, verify | phi^2 + 1/phi^2 = 3 | TRINITY
+//
+// Step 3b of R3-1 (#7332, epic #6655): t27c signs hardware receipts with
+// Ed25519 (specs/verified/signed_receipt.t27 fixes the scheme and sizes).
+// Today the signatures come from the ed25519-dalek crate; this spec, with
+// specs/tri/crypto/sha512.t27 for the hash, is the path that lets t27c run
+// them from generated code and drop the crate.
+//
+// Arithmetic is TweetNaCl-shaped, so it needs nothing wider than i64:
+// - a field element mod p = 2^255 - 19 is 16 limbs of 16 bits held in i64
+//   ([16]i64, little-endian). fe_carry pushes each limb's high part into
+//   the next and folds limb 15's carry into limb 0 times 38 (2^256 = 38 mod
+//   p); the shifts are arithmetic, so a negative limb borrows. fe_pack
+//   subtracts p twice under a mask to reach the canonical encoding. The
+//   inverse is a^(p-2) and the square root uses a^((p-5)/8), both as
+//   TweetNaCl's square-and-multiply chains.
+// - points are extended twisted Edwards (X, Y, Z, T) with T = XY/Z, added
+//   with the unified formula for a = -1 (2d precomputed), and multiplied by
+//   a 256-bit ladder of add/double with conditional swaps.
+// - scalars mod L = 2^252 + 27742317777372353535851937790883648493 are
+//   reduced from 64 signed limbs of 8 bits (TweetNaCl modL).
+// Constant time is not a goal of this spec (verification handles public
+// data), but the masked selects stay in place so the shape is TweetNaCl's.
+//
+// Verification is RFC 8032 section 5.1.7, strict where TweetNaCl is lax:
+// S must be below L (5.1.7: S out of range makes the signature invalid,
+// otherwise S + L verifies as S), and the public key must decode per
+// 5.1.3 (y below p, and x = 0 with the sign bit set is a failure). R is
+// checked by comparing its bytes with the canonical encoding of [S]B -
+// [k]A, which rejects a non-canonical R. Two of these strict rules go past
+// the oracle: OpenSSL (through Python cryptography 46) accepts an identity
+// public key encoded as y = p + 1 or with the sign bit set; RFC 8032 5.1.3
+// says both decodings fail, and so they fail here. Like ed25519-dalek's
+// verify_strict, which t27c used before this spec, verify also rejects a
+// small-order public key or R ([8]P is the identity): with one, a
+// signature verifies for messages its key holder never signed, and
+// OpenSSL accepts both cases (tested below with vectors it accepts).
+//
+// Dialect notes: `use` is path-relative and unqualified, so every helper
+// here is named so it cannot clash with sha512.t27's items (init, update,
+// finish, hash, same, nibble, ...). A unary operator loses the parentheses
+// around its operand in codegen (#6549), so there is no unary minus, `!` or
+// `~`: a mask is 0 - b, a negation is fe_sub(FE0, x), a test for false is
+// == false.
+//
+// Oracles: RFC 8032 section 7.1 TEST 1, TEST 2, TEST 3 and TEST SHA(abc)
+// (seed, public key, message, signature, copied from the RFC text), one
+// 300-byte message whose hashes span three SHA-512 blocks, S + L for TEST
+// 1, and scalar reductions; expected values were computed with Python
+// cryptography 46 (OpenSSL) and Python integers.
+//
+// Mutation-checked 2026-10-07 with t27c test-report on the lab: 34
+// one-line mutants (carry fold and shift, the mul fold factor and bound,
+// both limbs of p in fe_pack, its two subtraction rounds and the borrow
+// select, the unpack top mask, the select mask, the inv and pow2523
+// chains, one limb each of 2d and sqrt(-1), the 2 Z1 Z2 and Z3 terms of
+// addition, the base point's T, the ladder length, the sign bit in
+// pt_pack, the decode negation, sqrt(-1) branch, on-curve, canonical-y
+// and x = 0 checks, three modL constants, clamping, the nonce prefix,
+// the r term of S, the S < L check and its comparison, and A in the
+// verify hash); every one fails a test. Seven are caught by one test
+// only: one pack round (field test), the unpack mask (TEST SHA(abc), the
+// only key with bit 255 of a field byte in play), the base T (base-point
+// test), canonical-y and x = 0 (canonical-encoding test), on-curve (y = 2
+// test) and both S < L mutants (the S + L test).
+
+module TriEd25519;
+    use base::types;
+    use tri::crypto::sha512;
+
+    // ===========================================================
+    // 1. Constants
+    // ===========================================================
+
+    // field elements 0 and 1
+    pub const FE0 : [16]i64 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    pub const FE1 : [16]i64 = [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+
+    // d = -121665 / 121666 mod p
+    pub const ED_D : [16]i64 = [
+        0x78a3, 0x1359, 0x4dca, 0x75eb, 0xd8ab, 0x4141, 0x0a4d, 0x0070,
+        0xe898, 0x7779, 0x4079, 0x8cc7, 0xfe73, 0x2b6f, 0x6cee, 0x5203,
+    ];
+
+    // 2d mod p
+    pub const ED_D2 : [16]i64 = [
+        0xf159, 0x26b2, 0x9b94, 0xebd6, 0xb156, 0x8283, 0x149a, 0x00e0,
+        0xd130, 0xeef3, 0x80f2, 0x198e, 0xfce7, 0x56df, 0xd9dc, 0x2406,
+    ];
+
+    // the base point B: y = 4/5, x the even root (RFC 8032 section 5.1)
+    pub const ED_BX : [16]i64 = [
+        0xd51a, 0x8f25, 0x2d60, 0xc956, 0xa7b2, 0x9525, 0xc760, 0x692c,
+        0xdc5c, 0xfdd6, 0xe231, 0xc0a4, 0x53fe, 0xcd6e, 0x36d3, 0x2169,
+    ];
+    pub const ED_BY : [16]i64 = [
+        0x6658, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666,
+        0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666,
+    ];
+
+    // sqrt(-1) = 2^((p-1)/4) mod p
+    pub const SQRTM1 : [16]i64 = [
+        0xa0b0, 0x4a0e, 0x1b27, 0xc4ee, 0xe478, 0xad2f, 0x1806, 0x2f43,
+        0xd7a7, 0x3dfb, 0x0099, 0x2b4d, 0xdf0b, 0x4fc1, 0x2480, 0x2b83,
+    ];
+
+    // the group order L, little-endian bytes
+    pub const ED_L : [32]i64 = [
+        0xed, 0xd3, 0xf5, 0x5c, 0x1a, 0x63, 0x12, 0x58, 0xd6, 0x9c, 0xf7, 0xa2, 0xde, 0xf9, 0xde, 0x14,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x10,
+    ];
+
+    // ===========================================================
+    // 2. Types
+    // ===========================================================
+
+    // extended coordinates: x = X/Z, y = Y/Z, x*y = T/Z
+    pub const EdPoint = struct {
+        x : [16]i64,
+        y : [16]i64,
+        z : [16]i64,
+        t : [16]i64,
+    };
+
+    // a decoded public key, negated (TweetNaCl unpackneg), and whether the
+    // 32 bytes were a valid RFC 8032 encoding
+    pub const EdDecoded = struct {
+        ok : bool,
+        neg : EdPoint,
+    };
+
+    // ===========================================================
+    // 3. Field arithmetic mod p = 2^255 - 19
+    // ===========================================================
+
+    // one carry pass: limbs 0..14 end in [0, 2^16), limb 15's carry wraps
+    // into limb 0 times 38
+    fn fe_carry(a: [16]i64) -> [16]i64 {
+        var o : [16]i64 = a;
+        var i : usize = 0;
+        while (i < 16) {
+            const c = o[i] >> 16;
+            o[i] = o[i] & 65535;
+            if (i < 15) {
+                o[i + 1] = o[i + 1] + c;
+            } else {
+                o[0] = o[0] + 38 * c;
+            }
+            i = i + 1;
+        }
+        return o;
+    }
+
+    fn fe_add(a: [16]i64, b: [16]i64) -> [16]i64 {
+        var o : [16]i64 = FE0;
+        var i : usize = 0;
+        while (i < 16) {
+            o[i] = a[i] + b[i];
+            i = i + 1;
+        }
+        return o;
+    }
+
+    fn fe_sub(a: [16]i64, b: [16]i64) -> [16]i64 {
+        var o : [16]i64 = FE0;
+        var i : usize = 0;
+        while (i < 16) {
+            o[i] = a[i] - b[i];
+            i = i + 1;
+        }
+        return o;
+    }
+
+    // schoolbook product, the upper 15 limbs folded down times 38, then
+    // two carry passes
+    fn fe_mul(a: [16]i64, b: [16]i64) -> [16]i64 {
+        var t : [31]i64 = [0] ** 31;
+        var i : usize = 0;
+        while (i < 16) {
+            var j : usize = 0;
+            while (j < 16) {
+                t[i + j] = t[i + j] + a[i] * b[j];
+                j = j + 1;
+            }
+            i = i + 1;
+        }
+        i = 0;
+        while (i < 15) {
+            t[i] = t[i] + 38 * t[i + 16];
+            i = i + 1;
+        }
+        var o : [16]i64 = FE0;
+        i = 0;
+        while (i < 16) {
+            o[i] = t[i];
+            i = i + 1;
+        }
+        return fe_carry(fe_carry(o));
+    }
+
+    fn fe_sq(a: [16]i64) -> [16]i64 {
+        return fe_mul(a, a);
+    }
+
+    // q when b == 1, p when b == 0, through the mask 0 - b
+    fn fe_pick(p: [16]i64, q: [16]i64, b: i64) -> [16]i64 {
+        const c = 0 - b;
+        var o : [16]i64 = FE0;
+        var i : usize = 0;
+        while (i < 16) {
+            o[i] = p[i] ^ (c & (p[i] ^ q[i]));
+            i = i + 1;
+        }
+        return o;
+    }
+
+    // the canonical 32-byte little-endian encoding: three carry passes,
+    // then p is subtracted twice, each time kept only if it did not borrow
+    fn fe_pack(n: [16]i64) -> [32]u8 {
+        var t : [16]i64 = fe_carry(fe_carry(fe_carry(n)));
+        var m : [16]i64 = FE0;
+        var j : usize = 0;
+        while (j < 2) {
+            m[0] = t[0] - 0xffed;
+            var i : usize = 1;
+            while (i < 15) {
+                m[i] = t[i] - 0xffff - ((m[i - 1] >> 16) & 1);
+                m[i - 1] = m[i - 1] & 65535;
+                i = i + 1;
+            }
+            m[15] = t[15] - 0x7fff - ((m[14] >> 16) & 1);
+            const borrow = (m[15] >> 16) & 1;
+            m[14] = m[14] & 65535;
+            t = fe_pick(t, m, 1 - borrow);
+            j = j + 1;
+        }
+        var o : [32]u8 = [0] ** 32;
+        var k : usize = 0;
+        while (k < 16) {
+            o[2 * k] = (t[k] & 255) as u8;
+            o[2 * k + 1] = ((t[k] >> 8) & 255) as u8;
+            k = k + 1;
+        }
+        return o;
+    }
+
+    // 255 bits, little-endian; the top bit of byte 31 is dropped
+    fn fe_unpack(s: [32]u8) -> [16]i64 {
+        var o : [16]i64 = FE0;
+        var i : usize = 0;
+        while (i < 16) {
+            o[i] = (s[2 * i] as i64) + 256 * (s[2 * i + 1] as i64);
+            i = i + 1;
+        }
+        o[15] = o[15] & 0x7fff;
+        return o;
+    }
+
+    fn bytes32_eq(a: [32]u8, b: [32]u8) -> bool {
+        var i : usize = 0;
+        while (i < 32) {
+            if (a[i] != b[i]) {
+                return false;
+            }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    // a != b mod p
+    fn fe_neq(a: [16]i64, b: [16]i64) -> bool {
+        return bytes32_eq(fe_pack(a), fe_pack(b)) == false;
+    }
+
+    // the low bit of the canonical value: the "sign" of x
+    fn fe_parity(a: [16]i64) -> i64 {
+        const s = fe_pack(a);
+        return (s[0] & 1) as i64;
+    }
+
+    // a^(p-2) = 1/a (Fermat), TweetNaCl inv25519
+    fn fe_inv(a: [16]i64) -> [16]i64 {
+        var c : [16]i64 = a;
+        var n : usize = 0;
+        while (n < 254) {
+            const k = 253 - n;
+            c = fe_sq(c);
+            if (k != 2 and k != 4) {
+                c = fe_mul(c, a);
+            }
+            n = n + 1;
+        }
+        return c;
+    }
+
+    // a^((p-5)/8) = a^(2^252 - 3), TweetNaCl pow2523
+    fn fe_pow2523(a: [16]i64) -> [16]i64 {
+        var c : [16]i64 = a;
+        var n : usize = 0;
+        while (n < 251) {
+            const k = 250 - n;
+            c = fe_sq(c);
+            if (k != 1) {
+                c = fe_mul(c, a);
+            }
+            n = n + 1;
+        }
+        return c;
+    }
+
+    // ===========================================================
+    // 4. Points on -x^2 + y^2 = 1 + d x^2 y^2
+    // ===========================================================
+
+    fn pt_identity() -> EdPoint {
+        return EdPoint{ .x = FE0, .y = FE1, .z = FE1, .t = FE0 };
+    }
+
+    fn pt_base() -> EdPoint {
+        return EdPoint{ .x = ED_BX, .y = ED_BY, .z = FE1, .t = fe_mul(ED_BX, ED_BY) };
+    }
+
+    // unified addition (also doubles), TweetNaCl add
+    fn pt_add(p: EdPoint, q: EdPoint) -> EdPoint {
+        const a = fe_mul(fe_sub(p.y, p.x), fe_sub(q.y, q.x));
+        const b = fe_mul(fe_add(p.x, p.y), fe_add(q.x, q.y));
+        const c = fe_mul(fe_mul(p.t, q.t), ED_D2);
+        const dd = fe_mul(p.z, q.z);
+        const d2 = fe_add(dd, dd);
+        const e = fe_sub(b, a);
+        const f = fe_sub(d2, c);
+        const g = fe_add(d2, c);
+        const h = fe_add(b, a);
+        return EdPoint{ .x = fe_mul(e, f), .y = fe_mul(h, g), .z = fe_mul(g, f), .t = fe_mul(e, h) };
+    }
+
+    // q when b == 1, p when b == 0
+    fn pt_pick(p: EdPoint, q: EdPoint, b: i64) -> EdPoint {
+        return EdPoint{ .x = fe_pick(p.x, q.x, b), .y = fe_pick(p.y, q.y, b),
+            .z = fe_pick(p.z, q.z, b), .t = fe_pick(p.t, q.t, b) };
+    }
+
+    // [s]q for a 256-bit little-endian s, high bit first
+    fn pt_scalarmult(q: EdPoint, s: [32]u8) -> EdPoint {
+        var r0 : EdPoint = pt_identity();
+        var r1 : EdPoint = q;
+        var n : usize = 0;
+        while (n < 256) {
+            const k = 255 - n;
+            const b = (((s[k / 8] as usize) >> (k % 8)) & 1) as i64;
+            const a0 = pt_pick(r0, r1, b);
+            const a1 = pt_pick(r1, r0, b);
+            const sum = pt_add(a1, a0);
+            const dbl = pt_add(a0, a0);
+            r0 = pt_pick(dbl, sum, b);
+            r1 = pt_pick(sum, dbl, b);
+            n = n + 1;
+        }
+        return r0;
+    }
+
+    fn pt_scalarbase(s: [32]u8) -> EdPoint {
+        return pt_scalarmult(pt_base(), s);
+    }
+
+    // RFC 8032 section 5.1.2: y with the sign of x in bit 255
+    fn pt_pack(p: EdPoint) -> [32]u8 {
+        const zi = fe_inv(p.z);
+        const tx = fe_mul(p.x, zi);
+        const ty = fe_mul(p.y, zi);
+        var r : [32]u8 = fe_pack(ty);
+        r[31] = r[31] ^ ((fe_parity(tx) * 128) as u8);
+        return r;
+    }
+
+    // RFC 8032 section 5.1.3, returning -A as TweetNaCl unpackneg does:
+    // x^2 = (y^2 - 1) / (d y^2 + 1), the candidate root u v^3 (u v^7)^((p-5)/8),
+    // times sqrt(-1) if its square is -u/v. Fails when y >= p, when no root
+    // exists, and when x = 0 with the sign bit set.
+    fn pt_decode_neg(s: [32]u8) -> EdDecoded {
+        const y = fe_unpack(s);
+        var top : [32]u8 = s;
+        top[31] = top[31] & 127;
+        const canonical = bytes32_eq(fe_pack(y), top);
+        const y2 = fe_sq(y);
+        const num = fe_sub(y2, FE1);
+        const den = fe_add(fe_mul(y2, ED_D), FE1);
+        const den2 = fe_sq(den);
+        const den4 = fe_sq(den2);
+        const den6 = fe_mul(den4, den2);
+        var x : [16]i64 = fe_pow2523(fe_mul(fe_mul(den6, num), den));
+        x = fe_mul(fe_mul(fe_mul(fe_mul(x, num), den), den), den);
+        if (fe_neq(fe_mul(fe_sq(x), den), num)) {
+            x = fe_mul(x, SQRTM1);
+        }
+        const on_curve = fe_neq(fe_mul(fe_sq(x), den), num) == false;
+        const sign = (s[31] >> 7) as i64;
+        const bad_zero = fe_neq(x, FE0) == false and sign == 1;
+        if (fe_parity(x) == sign) {
+            x = fe_sub(FE0, x);
+        }
+        const neg = EdPoint{ .x = x, .y = y, .z = FE1, .t = fe_mul(x, y) };
+        return EdDecoded{ .ok = canonical and on_curve and bad_zero == false, .neg = neg };
+    }
+
+    // ===========================================================
+    // 5. Scalars mod L
+    // ===========================================================
+
+    // 64 signed 8-bit limbs reduced mod L into 32 bytes, TweetNaCl modL
+    fn mod_l(xin: [64]i64) -> [32]u8 {
+        var x : [64]i64 = xin;
+        var i : usize = 63;
+        while (i >= 32) {
+            var carry : i64 = 0;
+            var j : usize = i - 32;
+            while (j < i - 12) {
+                x[j] = x[j] + carry - 16 * x[i] * ED_L[j - (i - 32)];
+                carry = (x[j] + 128) >> 8;
+                x[j] = x[j] - carry * 256;
+                j = j + 1;
+            }
+            x[j] = x[j] + carry;
+            x[i] = 0;
+            i = i - 1;
+        }
+        var top : i64 = 0;
+        var k : usize = 0;
+        while (k < 32) {
+            x[k] = x[k] + top - (x[31] >> 4) * ED_L[k];
+            top = x[k] >> 8;
+            x[k] = x[k] & 255;
+            k = k + 1;
+        }
+        k = 0;
+        while (k < 32) {
+            x[k] = x[k] - top * ED_L[k];
+            k = k + 1;
+        }
+        var r : [32]u8 = [0] ** 32;
+        k = 0;
+        while (k < 32) {
+            x[k + 1] = x[k + 1] + (x[k] >> 8);
+            r[k] = (x[k] & 255) as u8;
+            k = k + 1;
+        }
+        return r;
+    }
+
+    // a 64-byte SHA-512 digest as an integer mod L
+    fn sc_reduce(h: [64]u8) -> [32]u8 {
+        var x : [64]i64 = [0] ** 64;
+        var i : usize = 0;
+        while (i < 64) {
+            x[i] = h[i] as i64;
+            i = i + 1;
+        }
+        return mod_l(x);
+    }
+
+    // S < L, comparing little-endian bytes from the top (RFC 8032 5.1.7)
+    fn sc_below_l(s: [32]u8) -> bool {
+        var n : usize = 0;
+        while (n < 32) {
+            const i = 31 - n;
+            const v = s[i] as i64;
+            if (v < ED_L[i]) {
+                return true;
+            }
+            if (v > ED_L[i]) {
+                return false;
+            }
+            n = n + 1;
+        }
+        return false;
+    }
+
+    // ===========================================================
+    // 6. Ed25519 (RFC 8032 section 5.1.5 - 5.1.7)
+    // ===========================================================
+
+    // the secret scalar a: the low half of SHA-512(seed), clamped
+    fn ed_scalar(dh: [64]u8) -> [32]u8 {
+        var a : [32]u8 = [0] ** 32;
+        var i : usize = 0;
+        while (i < 32) {
+            a[i] = dh[i];
+            i = i + 1;
+        }
+        a[0] = a[0] & 248;
+        a[31] = a[31] & 127;
+        a[31] = a[31] | 64;
+        return a;
+    }
+
+    pub fn public_key(seed: [32]u8) -> [32]u8 {
+        return pt_pack(pt_scalarbase(ed_scalar(hash(seed[0..32]))));
+    }
+
+    // R = [r]B with r = SHA-512(prefix || M) mod L, then
+    // S = (r + SHA-512(R || A || M) * a) mod L; the signature is R || S
+    pub fn sign(seed: [32]u8, msg: []const u8) -> [64]u8 {
+        const dh = hash(seed[0..32]);
+        const a = ed_scalar(dh);
+        const pk = pt_pack(pt_scalarbase(a));
+        var hr = init();
+        update(&hr, dh[32..64]);
+        update(&hr, msg);
+        const r = sc_reduce(finish(&hr));
+        const rb = pt_pack(pt_scalarbase(r));
+        var hk = init();
+        update(&hk, rb[0..32]);
+        update(&hk, pk[0..32]);
+        update(&hk, msg);
+        const k = sc_reduce(finish(&hk));
+        var x : [64]i64 = [0] ** 64;
+        var i : usize = 0;
+        while (i < 32) {
+            x[i] = r[i] as i64;
+            i = i + 1;
+        }
+        i = 0;
+        while (i < 32) {
+            var j : usize = 0;
+            while (j < 32) {
+                x[i + j] = x[i + j] + (k[i] as i64) * (a[j] as i64);
+                j = j + 1;
+            }
+            i = i + 1;
+        }
+        const s = mod_l(x);
+        var sig : [64]u8 = [0] ** 64;
+        i = 0;
+        while (i < 32) {
+            sig[i] = rb[i];
+            sig[32 + i] = s[i];
+            i = i + 1;
+        }
+        return sig;
+    }
+
+    // [8]P is the identity exactly when P is one of the 8 small-order points
+    fn pt_small_order(p: EdPoint) -> bool {
+        const p2 = pt_add(p, p);
+        const p4 = pt_add(p2, p2);
+        return bytes32_eq(pt_pack(pt_add(p4, p4)), pt_pack(pt_identity()));
+    }
+
+    // accepts iff S < L, A decodes and has large order, and the encoding of
+    // [S]B - [k]A is exactly the R half, k = SHA-512(R || A || M) mod L, and
+    // that point has large order too
+    pub fn verify(pk: [32]u8, msg: []const u8, sig: [64]u8) -> bool {
+        var rb : [32]u8 = [0] ** 32;
+        var sb : [32]u8 = [0] ** 32;
+        var i : usize = 0;
+        while (i < 32) {
+            rb[i] = sig[i];
+            sb[i] = sig[32 + i];
+            i = i + 1;
+        }
+        if (sc_below_l(sb) == false) {
+            return false;
+        }
+        const a = pt_decode_neg(pk);
+        if (a.ok == false) {
+            return false;
+        }
+        if (pt_small_order(a.neg)) {
+            return false;
+        }
+        var hk = init();
+        update(&hk, rb[0..32]);
+        update(&hk, pk[0..32]);
+        update(&hk, msg);
+        const k = sc_reduce(finish(&hk));
+        const check = pt_add(pt_scalarmult(a.neg, k), pt_scalarbase(sb));
+        if (pt_small_order(check)) {
+            return false;
+        }
+        return bytes32_eq(pt_pack(check), rb);
+    }
+
+    // ===========================================================
+    // TDD: Tests
+    // ===========================================================
+
+    fn ed_nibble(c: u8) -> u8 {
+        if (c >= 97) {
+            return c - 87;
+        }
+        return c - 48;
+    }
+
+    fn hex32(s: []const u8) -> [32]u8 {
+        var o : [32]u8 = [0] ** 32;
+        var i : usize = 0;
+        while (i < 32) {
+            o[i] = ed_nibble(s[2 * i]) * 16 + ed_nibble(s[2 * i + 1]);
+            i = i + 1;
+        }
+        return o;
+    }
+
+    fn hex64(s: []const u8) -> [64]u8 {
+        var o : [64]u8 = [0] ** 64;
+        var i : usize = 0;
+        while (i < 64) {
+            o[i] = ed_nibble(s[2 * i]) * 16 + ed_nibble(s[2 * i + 1]);
+            i = i + 1;
+        }
+        return o;
+    }
+
+    fn bytes64_eq(a: [64]u8, b: [64]u8) -> bool {
+        var i : usize = 0;
+        while (i < 64) {
+            if (a[i] != b[i]) {
+                return false;
+            }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    // up to 64 message bytes from hex; the caller slices [0 .. len / 2]
+    fn hex_msg(s: []const u8) -> [64]u8 {
+        var o : [64]u8 = [0] ** 64;
+        var i : usize = 0;
+        while (2 * i < s.len) {
+            o[i] = ed_nibble(s[2 * i]) * 16 + ed_nibble(s[2 * i + 1]);
+            i = i + 1;
+        }
+        return o;
+    }
+
+    // the 300-byte message (31 i + 7) mod 256
+    fn long_msg() -> [300]u8 {
+        var o : [300]u8 = [0] ** 300;
+        var i : usize = 0;
+        while (i < 300) {
+            o[i] = ((i * 31 + 7) % 256) as u8;
+            i = i + 1;
+        }
+        return o;
+    }
+
+    fn long_seed() -> [32]u8 {
+        var o : [32]u8 = [0] ** 32;
+        var i : usize = 0;
+        while (i < 32) {
+            o[i] = ((i * 7 + 3) % 256) as u8;
+            i = i + 1;
+        }
+        return o;
+    }
+
+    // a copy of sig with bit `bit` of byte `at` flipped
+    fn flip64(sig: [64]u8, at: usize, bit: u8) -> [64]u8 {
+        var o : [64]u8 = sig;
+        o[at] = o[at] ^ bit;
+        return o;
+    }
+
+    test "rfc8032 test 1: empty message" {
+        const seed = hex32("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60");
+        const pk = hex32("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a");
+        const sig = hex64("e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b");
+        assert bytes32_eq(public_key(seed), pk);
+        assert bytes64_eq(sign(seed, ""), sig);
+        assert verify(pk, "", sig);
+    }
+
+    test "rfc8032 test 2: one byte" {
+        const seed = hex32("4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb");
+        const pk = hex32("3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c");
+        const sig = hex64("92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00");
+        const m = hex_msg("72");
+        assert bytes32_eq(public_key(seed), pk);
+        assert bytes64_eq(sign(seed, m[0..1]), sig);
+        assert verify(pk, m[0..1], sig);
+    }
+
+    test "rfc8032 test 3: two bytes" {
+        const seed = hex32("c5aa8df43f9f837bedb7442f31dcb7b166d38535076f094b85ce3a2e0b4458f7");
+        const pk = hex32("fc51cd8e6218a1a38da47ed00230f0580816ed13ba3303ac5deb911548908025");
+        const sig = hex64("6291d657deec24024827e69c3abe01a30ce548a284743a445e3680d7db5ac3ac18ff9b538d16f290ae67f760984dc6594a7c15e9716ed28dc027beceea1ec40a");
+        const m = hex_msg("af82");
+        assert bytes32_eq(public_key(seed), pk);
+        assert bytes64_eq(sign(seed, m[0..2]), sig);
+        assert verify(pk, m[0..2], sig);
+    }
+
+    test "rfc8032 test sha(abc): 64-byte message" {
+        const seed = hex32("833fe62409237b9d62ec77587520911e9a759cec1d19755b7da901b96dca3d42");
+        const pk = hex32("ec172b93ad5e563bf4932c70e1245034c35467ef2efd4d64ebf819683467e2bf");
+        const sig = hex64("dc2a4459e7369633a52b1bf277839a00201009a3efbf3ecb69bea2186c26b58909351fc9ac90b3ecfdfbc7c66431e0303dca179c138ac17ad9bef1177331a704");
+        const m = hex_msg("ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f");
+        assert bytes32_eq(public_key(seed), pk);
+        assert bytes64_eq(sign(seed, m[0..64]), sig);
+        assert verify(pk, m[0..64], sig);
+    }
+
+    test "a 300-byte message signs as the oracle does" {
+        const seed = long_seed();
+        const m = long_msg();
+        const pk = hex32("755c4cb9256ca7cdc4acfdc6cfeeda849017e5b9f9514e99191bd67e0b0d4276");
+        const sig = hex64("ab5d4e8f3fa27f25083d888dafc37a5d17c58cb9992b3ed829c9a5568c2fd6f1055b9b59bfff89455e86743fcb6466cba1cd2e871e97908584f85aafd44f2208");
+        assert bytes32_eq(public_key(seed), pk);
+        assert bytes64_eq(sign(seed, m[0..300]), sig);
+        assert verify(pk, m[0..300], sig);
+        assert verify(pk, m[0..299], sig) == false;
+    }
+
+    test "one flipped bit in R or S is rejected" {
+        const pk = hex32("3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c");
+        const sig = hex64("92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00");
+        const m = hex_msg("72");
+        assert verify(pk, m[0..1], sig);
+        assert verify(pk, m[0..1], flip64(sig, 0, 1)) == false;
+        assert verify(pk, m[0..1], flip64(sig, 31, 128)) == false;
+        assert verify(pk, m[0..1], flip64(sig, 32, 1)) == false;
+        assert verify(pk, m[0..1], flip64(sig, 62, 16)) == false;
+    }
+
+    test "one flipped message bit is rejected" {
+        const pk = hex32("fc51cd8e6218a1a38da47ed00230f0580816ed13ba3303ac5deb911548908025");
+        const sig = hex64("6291d657deec24024827e69c3abe01a30ce548a284743a445e3680d7db5ac3ac18ff9b538d16f290ae67f760984dc6594a7c15e9716ed28dc027beceea1ec40a");
+        var m : [64]u8 = hex_msg("af82");
+        assert verify(pk, m[0..2], sig);
+        m[1] = m[1] ^ 1;
+        assert verify(pk, m[0..2], sig) == false;
+        m[1] = m[1] ^ 1;
+        m[0] = m[0] ^ 128;
+        assert verify(pk, m[0..2], sig) == false;
+    }
+
+    test "a signature under another public key is rejected" {
+        const pk1 = hex32("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a");
+        const pk2 = hex32("3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c");
+        const sig1 = hex64("e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b");
+        assert verify(pk1, "", sig1);
+        assert verify(pk2, "", sig1) == false;
+        var pk1x : [32]u8 = pk1;
+        pk1x[0] = pk1x[0] ^ 2;
+        assert verify(pk1x, "", sig1) == false;
+    }
+
+    test "S + L is rejected although it is S mod L (RFC 8032 5.1.7)" {
+        const pk = hex32("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a");
+        const sig_l = hex64("e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901554c8c7872aa064e049dbb3013fbf29380d25bf5f0595bbe24655141438e7a101b");
+        assert verify(pk, "", sig_l) == false;
+        assert sc_below_l(hex32("ecd3f55c1a631258d69cf7a2def9de1400000000000000000000000000000010"));
+        assert sc_below_l(hex32("edd3f55c1a631258d69cf7a2def9de1400000000000000000000000000000010")) == false;
+        assert sc_below_l(hex32("0000000000000000000000000000000000000000000000000000000000000011")) == false;
+        assert sc_below_l(hex32("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0f"));
+    }
+
+    // the identity key (y = 1) decodes but, being small order, verifies
+    // nothing; its two non-canonical encodings do not decode (RFC 8032 5.1.3)
+    test "public keys decode only from canonical encodings" {
+        const ident = hex32("0100000000000000000000000000000000000000000000000000000000000000");
+        const ident_p1 = hex32("eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f");
+        const ident_neg0 = hex32("0100000000000000000000000000000000000000000000000000000000000080");
+        const sig_b1 = hex64("58666666666666666666666666666666666666666666666666666666666666660100000000000000000000000000000000000000000000000000000000000000");
+        const sig_00 = hex64("01000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000");
+        const sig_00nc = hex64("eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f0000000000000000000000000000000000000000000000000000000000000000");
+        assert verify(ident, "t27", sig_b1) == false;
+        assert verify(ident, "t27", sig_00) == false;
+        assert verify(ident_p1, "t27", sig_b1) == false;
+        assert verify(ident_neg0, "t27", sig_b1) == false;
+        assert verify(ident, "t27", sig_00nc) == false;
+        assert pt_decode_neg(ident).ok;
+        assert pt_decode_neg(ident_p1).ok == false;
+        assert pt_decode_neg(ident_neg0).ok == false;
+    }
+
+    test "a y with no x on the curve does not decode" {
+        // y = 2: (y^2 - 1) / (d y^2 + 1) is not a square mod p
+        const y2 = hex32("0200000000000000000000000000000000000000000000000000000000000000");
+        assert pt_decode_neg(y2).ok == false;
+        const pk = hex32("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a");
+        assert pt_decode_neg(pk).ok;
+    }
+
+    test "the base point encodes as RFC 8032 says and has order L" {
+        const bb = hex32("5866666666666666666666666666666666666666666666666666666666666666");
+        assert bytes32_eq(pt_pack(pt_base()), bb);
+        const ll = hex32("edd3f55c1a631258d69cf7a2def9de1400000000000000000000000000000010");
+        assert bytes32_eq(pt_pack(pt_scalarbase(ll)), hex32("0100000000000000000000000000000000000000000000000000000000000000"));
+        const one = hex32("0100000000000000000000000000000000000000000000000000000000000000");
+        assert bytes32_eq(pt_pack(pt_scalarbase(one)), bb);
+        const two = hex32("0200000000000000000000000000000000000000000000000000000000000000");
+        assert bytes32_eq(pt_pack(pt_scalarbase(two)), pt_pack(pt_add(pt_base(), pt_base())));
+    }
+
+    test "field: packing is canonical, inverse and sqrt(-1) hold" {
+        // p itself packs to 0, p + 1 to 1, 2^255 - 1 to 18
+        const pp = fe_unpack(hex32("edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"));
+        assert bytes32_eq(fe_pack(pp), hex32("0000000000000000000000000000000000000000000000000000000000000000"));
+        const p1 = fe_unpack(hex32("eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"));
+        assert bytes32_eq(fe_pack(p1), hex32("0100000000000000000000000000000000000000000000000000000000000000"));
+        const top = fe_unpack(hex32("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"));
+        assert bytes32_eq(fe_pack(top), hex32("1200000000000000000000000000000000000000000000000000000000000000"));
+        const pm1 = fe_unpack(hex32("ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"));
+        assert bytes32_eq(fe_pack(pm1), hex32("ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"));
+        // sqrt(-1)^2 = p - 1, and 2d = d + d
+        assert fe_neq(fe_sq(SQRTM1), pm1) == false;
+        assert fe_neq(fe_add(ED_D, ED_D), ED_D2) == false;
+        // x * (1 / x) = 1 for x = d, x = base y, x = p - 1
+        assert fe_neq(fe_mul(ED_D, fe_inv(ED_D)), FE1) == false;
+        assert fe_neq(fe_mul(ED_BY, fe_inv(ED_BY)), FE1) == false;
+        assert fe_neq(fe_mul(pm1, fe_inv(pm1)), FE1) == false;
+        // a negative difference packs to its value mod p: 0 - 1 = p - 1
+        assert bytes32_eq(fe_pack(fe_sub(FE0, FE1)), hex32("ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"));
+        assert fe_parity(FE1) == 1;
+        assert fe_parity(fe_sub(FE0, FE1)) == 0;
+    }
+
+    test "scalars reduce mod L as Python integers do" {
+        const ff = hex64("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+        assert bytes32_eq(sc_reduce(ff), hex32("000f9c44e31106a447938568a71b0ed065bef517d273ecce3d9a307c1b419903"));
+        const ll = hex64("edd3f55c1a631258d69cf7a2def9de14000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000000");
+        assert bytes32_eq(sc_reduce(ll), hex32("0000000000000000000000000000000000000000000000000000000000000000"));
+        const lm1 = hex64("ecd3f55c1a631258d69cf7a2def9de14000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000000");
+        assert bytes32_eq(sc_reduce(lm1), hex32("ecd3f55c1a631258d69cf7a2def9de1400000000000000000000000000000010"));
+        var x : [64]u8 = [0] ** 64;
+        var i : usize = 0;
+        while (i < 64) {
+            x[i] = ((i * 89 + 13) % 256) as u8;
+            i = i + 1;
+        }
+        assert bytes32_eq(sc_reduce(x), hex32("298ecc828d1d139ae34eea6e29c5771b5b67be9106c9b2668cb63ac851d77906"));
+    }
+
+    // all 8 small-order points (canonical encodings, computed with Python
+    // integers) are small order; the base point and TEST 1's key are not
+    test "exactly the small-order points have [8]P = identity" {
+        assert pt_small_order(pt_decode_neg(hex32("0000000000000000000000000000000000000000000000000000000000000000")).neg);
+        assert pt_small_order(pt_decode_neg(hex32("0000000000000000000000000000000000000000000000000000000000000080")).neg);
+        assert pt_small_order(pt_decode_neg(hex32("0100000000000000000000000000000000000000000000000000000000000000")).neg);
+        assert pt_small_order(pt_decode_neg(hex32("26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05")).neg);
+        assert pt_small_order(pt_decode_neg(hex32("26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc85")).neg);
+        assert pt_small_order(pt_decode_neg(hex32("c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a")).neg);
+        assert pt_small_order(pt_decode_neg(hex32("c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac03fa")).neg);
+        assert pt_small_order(pt_decode_neg(hex32("ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f")).neg);
+        assert pt_small_order(pt_base()) == false;
+        assert pt_small_order(pt_decode_neg(hex32("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a")).neg) == false;
+    }
+
+    // both signatures satisfy the cofactorless equation and OpenSSL
+    // (Python cryptography 46) accepts them; ed25519-dalek verify_strict
+    // does not, and neither does this spec
+    test "a small-order key or a small-order R is rejected" {
+        const a8 = hex32("c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a");
+        const sig_a8 = hex64("0922dd887fef4d75ef2f2230ca285ebbde9d66341c945794ce6ad10f5d6be8910200000000000000000000000000000000000000000000000000000000000000");
+        assert pt_decode_neg(a8).ok;
+        assert verify(a8, "t27", sig_a8) == false;
+        const pk1 = hex32("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a");
+        const sig_r0 = hex64("0100000000000000000000000000000000000000000000000000000000000000e0301e53c7bc9a9d1ef589ec81b703e7d07ec94008ba98e0e9423c00f7ac750e");
+        assert verify(pk1, "t27", sig_r0) == false;
+    }

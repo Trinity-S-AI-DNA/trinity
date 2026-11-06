@@ -1,0 +1,240 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/tri/t27b/fuzz_oracle.t27 -- the agreement oracle of the t27b differential fuzzer (gHashTag/t27#6442)
+; Refs #6488 (sieve C3) and #6063 (t27b epic). fuzz.t27 generates a program whose every test already
+; carries its expected verdict in its name (f<K>_expect_pass or f<K>_expect_trap). This file judges one
+; generated test from three facts: what the generator expects, what t27b said, and what the reference
+; (t27c gen + zig test, one test per process) said. Three facts give five answers that matter:
+;   AGREE          -- both sides gave the expected verdict.
+;   T27B_BUG       -- the reference was right and t27b gave the other verdict, or t27b broke (crash,
+;                     JIT against interpreter mismatch).
+;   REFERENCE_BUG  -- t27b was right and the reference gave the other verdict.
+;   SEMANTICS_GAP  -- both sides agree with each other and not with the generator: the model in
+;                     fuzz.t27 and the language disagree, or the checksum is wrong. A wrong checksum
+;                     lands here, so the oracle cannot be fooled by a broken generator into AGREE.
+;   T27B_REJECTED / REFERENCE_REJECTED -- one side refused to compile a valid program: a t27b
+;                     allow-list gap, or a reference compile bug such as the CSE hoist of #6292.
+; A timeout on either side leaves the test UNJUDGED, and so does a host that refused the run (no
+; process or thread could be spawned): that says nothing about either compiler. disagree counts the four wrong-answer classes;
+; rejected and unjudged are published beside it, never folded into agree.
+; Not here: reading the corpus JSON, mapping a t27b file label to a verdict code. Those are I/O, and
+; t27 has no I/O yet; a driver calls these functions through `t27c gen-c`.
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module T27bFuzzOracle;
+
+/// What the generator expects of one test, read from the end of its name.
+pub const EXP_PASS : u8 = 0;
+pub const EXP_TRAP : u8 = 1;
+pub const EXP_UNKNOWN : u8 = 2;
+
+/// What one side said about one test. V_BROKEN is t27b crashing or its JIT and interpreter
+/// disagreeing; V_REJECT is a refusal to compile; V_MISSING is a test that side never reported;
+/// V_HOST is the host refusing the run (out of processes, threads or memory), whatever the label.
+pub const V_PASS : u8 = 0;
+pub const V_FAIL : u8 = 1;
+pub const V_REJECT : u8 = 2;
+pub const V_TIMEOUT : u8 = 3;
+pub const V_BROKEN : u8 = 4;
+pub const V_MISSING : u8 = 5;
+pub const V_HOST : u8 = 6;
+
+/// The marks a side's detail text carries when the host, not the compiler, failed the run, comma
+/// separated. A driver tests each against the detail; any hit makes that side V_HOST. Measured on
+/// the t27b lab (2026-10-06): under its 1000-pid cgroup a busy neighbour made t27b report
+/// `spawn: Resource temporarily unavailable (os error 11)` as a crash, which read as T27B_BUG.
+pub const HOST_FAILURES : str = "os error 11,os error 12,Resource temporarily unavailable,Cannot allocate memory,ThreadQuotaExceeded,SystemResources";
+
+/// The class of one judged test.
+pub const CLS_AGREE : u8 = 0;
+pub const CLS_T27B_BUG : u8 = 1;
+pub const CLS_REFERENCE_BUG : u8 = 2;
+pub const CLS_SEMANTICS_GAP : u8 = 3;
+pub const CLS_SPLIT : u8 = 4;
+pub const CLS_T27B_REJECTED : u8 = 5;
+pub const CLS_REFERENCE_REJECTED : u8 = 6;
+pub const CLS_UNJUDGED : u8 = 7;
+pub const CLS_COUNT : u8 = 8;
+
+/// The words a report prints for each class, in class order, comma separated.
+pub const CLS_NAMES : str = "AGREE,T27B_BUG,REFERENCE_BUG,SEMANTICS_GAP,SPLIT,T27B_REJECTED,REFERENCE_REJECTED,UNJUDGED";
+
+/// The keys a lab run publishes under `fuzz` in latest.json, comma separated.
+pub const PUBLISHED_KEYS : str = "cases,tests,agree,disagree,rejected,unjudged,seeds,seed,classes";
+
+/// The test-name suffixes the generator writes, and their lengths.
+pub const SUFFIX_PASS : str = "_expect_pass";
+pub const SUFFIX_TRAP : str = "_expect_trap";
+pub const SUFFIX_LEN : u32 = 12;
+
+/// The verdict a test that behaves as expected gets: a kept trap fails its test.
+pub fn wanted(e: u8) -> u8 {
+    if (e == EXP_TRAP) {
+        return V_FAIL;
+    }
+    return V_PASS;
+}
+
+/// True when the verdict is an answer (the test ran to a pass or a fail).
+pub fn answered(v: u8) -> bool {
+    return v == V_PASS or v == V_FAIL;
+}
+
+/// The class of one generated test. e is EXP_*, t and r are V_* for t27b and the reference.
+pub fn classify(e: u8, t: u8, r: u8) -> u8 {
+    if (e == EXP_UNKNOWN) {
+        return CLS_UNJUDGED;
+    }
+    if (t == V_TIMEOUT or r == V_TIMEOUT) {
+        return CLS_UNJUDGED;
+    }
+    if (t == V_HOST or r == V_HOST) {
+        return CLS_UNJUDGED;
+    }
+    const w = wanted(e);
+    if (t == V_BROKEN) {
+        return CLS_T27B_BUG;
+    }
+    if (answered(t) and answered(r)) {
+        if (t == w and r == w) {
+            return CLS_AGREE;
+        }
+        if (t == w) {
+            return CLS_REFERENCE_BUG;
+        }
+        if (r == w) {
+            return CLS_T27B_BUG;
+        }
+        return CLS_SEMANTICS_GAP;
+    }
+    if (answered(r)) {
+        if (r == w) {
+            return CLS_T27B_REJECTED;
+        }
+        return CLS_SPLIT;
+    }
+    if (answered(t)) {
+        if (t == w) {
+            return CLS_REFERENCE_REJECTED;
+        }
+        return CLS_SPLIT;
+    }
+    return CLS_REFERENCE_REJECTED;
+}
+
+/// The wrong-answer classes: these count as disagree.
+pub fn is_disagree(c: u8) -> bool {
+    return c == CLS_T27B_BUG or c == CLS_REFERENCE_BUG or c == CLS_SEMANTICS_GAP or c == CLS_SPLIT;
+}
+
+/// A side refused to compile a valid program: published as rejected.
+pub fn is_rejected(c: u8) -> bool {
+    return c == CLS_T27B_REJECTED or c == CLS_REFERENCE_REJECTED;
+}
+
+/// A case whose seed is published for regression: anything but AGREE and UNJUDGED.
+pub fn is_finding(c: u8) -> bool {
+    return c != CLS_AGREE and c != CLS_UNJUDGED;
+}
+
+/// The expectation a test name carries. s holds n bytes.
+pub fn expect_of(s: []const u8, n: u32) -> u8 {
+    if (n < SUFFIX_LEN) {
+        return EXP_UNKNOWN;
+    }
+    const base = n - SUFFIX_LEN;
+    var pass_ok = true;
+    var trap_ok = true;
+    var i: u32 = 0;
+    while (i < SUFFIX_LEN) {
+        if (s[base + i] != SUFFIX_PASS[i]) {
+            pass_ok = false;
+        }
+        if (s[base + i] != SUFFIX_TRAP[i]) {
+            trap_ok = false;
+        }
+        i += 1;
+    }
+    if (pass_ok) {
+        return EXP_PASS;
+    }
+    if (trap_ok) {
+        return EXP_TRAP;
+    }
+    return EXP_UNKNOWN;
+}
+
+test agree_on_pass_and_on_trap {
+    assert(classify(EXP_PASS, V_PASS, V_PASS) == CLS_AGREE);
+    assert(classify(EXP_TRAP, V_FAIL, V_FAIL) == CLS_AGREE);
+}
+
+test wrong_checksum_is_a_disagreement {
+    // The mutation check of the oracle: a generator whose checksum is wrong makes both sides fail an
+    // expect_pass test. That must not read as agreement.
+    const c = classify(EXP_PASS, V_FAIL, V_FAIL);
+    assert(c == CLS_SEMANTICS_GAP);
+    assert(is_disagree(c));
+    assert(is_finding(c));
+}
+
+test forgotten_trap_is_the_side_that_forgot {
+    // A kept trap's checksum is the wrapped value, so a side that forgets the trap PASSES.
+    assert(classify(EXP_TRAP, V_PASS, V_FAIL) == CLS_T27B_BUG);
+    assert(classify(EXP_TRAP, V_FAIL, V_PASS) == CLS_REFERENCE_BUG);
+    assert(classify(EXP_PASS, V_FAIL, V_PASS) == CLS_T27B_BUG);
+    assert(classify(EXP_PASS, V_PASS, V_FAIL) == CLS_REFERENCE_BUG);
+}
+
+test refusals_are_rejected_not_agree {
+    assert(classify(EXP_PASS, V_REJECT, V_PASS) == CLS_T27B_REJECTED);
+    assert(classify(EXP_PASS, V_MISSING, V_PASS) == CLS_T27B_REJECTED);
+    assert(classify(EXP_TRAP, V_FAIL, V_REJECT) == CLS_REFERENCE_REJECTED);
+    assert(classify(EXP_PASS, V_REJECT, V_REJECT) == CLS_REFERENCE_REJECTED);
+    assert(is_rejected(CLS_T27B_REJECTED));
+    assert(is_rejected(CLS_REFERENCE_REJECTED));
+    assert(is_disagree(CLS_T27B_REJECTED) == false);
+    assert(is_finding(CLS_REFERENCE_REJECTED));
+}
+
+test one_side_wrong_other_refused_is_split {
+    assert(classify(EXP_PASS, V_REJECT, V_FAIL) == CLS_SPLIT);
+    assert(classify(EXP_PASS, V_FAIL, V_REJECT) == CLS_SPLIT);
+    assert(is_disagree(CLS_SPLIT));
+}
+
+test broken_t27b_and_timeouts {
+    assert(classify(EXP_PASS, V_BROKEN, V_PASS) == CLS_T27B_BUG);
+    assert(classify(EXP_PASS, V_TIMEOUT, V_PASS) == CLS_UNJUDGED);
+    assert(classify(EXP_PASS, V_PASS, V_TIMEOUT) == CLS_UNJUDGED);
+    assert(classify(EXP_UNKNOWN, V_PASS, V_PASS) == CLS_UNJUDGED);
+    assert(is_finding(CLS_UNJUDGED) == false);
+    assert(is_disagree(CLS_AGREE) == false);
+}
+
+test a_refused_host_is_unjudged_not_a_bug {
+    // The lab defect this guards: t27b's spawn failed with EAGAIN, its row said crash, and the old
+    // order read V_BROKEN first and published T27B_BUG.
+    assert(classify(EXP_TRAP, V_HOST, V_REJECT) == CLS_UNJUDGED);
+    assert(classify(EXP_PASS, V_HOST, V_PASS) == CLS_UNJUDGED);
+    assert(classify(EXP_PASS, V_PASS, V_HOST) == CLS_UNJUDGED);
+    assert(classify(EXP_PASS, V_BROKEN, V_PASS) == CLS_T27B_BUG);
+    assert(is_finding(classify(EXP_PASS, V_HOST, V_HOST)) == false);
+}
+
+test names_carry_the_expectation {
+    assert(expect_of("f0_expect_pass", 14) == EXP_PASS);
+    assert(expect_of("f2_expect_trap", 14) == EXP_TRAP);
+    assert(expect_of("f2_expect_tarp", 14) == EXP_UNKNOWN);
+    assert(expect_of("_expect", 7) == EXP_UNKNOWN);
+}
+
+invariant classes_partition {
+    // Every class is exactly one of agree, disagree, rejected, unjudged.
+    assert(is_disagree(CLS_AGREE) == false and is_rejected(CLS_AGREE) == false);
+    assert(is_disagree(CLS_UNJUDGED) == false and is_rejected(CLS_UNJUDGED) == false);
+    assert(is_disagree(CLS_T27B_BUG) and is_rejected(CLS_T27B_BUG) == false);
+    assert(is_disagree(CLS_REFERENCE_BUG) and is_rejected(CLS_REFERENCE_BUG) == false);
+    assert(is_disagree(CLS_SEMANTICS_GAP) and is_rejected(CLS_SEMANTICS_GAP) == false);
+    assert(is_disagree(CLS_SPLIT) and is_rejected(CLS_SPLIT) == false);
+    assert(is_rejected(CLS_T27B_REJECTED) and is_rejected(CLS_REFERENCE_REJECTED));
+}

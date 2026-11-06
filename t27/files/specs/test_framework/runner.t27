@@ -1,0 +1,732 @@
+module runner;
+
+use test_framework::core::{TestResult, Verdict, ToleranceTier, EngineeringStatus, GatePipeline, for_all, metamorphic, differential, TapReporter, JsonReporter, Text, Report, ResultList, PropertySamples, MAX_CASES, text_empty, text_from, text_append_str, text_append_text, f64_to_text, report_empty, report_append_str, result_list_empty, result_list_push, result_list_count_verdict, gate_pipeline_verdict, tap_reporter_new, tap_reporter_generate_tap, json_reporter_new, json_reporter_generate_json};
+
+// Port notes (Rust dialect -> t27):
+// - `impl` blocks do not exist in t27: every method is a free function whose
+//   receiver `self` is the first parameter (`config_*` for TestRunnerConfig,
+//   `runner_*` for TestRunner).
+// - Result<T, string> is the error union `!T`; `?` is `try`; `Ok(x)` is
+//   `return x`. A Rust error MESSAGE becomes a named error (the message text
+//   is kept in a comment next to it).
+// - Option<T> is the optional type `?T`; None is `null`, Some(x) is `x`,
+//   `.unwrap_or(d)` is `if (o == null) d else o.?`.
+// - Closures are named functions.
+// - The core types come from specs/test_framework/core.t27 and are used in
+//   the shape its translation gives them:
+//   Vec<TestResult>   -> core's ResultList (fixed capacity MAX_RESULTS, set
+//                        in core; result_list_push drops results past it, as
+//                        core documents)
+//   TestResult        -> core's struct: `name` and `message` are Text,
+//                        each Option field is a `has_<field>` flag beside
+//                        the value, and input / expected / actual are f64
+//                        (core maps `any` to f64)
+//   string building   -> core's Text / Report buffers (text_* / report_*)
+//   format!("{}", x)  -> f64_to_text / Text appends
+//   Type::method()    -> core's free functions (tap_reporter_new,
+//                        gate_pipeline_verdict, ...)
+//   for_all(domain, property, iterations) -> core's
+//                        for_all(samples, iterations): the runner calls the
+//                        two functions and hands over the evaluated samples
+// - println! is the host `print` / `print_int`, as in core's test.
+
+/// Capacity of a spec's test-block list (Vec<TestBlock> in the original)
+pub const MAX_TEST_BLOCKS : u32 = 1024;
+/// Capacity of the command-line spec file list (Vec<string> in the original)
+pub const MAX_SPEC_FILES : u32 = 256;
+
+/// Test runner configuration
+struct TestRunnerConfig {
+    /// Maximum number of iterations for property-based tests
+    max_iterations: u32,
+    /// Default tolerance for numeric comparisons
+    default_tolerance: f64,
+    /// Whether to generate detailed reports
+    verbose: bool,
+    /// Output format (tap, json, both)
+    output_format: string,
+}
+
+// impl TestRunnerConfig
+
+fn config_default() -> TestRunnerConfig {
+    // The original ended this struct literal with `;`, which in Rust returns
+    // `()`; the evident intent, returning the defaults, is what is written.
+    return TestRunnerConfig {
+        max_iterations: 10000,
+        default_tolerance: 1e-12,
+        verbose: false,
+        output_format: "tap",
+    };
+}
+
+// `TestRunnerConfig { field: value, ..self }` (struct update syntax) is a copy
+// of the receiver with one field overwritten.
+fn config_with_iterations(self: TestRunnerConfig, iterations: u32) -> TestRunnerConfig {
+    var updated = self;
+    updated.max_iterations = iterations;
+    return updated;
+}
+
+fn config_with_tolerance(self: TestRunnerConfig, tolerance: f64) -> TestRunnerConfig {
+    var updated = self;
+    updated.default_tolerance = tolerance;
+    return updated;
+}
+
+fn config_with_verbose(self: TestRunnerConfig, verbose: bool) -> TestRunnerConfig {
+    var updated = self;
+    updated.verbose = verbose;
+    return updated;
+}
+
+fn config_with_format(self: TestRunnerConfig, format: string) -> TestRunnerConfig {
+    var updated = self;
+    updated.output_format = format;
+    return updated;
+}
+
+/// Test runner state
+struct TestRunner {
+    config: TestRunnerConfig,
+    results: ResultList,
+    start_time: f64  // Using f64 for timestamp
+}
+
+// impl TestRunner
+
+fn runner_new(config: TestRunnerConfig) -> TestRunner {
+    return TestRunner {
+        config: config,
+        results: result_list_empty(),
+        start_time: current_timestamp(),
+    };
+}
+
+/// Execute a single test specification
+fn runner_run_test_spec(self: *TestRunner, spec_path: string) -> !ResultList {
+    // Parse the .t27 specification
+    const spec_content = try read_file(spec_path);
+    const spec = try parse_t27_spec(spec_content);
+
+    // Execute all test blocks in the spec
+    var test_results = result_list_empty();
+
+    var i : u32 = 0;
+    while (i < spec.test_blocks.len) {
+        const result = try runner_execute_test_block(self, spec.test_blocks.items[i]);
+        result_list_push(&test_results, result);
+        i = i + 1;
+    }
+
+    return test_results;
+}
+
+/// Execute a single test block
+fn runner_execute_test_block(self: *TestRunner, test_block: TestBlock) -> !TestResult {
+    return switch (test_block.kind) {
+        .Unit => runner_execute_unit_test(self, test_block),
+        .Property => runner_execute_property_test(self, test_block),
+        .Invariant => runner_execute_invariant_test(self, test_block),
+        .Bench => runner_execute_benchmark_test(self, test_block),
+        .GatePipeline => runner_execute_gate_pipeline_test(self, test_block),
+    };
+}
+
+/// Execute unit test
+fn runner_execute_unit_test(self: *TestRunner, test_block: TestBlock) -> !TestResult {
+    const start = current_timestamp();
+
+    // Execute the test logic (the optional callback is unwrapped, then called)
+    const test_fn = test_block.test_fn.?;
+    const result = test_fn();
+    const duration = current_timestamp() - start;
+
+    // message: if result { None } else { Some("Unit test failed") }
+    var message = text_empty();
+    if (!result) {
+        message = text_from("Unit test failed");
+    }
+
+    return TestResult {
+        name: text_from(test_block.name),
+        verdict: if (result) Verdict.CLEAN else Verdict.FAIL,
+        tolerance: if (test_block.tolerance_tier == null) ToleranceTier.EXACT else test_block.tolerance_tier.?,
+        engineering: EngineeringStatus.tested,
+        has_claim_id: test_block.claim_id != null,
+        claim_id: if (test_block.claim_id == null) "" else test_block.claim_id.?,
+        input: test_block.input,
+        expected: test_block.expected,
+        // actual: result (a bool). core's `actual` is f64, so the outcome is
+        // stored as 1.0 (true) or 0.0 (false).
+        actual: if (result) 1.0 else 0.0,
+        has_delta: false,  // delta: None
+        delta: 0.0,
+        has_message: !result,
+        message: message,
+    };
+}
+
+/// Execute property-based test
+fn runner_execute_property_test(self: *TestRunner, test_block: TestBlock) -> !TestResult {
+    const iterations = if (test_block.iterations == null) self.config.max_iterations else test_block.iterations.?;
+    // `unwrap_or(|| default_domain())`: the fallback is the default domain.
+    const domain = if (test_block.domain_fn == null) default_domain() else test_block.domain_fn.?;
+    const property = if (test_block.property_fn == null) default_property() else test_block.property_fn.?;
+
+    // for_all(domain, property, iterations): core's for_all cannot take the
+    // two functions, so it takes their evaluated samples. domain() and
+    // property() are called here once per iteration, for the first
+    // MAX_CASES iterations -- the most core's for_all evaluates (its result
+    // says "capped at" when iterations is larger).
+    var samples = PropertySamples { inputs: [0.0; MAX_CASES], holds: [true; MAX_CASES] };
+    var k : u32 = 0;
+    while (k < iterations and k < MAX_CASES) {
+        const input = domain();
+        samples.inputs[k] = input;
+        samples.holds[k] = property(input);
+        k = k + 1;
+    }
+
+    const result = for_all(samples, iterations);
+
+    return result;
+}
+
+/// Execute invariant test
+fn runner_execute_invariant_test(self: *TestRunner, test_block: TestBlock) -> !TestResult {
+    // Invariant tests are always property tests with exact tolerance
+    var invariant_block = test_block;
+    invariant_block.tolerance_tier = ToleranceTier.EXACT;
+    return runner_execute_property_test(self, invariant_block);
+}
+
+/// Execute benchmark test
+fn runner_execute_benchmark_test(self: *TestRunner, test_block: TestBlock) -> !TestResult {
+    const start = current_timestamp();
+
+    // Run the benchmark operation multiple times
+    const iterations = if (test_block.iterations == null) 1000 else test_block.iterations.?;
+    const test_fn = test_block.test_fn.?;
+    var n : u32 = 0;
+    while (n < iterations) {
+        _ = test_fn();
+        n = n + 1;
+    }
+
+    const duration = current_timestamp() - start;
+    const avg_time = duration / (iterations as f64);
+
+    // format!("{}_bench", test_block.name)
+    var name = text_from(test_block.name);
+    text_append_str(&name, "_bench");
+
+    // format!("Average execution time: {:.6}s", avg_time). core's f64_to_text
+    // writes up to six fraction digits with trailing zeros removed, so the
+    // number can come out shorter than `{:.6}` would print it.
+    var message = text_from("Average execution time: ");
+    text_append_text(&message, f64_to_text(avg_time));
+    text_append_str(&message, "s");
+
+    return TestResult {
+        name: name,
+        verdict: Verdict.CLEAN,  // Benchmarks don't fail unless error
+        tolerance: ToleranceTier.EMPIRICAL_FIT,
+        engineering: EngineeringStatus.empirical,
+        has_claim_id: test_block.claim_id != null,
+        claim_id: if (test_block.claim_id == null) "" else test_block.claim_id.?,
+        input: iterations as f64,
+        expected: 0.0,  // Expected execution time
+        actual: avg_time,
+        has_delta: false,  // delta: None
+        delta: 0.0,
+        has_message: true,
+        message: message,
+    };
+}
+
+/// Execute gate pipeline test
+fn runner_execute_gate_pipeline_test(self: *TestRunner, test_block: TestBlock) -> !TestResult {
+    const pipeline_fn = if (test_block.pipeline_fn == null) default_pipeline() else test_block.pipeline_fn.?;
+    const pipeline = pipeline_fn();
+    const verdict = gate_pipeline_verdict(pipeline);
+
+    // format!("{}_pipeline", test_block.name)
+    var name = text_from(test_block.name);
+    text_append_str(&name, "_pipeline");
+
+    var message = text_empty();
+    if (verdict == Verdict.FAIL) {
+        message = text_from("Gate pipeline failed - check which gates are false");
+    }
+
+    return TestResult {
+        name: name,
+        verdict: verdict,
+        tolerance: ToleranceTier.EXACT,
+        engineering: EngineeringStatus.tested,
+        has_claim_id: test_block.claim_id != null,
+        claim_id: if (test_block.claim_id == null) "" else test_block.claim_id.?,
+        input: test_block.input,
+        // expected: GatePipeline::all_true(), actual: pipeline. core's
+        // expected / actual are f64, so each pipeline is stored as its
+        // six-gate mask (gate_pipeline_mask below; all gates true is 63).
+        expected: gate_pipeline_mask(gate_pipeline_all_true()),
+        actual: gate_pipeline_mask(pipeline),
+        has_delta: false,  // delta: None
+        delta: 0.0,
+        has_message: verdict == Verdict.FAIL,
+        message: message,
+    };
+}
+
+/// A GatePipeline as the f64 core's TestResult can hold: bit 0 parse_ok,
+/// bit 1 type_check_ok, bit 2 semantic_ok, bit 3 numeric_stability_ok,
+/// bit 4 physics_constraint_ok, bit 5 audit_ok (the order of core's
+/// gate_pipeline_sequential_all_gates invariant). The mask names the
+/// pipeline exactly, so no gate state is lost.
+fn gate_pipeline_mask(gate: GatePipeline) -> f64 {
+    var mask : u32 = 0;
+    if (gate.parse_ok) {
+        mask = mask + 1;
+    }
+    if (gate.type_check_ok) {
+        mask = mask + 2;
+    }
+    if (gate.semantic_ok) {
+        mask = mask + 4;
+    }
+    if (gate.numeric_stability_ok) {
+        mask = mask + 8;
+    }
+    if (gate.physics_constraint_ok) {
+        mask = mask + 16;
+    }
+    if (gate.audit_ok) {
+        mask = mask + 32;
+    }
+    return mask as f64;
+}
+
+/// Generate test reports
+// String::new() + push_str is core's Report buffer; bytes past REPORT_CAP
+// (set in core) are dropped, where a String would grow.
+fn runner_generate_reports(self: TestRunner) -> Report {
+    var output = report_empty();
+
+    if (str_contains(self.config.output_format, "tap") or str_contains(self.config.output_format, "both")) {
+        const tap_reporter = tap_reporter_new(self.results);
+        report_append_str(&output, "=== TAP Report ===\n");
+        const tap = tap_reporter_generate_tap(tap_reporter);
+        report_append_str(&output, tap.bytes[0..tap.len]);
+        report_append_str(&output, "\n");
+    }
+
+    if (str_contains(self.config.output_format, "json") or str_contains(self.config.output_format, "both")) {
+        const json_reporter = json_reporter_new(self.results);
+        report_append_str(&output, "=== JSON Report ===\n");
+        const json = json_reporter_generate_json(json_reporter);
+        report_append_str(&output, json.bytes[0..json.len]);
+        report_append_str(&output, "\n");
+    }
+
+    return output;
+}
+
+/// Print summary statistics
+// `self.results.iter().filter(|r| r.verdict == V).count()` is core's
+// result_list_count_verdict.
+fn runner_print_summary(self: TestRunner) {
+    const total = self.results.len;
+    const passed = result_list_count_verdict(self.results, Verdict.CLEAN);
+    const failed = result_list_count_verdict(self.results, Verdict.FAIL);
+    const skipped = result_list_count_verdict(self.results, Verdict.SKIP);
+    const partial = result_list_count_verdict(self.results, Verdict.PARTIAL);
+
+    print("=== Test Summary ===\n");
+    print("Total tests: ");
+    print_int(total);
+    print("\n");
+    print("Passed: ");
+    print_int(passed);
+    print("\n");
+    print("Failed: ");
+    print_int(failed);
+    print("\n");
+    print("Skipped: ");
+    print_int(skipped);
+    print("\n");
+    print("Partial: ");
+    print_int(partial);
+    print("\n");
+
+    if (failed > 0) {
+        print("\n=== Failed Tests ===\n");
+        var i : u32 = 0;
+        while (i < self.results.len) {
+            const result = self.results.items[i];
+            if (result.verdict == Verdict.FAIL) {
+                print("✗ ");
+                print(result.name.bytes[0..result.name.len]);
+                print("\n");
+                // if let Some(ref msg) = result.message
+                if (result.has_message) {
+                    print("   ");
+                    print(result.message.bytes[0..result.message.len]);
+                    print("\n");
+                }
+            }
+            i = i + 1;
+        }
+    }
+
+    if (self.config.verbose) {
+        print("\n=== All Results ===\n");
+        var j : u32 = 0;
+        while (j < self.results.len) {
+            const result = self.results.items[j];
+            const status = switch (result.verdict) {
+                .CLEAN => "✓",
+                .FAIL => "✗",
+                .SKIP => "○",
+                .PARTIAL => "~",
+            };
+            // println!("{} {} ({})", status, result.name, result.engineering)
+            print(status);
+            print(" ");
+            print(result.name.bytes[0..result.name.len]);
+            print(" (");
+            print(engineering_status_name(result.engineering));
+            print(")\n");
+            j = j + 1;
+        }
+    }
+}
+
+/// Exit with appropriate code based on test results
+fn runner_exit_with_code(self: TestRunner) -> noreturn {
+    const failed = result_list_count_verdict(self.results, Verdict.FAIL);
+
+    if (failed > 0) {
+        exit(1);
+    } else {
+        exit(0);
+    }
+}
+
+/// Text of an EngineeringStatus, as `{}` printed it in the original
+fn engineering_status_name(status: EngineeringStatus) -> string {
+    return switch (status) {
+        .proved => "proved",
+        .tested => "tested",
+        .empirical => "empirical",
+        .conjectural => "conjectural",
+        .deprecated => "deprecated",
+    };
+}
+
+/// Fixed-capacity list of test blocks (Vec<TestBlock> in the original)
+struct TestBlockList {
+    items: [MAX_TEST_BLOCKS]TestBlock,
+    len: u32,
+}
+
+/// Parsed .t27 test specification
+struct T27Spec {
+    name: string,
+    version: string,
+    test_blocks: TestBlockList
+}
+
+// Function types of the optional callbacks in TestBlock
+// (fn() -> bool, fn() -> any, fn(any) -> bool, fn() -> GatePipeline).
+// `any` is f64 here, as in core. (Zig and Rust lower these aliases to
+// function types; the C backend emits `static const int TestFn = fn ( )
+// bool;`, which is not C -- a backend gap, not a choice made here.)
+pub const TestFn = fn() bool;
+pub const DomainFn = fn() f64;
+pub const PropertyFn = fn(f64) bool;
+pub const PipelineFn = fn() GatePipeline;
+
+/// Individual test block within a specification
+struct TestBlock {
+    name: string,
+    kind: TestKind,
+    tolerance_tier: ?ToleranceTier,
+    claim_id: ?string,
+    input: f64,     // any -> f64, as core's TestResult.input
+    expected: f64,  // any -> f64, as core's TestResult.expected
+    iterations: ?u32,
+    test_fn: ?TestFn,
+    domain_fn: ?DomainFn,
+    property_fn: ?PropertyFn,
+    pipeline_fn: ?PipelineFn
+}
+
+/// Test kind classification
+enum TestKind {
+    Unit,        // Simple unit test
+    Property,    // Property-based test
+    Invariant,   // Mathematical invariant
+    Bench,       // Performance benchmark
+    GatePipeline // Sequential gate pipeline
+}
+
+/// Helper functions
+fn read_file(path: string) -> !string {
+    // Placeholder for file reading
+    return "";
+}
+
+fn parse_t27_spec(content: string) -> !T27Spec {
+    // Placeholder for .t27 specification parsing
+    return T27Spec {
+        name: "test_spec",
+        version: "1.0",
+        test_blocks: TestBlockList { items: undefined, len: 0 },
+    };
+}
+
+fn current_timestamp() -> f64 {
+    // Placeholder for timestamp
+    return 0.0;
+}
+
+/// `haystack.contains(needle)` as an explicit scan
+fn str_contains(haystack: string, needle: string) -> bool {
+    if (needle.len > haystack.len) {
+        return false;
+    }
+    var start : u32 = 0;
+    while (start + needle.len <= haystack.len) {
+        var k : u32 = 0;
+        var same = true;
+        while (k < needle.len) {
+            if (haystack[start + k] != needle[k]) {
+                same = false;
+                break;
+            }
+            k = k + 1;
+        }
+        if (same) {
+            return true;
+        }
+        start = start + 1;
+    }
+    return false;
+}
+
+/// String equality (Rust `==` on strings and `match` on `as_str()`) as an
+/// explicit byte comparison; `==` on two strings is not a content comparison
+/// in every backend.
+fn str_eq(a: string, b: string) -> bool {
+    if (a.len != b.len) {
+        return false;
+    }
+    var k : u32 = 0;
+    while (k < a.len) {
+        if (a[k] != b[k]) {
+            return false;
+        }
+        k = k + 1;
+    }
+    return true;
+}
+
+// The three defaults below returned closures (`|| 0u32`, `|_x| true`,
+// `|| GatePipeline::all_true()`); each closure is a named function and the
+// default returns that function.
+
+fn default_domain_sample() -> f64 {
+    // `|| 0u32`: the domain value 0, as f64 (core's type for `any`).
+    return 0.0;  // Default domain
+}
+
+fn default_domain() -> DomainFn {
+    return default_domain_sample;
+}
+
+fn default_property_holds(x: f64) -> bool {
+    return true;  // Default property (always true)
+}
+
+fn default_property() -> PropertyFn {
+    return default_property_holds;
+}
+
+// GatePipeline::all_true() is called by the original but is defined nowhere:
+// not in core.t27 and not elsewhere in specs/. It is called here under core's
+// free-function naming, gate_pipeline_all_true(), and still has no
+// definition; by its name it is the pipeline with all six gates true.
+fn default_pipeline_all_true() -> GatePipeline {
+    return gate_pipeline_all_true();
+}
+
+fn default_pipeline() -> PipelineFn {
+    return default_pipeline_all_true;
+}
+
+/// Execute test specification with default configuration
+pub fn run_test_spec_file(spec_path: string) -> !void {
+    const config = config_default();
+    return run_test_spec_file_with_config(spec_path, config);
+}
+
+/// Execute test specification with custom configuration
+pub fn run_test_spec_file_with_config(spec_path: string, config: TestRunnerConfig) -> !void {
+    var runner = runner_new(config);
+
+    // Run the test specification
+    const results = try runner_run_test_spec(&runner, spec_path);
+    runner.results = results;
+
+    // Generate reports
+    const reports = runner_generate_reports(runner);
+    if (runner.config.verbose) {
+        // println!("{}", reports)
+        print(reports.bytes[0..reports.len]);
+        print("\n");
+    }
+
+    // Print summary
+    runner_print_summary(runner);
+
+    // Exit with appropriate code
+    runner_exit_with_code(runner);
+}
+
+/// Command-line interface for test runner
+pub fn main(args: []string) -> !void {
+    var config = config_default();
+    var spec_files : [MAX_SPEC_FILES]string = undefined;
+    var spec_files_len : u32 = 0;
+
+    // Parse command line arguments
+    // (`match args[i].as_str()` with string patterns is an if/else chain of
+    // str_eq comparisons.)
+    // parse_u32 / parse_f64 are the host's number parsers (Rust
+    // `str::parse`), returning null when the text is not a number.
+    var i : u32 = 0;
+    while (i < args.len) {
+        const arg = args[i];
+        if (str_eq(arg, "--iterations") or str_eq(arg, "-i")) {
+            if (i + 1 < args.len) {
+                const parsed_iterations = parse_u32(args[i + 1]);
+                if (parsed_iterations == null) {
+                    return error.InvalidIterationCount;  // "Invalid iteration count"
+                }
+                config.max_iterations = parsed_iterations.?;
+                i += 1;
+            }
+        } else if (str_eq(arg, "--tolerance") or str_eq(arg, "-t")) {
+            if (i + 1 < args.len) {
+                const parsed_tolerance = parse_f64(args[i + 1]);
+                if (parsed_tolerance == null) {
+                    return error.InvalidTolerance;  // "Invalid tolerance"
+                }
+                config.default_tolerance = parsed_tolerance.?;
+                i += 1;
+            }
+        } else if (str_eq(arg, "--verbose") or str_eq(arg, "-v")) {
+            config.verbose = true;
+        } else if (str_eq(arg, "--format") or str_eq(arg, "-f")) {
+            if (i + 1 < args.len) {
+                config.output_format = args[i + 1];
+                i += 1;
+            }
+        } else {
+            // spec_files.push(...): the list is fixed-capacity here.
+            if (spec_files_len >= MAX_SPEC_FILES) {
+                return error.TooManySpecFiles;
+            }
+            spec_files[spec_files_len] = arg;
+            spec_files_len += 1;
+        }
+        i += 1;
+    }
+
+    // If no spec files provided, use default
+    if (spec_files_len == 0) {
+        spec_files[0] = "spec.t27";
+        spec_files_len = 1;
+    }
+
+    // Run each spec file
+    var f : u32 = 0;
+    while (f < spec_files_len) {
+        try run_test_spec_file_with_config(spec_files[f], config);
+        f += 1;
+    }
+
+    return;
+}
+
+// L4: the original carried no test; these check the configuration builders
+// and the string and gate-mask helpers exactly as written above.
+
+test "config_default_values" {
+    const config = config_default();
+    assert(config.max_iterations == 10000);
+    assert(config.default_tolerance == 1e-12);
+    assert(config.verbose == false);
+    assert(str_eq(config.output_format, "tap"));
+}
+
+test "config_builders_replace_one_field" {
+    const base = config_default();
+    const more = config_with_iterations(base, 500);
+    assert(more.max_iterations == 500);
+    assert(more.verbose == base.verbose);
+    const loud = config_with_verbose(base, true);
+    assert(loud.verbose == true);
+    assert(loud.max_iterations == 10000);
+    const json = config_with_format(base, "json");
+    assert(str_eq(json.output_format, "json"));
+    assert(json.max_iterations == 10000);
+    const tight = config_with_tolerance(base, 1e-9);
+    assert(tight.default_tolerance == 1e-9);
+}
+
+test "str_contains_matches_substrings" {
+    assert(str_contains("tap", "tap") == true);
+    assert(str_contains("both", "both") == true);
+    assert(str_contains("json", "tap") == false);
+    assert(str_contains("ta", "tap") == false);
+}
+
+test "str_eq_compares_content" {
+    assert(str_eq("--verbose", "--verbose") == true);
+    assert(str_eq("-v", "-t") == false);
+    assert(str_eq("tap", "taps") == false);
+    assert(str_eq("", "") == true);
+}
+
+test "gate_pipeline_mask_encodes_each_gate" {
+    const none = GatePipeline {
+        parse_ok: false,
+        type_check_ok: false,
+        semantic_ok: false,
+        numeric_stability_ok: false,
+        physics_constraint_ok: false,
+        audit_ok: false,
+    };
+    assert(gate_pipeline_mask(none) == 0.0);
+    const parse_and_audit = GatePipeline {
+        parse_ok: true,
+        type_check_ok: false,
+        semantic_ok: false,
+        numeric_stability_ok: false,
+        physics_constraint_ok: false,
+        audit_ok: true,
+    };
+    assert(gate_pipeline_mask(parse_and_audit) == 33.0);
+    const all = GatePipeline {
+        parse_ok: true,
+        type_check_ok: true,
+        semantic_ok: true,
+        numeric_stability_ok: true,
+        physics_constraint_ok: true,
+        audit_ok: true,
+    };
+    assert(gate_pipeline_mask(all) == 63.0);
+}

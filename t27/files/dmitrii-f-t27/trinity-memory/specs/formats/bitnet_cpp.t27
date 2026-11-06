@@ -1,0 +1,265 @@
+// SPDX-License-Identifier: Apache-2.0
+// Issue: https://github.com/dmitrii-f-t27/trinity-memory/issues/125
+// Coverage: https://github.com/dmitrii-f-t27/trinity-memory/issues/29
+// Coverage: https://github.com/dmitrii-f-t27/trinity-memory/issues/30
+// Coverage: https://github.com/dmitrii-f-t27/trinity-memory/issues/34
+// specs/formats/bitnet_cpp.t27 -- bitnet.cpp I2_S tensor layout
+// Restates upstream microsoft/BitNet@0b341e582afbf9e1011f24744b554c96a3477eb5:
+// include/gemm-config.h:1 (#define ACT_PARALLEL; the compiled
+// ggml-cpu-i2s.c of the submodule includes it, so the pinned build reads this
+// layout); src/ggml-bitnet-mad.cpp, which the pinned build does not compile
+// (see below) but which documents the layouts: :11-15 (QK_I2_S 128 on x86, 64
+// on ARM NEON), :51-96 (a quantize_i2_s for x86 ACT_PARALLEL: 32-byte groups,
+// f32 scale at byte n/4, n/4 + 32 bytes), :97-149 (x86 without ACT_PARALLEL:
+// four rows per byte), :151-194 (ARM: 16-byte groups), :198-295
+// (ggml_vec_dot_i2_i8_s_1x1 multiplies the raw 2-bit codes); utils/convert-hf-to-gguf-bitnet.py:666-727
+// (quantize_to_i2_s writes the same x86 bytes and a zero tail). Type ids come
+// from its llama.cpp submodule isHuangXin/llama.cpp@390c307752ab78fd8189f359d6954c9ba1be74af:
+// ggml/include/ggml.h:426 (I2_S 36), :428 (TL1 38), :433 (TL2 42), :434
+// (GGML_TYPE_COUNT 43); ggml/src/ggml.c:931-937 (I2_S block size 1),
+// :1314-1321 (I2_S bytes n/4 + 32; TL2 bytes by another formula);
+// src/llama-arch.cpp:86 (architecture "bitnet-b1.58", absent from ggml-org);
+// ggml/src/ggml-cpu/quants.c:1335-1356 (dequantize_row_i2_s, the to_float
+// of ggml.c:936: ACT_PARALLEL positions, y = scale * {-1, 0, +1, 0}[code], so
+// code 3 reads as 0), :1358-1387 (the quantize_i2_s that ggml.c:7787 calls:
+// four consecutive weights per byte at bit 6 - 2(i%4), scale at n/4);
+// ggml/src/ggml-cpu/ops.cpp:4783-4829 (get_rows through dequantize_row_i2_s);
+// ggml/src/ggml-cpu/ggml-cpu.c:1217-1252 and :1491-1545 (mul_mat: raw-code
+// dot products minus the activation sum, times scale / activation scale, so
+// code 3 acts as +2); ggml/src/ggml-cpu/ggml-cpu-i2s.c:38-120 (the AVX2 GEMM
+// reads the ACT_PARALLEL positions). At this pin pair the build compiles those
+// ggml-cpu files; src/ggml-bitnet-mad.cpp is only named in a variable that
+// src/CMakeLists.txt:2-3 overwrites, and ggml/src/ggml-cpu/CMakeLists.txt:30-57
+// does not list it. Its x86 ACT_PARALLEL layout is the one the Python
+// converter writes and dequantize_row_i2_s and the GEMM read.
+// The storage contract is the x86 ACT_PARALLEL layout. The ARM, four-row and
+// four-consecutive layouts are stated here so that reading their bytes as
+// ACT_PARALLEL is a documented negative case: those bytes are valid I2_S and
+// decode to other weights. TL1 and TL2 are kernel lookup-table layouts without a storage
+// contract here (specs/formats/OWNERS.md).
+// phi^2 + 1/phi^2 = 3 | TRINITY
+module TrinityFormatsBitnetCppSpec {
+    pub const TFS_BITNET_ERR_LENGTH: i32 = -51;
+    pub const TFS_BITNET_ERR_CAPACITY: i32 = -52;
+    pub const TFS_BITNET_ERR_CODE: i32 = -53;
+    pub const TFS_BITNET_ERR_SCALE_NONFINITE: i32 = -58;
+    pub const TFS_BITNET_FLAG_OUTSIDE_TERNARY: u32 = 0;
+    pub const TFS_BITNET_FLAG_SCALE_NEGATIVE: u32 = 2;
+    pub const TFS_BITNET_FLAG_SCALE_ZERO: u32 = 3;
+    pub const TFS_BITNET_FLAG_TRAILER_NONZERO: u32 = 4;
+    pub const TFS_BITNET_FLAG_COUNT: u32 = 7;
+
+    pub const TFS_BITNET_I2_S: i32 = 7;
+    pub const TFS_BITNET_TYPE_I2_S: u32 = 36;
+    pub const TFS_BITNET_TYPE_TL1: u32 = 38;
+    pub const TFS_BITNET_TYPE_TL2: u32 = 42;
+    pub const TFS_BITNET_TYPE_COUNT: u32 = 43;
+
+    // x86 ACT_PARALLEL geometry.
+    pub const TFS_BITNET_QK: u32 = 128;
+    pub const TFS_BITNET_GROUP_BYTES: u32 = 32;
+    pub const TFS_BITNET_QK_ARM: u32 = 64;
+    pub const TFS_BITNET_GROUP_BYTES_ARM: u32 = 16;
+    pub const TFS_BITNET_TAIL_BYTES: u32 = 32;
+    pub const TFS_BITNET_SCALE_BYTES: u32 = 4;
+    pub const TFS_BITNET_TRAILER_BYTES: u32 = 28;
+    pub const TFS_BITNET_CODE_BITS: u32 = 2;
+
+    // Code of weight e (flat, row-major over ne[0]) in the ACT_PARALLEL
+    // layout: block i = e / 128, j = e % 128, byte 32i + j%32, bits 6 - 2(j/32).
+    pub fn tfs_bitnet_code(data: []u8, e: usize) -> u32 {
+        var i: usize = e / 128;
+        var j: usize = e % 128;
+        return ((data[i * 32 + j % 32] as u32) >> (6 - 2 * (j / 32))) & 3;
+    }
+
+    // The ARM NEON layout: block i = e / 64, byte 16i + j%16, bits 6 - 2(j/16).
+    pub fn tfs_bitnet_code_arm(data: []u8, e: usize) -> u32 {
+        var i: usize = e / 64;
+        var j: usize = e % 64;
+        return ((data[i * 16 + j % 16] as u32) >> (6 - 2 * (j / 16))) & 3;
+    }
+
+    // The x86 layout without ACT_PARALLEL: weight (r, c) of a [rows, cols]
+    // tensor in byte (r/4)*cols + c, bits 6 - 2(r%4); rows % 4 == 0.
+    pub fn tfs_bitnet_code_1x4(data: []u8, cols: usize, r: usize, c: usize) -> u32 {
+        return ((data[(r / 4) * cols + c] as u32) >> (6 - 2 * (r % 4))) & 3;
+    }
+
+    // The layout of the submodule's ggml-cpu/quants.c quantize_i2_s: weight e
+    // (flat) in byte e/4, bits 6 - 2(e%4).
+    pub fn tfs_bitnet_code_seq(data: []u8, e: usize) -> u32 {
+        return ((data[e / 4] as u32) >> (6 - 2 * (e % 4))) & 3;
+    }
+
+    pub fn tfs_bitnet_bytes(count: usize) -> usize { return count / 4 + (TFS_BITNET_TAIL_BYTES as usize); }
+
+    fn tfs_bitnet_word(data: []u8, at: usize) -> u32 {
+        return (data[at] as u32) | ((data[at + 1] as u32) << 8) | ((data[at + 2] as u32) << 16) | ((data[at + 3] as u32) << 24);
+    }
+
+    // f32 scale: 0 positive, 1 zero, 2 negative, ERR_SCALE_NONFINITE.
+    pub fn tfs_bitnet_f32_class(word: u32) -> i32 {
+        if (((word >> 23) & 255) == 255) { return TFS_BITNET_ERR_SCALE_NONFINITE; }
+        if ((word & 2147483647) == 0) { return 1; }
+        if ((word >> 31) != 0) { return 2; }
+        return 0;
+    }
+
+    // LENGTH (count 0 or not whole 128-weight blocks, size not n/4 + 32),
+    // CAPACITY, SCALE_NONFINITE, else 0.
+    pub fn tfs_bitnet_validate(data: []u8, size: usize, count: usize, value_capacity: usize) -> i64 {
+        if (count == 0 || count % 128 != 0) { return TFS_BITNET_ERR_LENGTH as i64; }
+        if (size != tfs_bitnet_bytes(count)) { return TFS_BITNET_ERR_LENGTH as i64; }
+        if (count > value_capacity) { return TFS_BITNET_ERR_CAPACITY as i64; }
+        if (tfs_bitnet_f32_class(tfs_bitnet_word(data, count / 4)) < 0) { return TFS_BITNET_ERR_SCALE_NONFINITE as i64; }
+        return 0;
+    }
+
+    // Codes 0, 1, 2 are -1, 0, +1 (quantize_i2_s: q8 0/1/2); code 3 is never
+    // written and is reported as +2, as the mul_mat path uses it
+    // (dequantize_row_i2_s reads it as 0). Returns the count of code-3 weights.
+    pub fn tfs_bitnet_decode(data: []u8, size: usize, count: usize, values: []i32, value_capacity: usize,
+                             scale: []u32) -> i64 {
+        var status: i64 = tfs_bitnet_validate(data, size, count, value_capacity);
+        if (status < 0) { return status; }
+        var outside: i64 = 0;
+        var e: usize = 0;
+        while (e < count) {
+            var code: u32 = tfs_bitnet_code(data, e);
+            if (code == 3) { outside = outside + 1; }
+            values[e] = (code as i32) - 1;
+            e = e + 1;
+        }
+        scale[0] = tfs_bitnet_word(data, count / 4);
+        return outside;
+    }
+
+    pub fn tfs_bitnet_flags(data: []u8, size: usize, count: usize, flags: []i64) -> i64 {
+        var slot: u32 = 0;
+        while (slot < TFS_BITNET_FLAG_COUNT) { flags[slot] = 0; slot = slot + 1; }
+        var status: i64 = tfs_bitnet_validate(data, size, count, count);
+        if (status < 0) { return status; }
+        var s: i32 = tfs_bitnet_f32_class(tfs_bitnet_word(data, count / 4));
+        if (s == 1) { flags[TFS_BITNET_FLAG_SCALE_ZERO] = 1; }
+        if (s == 2) { flags[TFS_BITNET_FLAG_SCALE_NEGATIVE] = 1; }
+        var e: usize = 0;
+        while (e < count) {
+            if (tfs_bitnet_code(data, e) == 3) { flags[TFS_BITNET_FLAG_OUTSIDE_TERNARY] = flags[TFS_BITNET_FLAG_OUTSIDE_TERNARY] + 1; }
+            e = e + 1;
+        }
+        var t: usize = count / 4 + (TFS_BITNET_SCALE_BYTES as usize);
+        while (t < size) {
+            if (data[t] != 0) { flags[TFS_BITNET_FLAG_TRAILER_NONZERO] = flags[TFS_BITNET_FLAG_TRAILER_NONZERO] + 1; }
+            t = t + 1;
+        }
+        return 0;
+    }
+
+    // layout 0: ACT_PARALLEL, 1: ARM, 2: four rows per byte (count = rows * cols),
+    // 3: four consecutive weights per byte.
+    // Writes codes value + 1, the f32 scale word at n/4 and a zero trailer.
+    // LENGTH, CAPACITY and CODE are checked before anything is written.
+    pub fn tfs_bitnet_encode(layout: u32, values: []i32, rows: usize, cols: usize, scale: u32,
+                             out: []u8, capacity: usize) -> i64 {
+        var count: usize = rows * cols;
+        if (count == 0 || count % 128 != 0 || layout > 3) { return TFS_BITNET_ERR_LENGTH as i64; }
+        if (layout == 2 && rows % 4 != 0) { return TFS_BITNET_ERR_LENGTH as i64; }
+        var size: usize = tfs_bitnet_bytes(count);
+        if (size > capacity) { return TFS_BITNET_ERR_CAPACITY as i64; }
+        var i: usize = 0;
+        while (i < count) {
+            if (values[i] < -1 || values[i] > 1) { return TFS_BITNET_ERR_CODE as i64; }
+            i = i + 1;
+        }
+        i = 0;
+        while (i < size) { out[i] = 0; i = i + 1; }
+        var e: usize = 0;
+        while (e < count) {
+            var code: u32 = (values[e] + 1) as u32;
+            var at: usize = (e / 128) * 32 + (e % 128) % 32;
+            var shift: usize = 6 - 2 * ((e % 128) / 32);
+            if (layout == 1) {
+                at = (e / 64) * 16 + (e % 64) % 16;
+                shift = 6 - 2 * ((e % 64) / 16);
+            }
+            if (layout == 2) {
+                at = ((e / cols) / 4) * cols + e % cols;
+                shift = 6 - 2 * ((e / cols) % 4);
+            }
+            if (layout == 3) {
+                at = e / 4;
+                shift = 6 - 2 * (e % 4);
+            }
+            out[at] = ((out[at] as u32) | (code << shift)) as u8;
+            e = e + 1;
+        }
+        var k: usize = 0;
+        while (k < 4) { out[count / 4 + k] = ((scale >> (8 * k)) & 255) as u8; k = k + 1; }
+        return size as i64;
+    }
+
+    invariant bitnet_block_is_32_bytes { assert TFS_BITNET_QK * TFS_BITNET_CODE_BITS == TFS_BITNET_GROUP_BYTES * 8 && TFS_BITNET_QK_ARM * TFS_BITNET_CODE_BITS == TFS_BITNET_GROUP_BYTES_ARM * 8; }
+    invariant bitnet_tail_is_scale_and_trailer { assert TFS_BITNET_SCALE_BYTES + TFS_BITNET_TRAILER_BYTES == TFS_BITNET_TAIL_BYTES; }
+    invariant bitnet_two_bits_per_weight_plus_256_per_tensor { assert TFS_BITNET_CODE_BITS * 4 == 8 && TFS_BITNET_TAIL_BYTES * 8 == 256; }
+    invariant bitnet_type_ids { assert TFS_BITNET_TYPE_I2_S == 36 && TFS_BITNET_TYPE_TL1 == 38 && TFS_BITNET_TYPE_TL2 == 42 && TFS_BITNET_TYPE_COUNT == 43; }
+
+    test "bitnet i2_s packs weights 32 apart into one byte" {
+        var t: [128]i32;
+        var i: usize = 0;
+        while (i < 128) { t[i] = 0; i = i + 1; }
+        t[0] = 1; t[32] = 0; t[64] = -1; t[96] = 1;
+        var out: [64]u8;
+        assert tfs_bitnet_encode(0, t, 1, 128, 1065353216, out, 64) == 64;
+        assert out[0] == 146 && out[1] == 85 && out[32] == 0 && out[35] == 63;
+        var v: [128]i32;
+        var s: [1]u32;
+        assert tfs_bitnet_decode(out, 64, 128, v, 128, s) == 0;
+        assert v[0] == 1 && v[32] == 0 && v[64] == -1 && v[96] == 1 && s[0] == 1065353216;
+        var f: [7]i64;
+        assert tfs_bitnet_flags(out, 64, 128, f) == 0 && f[4] == 0;
+        out[40] = 7; out[0] = 255;
+        assert tfs_bitnet_flags(out, 64, 128, f) == 0 && f[4] == 1 && f[0] == 4;
+        assert tfs_bitnet_decode(out, 64, 128, v, 128, s) == 4 && v[0] == 2;
+    }
+    test "bitnet other layouts put the same codes in other bytes" {
+        var t: [128]i32;
+        var i: usize = 0;
+        while (i < 128) { t[i] = 0; i = i + 1; }
+        t[16] = 1;
+        var x86: [64]u8;
+        var arm: [64]u8;
+        var rows4: [64]u8;
+        assert tfs_bitnet_encode(0, t, 4, 32, 0, x86, 64) == 64;
+        assert tfs_bitnet_encode(1, t, 4, 32, 0, arm, 64) == 64;
+        assert tfs_bitnet_encode(2, t, 4, 32, 0, rows4, 64) == 64;
+        assert tfs_bitnet_code(x86, 16) == 2 && tfs_bitnet_code_arm(arm, 16) == 2 && tfs_bitnet_code_1x4(rows4, 32, 0, 16) == 2;
+        assert x86[16] == 149 && arm[0] == 101 && rows4[16] == 149;
+        // ARM bytes read as ACT_PARALLEL move weight 16 to weight 32.
+        assert tfs_bitnet_code(arm, 16) == 1 && tfs_bitnet_code(arm, 32) == 2;
+        // quants.c's quantize_i2_s layout read as ACT_PARALLEL moves weight 16 to weight 4.
+        var seq: [64]u8;
+        assert tfs_bitnet_encode(3, t, 4, 32, 0, seq, 64) == 64;
+        assert tfs_bitnet_code_seq(seq, 16) == 2 && seq[4] == 149;
+        assert tfs_bitnet_code(seq, 4) == 2 && tfs_bitnet_code(seq, 16) == 1;
+        assert tfs_bitnet_encode(2, t, 2, 64, 0, rows4, 64) == TFS_BITNET_ERR_LENGTH;
+    }
+    test "bitnet rejects lengths and non-finite scales" {
+        var d: [64]u8;
+        var i: usize = 0;
+        while (i < 64) { d[i] = 85; i = i + 1; }
+        d[32] = 0; d[33] = 0; d[34] = 192; d[35] = 127;
+        var v: [128]i32;
+        var s: [1]u32;
+        assert tfs_bitnet_decode(d, 64, 128, v, 128, s) == TFS_BITNET_ERR_SCALE_NONFINITE;
+        assert tfs_bitnet_decode(d, 63, 128, v, 128, s) == TFS_BITNET_ERR_LENGTH;
+        assert tfs_bitnet_decode(d, 64, 64, v, 128, s) == TFS_BITNET_ERR_LENGTH;
+        assert tfs_bitnet_decode(d, 64, 128, v, 127, s) == TFS_BITNET_ERR_CAPACITY;
+        d[35] = 191; d[34] = 128;
+        var f: [7]i64;
+        assert tfs_bitnet_flags(d, 64, 128, f) == 0 && f[2] == 1 && f[3] == 0;
+        // BitNet b1.58 2B4T blk.0.ffn_down: ne [6912, 2560] -> 4423712 bytes.
+        assert tfs_bitnet_bytes(17694720) == 4423712;
+        assert tfs_bitnet_f32_class(2147483648) == 1;
+    }
+}

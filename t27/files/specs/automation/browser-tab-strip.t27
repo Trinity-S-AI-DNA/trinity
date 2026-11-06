@@ -1,0 +1,245 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/automation/browser-tab-strip.t27 -- the tab strip above the person's live browser:
+// every page open in their pod's Chromium, one tap to switch, "+" to open, "x" to close.
+// Host: 999-multibots-telegraf apps/vibee-editor/render/src/browser/tab-strip.ts (the pure
+//       rules and the strip's I/O) behind the doors GET and POST /api/browser/strip in
+//       src/browser/routes.ts. The diagnostic GET /api/browser/tabs (read by b.sh, tri and
+//       the doctor) is a different door and stays as it was.
+// Consumer: apps/vibee-editor/player/src/components/Browser/TabStrip.tsx on the Browser
+//       page, above the picture; it reads POLL_MS and MAX_TABS_SHOWN from a byte copy of the gen.
+// Why a strip at all: the pod runs Chromium without its own tab bar in view, so a page the
+//       agent opened, or a link that opened a new tab, was a page the person could not get
+//       back to without asking the agent. Owner request, 2026-10-06.
+// Laws:
+//   - A tab is a target of type "page" whose address is not internal: chrome://,
+//     devtools:// and chrome-extension:// pages are the browser's own machinery, and
+//     listing them invites the person to land on the extension that holds their vault.
+//   - The strip is the PERSON's door. An agent key gets 403 on reading and on acting:
+//     the agent has its own tools (browser_open, browser_close_tab) and its own guard.
+//   - The last page is never closed: a browser with no page has no picture, and the
+//     stream would show the person a black screen they cannot leave.
+//   - Switching, opening and closing are the person's own hand on the wheel, so each one
+//     RENEWS the person's wheel lease -- it is never refused for lack of one.
+//   - Nothing but a title and a host leaves the pod: no path, no query, no page text.
+//     A query string is where a reset token or a search lives.
+//   - A tab the agent is working in carries a coarse mark: "desk" (a desk run holds it) or
+//     "chat" (a chat lane chose it). Only that word leaves the pod, never what the desk is
+//     doing or what the page says. Closing such a tab needs the person's explicit confirm:
+//     without {confirm: true} the door answers 409 "agent-working", so a client that does
+//     not know the mark cannot close the agent's page silently.
+//   - Which tab is in front is asked over ONE browser socket per poll (flattened sessions,
+//     one evaluate each), and the answer is shared for VISIBILITY_CACHE_MS, so two open
+//     app tabs do not double the load on the pod. A page that has not answered within
+//     VISIBILITY_PROBE_MS is not visible: one hung page must not hold the whole strip.
+// Claim status: v1 written 2026-10-06 with its host; not yet measured on a live pod.
+// v2 (2026-10-07): agent marks, confirm before closing an agent tab, one socket per poll.
+// phi^2 + 1/phi^2 = 3 | TRINITY
+
+module automation::browser_tab_strip {
+
+    pub const KIND : str = "automation";
+    pub const ID : str = "browser-tab-strip";
+    pub const REPO : str = "999-multibots-telegraf";
+    pub const VERSION : u8 = 2;
+
+    // ---- The door -------------------------------------------------------------------
+    pub const STRIP_DOOR : str = "/api/browser/strip";  // GET lists, POST acts
+    pub const ACTION_ACTIVATE : str = "activate";
+    pub const ACTION_NEW : str = "new";
+    pub const ACTION_CLOSE : str = "close";
+    pub const PERSON_ONLY : bool = true;  // the same check as the wheel and type doors
+    pub const AGENT_STATUS : u16 = 403;  // an agent key is refused, never served
+    pub const NO_SESSION_STATUS : u16 = 409;  // no live browser: nothing to list or act on
+    pub const REFUSED_STATUS : u16 = 409;  // the last page, or a full browser
+
+    // ---- Which targets are tabs ---------------------------------------------------------
+    pub const TAB_TYPE : str = "page";  // service workers, iframes and the browser are not
+    pub const HIDDEN_CHROME : str = "chrome://";
+    pub const HIDDEN_DEVTOOLS : str = "devtools://";
+    pub const HIDDEN_EXTENSION : str = "chrome-extension://";
+
+    // ---- What the strip shows -----------------------------------------------------------
+    pub const MAX_TABS_SHOWN : u8 = 12;  // the pod's own cap (tab-sweep.ts TAB_CAP)
+    pub const TITLE_MAX_CHARS : u8 = 40;  // a phone shows three tabs; a title longer
+                                          // than this is clipped with an ellipsis
+    pub const RETURNS_PATH : bool = false;  // the host of the address, never its path
+    pub const RETURNS_PAGE_TEXT : bool = false;  // the title, never the page
+    pub const NEW_TAB_URL : str = "https://www.google.com/";  // chrome://newtab is hidden
+                                                               // by the filter, so a new
+                                                               // tab opens on a real page
+
+    // ---- The player ---------------------------------------------------------------------
+    pub const POLL_MS : u16 = 3000;  // read while the page is visible and the browser live
+    pub const MIN_TOUCH_PX : u8 = 44;  // --touch-target: a tab is a finger, not a cursor
+
+    // ---- The person's hand --------------------------------------------------------------
+    pub const NEVER_CLOSE_LAST : bool = true;
+    pub const ACTION_RENEWS_WHEEL : bool = true;  // switching is driving
+
+    // ---- The agent's tabs (v2) ----------------------------------------------------------
+    pub const AGENT_DESK : str = "desk";  // a desk run holds the tab (desk-page.ts)
+    pub const AGENT_CHAT : str = "chat";  // a chat lane chose the tab (front-page.ts)
+    pub const MARK_NONE : u8 = 0;
+    pub const MARK_DESK : u8 = 1;
+    pub const MARK_CHAT : u8 = 2;
+    pub const RETURNS_DESK_INTERNALS : bool = false;  // a word, never the desk's work
+    pub const CLOSE_AGENT_NEEDS_CONFIRM : bool = true;
+    pub const AGENT_TAB_STATUS : u16 = 409;  // close without confirm on an agent tab
+    pub const REASON_AGENT_WORKING : str = "agent-working";
+
+    // ---- Which tab is in front (v2) ----------------------------------------------------
+    pub const SOCKETS_PER_POLL : u8 = 1;  // one browser socket, flattened sessions
+    pub const VISIBILITY_CACHE_MS : u16 = 1500;  // shared by every reader of one pod
+    pub const VISIBILITY_PROBE_MS : u16 = 1000;  // a page silent this long (a hung
+                                                 // renderer, an open alert) is not
+                                                 // visible; the strip does not wait
+                                                 // out the 20 s CDP call timeout
+
+    // A target is shown when it is a page and its address is not the browser's own.
+    fn shown(is_page: bool, internal: bool) -> bool {
+        return is_page && !internal;
+    }
+
+    // Who may use the strip: the person, by their own session. Never an agent key.
+    fn may_use(is_person: bool) -> bool {
+        return is_person;
+    }
+
+    // A tab may be closed while another page would remain.
+    fn may_close(open_pages: u8) -> bool {
+        return open_pages > 1;
+    }
+
+    // A tab may be opened while the browser is below its cap.
+    fn may_open(open_pages: u8) -> bool {
+        return open_pages < MAX_TABS_SHOWN;
+    }
+
+    // The characters of a title the strip keeps.
+    fn title_len(chars: u16) -> u16 {
+        if chars > TITLE_MAX_CHARS {
+            return TITLE_MAX_CHARS;
+        }
+        return chars;
+    }
+
+    // The strip reads again once a full beat has passed since the last read.
+    fn poll_due(elapsed_ms: u16) -> bool {
+        return elapsed_ms >= POLL_MS;
+    }
+
+    // A control fits a finger when it is at least the touch target on both sides.
+    fn fits_finger(px: u8) -> bool {
+        return px >= MIN_TOUCH_PX;
+    }
+
+    // Who is working in a tab: a desk run wins over a chat lane; nobody is MARK_NONE.
+    fn mark(desk: bool, chat: bool) -> u8 {
+        if desk {
+            return MARK_DESK;
+        }
+        if chat {
+            return MARK_CHAT;
+        }
+        return MARK_NONE;
+    }
+
+    // Closing: never the last page, and never an agent's tab without the person's yes.
+    fn may_close_tab(open_pages: u8, agent_here: bool, confirmed: bool) -> bool {
+        return may_close(open_pages) && (!agent_here || confirmed);
+    }
+
+    // A cached answer about the front tab is reused while younger than the cache.
+    fn cache_fresh(age_ms: u16) -> bool {
+        return age_ms < VISIBILITY_CACHE_MS;
+    }
+
+    test "only real pages are tabs, never the browser's own" {
+        assert(shown(true, false));
+        assert(!shown(true, true));
+        assert(!shown(false, false));
+        assert(!shown(false, true));
+        assert(TAB_TYPE == "page");
+        assert(HIDDEN_CHROME == "chrome://");
+        assert(HIDDEN_DEVTOOLS == "devtools://");
+        assert(HIDDEN_EXTENSION == "chrome-extension://");
+    }
+
+    test "the strip is the person's door, an agent key gets 403" {
+        assert(may_use(true));
+        assert(!may_use(false));
+        assert(PERSON_ONLY);
+        assert(AGENT_STATUS == 403);
+    }
+
+    test "the last page is never closed" {
+        assert(!may_close(0));
+        assert(!may_close(1));
+        assert(may_close(2));
+        assert(NEVER_CLOSE_LAST);
+    }
+
+    test "a new tab respects the pod's cap" {
+        assert(may_open(1));
+        assert(may_open(MAX_TABS_SHOWN - 1));
+        assert(!may_open(MAX_TABS_SHOWN));
+        assert(MAX_TABS_SHOWN == 12);
+    }
+
+    test "only a clipped title and a host leave the pod" {
+        assert(title_len(5) == 5);
+        assert(title_len(40) == 40);
+        assert(title_len(200) == TITLE_MAX_CHARS);
+        assert(!RETURNS_PATH);
+        assert(!RETURNS_PAGE_TEXT);
+    }
+
+    test "every action renews the person's wheel" {
+        assert(ACTION_RENEWS_WHEEL);
+        assert(ACTION_ACTIVATE == "activate");
+        assert(ACTION_NEW == "new");
+        assert(ACTION_CLOSE == "close");
+    }
+
+    test "the strip is read every three seconds and fits a finger" {
+        assert(!poll_due(2999));
+        assert(poll_due(3000));
+        assert(!fits_finger(43));
+        assert(fits_finger(44));
+        assert(POLL_MS == 3000);
+        assert(MIN_TOUCH_PX >= 44);
+    }
+
+    test "a tab the agent works in is marked with a word, desk before chat" {
+        assert(mark(false, false) == MARK_NONE);
+        assert(mark(true, false) == MARK_DESK);
+        assert(mark(false, true) == MARK_CHAT);
+        assert(mark(true, true) == MARK_DESK);
+        assert(AGENT_DESK == "desk");
+        assert(AGENT_CHAT == "chat");
+        assert(!RETURNS_DESK_INTERNALS);
+        assert(VERSION == 2);
+    }
+
+    test "closing an agent tab needs the person's confirm" {
+        assert(may_close_tab(2, false, false));
+        assert(!may_close_tab(2, true, false));
+        assert(may_close_tab(2, true, true));
+        assert(!may_close_tab(1, true, true));
+        assert(!may_close_tab(1, false, false));
+        assert(CLOSE_AGENT_NEEDS_CONFIRM);
+        assert(AGENT_TAB_STATUS == 409);
+        assert(REASON_AGENT_WORKING == "agent-working");
+    }
+
+    test "the front tab is asked over one socket and shared briefly" {
+        assert(SOCKETS_PER_POLL == 1);
+        assert(cache_fresh(0));
+        assert(cache_fresh(1499));
+        assert(!cache_fresh(1500));
+        assert(VISIBILITY_CACHE_MS < POLL_MS);
+        assert(VISIBILITY_PROBE_MS < VISIBILITY_CACHE_MS);
+    }
+}
+
+// phi^2 + 1/phi^2 = 3 | TRINITY

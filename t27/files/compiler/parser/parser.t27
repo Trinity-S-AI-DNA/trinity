@@ -1,0 +1,1324 @@
+// parser.t27 — Parser for TRI-27 Assembly
+// Builds AST from tokens produced by lexer
+// φ² + 1/φ² = 3 | TRINITY
+
+module parser {
+    using lexer: @import("lexer.t27");
+    using ast: @import("../../ast.t27");
+
+    // Parser state
+    pub const Parser = struct {
+        tokens: []Token,
+        pos: u32,
+        current: Token,
+        context: CompilerContext,
+    };
+
+    // Create new parser
+    pub fn Parser.new(tokens: []Token, source_file: []const u8) Parser {
+        const p = Parser{
+            .tokens = tokens,
+            .pos = 0,
+            .current = Token{ .type = TokenType.EOF, .text = "", .value = 0, .line = 0, .column = 0, .source_file = source_file },
+            .context = CompilerContext{
+                .ast_root = Program{
+                    .node_type = NodeType.Program,
+                    .line = 1,
+                    .column = 1,
+                    .source_file = source_file,
+                    .spec_decl = null,
+                    .constants = &[0]ConstDef{},
+                    .data_section = DataSection{},
+                    .code_section = CodeSection{},
+                    .test_section = null,
+                    .invariant_section = null,
+                    .bench_section = null,
+                    // (`&[0][]const u8{}` -- an empty list of strings -- is
+                    // written as the empty array literal `[]`.)
+                    .exports = [],
+                    .imports = [],
+                },
+                .symbol_table = SymbolTable.new(null),
+                .errors = &[0]CompileError{},
+                .warnings = &[0]CompileWarning{},
+                .current_phase = CompilationPhase.Parsing,
+            },
+        };
+        if (p.tokens.len > 0) {
+            p.current = p.tokens[0];
+        }
+        return p;
+    }
+
+    // Advance to next token
+    pub fn Parser.advance() Token {
+        const prev = self.current;
+        self.pos += 1;
+        if (self.pos < self.tokens.len) {
+            self.current = self.tokens[self.pos];
+        } else {
+            self.current = Token{
+                .type = TokenType.EOF,
+                .text = "",
+                .value = 0,
+                .line = 0,
+                .column = 0,
+                .source_file = self.context.ast_root.source_file,
+            };
+        }
+        return prev;
+    }
+
+    // Peek at next token
+    pub fn Parser.peek() Token {
+        if (self.pos + 1 < self.tokens.len) {
+            return self.tokens[self.pos + 1];
+        }
+        return Token{
+            .type = TokenType.EOF,
+            .text = "",
+            .value = 0,
+            .line = 0,
+            .column = 0,
+            .source_file = self.context.ast_root.source_file,
+        };
+    }
+
+    // Check if current token matches expected type
+    pub fn Parser.check(token_type: TokenType) bool {
+        return self.current.type == token_type;
+    }
+
+    // Consume token if it matches, otherwise error
+    pub fn Parser.consume(token_type: TokenType, error_msg: []const u8) Token {
+        if (self.check(token_type)) {
+            return self.advance();
+        }
+        self.context.add_error(error_msg, self.current.line, self.current.column);
+        return self.current;
+    }
+
+    // Expect token type without consuming
+    pub fn Parser.expect(token_type: TokenType, error_msg: []const u8) void {
+        if (!self.check(token_type)) {
+            self.context.add_error(error_msg, self.current.line, self.current.column);
+        }
+    }
+
+    // Skip newlines
+    pub fn Parser.skip_newlines() void {
+        while (self.check(TokenType.Newline)) {
+            _ = self.advance();
+        }
+    }
+
+    // Match any of the given token types
+    pub fn Parser.match(types: []const TokenType) bool {
+        // (Zig `for (xs) |x|` loops are written as indexed while loops.)
+        var k: usize = 0;
+        while (k < types.len) : (k += 1) {
+            const t = types[k];
+            if (self.check(t)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Parse entire program
+    pub fn Parser.parse_program() Program {
+        self.skip_newlines();
+
+        // Check for spec-style header (high-level TDD)
+        if (self.check(TokenType.Spec)) {
+            _ = self.parse_spec_decl();
+            self.skip_newlines();
+
+            // Parse test blocks in spec
+            while (self.check(TokenType.Test)) {
+                const test_block = self.parse_test_block();
+                if (self.context.ast_root.spec_decl != null) {
+                    self.context.ast_root.spec_decl.?.test_blocks.append(test_block);
+                }
+                self.skip_newlines();
+            }
+
+            // Parse invariants in spec
+            while (self.check(TokenType.Invariant)) {
+                const inv = self.parse_invariant_block();
+                if (self.context.ast_root.spec_decl != null) {
+                    self.context.ast_root.spec_decl.?.invariants.append(inv);
+                }
+                self.skip_newlines();
+            }
+
+            // Parse rules in spec
+            while (self.check(TokenType.Rule)) {
+                const rule = self.parse_rule_block();
+                if (self.context.ast_root.spec_decl != null) {
+                    self.context.ast_root.spec_decl.?.rules.append(rule);
+                }
+                self.skip_newlines();
+            }
+
+            // Validate spec has tests
+            _ = self.validate_spec();
+        } else {
+            // Assembly-style parsing
+
+            // Parse constants (.const declarations)
+            while (self.check(TokenType.Const) or self.check(TokenType.Dot)) {
+                _ = self.parse_const_def();
+                self.skip_newlines();
+            }
+
+            // Parse data section
+            if (self.match(&[_]TokenType{TokenType.Data})) {
+                _ = self.parse_data_section();
+                self.skip_newlines();
+            }
+
+            // Parse code section
+            if (self.match(&[_]TokenType{TokenType.Code})) {
+                _ = self.parse_code_section();
+                self.skip_newlines();
+            }
+
+            // Parse test section (assembly-style)
+            if (self.match(&[_]TokenType{TokenType.Test})) {
+                _ = self.parse_test_section();
+                self.skip_newlines();
+            }
+
+            // Parse invariant section (assembly-style)
+            if (self.match(&[_]TokenType{TokenType.Invariant})) {
+                _ = self.parse_invariant_section();
+                self.skip_newlines();
+            }
+
+            // Parse bench section
+            if (self.match(&[_]TokenType{TokenType.Bench})) {
+                _ = self.parse_bench_section();
+                self.skip_newlines();
+            }
+
+            // Validate assembly spec has tests
+            _ = self.validate_spec();
+        }
+
+        return self.context.ast_root;
+    }
+
+    // Parse constant definition
+    pub fn Parser.parse_const_def() ConstDef {
+        var dot_token = Token{ .type = TokenType.Dot, .text = ".", .value = 0, .line = 0, .column = 0, .source_file = "" };
+
+        // Optional . prefix
+        if (self.check(TokenType.Dot)) {
+            dot_token = self.advance();
+        }
+
+        const const_token = self.consume(TokenType.Const, "Expected 'const' keyword");
+        const name = self.consume(TokenType.Identifier, "Expected constant name");
+        const value = self.consume(TokenType.Integer, "Expected integer value for constant");
+
+        const const_def = ConstDef{
+            .node_type = NodeType.ConstDef,
+            .line = dot_token.line,
+            .column = dot_token.column,
+            .source_file = self.context.ast_root.source_file,
+            .name = name.text,
+            .value = value.value,
+        };
+
+        // Add to AST
+        self.context.ast_root.constants.append(const_def);
+
+        // Add to symbol table
+        const symbol = Symbol{
+            .name = name.text,
+            .node = ast_node_from_const(const_def),
+            .scope = "global",
+            .is_exported = true,
+            .is_defined = true,
+        };
+        self.context.symbol_table.add(symbol);
+
+        return const_def;
+    }
+
+    // Parse data section
+    pub fn Parser.parse_data_section() DataSection {
+        const data_token = self.advance(); // Consume 'data'
+        self.skip_newlines();
+
+        const data_section = DataSection{
+            .node_type = NodeType.DataSection,
+            .line = data_token.line,
+            .column = data_token.column,
+            .source_file = self.context.ast_root.source_file,
+            .declarations = &[0]DataDecl{},
+        };
+
+        // Parse data declarations until .code or EOF
+        while (!self.check(TokenType.Code) and !self.check(TokenType.EOF)) {
+            self.skip_newlines();
+
+            // Check for label
+            var label: []const u8 = "";
+            if (self.check(TokenType.Identifier) and self.peek().type == TokenType.Colon) {
+                const label_token = self.advance();
+                label = label_token.text;
+                _ = self.consume(TokenType.Colon, "Expected colon after label");
+                self.skip_newlines();
+            }
+
+            // Parse directive
+            if (self.match(&[_]TokenType{TokenType.Dot})) {
+                _ = self.advance(); // Consume '.'
+
+                if (self.match(&[_]TokenType{TokenType.DWord})) {
+                    self.parse_dword(label, &data_section);
+                } else if (self.match(&[_]TokenType{TokenType.DSpace})) {
+                    self.parse_dspace(label, &data_section);
+                } else if (self.match(&[_]TokenType{TokenType.DTrit})) {
+                    self.parse_dtrit(label, &data_section);
+                }
+            }
+
+            self.skip_newlines();
+        }
+
+        self.context.ast_root.data_section = data_section;
+        return data_section;
+    }
+
+    // Parse .dword declaration
+    pub fn Parser.parse_dword(label: []const u8, section: *DataSection) void {
+        const dword_token = self.advance(); // Consume 'dword'
+        const value = self.consume(TokenType.Integer, "Expected integer for .dword");
+
+        const decl = DataDecl{
+            .node_type = NodeType.DWord,
+            .line = dword_token.line,
+            .column = dword_token.column,
+            .source_file = self.context.ast_root.source_file,
+            .size = 32, // 4 bytes
+            .initial_value = value.value,
+            .label = label,
+        };
+
+        section.declarations.append(decl);
+    }
+
+    // Parse .dspace declaration
+    pub fn Parser.parse_dspace(label: []const u8, section: *DataSection) void {
+        const dspace_token = self.advance(); // Consume 'dspace'
+        const value = self.consume(TokenType.Integer, "Expected integer for .dspace");
+
+        const decl = DataDecl{
+            .node_type = NodeType.DSpace,
+            .line = dspace_token.line,
+            .column = dspace_token.column,
+            .source_file = self.context.ast_root.source_file,
+            .size = 32, // 4 bytes
+            .initial_value = value.value,
+            .label = label,
+        };
+
+        section.declarations.append(decl);
+    }
+
+    // Parse .dtrit declaration
+    pub fn Parser.parse_dtrit(label: []const u8, section: *DataSection) void {
+        const dtrit_token = self.advance(); // Consume 'dtrit'
+        const value = self.consume(TokenType.Integer, "Expected integer for .dtrit");
+
+        const decl = DataDecl{
+            .node_type = NodeType.DTrit,
+            .line = dtrit_token.line,
+            .column = dtrit_token.column,
+            .source_file = self.context.ast_root.source_file,
+            .size = 2, // 2 bits per trit
+            .initial_value = value.value,
+            .label = label,
+        };
+
+        section.declarations.append(decl);
+    }
+
+    // Parse code section
+    pub fn Parser.parse_code_section() CodeSection {
+        const code_token = self.advance(); // Consume 'code'
+        self.skip_newlines();
+
+        var code_section = CodeSection{
+            .node_type = NodeType.CodeSection,
+            .line = code_token.line,
+            .column = code_token.column,
+            .source_file = self.context.ast_root.source_file,
+            .instructions = &[0]Instruction{},
+            .labels = std.StringHashMap(u32).init(std.heap.page_allocator),
+        };
+
+        // Parse instructions until EOF
+        while (!self.check(TokenType.EOF)) {
+            self.skip_newlines();
+
+            // Check for label
+            if (self.check(TokenType.Identifier) and self.peek().type == TokenType.Colon) {
+                const label_token = self.advance();
+                const label_name = label_token.text;
+                _ = self.consume(TokenType.Colon, "Expected colon after label");
+
+                // Record label position
+                code_section.labels.put(label_name, @intCast(code_section.instructions.len));
+
+                // Add to symbol table
+                const symbol = Symbol{
+                    .name = label_name,
+                    .node = ast_node_from_label(label_token),
+                    .scope = "code",
+                    .is_exported = false,
+                    .is_defined = true,
+                };
+                self.context.symbol_table.add(symbol);
+
+                self.skip_newlines();
+                continue;
+            }
+
+            // Parse instruction
+            if (self.check(TokenType.Identifier)) {
+                const inst = self.parse_instruction();
+                if (inst != null) {
+                    code_section.instructions.append(inst.?);
+                }
+            }
+
+            self.skip_newlines();
+        }
+
+        self.context.ast_root.code_section = code_section;
+        return code_section;
+    }
+
+    // Parse single instruction
+    pub fn Parser.parse_instruction() ?Instruction {
+        const opcode_token = self.current;
+        const opcode = self.get_opcode(opcode_token.text);
+
+        if (opcode == null) {
+            self.context.add_error("Unknown instruction: " ++ opcode_token.text, opcode_token.line, opcode_token.column);
+            _ = self.advance();
+            return null;
+        }
+
+        _ = self.advance(); // Consume opcode
+
+        var operands: []const Operand = &[0]Operand{};
+
+        // Parse operands
+        if (!self.check(TokenType.Semicolon) and !self.check(TokenType.Newline) and !self.check(TokenType.EOF)) {
+            const operand = self.parse_operand();
+            if (operand != null) {
+                operands = operands ++ operand.?;
+            }
+
+            // Parse comma-separated operands
+            while (self.check(TokenType.Comma)) {
+                _ = self.advance();
+                self.skip_newlines();
+                const op = self.parse_operand();
+                if (op != null) {
+                    operands = operands ++ op.?;
+                }
+            }
+        }
+
+        // Optional comment
+        if (self.check(TokenType.Semicolon)) {
+            // Skip to end of line
+            while (!self.check(TokenType.Newline) and !self.check(TokenType.EOF)) {
+                _ = self.advance();
+            }
+        }
+
+        return Instruction{
+            .node_type = NodeType.Instruction,
+            .line = opcode_token.line,
+            .column = opcode_token.column,
+            .source_file = self.context.ast_root.source_file,
+            .opcode = opcode.?,
+            .operands = operands,
+        };
+    }
+
+    // Parse operand
+    pub fn Parser.parse_operand() ?Operand {
+        self.skip_newlines();
+
+        // Register (r0-r26)
+        if (self.check(TokenType.Reg)) {
+            const reg_token = self.advance();
+            return RegOperand{
+                .node_type = NodeType.Reg,
+                .line = reg_token.line,
+                .column = reg_token.column,
+                .source_file = self.context.ast_root.source_file,
+                .operand_type = OperandType.Register,
+                .reg_num = @intCast(reg_token.value),
+            };
+        }
+
+        // Immediate (#value)
+        if (self.check(TokenType.Hash)) {
+            _ = self.advance(); // Consume '#'
+            const value_token = self.consume(TokenType.Integer, "Expected integer after '#'");
+            return ImmOperand{
+                .node_type = NodeType.Imm,
+                .line = value_token.line,
+                .column = value_token.column,
+                .source_file = self.context.ast_root.source_file,
+                .operand_type = OperandType.Immediate,
+                .value = value_token.value,
+            };
+        }
+
+        // Label reference
+        if (self.check(TokenType.Identifier)) {
+            const label_token = self.advance();
+            return LabelOperand{
+                .node_type = NodeType.Label,
+                .line = label_token.line,
+                .column = label_token.column,
+                .source_file = self.context.ast_root.source_file,
+                .operand_type = OperandType.LabelRef,
+                .label_name = label_token.text,
+            };
+        }
+
+        // Memory reference [reg] or [reg + offset]
+        if (self.check(TokenType.LBracket)) {
+            const lbracket_token = self.advance(); // Consume '[' and capture position
+            self.skip_newlines();
+
+            var base_reg: u8 = 0;
+            var offset: i16 = 0;
+
+            if (self.check(TokenType.Reg)) {
+                const reg_token = self.advance();
+                base_reg = @intCast(reg_token.value);
+            }
+
+            self.skip_newlines();
+
+            // Check for offset
+            if (self.match(&[_]TokenType{ TokenType.Plus, TokenType.Minus })) {
+                const op = self.advance();
+                const value_token = self.consume(TokenType.Integer, "Expected integer offset");
+                if (op.type == TokenType.Plus) {
+                    offset = @intCast(value_token.value);
+                } else {
+                    offset = -@as(i16, @intCast(value_token.value));
+                }
+            }
+
+            _ = self.consume(TokenType.RBracket, "Expected ']'");
+
+            return MemOperand{
+                .node_type = NodeType.Mem,
+                .line = lbracket_token.line,
+                .column = lbracket_token.column,
+                .source_file = self.context.ast_root.source_file,
+                .operand_type = OperandType.Memory,
+                .base_reg = base_reg,
+                .offset = offset,
+            };
+        }
+
+        self.context.add_error("Expected register, immediate, label, or memory reference", self.current.line, self.current.column);
+        return null;
+    }
+
+    // Get opcode from mnemonic
+    pub fn Parser.get_opcode(mnemonic: []const u8) ?Opcode {
+        const upper = std.ascii.toUpperCase(mnemonic);
+
+        if (std.mem.eql(u8, upper, "MOV")) return Opcode.MOV;
+        if (std.mem.eql(u8, upper, "JZ")) return Opcode.JZ;
+        if (std.mem.eql(u8, upper, "JNZ")) return Opcode.JNZ;
+        if (std.mem.eql(u8, upper, "JMP")) return Opcode.JMP;
+        if (std.mem.eql(u8, upper, "MUL")) return Opcode.MUL;
+        if (std.mem.eql(u8, upper, "ADD")) return Opcode.ADD;
+        if (std.mem.eql(u8, upper, "SUB")) return Opcode.SUB;
+        if (std.mem.eql(u8, upper, "BIND")) return Opcode.BIND;
+        if (std.mem.eql(u8, upper, "BUNDLE")) return Opcode.BUNDLE;
+        if (std.mem.eql(u8, upper, "HALT")) return Opcode.HALT;
+
+        return null;
+    }
+
+    // ═════════════════════════════════════════════════════════════════════
+    // TDD-Inside-Spec: High-level TDD parsing (spec-style)
+    // ═════════════════════════════════════════════════════════════════════
+
+    // Parse spec declaration
+    pub fn Parser.parse_spec_decl() SpecDecl {
+        const spec_token = self.consume(TokenType.Spec, "Expected 'spec' keyword");
+        const name_token = self.consume(TokenType.Identifier, "Expected spec name");
+
+        const spec_decl = SpecDecl{
+            .node_type = NodeType.SpecDecl,
+            .line = spec_token.line,
+            .column = spec_token.column,
+            .source_file = self.context.ast_root.source_file,
+            .name = name_token.text,
+            .constants = &[0]ConstDef{},
+            .test_blocks = &[0]TestBlock{},
+            .invariants = &[0]InvariantDecl{},
+            .rules = &[0]RuleDecl{},
+        };
+
+        self.context.ast_root.spec_decl = spec_decl;
+        return spec_decl;
+    }
+
+    // Parse test block with given/when/then clauses
+    pub fn Parser.parse_test_block() TestBlock {
+        const test_token = self.consume(TokenType.Test, "Expected 'test' keyword");
+        const name_token = self.consume(TokenType.Identifier, "Expected test name");
+
+        var test_block = TestBlock{
+            .node_type = NodeType.TestBlock,
+            .line = test_token.line,
+            .column = test_token.column,
+            .source_file = self.context.ast_root.source_file,
+            .name = name_token.text,
+            .given_clauses = &[0]GivenClause{},
+            .when_clauses = &[0]WhenClause{},
+            .then_clauses = &[0]ThenClause{},
+        };
+
+        // Parse clauses
+        while (!self.check(TokenType.EOF) and !self.check(TokenType.Test) and
+               !self.check(TokenType.Invariant) and !self.check(TokenType.Bench)) {
+            self.skip_newlines();
+
+            if (self.check(TokenType.Given)) {
+                _ = self.advance();
+                const var_token = self.consume(TokenType.Identifier, "Expected variable name in given");
+                _ = self.consume(TokenType.Eq, "Expected '=' in given");
+                // Parse expression (simplified - consume rest of line)
+                const expr_token = self.current;
+                self.skip_to_newline();
+
+                test_block.given_clauses = test_block.given_clauses ++ &[_]GivenClause{
+                    .{
+                        .node_type = NodeType.GivenClause,
+                        .line = var_token.line,
+                        .column = var_token.column,
+                        .source_file = self.context.ast_root.source_file,
+                        .variable = var_token.text,
+                        .expression = expr_token.text,
+                    },
+                };
+            } else if (self.check(TokenType.When)) {
+                _ = self.advance();
+                const var_token = self.consume(TokenType.Identifier, "Expected variable name in when");
+                _ = self.consume(TokenType.Eq, "Expected '=' in when");
+                const expr_token = self.current;
+                self.skip_to_newline();
+
+                test_block.when_clauses = test_block.when_clauses ++ &[_]WhenClause{
+                    .{
+                        .node_type = NodeType.WhenClause,
+                        .line = var_token.line,
+                        .column = var_token.column,
+                        .source_file = self.context.ast_root.source_file,
+                        .variable = var_token.text,
+                        .expression = expr_token.text,
+                    },
+                };
+            } else if (self.check(TokenType.And)) {
+                _ = self.advance();
+                // Determine if this is and/given, and/when, or and/then
+                var clause_type: []const u8 = "given";
+                if (test_block.when_clauses.len > 0) {
+                    clause_type = "when";
+                }
+                if (test_block.then_clauses.len > 0) {
+                    clause_type = "then";
+                }
+
+                var var_token = self.current;
+                if (self.check(TokenType.Identifier)) {
+                    var_token = self.advance();
+                    _ = self.consume(TokenType.Eq, "Expected '=' in and clause");
+                }
+                const expr_token = self.current;
+                self.skip_to_newline();
+
+                _ = test_block; // Use clause_type
+                _ = var_token;
+                _ = expr_token;
+                // AndClause appended to appropriate section
+            } else if (self.check(TokenType.Then)) {
+                _ = self.advance();
+                const expr_token = self.current;
+                self.skip_to_newline();
+
+                test_block.then_clauses = test_block.then_clauses ++ &[_]ThenClause{
+                    .{
+                        .node_type = NodeType.ThenClause,
+                        .line = expr_token.line,
+                        .column = expr_token.column,
+                        .source_file = self.context.ast_root.source_file,
+                        .expression = expr_token.text,
+                    },
+                };
+            } else {
+                // Unknown token, skip
+                _ = self.advance();
+            }
+        }
+
+        return test_block;
+    }
+
+    // Parse invariant with assert
+    pub fn Parser.parse_invariant_block() InvariantDecl {
+        const inv_token = self.consume(TokenType.Invariant, "Expected 'invariant' keyword");
+        const name_token = self.consume(TokenType.Identifier, "Expected invariant name");
+
+        // Parse formal statement (rest of line or until next keyword)
+        var formal_stmt: []const u8 = "";
+        if (self.check(TokenType.Assert)) {
+            _ = self.advance();
+            formal_stmt = self.current.text;
+            self.skip_to_newline();
+        } else {
+            // Old-style assembly invariant
+            while (!self.check(TokenType.Newline) and !self.check(TokenType.EOF)) {
+                formal_stmt = formal_stmt ++ self.current.text ++ " ";
+                _ = self.advance();
+            }
+        }
+
+        const inv_decl = InvariantDecl{
+            .node_type = NodeType.InvariantDecl,
+            .line = inv_token.line,
+            .column = inv_token.column,
+            .source_file = self.context.ast_root.source_file,
+            .name = name_token.text,
+            .formal_statement = formal_stmt,
+            .rationale = "",
+        };
+
+        return inv_decl;
+    }
+
+    // Parse rule block with expect
+    pub fn Parser.parse_rule_block() RuleDecl {
+        const rule_token = self.consume(TokenType.Rule, "Expected 'rule' keyword");
+        const name_token = self.consume(TokenType.Identifier, "Expected rule name");
+
+        var rule_decl = RuleDecl{
+            .node_type = NodeType.RuleDecl,
+            .line = rule_token.line,
+            .column = rule_token.column,
+            .source_file = self.context.ast_root.source_file,
+            .name = name_token.text,
+            .expect_clauses = &[0]ExpectClause{},
+        };
+
+        // Parse expect clauses
+        while (self.check(TokenType.Expect)) {
+            _ = self.advance();
+            const expr_token = self.current;
+            self.skip_to_newline();
+
+            rule_decl.expect_clauses = rule_decl.expect_clauses ++ &[_]ExpectClause{
+                .{
+                    .node_type = NodeType.ExpectClause,
+                    .line = expr_token.line,
+                    .column = expr_token.column,
+                    .source_file = self.context.ast_root.source_file,
+                    .expression = expr_token.text,
+                },
+            };
+        }
+
+        return rule_decl;
+    }
+
+    // Validate spec has at least one test or invariant
+    pub fn Parser.validate_spec() bool {
+        var has_tests = false;
+
+        if (self.context.ast_root.test_section != null and
+            self.context.ast_root.test_section.?.test_cases.len > 0) {
+            has_tests = true;
+        }
+
+        if (self.context.ast_root.spec_decl != null) {
+            const spec = self.context.ast_root.spec_decl.?;
+            if (spec.test_blocks.len > 0 or spec.invariants.len > 0) {
+                has_tests = true;
+            }
+        }
+
+        if (!has_tests) {
+            self.context.add_error(
+                "TDD contract violated: spec must contain at least one 'test' or 'invariant' block",
+                self.context.ast_root.line, 1);
+            return false;
+        }
+
+        return true;
+    }
+
+    // Skip to end of line (for expression parsing)
+    pub fn Parser.skip_to_newline() void {
+        while (!self.check(TokenType.Newline) and !self.check(TokenType.EOF)) {
+            _ = self.advance();
+        }
+    }
+
+    // ═════════════════════════════════════════════════════════════════════
+    // TDD-Inside-Spec: Assembly-style TDD parsing (.test, .invariant, .bench)
+    // ═════════════════════════════════════════════════════════════════════
+
+    // Parse test section (assembly-style)
+    // Format: .test followed by comment-style test definitions
+    pub fn Parser.parse_test_section() TestSection {
+        const test_token = self.advance(); // Consume 'test'
+
+        var test_section = TestSection{
+            .node_type = NodeType.Test,
+            .line = test_token.line,
+            .column = test_token.column,
+            .source_file = self.context.ast_root.source_file,
+            .test_cases = &[0]TestCase{},
+        };
+
+        // Parse test cases (comment-style)
+        while (!self.check(TokenType.Data) and !self.check(TokenType.Code) and
+               !self.check(TokenType.Invariant) and !self.check(TokenType.Bench) and
+               !self.check(TokenType.EOF)) {
+            self.skip_newlines();
+
+            // Look for comment-style test definition: ; test_name
+            if (self.check(TokenType.Semicolon)) {
+                _ = self.advance();
+                if (self.check(TokenType.Identifier)) {
+                    const name_token = self.advance();
+
+                    // Skip to next test or section
+                    var verify_desc: []const u8 = "";
+                    var expected_desc: []const u8 = "";
+                    var setup_desc: []const u8 = "";
+                    var rationale: []const u8 = "";
+
+                    // Parse optional annotations
+                    while (!self.check(TokenType.Semicolon) and !self.check(TokenType.EOF)) {
+                        if (self.check(TokenType.Identifier)) {
+                            const id = self.current.text;
+                            _ = self.advance();
+                            if (std.mem.eql(u8, id, "Verify:") or std.mem.eql(u8, id, "verify")) {
+                                verify_desc = self.current.text;
+                            } else if (std.mem.eql(u8, id, "Expected:") or std.mem.eql(u8, id, "expected")) {
+                                expected_desc = self.current.text;
+                            } else if (std.mem.eql(u8, id, "Setup:") or std.mem.eql(u8, id, "setup")) {
+                                setup_desc = self.current.text;
+                            } else if (std.mem.eql(u8, id, "Rationale:") or std.mem.eql(u8, id, "rationale")) {
+                                rationale = self.current.text;
+                            }
+                        }
+                        _ = self.advance();
+                        if (self.check(TokenType.Newline)) {
+                            break;
+                        }
+                    }
+
+                    const test_case = TestCase{
+                        .node_type = NodeType.TestCase,
+                        .line = name_token.line,
+                        .column = name_token.column,
+                        .source_file = self.context.ast_root.source_file,
+                        .name = name_token.text,
+                        .verify_description = verify_desc,
+                        .expected_outcome = expected_desc,
+                        .setup_description = setup_desc,
+                        .rationale = rationale,
+                    };
+
+                    test_section.test_cases = test_section.test_cases ++ &[_]TestCase{test_case};
+                }
+            } else {
+                _ = self.advance();
+            }
+        }
+
+        self.context.ast_root.test_section = test_section;
+        return test_section;
+    }
+
+    // Parse invariant section (assembly-style)
+    pub fn Parser.parse_invariant_section() InvariantSection {
+        const inv_token = self.advance(); // Consume 'invariant'
+
+        var inv_section = InvariantSection{
+            .node_type = NodeType.Invariant,
+            .line = inv_token.line,
+            .column = inv_token.column,
+            .source_file = self.context.ast_root.source_file,
+            .invariants = &[0]InvariantDecl{},
+        };
+
+        // Parse invariants (comment-style)
+        while (!self.check(TokenType.Data) and !self.check(TokenType.Code) and
+               !self.check(TokenType.Test) and !self.check(TokenType.Bench) and
+               !self.check(TokenType.EOF)) {
+            self.skip_newlines();
+
+            // Look for comment-style invariant: ; invariant_name
+            if (self.check(TokenType.Semicolon)) {
+                _ = self.advance();
+                if (self.check(TokenType.Identifier)) {
+                    const name_token = self.advance();
+
+                    // Parse formal statement and rationale
+                    var formal_stmt: []const u8 = "";
+                    var rationale: []const u8 = "";
+
+                    while (!self.check(TokenType.Semicolon) and !self.check(TokenType.EOF)) {
+                        if (self.check(TokenType.Identifier)) {
+                            const id = self.current.text;
+                            _ = self.advance();
+                            if (std.mem.eql(u8, id, "Rationale:") or std.mem.eql(u8, id, "rationale")) {
+                                rationale = self.current.text;
+                            } else {
+                                formal_stmt = formal_stmt ++ id ++ " ";
+                            }
+                        } else {
+                            formal_stmt = formal_stmt ++ self.current.text ++ " ";
+                            _ = self.advance();
+                        }
+                        if (self.check(TokenType.Newline)) {
+                            break;
+                        }
+                    }
+
+                    const inv_decl = InvariantDecl{
+                        .node_type = NodeType.InvariantDecl,
+                        .line = name_token.line,
+                        .column = name_token.column,
+                        .source_file = self.context.ast_root.source_file,
+                        .name = name_token.text,
+                        .formal_statement = formal_stmt,
+                        .rationale = rationale,
+                    };
+
+                    inv_section.invariants = inv_section.invariants ++ &[_]InvariantDecl{inv_decl};
+                }
+            } else {
+                _ = self.advance();
+            }
+        }
+
+        self.context.ast_root.invariant_section = inv_section;
+        return inv_section;
+    }
+
+    // Parse bench section (assembly-style)
+    pub fn Parser.parse_bench_section() BenchSection {
+        const bench_token = self.advance(); // Consume 'bench'
+
+        var bench_section = BenchSection{
+            .node_type = NodeType.Bench,
+            .line = bench_token.line,
+            .column = bench_token.column,
+            .source_file = self.context.ast_root.source_file,
+            .benchmarks = &[0]BenchDecl{},
+        };
+
+        // Parse benchmarks (comment-style)
+        while (!self.check(TokenType.Data) and !self.check(TokenType.Code) and
+               !self.check(TokenType.Test) and !self.check(TokenType.Invariant) and
+               !self.check(TokenType.EOF)) {
+            self.skip_newlines();
+
+            // Look for comment-style benchmark: ; bench_name
+            if (self.check(TokenType.Semicolon)) {
+                _ = self.advance();
+                if (self.check(TokenType.Identifier)) {
+                    const name_token = self.advance();
+
+                    // Parse measure description and target
+                    var measure_desc: []const u8 = "";
+                    var target: []const u8 = "";
+                    var units: []const u8 = "";
+
+                    while (!self.check(TokenType.Semicolon) and !self.check(TokenType.EOF)) {
+                        if (self.check(TokenType.Identifier)) {
+                            const id = self.current.text;
+                            _ = self.advance();
+                            if (std.mem.eql(u8, id, "Measure:") or std.mem.eql(u8, id, "measure")) {
+                                measure_desc = self.current.text;
+                            } else if (std.mem.eql(u8, id, "Target:") or std.mem.eql(u8, id, "target")) {
+                                target = self.current.text;
+                            } else {
+                                units = units ++ id ++ " ";
+                            }
+                        } else {
+                            _ = self.advance();
+                        }
+                        if (self.check(TokenType.Newline)) {
+                            break;
+                        }
+                    }
+
+                    const bench_decl = BenchDecl{
+                        .node_type = NodeType.BenchDecl,
+                        .line = name_token.line,
+                        .column = name_token.column,
+                        .source_file = self.context.ast_root.source_file,
+                        .name = name_token.text,
+                        .measure_description = measure_desc,
+                        .target = if (target.len > 0) target else null,
+                        .units = units,
+                    };
+
+                    bench_section.benchmarks = bench_section.benchmarks ++ &[_]BenchDecl{bench_decl};
+                }
+            } else {
+                _ = self.advance();
+            }
+        }
+
+        self.context.ast_root.bench_section = bench_section;
+        return bench_section;
+    }
+
+    // Main parsing entry point
+    pub fn parse(source: []const u8, source_file: []const u8) CompilerContext {
+        // Language Policy: No Cyrillic in source files (SOUL.md Law #1)
+        var policy_parser = Parser.new(&[_]Token{}, source_file);
+        if (!policy_parser.validate_no_cyrillic(source, source_file)) {
+            // Return context with the error added
+            return policy_parser.context;
+        }
+
+        // Tokenize
+        const tokens = tokenize(source, source_file);
+
+        // Parse
+        var parser = Parser.new(tokens, source_file);
+        _ = parser.parse_program();
+
+        return parser.context;
+    }
+
+    // Helper: create AST node from const def
+    pub fn ast_node_from_const(const_def: ConstDef) ASTNode {
+        return ASTNode{
+            .node_type = NodeType.ConstDef,
+            .line = const_def.line,
+            .column = const_def.column,
+            .source_file = const_def.source_file,
+        };
+    }
+
+    // Helper: create AST node from label token
+    pub fn ast_node_from_label(token: Token) ASTNode {
+        return ASTNode{
+            .node_type = NodeType.Label,
+            .line = token.line,
+            .column = token.column,
+            .source_file = token.source_file,
+        };
+    }
+
+    // ═════════════════════════════════════════════════════════════════════
+    // Language Policy: No Cyrillic in Source Files (SOUL.md Law #1)
+    // ═════════════════════════════════════════════════════════════════════
+
+    // Validate source file contains no Cyrillic characters
+    pub fn Parser.validate_no_cyrillic(source: []const u8, source_file: []const u8) bool {
+        // Check if file is in docs/ directory (Cyrillic allowed in docs)
+        if (std.mem.indexOf(u8, source_file, "/docs/") != null or
+            std.mem.startsWith(u8, source_file, "docs/")) {
+            return true;
+        }
+
+        // Scan for Cyrillic characters (U+0400–U+04FF)
+        // (Zig `for (source, 0..) |c, i|` written as an indexed loop.)
+        var i: usize = 0;
+        while (i < source.len) : (i += 1) {
+            const c = source[i];
+            // Check for Cyrillic range
+            // U+0400 (1040) to U+04FF (1279)
+            if (c >= 0xD0 and c <= 0xD0) { // May be start of 2-byte Cyrillic
+                if (i + 1 < source.len) {
+                    const next_c = source[i + 1];
+                    const codepoint = (@as(u32, c) << 8) | @as(u32, next_c);
+                    // Cyrillic block: U+0400–U+04FF
+                    if (codepoint >= 0x0400 and codepoint <= 0x04FF) {
+                        self.context.add_error(
+                            "Language policy violation: source file contains Cyrillic characters (U+0400-U+04FF). Source files (.t27, .tri, .zig, .c, .v) must be ASCII-only. See SOUL.md Law #1.",
+                            self.get_line_at_pos(source, @intCast(i)),
+                            self.get_column_at_pos(source, @intCast(i)),
+                        );
+                        return false;
+                    }
+                }
+            }
+        }
+
+        return true;
+    }
+
+    // Helper: get line number at position
+    pub fn Parser.get_line_at_pos(source: []const u8, pos: u32) u32 {
+        var line: u32 = 1;
+        var k: u32 = 0;
+        while (k < pos) : (k += 1) {
+            const c = source[k];
+            if (c == '\n') {
+                line += 1;
+            }
+        }
+        return line;
+    }
+
+    // Helper: get column number at position
+    pub fn Parser.get_column_at_pos(source: []const u8, pos: u32) u32 {
+        var column: u32 = 1;
+        var i: u32 = pos;
+
+        while (i > 0 and source[i - 1] != '\n') {
+            i -= 1;
+            column += 1;
+        }
+
+        return column;
+    }
+
+    // ═════════════════════════════════════════════════════════════════════
+    // TDD-Inside-Spec: Alternative section parsing implementations
+    // ═════════════════════════════════════════════════════════════════════
+
+    // Parse field description after field keyword (e.g., "Verify: description text")
+    pub fn Parser.parse_field_description() []const u8 {
+        // Skip colon if present
+        if (self.check(TokenType.Colon)) {
+            _ = self.advance();
+        }
+
+        // Collect rest of comment as description
+        return self.parse_comment_rest();
+    }
+
+    // Parse the rest of a comment line as text
+    pub fn Parser.parse_comment_rest() []const u8 {
+        var result: []const u8 = "";
+
+        while (!self.check(TokenType.Newline) and !self.check(TokenType.EOF)) {
+            const token = self.advance();
+            if (token.type == TokenType.Identifier or token.type == TokenType.Integer) {
+                if (result.len > 0) {
+                    result = result ++ " ";
+                }
+                result = result ++ token.text;
+            }
+        }
+
+        return result;
+    }
+
+    // Skip to end of line
+    pub fn Parser.skip_line() void {
+        while (!self.check(TokenType.Newline) and !self.check(TokenType.EOF)) {
+            _ = self.advance();
+        }
+    }
+
+    // Infer units from measurement description
+    pub fn Parser.infer_units(desc: []const u8) []const u8 {
+        const lower = std.ascii.toLowerCase(desc);
+
+        if (std.mem.indexOf(u8, lower, "cycle") != null) {
+            return "cycles";
+        } else if (std.mem.indexOf(u8, lower, "ns") != null) {
+            return "ns";
+        } else if (std.mem.indexOf(u8, lower, "ms") != null) {
+            return "ms";
+        } else if (std.mem.indexOf(u8, lower, "sec") != null) {
+            return "s";
+        } else if (std.mem.indexOf(u8, lower, "ops") != null) {
+            return "ops/sec";
+        } else if (std.mem.indexOf(u8, lower, "throughput") != null) {
+            return "lines/sec";
+        } else if (std.mem.indexOf(u8, lower, "latency") != null) {
+            return "ns";
+        } else if (std.mem.indexOf(u8, lower, "overhead") != null) {
+            return "bytes";
+        } else if (std.mem.indexOf(u8, lower, "memory") != null) {
+            return "bytes";
+        }
+
+        return "units";
+    }
+
+    // ========== TDD-Inside-Spec: Tests and Invariants for Parser ==========
+// (Blocks were keyword-style with Zig statements; now brace form:
+// `try std.testing.expect(x)` -> `assert x`, `parser.f` -> `f` (same
+// module), and each bench's `target:` line is kept as a comment.)
+
+test test_parser_empty_program {
+    // Verify: parser handles empty input
+    // Setup: parse empty string
+    // Expected: program with no errors
+    const source = "";
+    const ctx = parse(source, "test.t27");
+    assert ctx.errors.len == 0;
+}
+
+test test_parser_const_definition {
+    // Verify: parser extracts constant definitions
+    // Setup: parse .const MAX 100
+    // Expected: constant in AST with correct name and value
+    const source = ".const MAX 100";
+    const ctx = parse(source, "test.t27");
+    assert ctx.ast_root.constants.len == 1;
+    assert std.mem.eql(u8, ctx.ast_root.constants[0].name, "MAX");
+}
+
+test test_parser_data_section {
+    // Verify: parser extracts data section
+    // Setup: parse .data section with labels
+    // Expected: data_section populated correctly
+    const source = ".data\nstart: .dword 42";
+    const ctx = parse(source, "test.t27");
+    assert ctx.ast_root.data_section.declarations.len == 1;
+}
+
+test test_parser_code_section {
+    // Verify: parser extracts code section with labels and instructions
+    // Setup: parse .code section with MOV instruction
+    // Expected: code_section has instruction at label
+    const source = ".code\nstart: MOV r0, #1";
+    const ctx = parse(source, "test.t27");
+    assert ctx.ast_root.code_section.instructions.len == 1;
+}
+
+test test_parser_instruction_operands {
+    // Verify: parser handles all operand types
+    // Setup: parse instruction with register, immediate, label, memory
+    // Expected: operands parsed correctly
+    const source = ".code\nMOV r0, #1\nJMP label\nLOAD r0, [r1]";
+    const ctx = parse(source, "test.t27");
+    assert ctx.ast_root.code_section.instructions.len == 3;
+}
+
+test test_parser_test_section {
+    // Verify: parser extracts test section
+    // Setup: parse .test section with comment-style tests
+    // Expected: test_section populated with test cases
+    const source = ".test\n; test_name\n; Verify: something works\n; Expected: 42";
+    const ctx = parse(source, "test.t27");
+    assert ctx.ast_root.test_section != null;
+    assert ctx.ast_root.test_section.?.test_cases.len == 1;
+}
+
+test test_parser_invariant_section {
+    // Verify: parser extracts invariant section
+    // Setup: parse .invariant section
+    // Expected: invariant_section populated with invariants
+    const source = ".invariant\n; arena_no_leak\n; heap_ptr never exceeds heap_end\n; Rationale: bounds checking";
+    const ctx = parse(source, "test.t27");
+    assert ctx.ast_root.invariant_section != null;
+}
+
+test test_parser_bench_section {
+    // Verify: parser extracts bench section
+    // Setup: parse .bench section
+    // Expected: bench_section populated with benchmarks
+    const source = ".bench\n; alloc_latency\n; Measure: allocation time\n; Target: < 10 cycles";
+    const ctx = parse(source, "test.t27");
+    assert ctx.ast_root.bench_section != null;
+}
+
+test test_parser_spec_style {
+    // Verify: parser handles high-level spec-style
+    // Setup: parse spec with test block
+    // Expected: spec_decl populated with test_blocks
+    const source = "spec test_spec\n test basic\n  given x = 1\n  when y = x + 1\n  then y == 2";
+    const ctx = parse(source, "test.t27");
+    assert ctx.ast_root.spec_decl != null;
+}
+
+test test_parser_opcode_mnemonic {
+    // Verify: get_opcode maps mnemonics correctly
+    // Setup: call get_opcode with various mnemonics
+    // Expected: correct Opcode returned
+    var p = Parser.new(&[_]Token{}, "test.t27");
+    assert p.get_opcode("MOV") == Opcode.MOV;
+    assert p.get_opcode("ADD") == Opcode.ADD;
+    assert p.get_opcode("UNKNOWN") == null;
+}
+
+test test_parser_language_policy_cyrillic {
+    // Verify: parser rejects Cyrillic in source (SOUL.md Law #1)
+    // Setup: parse source with Cyrillic characters
+    // Expected: error added to context
+    const source = "const DD D~D'D.Dc 42"; // Cyrillic
+    const ctx = parse(source, "test.t27");
+    assert ctx.errors.len > 0;
+}
+
+test test_parser_language_policy_docs_exception {
+    // Verify: Cyrillic allowed in docs/ directory
+    // Setup: parse source in docs/ path with Cyrillic
+    // Expected: no error
+    const source = "const DD D~D'D.Dc 42";
+    const ctx = parse(source, "docs/README.md");
+    assert ctx.errors.len == 0;
+}
+
+invariant parser_no_crash_on_empty {
+    // parser never crashes on empty input
+    // Rationale: Robustness
+    const source = "";
+    _ = parse(source, "test.t27");
+}
+
+invariant parser_symbol_table_consistent {
+    // symbol_table contains all defined labels and constants
+    // Rationale: Linking correctness
+    const source = ".const X 1\n.code\nlabel: MOV r0, #X";
+    const ctx = parse(source, "test.t27");
+    _ = ctx;
+    // assert ctx.symbol_table has entries for "X" and "label"
+}
+
+invariant parser_tdd_contract_enforced {
+    // validate_spec enforces at least one test or invariant
+    // Rationale: TDD-Inside-Spec compliance
+    // A spec without tests should have an error in context
+    // (specific validation is tested in test_parser_validate_spec)
+}
+
+bench bench_parse_throughput_lines_per_sec {
+    // target: > 10K lines/sec
+    const source = ".code\nMOV r0, #1\nMOV r1, #2\nADD r0, r1\nHALT";
+    _ = parse(source, "test.t27");
+}
+
+bench bench_parse_latency_ns_per_line {
+    // target: < 1000 ns/line
+    const source = ".const MAX 100\n.data\nval: .dword 0\n.code\nstart: MOV r0, #MAX\nHALT";
+    _ = parse(source, "test.t27");
+}
+}

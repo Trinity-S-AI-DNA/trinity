@@ -1,0 +1,175 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/queen/review_first.t27 -- no new work from the backlog while finished work waits in review (gHashTag/t27#10555).
+; The owner's rule, 2026-10-18: the Queen takes nothing from the backlog while there is a queue in review.
+; Measured 2026-10-18 17:09Z on api.t27.ai/queen/status: 69 of 70 workers busy; in the last hour 102
+; dispatched, 56 finished, 11 reviewed; reviewable (the review sweep's own queue) 29, unreviewed 362.
+; The swarm starts about nine bees for every verdict, so the queue in review only grows, and each new bee
+; holds files (claim.t27) that the bees already in review need when they are sent back.
+; The rule:
+;   1. the review queue is exactly the review sweep's own filter, the one the status page counts as
+;      `reviewable`: the dispatch started, it finished, its review_state is NULL or 'wait', it was not
+;      reaped, and its issue is still open (in_review_queue);
+;   2. while that queue is longer than REVIEW_QUEUE_MAX (0: not while anything waits) a candidate from
+;      the backlog is refused, and the round says why (admission, R_REVIEW_FIRST);
+;   3. work the review itself asked for is never backlog: an issue the review sent back is dispatched
+;      again at any queue length (KIND_REWORK), and so is an issue the owner assigned by hand
+;      (KIND_ASSIGNED, the supervisor's pendingAssigns);
+;   4. the queue empties on its own: every outcome of the review that is not an accept has a clock
+;      (review_valve.t27), so a closed backlog always reopens without a person.
+; The host counts the queue and names each candidate's kind; this file decides. Not here: the wiring into
+; trios (queen-tick.ts candidate filter, vendored wasm and t27c gen-ts constants), how keys are shared
+; between bees and the reviewer, the review verdicts themselves. ASCII only (L3).
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module QueenReviewFirst;
+
+; --- 1. What a candidate is ---------------------------------------------------------------------------
+
+/// KIND_BACKLOG: an open issue with no dispatch the review is working on. KIND_REWORK: an issue whose
+/// last dispatch the review sent back (review_state 'sendBack'). KIND_ASSIGNED: an issue the owner
+/// assigned by hand. The codes are mirrored by number: a new kind takes the next code, none moves.
+pub const KIND_BACKLOG : u8 = 0;
+pub const KIND_REWORK : u8 = 1;
+pub const KIND_ASSIGNED : u8 = 2;
+
+/// The owner's hand wins over the review's send-back, and both win over the backlog.
+pub fn kind_of(assigned: bool, sent_back: bool) -> u8 {
+    if (assigned) { return KIND_ASSIGNED; }
+    if (sent_back) { return KIND_REWORK; }
+    return KIND_BACKLOG;
+}
+
+; --- 2. What the review queue is ----------------------------------------------------------------------
+
+/// A dispatch row's review_state as the host reads it: RS_NONE is NULL (no verdict yet), RS_WAIT is
+/// 'wait' (fewer verdicts than criteria, dispatch.t27 REVIEW_RULE), RS_OTHER is any written verdict.
+pub const RS_NONE : u8 = 0;
+pub const RS_WAIT : u8 = 1;
+pub const RS_OTHER : u8 = 2;
+
+/// Whether one dispatch row is in the review queue: the sweep's own filter (trios queen-tick.ts
+/// reviewFinishedDispatches, counted as `reviewable` by queen-public-status.ts). A row whose issue was
+/// closed is never reviewed, so it never holds the backlog shut.
+pub fn in_review_queue(started: bool, finished: bool, state: u8, reaped: bool, issue_open: bool) -> bool {
+    if (started == false) { return false; }
+    if (finished == false) { return false; }
+    if (reaped) { return false; }
+    if (issue_open == false) { return false; }
+    if (state == RS_NONE) { return true; }
+    return state == RS_WAIT;
+}
+
+; --- 3. Admission -------------------------------------------------------------------------------------
+
+/// How many dispatches may wait in review while the backlog stays open. Zero, the owner's words: not
+/// while anything is in review.
+pub const REVIEW_QUEUE_MAX : u32 = 0;
+
+/// R_ADMIT: the candidate may be chosen. R_REVIEW_FIRST: refused, the backlog is closed while the review
+/// queue is longer than REVIEW_QUEUE_MAX.
+pub const R_ADMIT : u8 = 0;
+pub const R_REVIEW_FIRST : u8 = 1;
+
+/// The refusal as the round reports it, after the queue length: "29 dispatches wait in review; ...".
+pub const REFUSAL_TAIL : str = " dispatches wait in review; the backlog is closed until the review queue is empty";
+
+pub fn backlog_open(review_queue: u32) -> bool {
+    return review_queue <= REVIEW_QUEUE_MAX;
+}
+
+pub fn admission(kind: u8, review_queue: u32) -> u8 {
+    if (kind == KIND_REWORK) { return R_ADMIT; }
+    if (kind == KIND_ASSIGNED) { return R_ADMIT; }
+    if (backlog_open(review_queue)) { return R_ADMIT; }
+    return R_REVIEW_FIRST;
+}
+
+pub fn admits(kind: u8, review_queue: u32) -> bool {
+    return admission(kind, review_queue) == R_ADMIT;
+}
+
+/// Whether a round that admitted no candidate owes the review-first sentence: some candidate was
+/// refused by this rule and none was admitted.
+pub fn round_refused(admitted: u32, refused: u32) -> bool {
+    if (admitted > 0) { return false; }
+    return refused > 0;
+}
+
+; --- 4. Tests -----------------------------------------------------------------------------------------
+
+test the_owner_hand_wins_then_the_review_then_the_backlog {
+    assert kind_of(false, false) == 0;
+    assert kind_of(false, true) == 1;
+    assert kind_of(true, false) == 2;
+    assert kind_of(true, true) == 2;
+}
+
+test the_queue_is_the_sweeps_own_filter {
+    assert in_review_queue(true, true, RS_NONE, false, true) == true;
+    assert in_review_queue(true, true, RS_WAIT, false, true) == true;
+    assert in_review_queue(true, true, RS_OTHER, false, true) == false;
+    assert in_review_queue(true, false, RS_NONE, false, true) == false;
+    assert in_review_queue(false, true, RS_NONE, false, true) == false;
+    assert in_review_queue(true, true, RS_NONE, true, true) == false;
+    assert in_review_queue(true, true, RS_NONE, false, false) == false;
+    assert in_review_queue(true, true, RS_WAIT, true, true) == false;
+    assert in_review_queue(true, true, 7, false, true) == false;
+}
+
+test the_backlog_is_closed_while_anything_waits_in_review {
+    assert admission(KIND_BACKLOG, 0) == 0;
+    assert admission(KIND_BACKLOG, 1) == 1;
+    assert admission(KIND_BACKLOG, 29) == 1;
+    assert admission(KIND_BACKLOG, 4294967295) == 1;
+    assert backlog_open(0) == true;
+    assert backlog_open(1) == false;
+    assert admits(KIND_BACKLOG, 0) == true;
+    assert admits(KIND_BACKLOG, 1) == false;
+}
+
+test work_the_review_asked_for_is_never_backlog {
+    assert admission(KIND_REWORK, 0) == 0;
+    assert admission(KIND_REWORK, 1) == 0;
+    assert admission(KIND_REWORK, 29) == 0;
+    assert admission(KIND_REWORK, 4294967295) == 0;
+    assert admits(KIND_REWORK, 362) == true;
+}
+
+test the_owners_assignment_is_never_held {
+    assert admission(KIND_ASSIGNED, 0) == 0;
+    assert admission(KIND_ASSIGNED, 29) == 0;
+    assert admits(KIND_ASSIGNED, 4294967295) == true;
+}
+
+test an_unknown_kind_is_backlog_and_is_held {
+    assert admission(3, 0) == 0;
+    assert admission(3, 1) == 1;
+    assert admission(255, 29) == 1;
+}
+
+test a_round_reports_the_rule_only_when_it_stopped_everything {
+    assert round_refused(0, 0) == false;
+    assert round_refused(0, 5) == true;
+    assert round_refused(1, 5) == false;
+    assert round_refused(3, 0) == false;
+}
+
+test the_measured_round_of_2026_10_18 {
+    assert admits(kind_of(false, false), 29) == false;
+    assert admits(kind_of(false, true), 29) == true;
+    assert admits(kind_of(true, false), 29) == true;
+    assert admits(kind_of(false, false), 0) == true;
+}
+
+; --- 5. Invariants ------------------------------------------------------------------------------------
+
+invariant the_codes_never_move {
+    assert KIND_BACKLOG == 0 and KIND_REWORK == 1 and KIND_ASSIGNED == 2;
+    assert RS_NONE == 0 and RS_WAIT == 1 and RS_OTHER == 2;
+    assert R_ADMIT == 0 and R_REVIEW_FIRST == 1;
+}
+
+/// The owner's bound: nothing may wait in review while the backlog is open.
+invariant the_bound_is_the_owners {
+    assert REVIEW_QUEUE_MAX == 0;
+}

@@ -1,0 +1,202 @@
+// End-to-end encrypted direct-message envelope policy.
+// HTTP, SQLite, X25519, AEAD, and APNs adapters are outside this specification.
+// phi^2 + phi^-2 = 3
+
+module DirectMessage {
+    use base::types;
+
+    const CRYPTO_VERSION_V1: u8 = 1;
+    const X25519_PUBLIC_KEY_BYTES: u16 = 32;
+    const CONTENT_KEY_BYTES: u16 = 32;
+    const AEAD_NONCE_BYTES: u16 = 12;
+    const AEAD_TAG_BYTES: u16 = 16;
+    const MAX_PLAINTEXT_BYTES: u16 = 4096;
+    const MAX_CIPHERTEXT_BYTES: u16 = 4112;
+    const MAX_RECIPIENT_DEVICES: u16 = 32;
+    const MAX_MESSAGE_PAGE: u16 = 100;
+    const PUSH_ALERT_MAX_AGE_SECONDS: u32 = 3600;
+
+    fn text_key_is_valid(byte_length: u16, all_zero: bool) -> bool {
+        return byte_length == X25519_PUBLIC_KEY_BYTES && !all_zero;
+    }
+
+    // Version 1 interoperates as ephemeral X25519 -> HKDF-SHA256 (32-byte
+    // key, empty salt, TRINET-DIRECT-MESSAGE-KEY-V1 metadata info) ->
+    // ChaCha20-Poly1305. AAD uses TRINET-DIRECT-MESSAGE-AAD-V1; the detached
+    // nonce is 12 bytes and stored ciphertext appends the 16-byte tag. The
+    // P-256 signature uses TRINET-DIRECT-MESSAGE-V1 and covers the version,
+    // routing identity, key fingerprint, ephemeral key, nonce, and ciphertext.
+    // Every field after a domain is u32-BE length-prefixed. The adapter
+    // transports and signs the opaque result but never decrypts it.
+    fn crypto_version_is_supported(crypto_version: u8) -> bool {
+        return crypto_version == CRYPTO_VERSION_V1;
+    }
+
+    fn recipient_may_resolve(sender_is_recipient: bool, sender_has_nickname: bool, recipient_has_nickname: bool, active_devices: u16, keyed_devices: u16) -> bool {
+        return !sender_is_recipient &&
+               sender_has_nickname &&
+               recipient_has_nickname &&
+               active_devices > 0 &&
+               active_devices <= MAX_RECIPIENT_DEVICES &&
+               keyed_devices == active_devices;
+    }
+
+    fn envelope_is_valid(crypto_version: u8, ephemeral_key_bytes: u16, ephemeral_key_all_zero: bool, nonce_bytes: u16, ciphertext_bytes: u16, signature_valid: bool) -> bool {
+        return crypto_version_is_supported(crypto_version) &&
+               text_key_is_valid(ephemeral_key_bytes, ephemeral_key_all_zero) &&
+               nonce_bytes == AEAD_NONCE_BYTES &&
+               ciphertext_bytes > AEAD_TAG_BYTES &&
+               ciphertext_bytes <= MAX_CIPHERTEXT_BYTES &&
+               signature_valid;
+    }
+
+    fn envelope_set_is_complete(expected_devices: u16, provided_envelopes: u16, unique_devices: u16) -> bool {
+        return expected_devices > 0 &&
+               expected_devices == provided_envelopes &&
+               expected_devices == unique_devices &&
+               expected_devices <= MAX_RECIPIENT_DEVICES;
+    }
+
+    fn message_may_be_committed(recipient_valid: bool, envelope_set_complete: bool, every_envelope_valid: bool, client_message_id_valid: bool) -> bool {
+        return recipient_valid &&
+               envelope_set_complete &&
+               every_envelope_valid &&
+               client_message_id_valid;
+    }
+
+    // A device can move to another account through trusted-device linking.
+    // Its old idempotency keys must never expose or resume an old account's
+    // message. A retry is valid only for the original sender account and the
+    // exact stored recipient/envelope intent.
+    fn message_retry_is_idempotent(same_sender_account: bool, same_recipient: bool, envelope_intent_matches: bool) -> bool {
+        return same_sender_account && same_recipient && envelope_intent_matches;
+    }
+
+    fn message_page_size(requested: u16) -> u16 {
+        if (requested == 0) {
+            return 1;
+        }
+        if (requested > MAX_MESSAGE_PAGE) {
+            return MAX_MESSAGE_PAGE;
+        }
+        return requested;
+    }
+
+    fn advance_read_cursor(current_message_id: u64, observed_message_id: u64) -> u64 {
+        if (observed_message_id > current_message_id) {
+            return observed_message_id;
+        }
+        return current_message_id;
+    }
+
+    fn message_counts_as_unread(message_id: u64, read_cursor: u64, sender_is_self: bool) -> bool {
+        return !sender_is_self && message_id > read_cursor;
+    }
+
+    fn push_alert_may_be_sent(sender_is_recipient: bool, token_valid: bool, inserted_new_message: bool) -> bool {
+        return !sender_is_recipient && token_valid && inserted_new_message;
+    }
+
+    // A new encrypted message and its per-device APNs events commit in one
+    // transaction. An idempotent API retry must not enqueue another alert.
+    fn push_alert_outbox_event_may_enqueue(sender_is_recipient: bool, token_valid: bool, inserted_new_message: bool) -> bool {
+        return push_alert_may_be_sent(sender_is_recipient, token_valid, inserted_new_message);
+    }
+
+    fn push_alert_is_fresh(created_at: u32, now: u32) -> bool {
+        if (now < created_at) {
+            return false;
+        }
+        return (now - created_at) <= PUSH_ALERT_MAX_AGE_SECONDS;
+    }
+
+    // Inbox state is authoritative. A delayed notification is useful only for
+    // an unread, recent message and only for the newest pending event on that
+    // device; the client fetches the full idempotent inbox after the alert.
+    fn push_alert_outbox_event_should_deliver(unread: bool, fresh: bool, newer_event_pending: bool) -> bool {
+        return unread && fresh && !newer_event_pending;
+    }
+
+    test every_active_device_requires_an_envelope {
+        assert(recipient_may_resolve(false, true, true, 2, 2) == true, "two keyed devices");
+        assert(recipient_may_resolve(false, true, true, 2, 1) == false, "missing device key");
+        assert(recipient_may_resolve(true, true, true, 1, 1) == false, "self message rejected");
+        assert(envelope_set_is_complete(2, 2, 2) == true, "complete unique fanout");
+        assert(envelope_set_is_complete(2, 1, 1) == false, "missing envelope");
+        assert(envelope_set_is_complete(2, 2, 1) == false, "duplicate device");
+    }
+
+    test ciphertext_and_signature_are_mandatory {
+        assert(envelope_is_valid(1, 32, false, 12, 17, true) == true, "small sealed payload");
+        assert(envelope_is_valid(2, 32, false, 12, 17, true) == false, "unknown crypto version");
+        assert(envelope_is_valid(1, 32, true, 12, 17, true) == false, "zero ephemeral key");
+        assert(envelope_is_valid(1, 31, false, 12, 17, true) == false, "wrong key length");
+        assert(envelope_is_valid(1, 32, false, 11, 17, true) == false, "wrong nonce length");
+        assert(envelope_is_valid(1, 32, false, 12, 16, true) == false, "tag without plaintext");
+        assert(envelope_is_valid(1, 32, false, 12, 4113, true) == false, "oversized ciphertext");
+        assert(envelope_is_valid(1, 32, false, 12, 17, false) == false, "unsigned envelope");
+    }
+
+    test commit_requires_complete_valid_encrypted_fanout {
+        assert(message_may_be_committed(true, true, true, true) == true, "valid message");
+        assert(message_may_be_committed(false, true, true, true) == false, "invalid recipient");
+        assert(message_may_be_committed(true, false, true, true) == false, "incomplete fanout");
+        assert(message_may_be_committed(true, true, false, true) == false, "invalid envelope");
+        assert(message_may_be_committed(true, true, true, false) == false, "invalid idempotency key");
+        assert(message_retry_is_idempotent(true, true, true) == true, "exact retry");
+        assert(message_retry_is_idempotent(false, true, true) == false, "old account denied");
+        assert(message_retry_is_idempotent(true, false, true) == false, "changed recipient denied");
+        assert(message_retry_is_idempotent(true, true, false) == false, "changed envelope denied");
+    }
+
+    test read_cursor_is_monotonic_and_account_scoped {
+        assert(advance_read_cursor(7, 12) == 12, "new read advances");
+        assert(advance_read_cursor(12, 7) == 12, "delayed device cannot regress");
+        assert(message_counts_as_unread(12, 7, false) == true, "remote unread");
+        assert(message_counts_as_unread(12, 7, true) == false, "own message excluded");
+    }
+
+    test pages_and_pushes_are_bounded {
+        assert(message_page_size(0) == 1, "non-empty page");
+        assert(message_page_size(500) == 100, "bounded page");
+        assert(push_alert_may_be_sent(false, true, true) == true, "new remote message");
+        assert(push_alert_may_be_sent(false, true, false) == false, "retry has no push");
+        assert(push_alert_may_be_sent(true, true, true) == false, "sender has no push");
+        assert(push_alert_outbox_event_may_enqueue(false, true, true) == true, "new alert persists");
+        assert(push_alert_outbox_event_may_enqueue(false, true, false) == false, "retry has no outbox row");
+        assert(push_alert_is_fresh(100, 3700) == true, "one-hour boundary remains useful");
+        assert(push_alert_is_fresh(100, 3701) == false, "stale alert is suppressed");
+        assert(push_alert_outbox_event_should_deliver(true, true, false) == true, "latest unread alert is delivered");
+        assert(push_alert_outbox_event_should_deliver(false, true, false) == false, "read alert is suppressed");
+        assert(push_alert_outbox_event_should_deliver(true, true, true) == false, "older pending alert is coalesced");
+    }
+
+    invariant ciphertext_limit_includes_one_aead_tag
+        assert MAX_CIPHERTEXT_BYTES == MAX_PLAINTEXT_BYTES + AEAD_TAG_BYTES
+
+    invariant x25519_key_is_larger_than_nonce
+        assert X25519_PUBLIC_KEY_BYTES > AEAD_NONCE_BYTES
+
+    invariant content_key_is_256_bits
+        assert CONTENT_KEY_BYTES == 32
+
+    invariant read_cursor_never_regresses
+        assert advance_read_cursor(12, 7) >= 12
+
+    invariant idempotent_retry_never_pushes
+        assert push_alert_may_be_sent(false, true, false) == false
+
+    invariant idempotent_retry_never_enqueues_alert
+        assert push_alert_outbox_event_may_enqueue(false, true, false) == false
+
+    invariant stale_or_coalesced_alert_never_delivers
+        forall newer_event_pending: bool
+        assert push_alert_outbox_event_should_deliver(true, false, newer_event_pending) == false
+
+    invariant relinked_device_cannot_reuse_old_message_id
+        assert message_retry_is_idempotent(false, true, true) == false
+
+    bench encrypted_envelope_policy_latency
+        measure: nanoseconds to envelope_is_valid(1, 32, false, 12, 128, true)
+        target: < 1000ns
+}

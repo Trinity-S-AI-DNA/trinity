@@ -1,0 +1,1065 @@
+// SPDX-License-Identifier: Apache-2.0
+// t27/specs/pins/parser.t27
+// Pins Parser for Trinity t27
+// Parse .t27 pin specifications into Pins IR
+// phi^2 + 1/phi^2 = 3 | TRINITY
+
+module PinsParser {
+    use base::types;
+    use base::ops;
+    use pins::ir;
+
+    // Translation notes. This spec was first written in Rust syntax; t27 has
+    // no enum variants with payloads, heap Vec/String, Option<T> with
+    // Some/None, Result<T, E> with `?`, impl blocks, closures, match or
+    // format!. Each is expressed with t27 features instead:
+    //   variant payloads        -> a kind enum plus a struct that carries the
+    //                              payload (PinToken + PinTok, AstNode + the
+    //                              Ast* structs, LexErrorKind + LexError)
+    //   String                  -> []const u8 (a slice of the input text), or
+    //                              a fixed-size message buffer with a length
+    //   Vec<T>                  -> fixed-capacity array plus a count
+    //   Option<T>, Some(x), None -> ?T, x, null
+    //   Result<T, E> and `?`    -> the fn returns bool (true = Ok) and writes
+    //                              T through an out pointer; the Err value is
+    //                              stored (Parser.err, or the LexError out
+    //                              pointer) and each caller returns false at
+    //                              once, which is what `?` did
+    //   impl X { fn m(&self) }  -> free fn x_m(x: *X)
+    //   format!(...)            -> format3 into a message buffer
+    //   map_or(false, |c| ...)  -> an explicit null test plus the predicate
+    //
+    // NOTE (behaviour kept as written): the logic below follows the original
+    // step by step. As written, it does not do what test_basic_parsing,
+    // test_io_standard_parsing and the parser_robustness invariant expect,
+    // for reasons that are in the original and not introduced by the
+    // translation:
+    //   1. scan_token reads a character with advance() and then calls
+    //      number() / identifier(), which start from the NEXT character, so a
+    //      number or identifier loses its first character ("module" lexes as
+    //      IDENTIFIER("odule"), "34" as NUMBER(4), "8" as InvalidNumber).
+    //   2. parse_module consumes the `signal` / `constraint` keyword with
+    //      match_keyword, and parse_signal_decl / parse_constraint then
+    //      expect that keyword a second time.
+    //   3. parse_io_standard reads the standard name with expect_identifier,
+    //      while the test writes it as a string ("LVCMOS33").
+    //   4. number() reads digits only, so `12_000_000` is not one number.
+    // They are left for the spec's owners to decide. test_error_handling and
+    // the error_recovery invariant hold either way. The ast_consistency
+    // invariant holds only VACUOUSLY for now: its assert runs only when the
+    // basic input parses, and defect 1 already stops that input in the lexer
+    // ("data[8]": the 8 is consumed by advance(), so number() finds no digit
+    // and reports InvalidNumber). Until the lexer is fixed that assert is
+    // never reached, so it checks nothing.
+
+    // Capacities that replace Vec growth (pushes beyond them are not stored).
+    const MAX_TOKENS : usize = 1024;
+    const MAX_SIGNALS : usize = 64;
+    const MAX_CONSTRAINTS : usize = 64;
+    const MSG_CAP : usize = 64;
+
+    // Lexer tokens for pin specifications
+    // (IDENTIFIER(String), STRING(String) and NUMBER(u32) carried a payload;
+    // PinTok below holds it beside the kind)
+    enum PinToken {
+        IDENTIFIER,
+        STRING,
+        NUMBER,
+        COLON,           // :
+        EQUALS,          // =
+        COMMA,           // ,
+        SEMICOLON,       // ;
+        LEFT_BRACE,      // {
+        RIGHT_BRACE,     // }
+        LEFT_BRACKET,    // [
+        RIGHT_BRACKET,   // ]
+        LEFT_PAREN,      // (
+        RIGHT_PAREN,     // )
+        ARROW,           // ->
+        DOT,             // .
+        AT,              // @
+        HASH,            // #
+        EOF,
+    }
+
+    // One lexed token: its kind and the payload of the payload variants.
+    struct PinTok {
+        kind: PinToken,
+        text: []const u8,    // IDENTIFIER / STRING payload: a slice of the input
+        number: u32,         // NUMBER payload
+    }
+
+    // A token of a payload-free kind (COLON, EQUALS, ..., EOF).
+    fn pin_tok(kind: PinToken) -> PinTok {
+        return PinTok{ .kind = kind, .text = "", .number = 0 };
+    }
+
+    // The variant name `{:?}` printed for a token kind.
+    fn pin_token_name(kind: PinToken) -> []const u8 {
+        return switch (kind) {
+            .IDENTIFIER => "IDENTIFIER",
+            .STRING => "STRING",
+            .NUMBER => "NUMBER",
+            .COLON => "COLON",
+            .EQUALS => "EQUALS",
+            .COMMA => "COMMA",
+            .SEMICOLON => "SEMICOLON",
+            .LEFT_BRACE => "LEFT_BRACE",
+            .RIGHT_BRACE => "RIGHT_BRACE",
+            .LEFT_BRACKET => "LEFT_BRACKET",
+            .RIGHT_BRACKET => "RIGHT_BRACKET",
+            .LEFT_PAREN => "LEFT_PAREN",
+            .RIGHT_PAREN => "RIGHT_PAREN",
+            .ARROW => "ARROW",
+            .DOT => "DOT",
+            .AT => "AT",
+            .HASH => "HASH",
+            .EOF => "EOF",
+        };
+    }
+
+    // AST Node Types
+    // (the original `enum AstNode` had struct-like variants; t27 enums carry
+    // no fields, so AstNode names the variants and each variant's fields are
+    // the struct Ast<Variant> below)
+    enum AstNode {
+        Module,
+        SignalDecl,
+        Constraint,
+        SignalType,
+        BaseType,
+        PinLocation,
+        IoStandard,
+        ConstraintValue,
+    }
+
+    struct AstModule {
+        name: []const u8,
+        signals: [MAX_SIGNALS]AstSignalDecl,       // was Vec<SignalDecl>
+        signal_count: usize,
+        constraints: [MAX_CONSTRAINTS]AstConstraint, // was Vec<Constraint>
+        constraint_count: usize,
+    }
+
+    struct AstSignalDecl {
+        name: []const u8,
+        type: AstSignalType,
+        location: ?AstPinLocation,
+        iostandard: ?AstIoStandard,
+    }
+
+    struct AstConstraint {
+        target: []const u8,
+        value: AstConstraintValue,
+    }
+
+    struct AstSignalType {
+        base: AstBaseType,
+        width: ?u32,
+    }
+
+    struct AstBaseType {
+        name: []const u8,
+    }
+
+    struct AstPinLocation {
+        package_pin: []const u8,
+        bank: ?u8,
+    }
+
+    struct AstIoStandard {
+        name: []const u8,
+        voltage: ?[]const u8,
+        drive_strength: ?u8,
+    }
+
+    struct AstConstraintValue {
+        literal: ?[]const u8,
+        number: ?u32,
+    }
+
+    // Parser State
+    // (`err` holds the ParseError of the step that failed: the Err value)
+    struct Parser {
+        tokens: []const PinTok,        // was Vec<PinToken>
+        current: usize,
+        current_module: ?[]const u8,
+        err: ParseError,
+    }
+
+    // Parser Implementation
+    // (impl Parser: each method is a free fn taking the parser first)
+    fn parser_new(tokens: []const PinTok) -> Parser {
+        return Parser{
+            .tokens = tokens,
+            .current = 0,
+            .current_module = null,
+            .err = parse_error_new("", 0),
+        };
+    }
+
+    fn parser_parse(p: *Parser, out: *AstModule) -> bool {
+        return parser_parse_module(p, out);
+    }
+
+    fn parser_parse_module(p: *Parser, out: *AstModule) -> bool {
+        // Parse module declaration
+        var keyword : []const u8 = "";
+        if (!parser_expect_keyword(p, "module", &keyword)) {
+            return false;
+        }
+        var name : []const u8 = "";
+        if (!parser_expect_identifier(p, &name)) {
+            return false;
+        }
+        if (!parser_expect_token(p, PinToken.LEFT_BRACE)) {
+            return false;
+        }
+
+        var signals : [MAX_SIGNALS]AstSignalDecl = undefined;
+        var signal_count : usize = 0;
+        var constraints : [MAX_CONSTRAINTS]AstConstraint = undefined;
+        var constraint_count : usize = 0;
+
+        while (!parser_match_token(p, PinToken.RIGHT_BRACE) and !parser_is_at_end(p)) {
+            if (parser_match_keyword(p, "signal")) {
+                var signal : AstSignalDecl = undefined;
+                if (!parser_parse_signal_decl(p, &signal)) {
+                    return false;
+                }
+                if (signal_count < MAX_SIGNALS) {
+                    signals[signal_count] = signal;
+                    signal_count += 1;
+                }
+            } else if (parser_match_keyword(p, "constraint")) {
+                var constraint : AstConstraint = undefined;
+                if (!parser_parse_constraint(p, &constraint)) {
+                    return false;
+                }
+                if (constraint_count < MAX_CONSTRAINTS) {
+                    constraints[constraint_count] = constraint;
+                    constraint_count += 1;
+                }
+            } else {
+                return parser_error(p, "Expected 'signal' or 'constraint'");
+            }
+        }
+
+        // The original line is `self.consume_token(PinToken::RIGHT_BRACE)?`:
+        // consume_token takes no argument and returns an Option, which `?`
+        // cannot turn into a ParseError. It is kept as the call it names --
+        // consume the next token -- with the argument and `?` dropped.
+        _ = parser_consume_token(p);
+
+        out.* = AstModule{
+            .name = name,
+            .signals = signals,
+            .signal_count = signal_count,
+            .constraints = constraints,
+            .constraint_count = constraint_count,
+        };
+        return true;
+    }
+
+    fn parser_parse_signal_decl(p: *Parser, out: *AstSignalDecl) -> bool {
+        var keyword : []const u8 = "";
+        if (!parser_expect_keyword(p, "signal", &keyword)) {
+            return false;
+        }
+        var name : []const u8 = "";
+        if (!parser_expect_identifier(p, &name)) {
+            return false;
+        }
+        if (!parser_expect_token(p, PinToken.COLON)) {
+            return false;
+        }
+
+        var type_node : AstSignalType = undefined;
+        if (!parser_parse_signal_type(p, &type_node)) {
+            return false;
+        }
+
+        var location : ?AstPinLocation = null;
+        var iostandard : ?AstIoStandard = null;
+
+        // Parse optional attributes
+        while (parser_match_token(p, PinToken.AT)) {
+            if (parser_match_keyword(p, "location")) {
+                var loc : AstPinLocation = undefined;
+                if (!parser_parse_pin_location(p, &loc)) {
+                    return false;
+                }
+                location = loc;
+            } else if (parser_match_keyword(p, "iostd")) {
+                var std_node : AstIoStandard = undefined;
+                if (!parser_parse_io_standard(p, &std_node)) {
+                    return false;
+                }
+                iostandard = std_node;
+            } else {
+                return parser_error(p, "Expected 'location' or 'iostd'");
+            }
+        }
+
+        if (!parser_expect_token(p, PinToken.SEMICOLON)) {
+            return false;
+        }
+
+        out.* = AstSignalDecl{
+            .name = name,
+            .type = type_node,
+            .location = location,
+            .iostandard = iostandard,
+        };
+        return true;
+    }
+
+    fn parser_parse_signal_type(p: *Parser, out: *AstSignalType) -> bool {
+        var base_name : []const u8 = "";
+        if (!parser_expect_identifier(p, &base_name)) {
+            return false;
+        }
+
+        var width : ?u32 = null;
+        if (parser_match_token(p, PinToken.LEFT_BRACKET)) {
+            var width_num : u32 = 0;
+            if (!parser_expect_number(p, &width_num)) {
+                return false;
+            }
+            width = width_num;
+            if (!parser_expect_token(p, PinToken.RIGHT_BRACKET)) {
+                return false;
+            }
+        }
+
+        out.* = AstSignalType{
+            .base = AstBaseType{ .name = base_name },
+            .width = width,
+        };
+        return true;
+    }
+
+    fn parser_parse_pin_location(p: *Parser, out: *AstPinLocation) -> bool {
+        if (!parser_expect_token(p, PinToken.LEFT_PAREN)) {
+            return false;
+        }
+        var package_pin : []const u8 = "";
+        if (!parser_expect_string(p, &package_pin)) {
+            return false;
+        }
+
+        var bank : ?u8 = null;
+        if (parser_match_token(p, PinToken.COMMA)) {
+            var bank_num : u32 = 0;
+            if (!parser_expect_number(p, &bank_num)) {
+                return false;
+            }
+            bank = bank_num as u8;
+        }
+
+        if (!parser_expect_token(p, PinToken.RIGHT_PAREN)) {
+            return false;
+        }
+
+        out.* = AstPinLocation{
+            .package_pin = package_pin,
+            .bank = bank,
+        };
+        return true;
+    }
+
+    fn parser_parse_io_standard(p: *Parser, out: *AstIoStandard) -> bool {
+        if (!parser_expect_token(p, PinToken.LEFT_PAREN)) {
+            return false;
+        }
+        var name : []const u8 = "";
+        if (!parser_expect_identifier(p, &name)) {
+            return false;
+        }
+
+        var voltage : ?[]const u8 = null;
+        var drive_strength : ?u8 = null;
+
+        if (parser_match_token(p, PinToken.COMMA)) {
+            var volts : []const u8 = "";
+            if (!parser_expect_string(p, &volts)) {
+                return false;
+            }
+            voltage = volts;
+            if (parser_match_token(p, PinToken.COMMA)) {
+                var strength : u32 = 0;
+                if (!parser_expect_number(p, &strength)) {
+                    return false;
+                }
+                drive_strength = strength as u8;
+            }
+        }
+
+        if (!parser_expect_token(p, PinToken.RIGHT_PAREN)) {
+            return false;
+        }
+
+        out.* = AstIoStandard{
+            .name = name,
+            .voltage = voltage,
+            .drive_strength = drive_strength,
+        };
+        return true;
+    }
+
+    fn parser_parse_constraint(p: *Parser, out: *AstConstraint) -> bool {
+        var keyword : []const u8 = "";
+        if (!parser_expect_keyword(p, "constraint", &keyword)) {
+            return false;
+        }
+        var target : []const u8 = "";
+        if (!parser_expect_identifier(p, &target)) {
+            return false;
+        }
+        if (!parser_expect_token(p, PinToken.EQUALS)) {
+            return false;
+        }
+
+        var value : AstConstraintValue = undefined;
+        if (parser_match_token(p, PinToken.STRING)) {
+            value = AstConstraintValue{
+                .literal = parser_last_string_value(p),
+                .number = null,
+            };
+        } else {
+            var num : u32 = 0;
+            if (!parser_expect_number(p, &num)) {
+                return false;
+            }
+            value = AstConstraintValue{
+                .literal = null,
+                .number = num,
+            };
+        }
+
+        if (!parser_expect_token(p, PinToken.SEMICOLON)) {
+            return false;
+        }
+
+        out.* = AstConstraint{
+            .target = target,
+            .value = value,
+        };
+        return true;
+    }
+
+    // Helper methods
+    fn parser_is_at_end(p: *Parser) -> bool {
+        return p.current >= p.tokens.len;
+    }
+
+    fn parser_peek(p: *Parser) -> ?PinTok {
+        if (p.current < p.tokens.len) {
+            return p.tokens[p.current];
+        }
+        return null;
+    }
+
+    fn parser_consume_token(p: *Parser) -> ?PinTok {
+        if (parser_is_at_end(p)) {
+            return null;
+        }
+        p.current += 1;
+        return p.tokens[p.current - 1];
+    }
+
+    // Compares token kinds, as std::mem::discriminant did.
+    fn parser_match_token(p: *Parser, token: PinToken) -> bool {
+        const peeked = parser_peek(p);
+        if (peeked != null) {
+            if (peeked.?.kind == token) {
+                _ = parser_consume_token(p);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn parser_expect_token(p: *Parser, token: PinToken) -> bool {
+        if (parser_match_token(p, token)) {
+            return true;
+        }
+        // format!("Expected {:?}", token)
+        var buf : [MSG_CAP]u8 = undefined;
+        const n = format3(buf[0..], "Expected ", pin_token_name(token), "");
+        return parser_error(p, buf[0..n]);
+    }
+
+    fn parser_match_keyword(p: *Parser, keyword: []const u8) -> bool {
+        const peeked = parser_peek(p);
+        if (peeked != null and peeked.?.kind == PinToken.IDENTIFIER) {
+            if (bytes_eq(peeked.?.text, keyword)) {
+                _ = parser_consume_token(p);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn parser_expect_keyword(p: *Parser, keyword: []const u8, out: *[]const u8) -> bool {
+        const tok = parser_consume_token(p);
+        if (tok != null and tok.?.kind == PinToken.IDENTIFIER) {
+            if (bytes_eq(tok.?.text, keyword)) {
+                out.* = tok.?.text;
+                return true;
+            }
+        }
+        // format!("Expected keyword '{}'", keyword)
+        var buf : [MSG_CAP]u8 = undefined;
+        const n = format3(buf[0..], "Expected keyword '", keyword, "'");
+        return parser_error(p, buf[0..n]);
+    }
+
+    fn parser_expect_identifier(p: *Parser, out: *[]const u8) -> bool {
+        const tok = parser_consume_token(p);
+        if (tok != null and tok.?.kind == PinToken.IDENTIFIER) {
+            out.* = tok.?.text;
+            return true;
+        }
+        return parser_error(p, "Expected identifier");
+    }
+
+    fn parser_expect_string(p: *Parser, out: *[]const u8) -> bool {
+        const tok = parser_consume_token(p);
+        if (tok != null and tok.?.kind == PinToken.STRING) {
+            out.* = tok.?.text;
+            return true;
+        }
+        return parser_error(p, "Expected string");
+    }
+
+    // (the original wrote `this.error(...)` here; `this` is the same parser)
+    fn parser_expect_number(p: *Parser, out: *u32) -> bool {
+        const tok = parser_consume_token(p);
+        if (tok != null and tok.?.kind == PinToken.NUMBER) {
+            out.* = tok.?.number;
+            return true;
+        }
+        return parser_error(p, "Expected number");
+    }
+
+    fn parser_last_string_value(p: *Parser) -> []const u8 {
+        // Implementation would get last string token value
+        return ""; // Placeholder (the original's String::new())
+    }
+
+    // The original `error(&self, message) -> Result<T, E>` built the Err
+    // value; here it is stored in p.err and false (= Err) is returned.
+    fn parser_error(p: *Parser, message: []const u8) -> bool {
+        p.err = parse_error_new(message, p.current);
+        return false;
+    }
+
+    // Error Types
+    // (message was a heap String: here a fixed buffer plus its length)
+    struct ParseError {
+        message: [MSG_CAP]u8,
+        message_len: usize,
+        position: usize,
+    }
+
+    fn parse_error_new(message: []const u8, position: usize) -> ParseError {
+        var e = ParseError{
+            .message = undefined,
+            .message_len = 0,
+            .position = position,
+        };
+        e.message_len = msg_copy(e.message[0..], 0, message);
+        return e;
+    }
+
+    // Lexer Implementation
+    // (input was an owned String; the tokens slice into it, so it is
+    // borrowed for as long as the tokens and the AST are used)
+    struct Lexer {
+        input: []const u8,
+        position: usize,
+    }
+
+    fn lexer_new(input: []const u8) -> Lexer {
+        return Lexer{
+            .input = input,
+            .position = 0,
+        };
+    }
+
+    // Writes the tokens into `tokens` and their number into `count`
+    // (the original returned Vec<PinToken>).
+    fn lexer_tokenize(lx: *Lexer, tokens: []PinTok, count: *usize, err: *LexError) -> bool {
+        var n : usize = 0;
+
+        while (!lexer_is_at_end(lx)) {
+            lexer_skip_whitespace(lx);
+
+            if (lexer_is_at_end(lx)) {
+                break;
+            }
+
+            var token : PinTok = undefined;
+            if (!lexer_scan_token(lx, &token, err)) {
+                return false;
+            }
+            if (n < tokens.len) {
+                tokens[n] = token;
+                n += 1;
+            }
+        }
+
+        if (n < tokens.len) {
+            tokens[n] = pin_tok(PinToken.EOF);
+            n += 1;
+        }
+        count.* = n;
+        return true;
+    }
+
+    fn lexer_scan_token(lx: *Lexer, out: *PinTok, err: *LexError) -> bool {
+        const c = lexer_advance(lx);
+
+        // match c { ... } as an if-chain
+        if (c == ':') {
+            out.* = pin_tok(PinToken.COLON);
+            return true;
+        } else if (c == '=') {
+            out.* = pin_tok(PinToken.EQUALS);
+            return true;
+        } else if (c == ',') {
+            out.* = pin_tok(PinToken.COMMA);
+            return true;
+        } else if (c == ';') {
+            out.* = pin_tok(PinToken.SEMICOLON);
+            return true;
+        } else if (c == '{') {
+            out.* = pin_tok(PinToken.LEFT_BRACE);
+            return true;
+        } else if (c == '}') {
+            out.* = pin_tok(PinToken.RIGHT_BRACE);
+            return true;
+        } else if (c == '[') {
+            out.* = pin_tok(PinToken.LEFT_BRACKET);
+            return true;
+        } else if (c == ']') {
+            out.* = pin_tok(PinToken.RIGHT_BRACKET);
+            return true;
+        } else if (c == '(') {
+            out.* = pin_tok(PinToken.LEFT_PAREN);
+            return true;
+        } else if (c == ')') {
+            out.* = pin_tok(PinToken.RIGHT_PAREN);
+            return true;
+        } else if (c == '@') {
+            out.* = pin_tok(PinToken.AT);
+            return true;
+        } else if (c == '#') {
+            out.* = pin_tok(PinToken.HASH);
+            return true;
+        } else if (c == '-') {
+            if (lexer_match_char(lx, '>')) {
+                out.* = pin_tok(PinToken.ARROW);
+                return true;
+            }
+            err.* = LexError{ .kind = LexErrorKind.UnexpectedCharacter, .character = c };
+            return false;
+        } else if (c == '"') {
+            return lexer_string(lx, out, err);
+        } else if (is_ascii_digit(c)) {
+            return lexer_number(lx, out, err);
+        } else if (is_ascii_alpha(c) or c == '_') {
+            return lexer_identifier(lx, out);
+        }
+        err.* = LexError{ .kind = LexErrorKind.UnexpectedCharacter, .character = c };
+        return false;
+    }
+
+    fn lexer_string(lx: *Lexer, out: *PinTok, err: *LexError) -> bool {
+        // (the literal was pushed char by char into a String; it is the slice
+        // of the input between the quotes)
+        const start = lx.position;
+
+        while (!lexer_peek_is(lx, '"') and !lexer_is_at_end(lx)) {
+            _ = lexer_advance(lx);
+        }
+
+        if (lexer_is_at_end(lx)) {
+            err.* = LexError{ .kind = LexErrorKind.UnterminatedString, .character = 0 };
+            return false;
+        }
+
+        const literal = lx.input[start..lx.position];
+        _ = lexer_advance(lx); // Consume closing "
+        out.* = PinTok{ .kind = PinToken.STRING, .text = literal, .number = 0 };
+        return true;
+    }
+
+    fn lexer_number(lx: *Lexer, out: *PinTok, err: *LexError) -> bool {
+        // (the digits were collected into a String and read with
+        // parse::<u32>(), a failure mapping to InvalidNumber; they are
+        // accumulated directly, and no digits or a value above the u32 range
+        // is that same failure)
+        var value : u64 = 0;
+        var digits : usize = 0;
+        var overflow : bool = false;
+
+        while (true) {
+            // `self.peek().map_or(false, |c| c.is_ascii_digit())`
+            const next = lexer_peek(lx);
+            if (next == null or !is_ascii_digit(next.?)) {
+                break;
+            }
+            const d = lexer_advance(lx);
+            if (!overflow) {
+                value = value * 10 + ((d - '0') as u64);
+                if (value > 4294967295) {
+                    overflow = true;
+                }
+            }
+            digits += 1;
+        }
+
+        if (digits == 0 or overflow) {
+            err.* = LexError{ .kind = LexErrorKind.InvalidNumber, .character = 0 };
+            return false;
+        }
+        out.* = PinTok{ .kind = PinToken.NUMBER, .text = "", .number = value as u32 };
+        return true;
+    }
+
+    fn lexer_identifier(lx: *Lexer, out: *PinTok) -> bool {
+        const start = lx.position;
+
+        while (true) {
+            // `self.peek().map_or(false, |c| c.is_ascii_alphanumeric() || c == '_')`
+            const next = lexer_peek(lx);
+            if (next == null or !(is_ascii_alphanumeric(next.?) or next.? == '_')) {
+                break;
+            }
+            _ = lexer_advance(lx);
+        }
+
+        out.* = PinTok{ .kind = PinToken.IDENTIFIER, .text = lx.input[start..lx.position], .number = 0 };
+        return true;
+    }
+
+    // Helper methods for lexer
+    // (`self.input.chars().nth(i)`: the input is read byte by byte -- pin
+    // specifications are ASCII -- and indexing past the end traps, as
+    // unwrap() on None did)
+    fn lexer_advance(lx: *Lexer) -> u8 {
+        const c = lx.input[lx.position];
+        lx.position += 1;
+        return c;
+    }
+
+    fn lexer_peek(lx: *Lexer) -> ?u8 {
+        if (lx.position < lx.input.len) {
+            return lx.input[lx.position];
+        }
+        return null;
+    }
+
+    // `self.peek() == Some(expected)`
+    fn lexer_peek_is(lx: *Lexer, expected: u8) -> bool {
+        const next = lexer_peek(lx);
+        return next != null and next.? == expected;
+    }
+
+    fn lexer_match_char(lx: *Lexer, expected: u8) -> bool {
+        if (lexer_peek_is(lx, expected)) {
+            _ = lexer_advance(lx);
+            return true;
+        }
+        return false;
+    }
+
+    fn lexer_is_at_end(lx: *Lexer) -> bool {
+        return lx.position >= lx.input.len;
+    }
+
+    fn lexer_skip_whitespace(lx: *Lexer) {
+        while (true) {
+            // `self.peek().map_or(false, |c| c.is_ascii_whitespace())`
+            const next = lexer_peek(lx);
+            if (next == null or !is_ascii_whitespace(next.?)) {
+                break;
+            }
+            _ = lexer_advance(lx);
+        }
+    }
+
+    // Lexer Error
+    // (UnexpectedCharacter(char) carried the character; LexError holds it)
+    struct LexError {
+        kind: LexErrorKind,
+        character: u8,       // payload of UnexpectedCharacter
+    }
+
+    enum LexErrorKind {
+        UnexpectedCharacter,
+        UnterminatedString,
+        InvalidNumber,
+    }
+
+    // The variant name `{:?}` printed for a lex error kind.
+    fn lex_error_kind_name(kind: LexErrorKind) -> []const u8 {
+        return switch (kind) {
+            .UnexpectedCharacter => "UnexpectedCharacter",
+            .UnterminatedString => "UnterminatedString",
+            .InvalidNumber => "InvalidNumber",
+        };
+    }
+
+    // ---------------------------------------------
+    // Byte and character helpers (stand-ins for String / char methods)
+    // ---------------------------------------------
+
+    // Byte-wise equality; stands in for `id == keyword` on strings.
+    fn bytes_eq(a: []const u8, b: []const u8) -> bool {
+        if (a.len != b.len) {
+            return false;
+        }
+        var i : usize = 0;
+        while (i < a.len) {
+            if (a[i] != b[i]) {
+                return false;
+            }
+            i += 1;
+        }
+        return true;
+    }
+
+    // True when `needle` occurs in `haystack` (str::contains).
+    fn bytes_contains(haystack: []const u8, needle: []const u8) -> bool {
+        if (needle.len > haystack.len) {
+            return false;
+        }
+        var start : usize = 0;
+        while (start + needle.len <= haystack.len) {
+            var j : usize = 0;
+            while (j < needle.len and haystack[start + j] == needle[j]) {
+                j += 1;
+            }
+            if (j == needle.len) {
+                return true;
+            }
+            start += 1;
+        }
+        return false;
+    }
+
+    // Copy `src` into `out` from `pos` and return the new length. Bytes past
+    // the end of `out` are not written (the buffer bound replaces String growth).
+    fn msg_copy(out: []u8, pos: usize, src: []const u8) -> usize {
+        var w : usize = pos;
+        var r : usize = 0;
+        while (r < src.len and w < out.len) {
+            out[w] = src[r];
+            w += 1;
+            r += 1;
+        }
+        return w;
+    }
+
+    // Writes a, b, c one after another into `out` and returns the length:
+    // stands in for format! with one value between two fixed pieces.
+    fn format3(out: []u8, a: []const u8, b: []const u8, c: []const u8) -> usize {
+        var n : usize = msg_copy(out, 0, a);
+        n = msg_copy(out, n, b);
+        n = msg_copy(out, n, c);
+        return n;
+    }
+
+    // char::is_ascii_digit
+    fn is_ascii_digit(c: u8) -> bool {
+        return c >= '0' and c <= '9';
+    }
+
+    // 'a'..='z' | 'A'..='Z'
+    fn is_ascii_alpha(c: u8) -> bool {
+        return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z');
+    }
+
+    // char::is_ascii_alphanumeric
+    fn is_ascii_alphanumeric(c: u8) -> bool {
+        return is_ascii_alpha(c) or is_ascii_digit(c);
+    }
+
+    // char::is_ascii_whitespace: space, tab, line feed, form feed (12), carriage return
+    fn is_ascii_whitespace(c: u8) -> bool {
+        return c == ' ' or c == '\t' or c == '\n' or c == 12 or c == '\r';
+    }
+
+    // Main entry point
+    // (Result<AstNode, ParseError>: returns true with the module in `out`,
+    // or false with the error in `err`)
+    fn parse_pins_spec(input: []const u8, out: *AstModule, err: *ParseError) -> bool {
+        var lexer = lexer_new(input);
+        var tokens : [MAX_TOKENS]PinTok = undefined;
+        var token_count : usize = 0;
+        var lex_err : LexError = undefined;
+        if (!lexer_tokenize(&lexer, tokens[0..], &token_count, &lex_err)) {
+            // `lexer.tokenize()?` passed a LexError up through a function whose
+            // error type is ParseError, and the original defines no conversion
+            // between them. The lex error is reported as a ParseError named
+            // after its LexErrorKind, at the lexer's input position.
+            err.* = parse_error_new(lex_error_kind_name(lex_err.kind), lexer.position);
+            return false;
+        }
+
+        var parser = parser_new(tokens[0..token_count]);
+        if (!parser_parse(&parser, out)) {
+            err.* = parser.err;
+            return false;
+        }
+        return true;
+    }
+
+    // True when no two signals of `m` share a name (used by the
+    // ast_consistency invariant below).
+    fn ast_signal_names_unique(m: *AstModule) -> bool {
+        var i : usize = 0;
+        while (i < m.signal_count) {
+            var j : usize = i + 1;
+            while (j < m.signal_count) {
+                if (bytes_eq(m.signals[i].name, m.signals[j].name)) {
+                    return false;
+                }
+                j += 1;
+            }
+            i += 1;
+        }
+        return true;
+    }
+
+    // Tests
+    // The original `test: { name: { description, input, expect: {...} } }`
+    // records are executable tests: the description is the first comment,
+    // `input` is a constant, and each `expect` field is an assertion. The
+    // raw strings r#"..."# are ordinary string literals with \n and \"
+    // escapes (same text, same line breaks and indentation).
+
+    const TEST_BASIC_INPUT : []const u8 = "\n                module test_board {\n                    signal clk : clock @location(\"E3\", 34);\n                    signal data : data[8] @location(\"D4\", 35);\n                    constraint clock_freq = 12_000_000;\n                }\n            ";
+
+    const TEST_IOSTD_INPUT : []const u8 = "\n                module board_with_iostd {\n                    signal uart_tx : uart @location(\"T15\", 34) @iostd(\"LVCMOS33\", \"3.3\", 8);\n                }\n            ";
+
+    const TEST_INVALID_INPUT : []const u8 = "module invalid { signal : }";
+
+    test "test_basic_parsing" {
+        // Parse basic pin specification
+        var ast : AstModule = undefined;
+        var err : ParseError = undefined;
+        // ast: parse_pins_spec(input)
+        const ok = parse_pins_spec(TEST_BASIC_INPUT, &ast, &err);
+        assert(ok);
+        // module_name: "test_board"
+        assert(bytes_eq(ast.name, "test_board"));
+        // signal_count: 2
+        assert(ast.signal_count == 2);
+        // constraint_count: 1
+        assert(ast.constraint_count == 1);
+    }
+
+    test "test_io_standard_parsing" {
+        // Parse pin with IO standard
+        var ast : AstModule = undefined;
+        var err : ParseError = undefined;
+        // ast: parse_pins_spec(input)
+        const ok = parse_pins_spec(TEST_IOSTD_INPUT, &ast, &err);
+        assert(ok);
+        // (the expectations below are about the input's one signal)
+        assert(ast.signal_count >= 1);
+        // has_io_standard: true
+        assert(ast.signals[0].iostandard != null);
+        // voltage: "3.3"
+        assert(bytes_eq(ast.signals[0].iostandard.?.voltage.?, "3.3"));
+        // drive_strength: 8
+        assert(ast.signals[0].iostandard.?.drive_strength.? == 8);
+    }
+
+    test "test_error_handling" {
+        // Handle parsing errors gracefully
+        var ast : AstModule = undefined;
+        var err : ParseError = undefined;
+        // result: parse_pins_spec(input)
+        const ok = parse_pins_spec(TEST_INVALID_INPUT, &ast, &err);
+        // is_error: true
+        assert(ok == false);
+        // error_contains: "Expected"
+        assert(bytes_contains(err.message[0..err.message_len], "Expected"));
+    }
+
+    // Invariants
+    // The original `invariant: { name: { description, check } }` records were
+    // prose. Each is an invariant block that checks its `check` text on the
+    // test inputs above; description and check are the first comments.
+
+    invariant parser_robustness {
+        // Parser must handle all valid pin specifications
+        // check: All test cases pass without panics
+        // (checked as: each test input is parsed to completion with the
+        // outcome its test expects)
+        var ast : AstModule = undefined;
+        var err : ParseError = undefined;
+        assert(parse_pins_spec(TEST_BASIC_INPUT, &ast, &err));
+        assert(parse_pins_spec(TEST_IOSTD_INPUT, &ast, &err));
+        assert(parse_pins_spec(TEST_INVALID_INPUT, &ast, &err) == false);
+    }
+
+    invariant ast_consistency {
+        // Generated AST must be consistent
+        // check: No duplicate signal names, valid references
+        // (checked as: an AST parsed from the basic test input has distinct
+        // signal names; "valid references" names no rule the AST can be
+        // checked against, so that half stays prose)
+        // (vacuous until the lexer defect in the NOTE at the top is fixed:
+        // TEST_BASIC_INPUT does not parse yet, so the assert below never runs)
+        var ast : AstModule = undefined;
+        var err : ParseError = undefined;
+        if (parse_pins_spec(TEST_BASIC_INPUT, &ast, &err)) {
+            assert(ast_signal_names_unique(&ast));
+        }
+    }
+
+    invariant error_recovery {
+        // Parser must provide meaningful error messages
+        // check: Error position and description are accurate
+        // (checked as: the invalid test input fails with a non-empty message
+        // at a token position inside its token stream)
+        var ast : AstModule = undefined;
+        var err : ParseError = undefined;
+        assert(parse_pins_spec(TEST_INVALID_INPUT, &ast, &err) == false);
+        assert(err.message_len > 0);
+        var lexer = lexer_new(TEST_INVALID_INPUT);
+        var tokens : [MAX_TOKENS]PinTok = undefined;
+        var token_count : usize = 0;
+        var lex_err : LexError = undefined;
+        assert(lexer_tokenize(&lexer, tokens[0..], &token_count, &lex_err));
+        assert(err.position <= token_count);
+    }
+
+    // Documentation
+    // (the original `documentation: { ... }` record; t27 has no such block,
+    // so each field is a module constant)
+    const DOC_TITLE : []const u8 = "Pins Parser Specification";
+    const DOC_DESCRIPTION : []const u8 = "Parse .t27 pin specifications into Pins Intermediate Representation";
+
+    const DOC_SYNTAX_EXAMPLE : []const u8 = "\n            module board_name {\n                signal signal_name : type @location(\"pin\", bank);\n                signal array : type[width] @location(\"pin\", bank);\n                constraint constraint_name = value;\n            }\n        ";
+
+    const DOC_SUPPORTED_TYPES : [8][]const u8 = [
+        "clock", "reset", "uart", "spi", "i2c", "gpio", "led", "button"
+    ];
+
+    const DOC_IOSTANDARDS : [6][]const u8 = [
+        "LVCMOS33", "LVCMOS18", "LVCMOS25", "LVCMOS15", "LVTTL", "SSTL"
+    ];
+
+    const DOC_ERROR_HANDLING : []const u8 = "All parsing errors provide position and descriptive message";
+
+    const DOC_INTEGRATION : []const u8 = "This parser replaces pins_parser.zig in bootstrap pipeline";
+}
+
+// phi^2 + 1/phi^2 = 3 | TRINITY

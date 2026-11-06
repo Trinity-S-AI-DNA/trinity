@@ -1,0 +1,238 @@
+// SPDX-License-Identifier: Apache-2.0
+// tri-net/specs/crypto_frame.t27
+// Partial spec-first lift of src/crypto.rs (T27-first): the INTEGER session-frame
+// discipline. The AEAD itself (ChaCha20-Poly1305), X25519 and HKDF stay in Rust;
+// what lives here is everything an auditor checks with arithmetic alone:
+//   wire frame  = [epoch u32 BE][counter u64 BE][ciphertext || tag16]
+//   AEAD nonce  = [dir:1][epoch:4 BE][counter low 7 BE]  (12 bytes)
+//   rekey       = ratchet at 2^20 frames, hard nonce-reuse stop at 2^24
+// Mirrors src/crypto.rs bit-for-bit; early-return style (t27c-0.1.0 forbids
+// local reassignment).
+//
+// The 64-frame replay window is lifted LANE-SPLIT (two u32 halves). t27c-0.1.0
+// wraps integer compare/mask operands in `as u32` and types the literal `1` in
+// `1 << n` as i32; a single u64 bitmap MISCOMPILES (`(bitmap & (1 << 34)) as u32`
+// truncates bits 32..63, `1i32 << 34` wraps the shift to bit 2 — a frame at
+// distance 34 read as fresh when it is a replay). Carrying the window as two
+// 32-bit lanes keeps every operand <= 32 bits, so the codegen is exact. A
+// differential harness (scratchpad/crypto_frame_diff.rs) drives the generated
+// lane functions and an exact copy of src/crypto.rs's u64 window through 5000
+// clustered-random counters and confirms bit-identical accept + state.
+// phi^2 + phi^-2 = 3 | TRINITY
+
+module CryptoFrame {
+    use base::types;
+
+    // ---- wire frame geometry ----
+    const EPOCH_LEN : usize = 4;
+    const COUNTER_LEN : usize = 8;
+    const HEADER_LEN : usize = 12;    // EPOCH_LEN + COUNTER_LEN
+    const TAG_LEN : usize = 16;
+    const NONCE_LEN : usize = 12;
+
+    // Counter offset inside the header; ciphertext starts after the header.
+    fn counter_offset() -> usize {
+        return EPOCH_LEN;
+    }
+
+    fn ciphertext_offset() -> usize {
+        return HEADER_LEN;
+    }
+
+    // open() gate: a frame shorter than the header can never be valid.
+    fn frame_len_ok(byte_len: usize) -> bool {
+        return byte_len >= HEADER_LEN;
+    }
+
+    // ---- rekey discipline ----
+    const REKEY_EVERY_FRAMES : u64 = 1048576;    // 2^20 — routine forward-secrecy ratchet
+    const REKEY_HARD_CAP : u64 = 16777216;       // 2^24 — absolute nonce-reuse stop
+
+    // seal() ratchets BEFORE using the counter once the per-epoch budget is spent.
+    fn should_ratchet(tx_counter: u64) -> bool {
+        return tx_counter >= REKEY_EVERY_FRAMES;
+    }
+
+    // seal() refuses outright at the hard cap — never reuse a nonce.
+    fn must_reject(tx_counter: u64) -> bool {
+        return tx_counter >= REKEY_HARD_CAP;
+    }
+
+    // ---- nonce layout: [dir:1][epoch:4 BE][counter low 7 BE] ----
+    // Byte i of the 12-byte nonce, as pure arithmetic on the fields.
+    fn nonce_byte(dir: u8, epoch: u32, ctr: u64, i: u32) -> u32 {
+        if (i == 0) {
+            return dir as u32;
+        }
+        if (i < 5) {
+            // epoch big-endian: byte 1 is the most significant epoch byte
+            return (epoch >> ((4 - i) * 8)) & 255;
+        }
+        // bytes 5..11: low 7 bytes of the counter, big-endian
+        return ((ctr >> ((11 - i) * 8)) & 255) as u32;
+    }
+
+    // The two peers' TX directions must differ; RX inverts the local TX dir.
+    fn rx_dir(tx_dir: u8) -> u8 {
+        return 1 - tx_dir;
+    }
+
+    // ---- 64-frame replay window, LANE-SPLIT (IPsec RFC 6479 style) ----
+    // The u64 window bitmap of src/crypto.rs is carried here as TWO u32 lanes
+    // (blo = bits 0..31, bhi = bits 32..63) so no operand ever exceeds 32 bits.
+    // This dodges the t27c-0.1.0 codegen bug that miscompiled a single u64 mask
+    // (see the NOT-LIFTED note above); every shift amount below is < 32 and every
+    // mask fits a lane. Verified bit-identical to the u64 window by a differential
+    // harness over 5000 clustered-random counters (scratchpad/crypto_frame_diff.rs).
+    // `top` is the highest counter seen; counters are bounded by REKEY_HARD_CAP
+    // (2^24), so the u64 `top`/`ctr` comparisons stay exact under u32 codegen.
+    const WINDOW_WIDTH : u64 = 64;
+
+    // Fresh iff the frame is newer than the window top, or its in-window bit is unset.
+    fn replay_accept(seen_any: bool, top: u64, blo: u32, bhi: u32, ctr: u64) -> bool {
+        if (seen_any == false) {
+            return true;
+        }
+        if (ctr > top) {
+            return true;
+        }
+        let d : u64 = top - ctr;
+        if (d >= WINDOW_WIDTH) {
+            return false;    // too old to prove non-replay
+        }
+        if (d < 32) {
+            return (blo & (1 << d)) == 0;
+        }
+        return (bhi & (1 << (d - 32))) == 0;
+    }
+
+    // New window top after admitting ctr (max of top and ctr).
+    fn replay_next_top(seen_any: bool, top: u64, ctr: u64) -> u64 {
+        if (seen_any == false) {
+            return ctr;
+        }
+        if (ctr > top) {
+            return ctr;
+        }
+        return top;
+    }
+
+    // Low lane after admitting ctr. On a forward jump the whole 64-bit value shifts
+    // left by s and bit 0 is set; on an in-window frame the matching bit is set.
+    fn replay_next_blo(seen_any: bool, top: u64, blo: u32, bhi: u32, ctr: u64) -> u32 {
+        if (seen_any == false) {
+            return 1;         // first frame: bit 0
+        }
+        if (ctr > top) {
+            let s : u64 = ctr - top;
+            if (s >= 32) {
+                return 1;     // low lane fully shifted out; only the new bit 0
+            }
+            return (blo << s) | 1;
+        }
+        let d : u64 = top - ctr;
+        if (d < 32) {
+            return blo | (1 << d);
+        }
+        return blo;
+    }
+
+    // High lane after admitting ctr. Carries the bits shifting up out of the low
+    // lane on a forward jump, or sets the matching bit for an in-window frame.
+    fn replay_next_bhi(seen_any: bool, top: u64, blo: u32, bhi: u32, ctr: u64) -> u32 {
+        if (seen_any == false) {
+            return 0;         // first frame lives in the low lane
+        }
+        if (ctr > top) {
+            let s : u64 = ctr - top;
+            if (s >= WINDOW_WIDTH) {
+                return 0;     // jumped past the whole window
+            }
+            if (s >= 32) {
+                return blo << (s - 32);
+            }
+            return (bhi << s) | (blo >> (32 - s));
+        }
+        let d : u64 = top - ctr;
+        if (d >= 32) {
+            return bhi | (1 << (d - 32));
+        }
+        return bhi;
+    }
+
+    // ---- TDD (L4): mirror src/crypto.rs behavior ----
+    test header_is_epoch_plus_counter
+        given h = EPOCH_LEN + COUNTER_LEN
+        and   co = ciphertext_offset()
+        then h == 12
+        and  co == 12
+
+    test short_frame_rejected
+        given bad = frame_len_ok(11)
+        and   ok = frame_len_ok(12)
+        then bad == false
+        and  ok == true
+
+    test ratchet_at_budget_reject_at_cap
+        given before = should_ratchet(1048575)
+        and   at = should_ratchet(1048576)
+        and   cap = must_reject(16777216)
+        and   under_cap = must_reject(16777215)
+        then before == false
+        and  at == true
+        and  cap == true
+        and  under_cap == false
+
+    test nonce_layout_dir_epoch_ctr
+        given d = nonce_byte(1, 258, 5, 0)
+        and   e_hi = nonce_byte(1, 258, 5, 1)
+        and   e_lo = nonce_byte(1, 258, 5, 4)
+        and   c_lo = nonce_byte(1, 258, 5, 11)
+        then d == 1
+        and  e_hi == 0
+        and  e_lo == 2
+        and  c_lo == 5
+
+    test rx_inverts_tx_direction
+        given a = rx_dir(0)
+        and   b = rx_dir(1)
+        then a == 1
+        and  b == 0
+
+    test replay_first_and_duplicate
+        given first = replay_accept(false, 0, 0, 0, 7)
+        and   blo = replay_next_blo(false, 0, 0, 0, 7)
+        and   dup = replay_accept(true, 7, 1, 0, 7)
+        then first == true
+        and  blo == 1
+        and  dup == false
+
+    test replay_low_lane_in_window
+        given fresh = replay_accept(true, 10, 1, 0, 5)
+        and   blo = replay_next_blo(true, 10, 1, 0, 5)
+        then fresh == true
+        and  blo == 33
+
+    test replay_high_lane_bit
+        given fresh = replay_accept(true, 40, 1, 0, 5)
+        and   bhi = replay_next_bhi(true, 40, 1, 0, 5)
+        then fresh == true
+        and  bhi == 8
+
+    test replay_too_old_rejected
+        given old = replay_accept(true, 70, 1, 0, 5)
+        then old == false
+
+    test replay_forward_jump_carries_lane
+        given blo = replay_next_blo(true, 5, 1, 0, 8)
+        and   bhi = replay_next_bhi(true, 5, 1, 0, 8)
+        then blo == 9
+        and  bhi == 0
+
+    // ---- invariants (mirror the const asserts in src/crypto.rs) ----
+    invariant routine_ratchet_below_hard_cap
+        assert REKEY_EVERY_FRAMES < REKEY_HARD_CAP
+
+    invariant hard_cap_fits_seven_nonce_bytes
+        assert REKEY_HARD_CAP < 72057594037927936
+}

@@ -1,0 +1,680 @@
+// SPDX-License-Identifier: MIT
+; Specs/text_rules.t27 -- DiskBloom: rules over names, bundle IDs and paths, read byte by byte
+; Swift hands this spec UTF-8 bytes (paths in canonical decomposition, so byte equality matches
+; Swift's string equality) in a buffer of TX_MAX bytes with their length, plus, where Unicode
+; classification is needed, one class byte per Unicode scalar. Every decision about the text is
+; made here: which identifiers and names are safe to build a path from, the canonical form of a
+; bundle ID, how two paths relate, and which parts of the home folder a path falls in.
+; A text longer than TX_MAX bytes is refused by every rule that takes it (TX_TOO_LONG).
+; Generated C: Sources/Generated/text_rules.h (Specs/generate.sh). ASCII only.
+
+module DiskBloomTextRules;
+
+pub const TX_MAX : u32 = 4096;
+
+; --- Bytes this spec looks for ---------------------------------------------------------------------
+pub const TX_SLASH : u8 = 47;
+pub const TX_DOT : u8 = 46;
+pub const TX_DASH : u8 = 45;
+pub const TX_UNDERSCORE : u8 = 95;
+pub const TX_COLON : u8 = 58;
+pub const TX_NUL : u8 = 0;
+
+; --- Classes of Unicode scalars, as Swift reports them --------------------------------------------
+pub const TX_CLASS_OTHER : u8 = 0;
+pub const TX_CLASS_ALNUM : u8 = 1;
+pub const TX_CLASS_DOT : u8 = 2;
+pub const TX_CLASS_DASH : u8 = 3;
+pub const TX_CLASS_UNDERSCORE : u8 = 4;
+
+; --- How path A relates to path B -------------------------------------------------------------------
+pub const TX_SAME : u32 = 0;
+pub const TX_INSIDE : u32 = 1;
+pub const TX_CONTAINS : u32 = 2;
+pub const TX_UNRELATED : u32 = 3;
+pub const TX_TOO_LONG : u32 = 4;
+
+; --- Where under the home folder a relative path falls ---------------------------------------------
+pub const TX_LIB_NONE : u32 = 0;
+pub const TX_LIB_ALLOWED_CACHE : u32 = 1;
+pub const TX_LIB_OTHER : u32 = 2;
+
+; --- Bytes of the fixed path words (lowercase where matching ignores case) ---------------------------
+; "Library"
+pub const TX_W_LIBRARY : [7]u8 = [76, 105, 98, 114, 97, 114, 121];
+; "Library/Caches"
+pub const TX_W_LIBRARY_CACHES : [14]u8 = [76, 105, 98, 114, 97, 114, 121, 47, 67, 97, 99, 104, 101, 115];
+; "Library/Developer/Xcode/DerivedData"
+pub const TX_W_DERIVED_DATA : [35]u8 = [76, 105, 98, 114, 97, 114, 121, 47, 68, 101, 118, 101, 108, 111, 112, 101, 114, 47, 88, 99, 111, 100, 101, 47, 68, 101, 114, 105, 118, 101, 100, 68, 97, 116, 97];
+; ".cache"
+pub const TX_W_DOT_CACHE : [6]u8 = [46, 99, 97, 99, 104, 101];
+; ".Trash"
+pub const TX_W_TRASH : [6]u8 = [46, 84, 114, 97, 115, 104];
+; ".Trashes"
+pub const TX_W_TRASHES : [8]u8 = [46, 84, 114, 97, 115, 104, 101, 115];
+; "Volumes"
+pub const TX_W_VOLUMES : [7]u8 = [86, 111, 108, 117, 109, 101, 115];
+; "com.apple." and "group." (bundle ID prefixes, already lowercase)
+pub const TX_W_COM_APPLE : [10]u8 = [99, 111, 109, 46, 97, 112, 112, 108, 101, 46];
+pub const TX_W_GROUP : [6]u8 = [103, 114, 111, 117, 112, 46];
+; ".savedState"
+pub const TX_W_SAVED_STATE : [11]u8 = [46, 115, 97, 118, 101, 100, 83, 116, 97, 116, 101];
+
+; --- Extensions this app tells apart --------------------------------------------------------------------
+pub const TX_EXT_NONE : u32 = 0;
+pub const TX_EXT_APP : u32 = 1;
+pub const TX_EXT_APPEX : u32 = 2;
+pub const TX_EXT_XPC : u32 = 3;
+pub const TX_EXT_FRAMEWORK : u32 = 4;
+pub const TX_EXT_BUNDLE : u32 = 5;
+pub const TX_EXT_SYSTEMEXTENSION : u32 = 6;
+pub const TX_EXT_PLIST : u32 = 7;
+pub const TX_EXT_OTHER : u32 = 8;
+; The known extensions, lowercase, packed: app appex xpc framework bundle systemextension plist
+pub const TX_EXT_BYTES : [46]u8 = [97, 112, 112, 97, 112, 112, 101, 120, 120, 112, 99, 102, 114, 97, 109, 101, 119, 111, 114, 107, 98, 117, 110, 100, 108, 101, 115, 121, 115, 116, 101, 109, 101, 120, 116, 101, 110, 115, 105, 111, 110, 112, 108, 105, 115, 116];
+pub const TX_EXT_OFFSETS : [7]u32 = [0, 3, 8, 11, 20, 26, 41];
+pub const TX_EXT_LENGTHS : [7]u32 = [3, 5, 3, 9, 6, 15, 5];
+
+; --- Bytes --------------------------------------------------------------------------------------------
+
+pub fn tx_lower(c: u8) -> u8 {
+    if (c >= 65 and c <= 90) { return c + 32; }
+    return c;
+}
+
+pub fn tx_is_ascii_alnum(c: u8) -> bool {
+    if (c >= 48 and c <= 57) { return true; }
+    if (c >= 65 and c <= 90) { return true; }
+    if (c >= 97 and c <= 122) { return true; }
+    return false;
+}
+
+pub fn tx_is_ascii_lower_letter(c: u8) -> bool {
+    return c >= 97 and c <= 122;
+}
+
+; --- Safe identifiers (AppRemovalPathSafety.safeIdentifier) -------------------------------------------
+; classes: one TX_CLASS_* per Unicode scalar; scalars: their count; characters: the grapheme count.
+; Safe: 3 to 255 characters; every scalar alphanumeric, dot, dash or underscore; at least one dot;
+; no dot first or last; no two dots together.
+
+pub fn tx_safe_identifier(classes: [4096]u8, scalars: u32, characters: u32) -> bool {
+    if (scalars > TX_MAX) { return false; }
+    if (characters < 3 or characters > 255) { return false; }
+    var has_dot: bool = false;
+    var previous_dot: bool = false;
+    var i: u32 = 0;
+    while (i < scalars) {
+        var c: u8 = classes[i];
+        if (c == TX_CLASS_OTHER) { return false; }
+        if (c == TX_CLASS_DOT) {
+            if (i == 0 or previous_dot) { return false; }
+            has_dot = true;
+            previous_dot = true;
+        } else {
+            previous_dot = false;
+        }
+        i = i + 1;
+    }
+    if (has_dot == false or previous_dot) { return false; }
+    return true;
+}
+
+; --- Canonical bundle IDs (OrphanBundleIdentifier.canonical) -----------------------------------------
+; ASCII letters, digits, dots and dashes only; 3 to 255 bytes; at least one dot; every dot-separated
+; part non-empty and starting with a letter or digit. tx_canonical_id writes the lowercase form to
+; out and returns its length, or 0 when the text is not a bundle ID.
+
+pub fn tx_is_canonical_id(text: [4096]u8, len: u32) -> bool {
+    if (len < 3 or len > 255) { return false; }
+    var has_dot: bool = false;
+    var part_start: bool = true;
+    var i: u32 = 0;
+    while (i < len) {
+        var c: u8 = text[i];
+        if (c == TX_DOT) {
+            if (part_start) { return false; }
+            has_dot = true;
+            part_start = true;
+        } else {
+            if (tx_is_ascii_alnum(c) == false and c != TX_DASH) { return false; }
+            if (part_start and tx_is_ascii_alnum(c) == false) { return false; }
+            part_start = false;
+        }
+        i = i + 1;
+    }
+    if (has_dot == false or part_start) { return false; }
+    return true;
+}
+
+pub fn tx_canonical_id(text: [4096]u8, len: u32, out: [4096]u8) -> u32 {
+    if (tx_is_canonical_id(text, len) == false) { return 0; }
+    var i: u32 = 0;
+    while (i < len) {
+        out[i] = tx_lower(text[i]);
+        i = i + 1;
+    }
+    return len;
+}
+
+; The vendor namespace of a canonical ID is its first two parts: the length up to the second dot.
+pub fn tx_vendor_namespace_length(id: [4096]u8, len: u32) -> u32 {
+    var dots: u32 = 0;
+    var i: u32 = 0;
+    while (i < len) {
+        if (id[i] == TX_DOT) {
+            dots = dots + 1;
+            if (dots == 2) { return i; }
+        }
+        i = i + 1;
+    }
+    if (dots == 0) { return 0; }
+    return len;
+}
+
+; An ID with its last `drop` dot-separated parts removed, as Swift's split(".") reads it: empty parts
+; are skipped and the rest joined with single dots. Written to out; returns the length, or 0 when
+; fewer than two parts would remain.
+pub fn tx_id_prefix(id: [4096]u8, len: u32, drop: u32, out: [4096]u8) -> u32 {
+    var parts: u32 = 0;
+    var in_part: bool = false;
+    var i: u32 = 0;
+    while (i < len) {
+        if (id[i] == TX_DOT) {
+            in_part = false;
+        } else {
+            if (in_part == false) { parts = parts + 1; }
+            in_part = true;
+        }
+        i = i + 1;
+    }
+    if (parts < 2 + drop) { return 0; }
+    var keep: u32 = parts - drop;
+    var written: u32 = 0;
+    var seen: u32 = 0;
+    in_part = false;
+    i = 0;
+    while (i < len) {
+        if (id[i] == TX_DOT) {
+            in_part = false;
+        } else {
+            if (in_part == false) {
+                seen = seen + 1;
+                if (seen > keep) { return written; }
+                if (seen > 1) { out[written] = TX_DOT; written = written + 1; }
+            }
+            in_part = true;
+            out[written] = id[i];
+            written = written + 1;
+        }
+        i = i + 1;
+    }
+    return written;
+}
+
+; --- Safe display names (AppRemovalPathSafety.safeDisplayName, on the trimmed text) -------------------
+
+pub fn tx_safe_display_name(text: [4096]u8, len: u32, characters: u32) -> bool {
+    if (len == 0 or len > TX_MAX) { return false; }
+    if (characters > 200) { return false; }
+    if (len == 1 and text[0] == TX_DOT) { return false; }
+    if (len == 2 and text[0] == TX_DOT and text[1] == TX_DOT) { return false; }
+    var i: u32 = 0;
+    while (i < len) {
+        var c: u8 = text[i];
+        if (c == TX_SLASH or c == TX_COLON or c == TX_NUL) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+; --- Paths ----------------------------------------------------------------------------------------------
+; A is INSIDE B when A starts with B followed by a slash; B CONTAINS A in the opposite case. As in
+; the Swift it replaces, "/" contains nothing by this rule; callers that mean the whole disk say so.
+
+pub fn tx_starts_with_dir(a: [4096]u8, alen: u32, b: [4096]u8, blen: u32) -> bool {
+    if (alen <= blen) { return false; }
+    if (a[blen] != TX_SLASH) { return false; }
+    var i: u32 = 0;
+    while (i < blen) {
+        if (a[i] != b[i]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+pub fn tx_same(a: [4096]u8, alen: u32, b: [4096]u8, blen: u32) -> bool {
+    if (alen != blen) { return false; }
+    var i: u32 = 0;
+    while (i < alen) {
+        if (a[i] != b[i]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+pub fn tx_path_relation(a: [4096]u8, alen: u32, b: [4096]u8, blen: u32) -> u32 {
+    if (alen > TX_MAX or blen > TX_MAX) { return TX_TOO_LONG; }
+    if (tx_same(a, alen, b, blen)) { return TX_SAME; }
+    if (tx_starts_with_dir(a, alen, b, blen)) { return TX_INSIDE; }
+    if (tx_starts_with_dir(b, blen, a, alen)) { return TX_CONTAINS; }
+    return TX_UNRELATED;
+}
+
+; A strictly below B, where B = "/" means every other absolute path (the duplicate finder's root rule).
+pub fn tx_strict_descendant(a: [4096]u8, alen: u32, b: [4096]u8, blen: u32) -> bool {
+    if (alen > TX_MAX or blen > TX_MAX) { return false; }
+    if (blen == 1 and b[0] == TX_SLASH) {
+        if (alen == 0 or a[0] != TX_SLASH) { return false; }
+        return alen > 1;
+    }
+    return tx_starts_with_dir(a, alen, b, blen);
+}
+
+; The needle occurs somewhere in the haystack (both at most TX_MAX bytes; Swift searches longer text in
+; overlapping chunks).
+pub fn tx_contains(hay: [4096]u8, hlen: u32, needle: [4096]u8, nlen: u32) -> bool {
+    if (hlen > TX_MAX or nlen > TX_MAX) { return false; }
+    if (nlen == 0) { return true; }
+    if (nlen > hlen) { return false; }
+    var at: u32 = 0;
+    while (at + nlen <= hlen) {
+        var same: bool = true;
+        var i: u32 = 0;
+        while (i < nlen and same) {
+            if (hay[at + i] != needle[i]) { same = false; }
+            i = i + 1;
+        }
+        if (same) { return true; }
+        at = at + 1;
+    }
+    return false;
+}
+
+; Byte order of two texts (Swift passes them in canonical composition, so this is Swift's < on strings):
+; TX_BEFORE, TX_EQUAL or TX_AFTER.
+pub const TX_BEFORE : u32 = 0;
+pub const TX_EQUAL : u32 = 1;
+pub const TX_AFTER : u32 = 2;
+
+pub fn tx_compare(a: [4096]u8, alen: u32, b: [4096]u8, blen: u32) -> u32 {
+    var n: u32 = alen;
+    if (blen < n) { n = blen; }
+    if (n > TX_MAX) { n = TX_MAX; }
+    var i: u32 = 0;
+    while (i < n) {
+        if (a[i] < b[i]) { return TX_BEFORE; }
+        if (a[i] > b[i]) { return TX_AFTER; }
+        i = i + 1;
+    }
+    if (alen < blen) { return TX_BEFORE; }
+    if (alen > blen) { return TX_AFTER; }
+    return TX_EQUAL;
+}
+
+; True when A is B or inside it.
+pub fn tx_within(a: [4096]u8, alen: u32, b: [4096]u8, blen: u32) -> bool {
+    var r: u32 = tx_path_relation(a, alen, b, blen);
+    return r == TX_SAME or r == TX_INSIDE;
+}
+
+; --- Places under the home folder, read from the path relative to home ----------------------------------
+
+pub fn tx_matches_dir(text: [4096]u8, len: u32, word_kind: u32) -> bool {
+    // word_kind 0: Library, 1: Library/Caches, 2: Library/Developer/Xcode/DerivedData
+    var wlen: u32 = 7;
+    if (word_kind == 1) { wlen = 14; }
+    if (word_kind == 2) { wlen = 35; }
+    if (len < wlen) { return false; }
+    if (len > wlen and text[wlen] != TX_SLASH) { return false; }
+    var i: u32 = 0;
+    while (i < wlen) {
+        var expected: u8 = TX_W_LIBRARY[0];
+        if (word_kind == 0) { expected = TX_W_LIBRARY[i]; }
+        if (word_kind == 1) { expected = TX_W_LIBRARY_CACHES[i]; }
+        if (word_kind == 2) { expected = TX_W_DERIVED_DATA[i]; }
+        if (text[i] != expected) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+pub fn tx_library_area(relative: [4096]u8, len: u32) -> u32 {
+    if (tx_matches_dir(relative, len, 0) == false) { return TX_LIB_NONE; }
+    if (tx_matches_dir(relative, len, 1) or tx_matches_dir(relative, len, 2)) { return TX_LIB_ALLOWED_CACHE; }
+    return TX_LIB_OTHER;
+}
+
+; The first component starts with a dot and is not exactly ".cache".
+pub fn tx_hidden_first_component(relative: [4096]u8, len: u32) -> bool {
+    if (len == 0 or relative[0] != TX_DOT) { return false; }
+    var end: u32 = 0;
+    while (end < len and relative[end] != TX_SLASH) { end = end + 1; }
+    if (end != 6) { return true; }
+    var i: u32 = 0;
+    while (i < 6) {
+        if (relative[i] != TX_W_DOT_CACHE[i]) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+; Some component is exactly ".Trash" or ".Trashes".
+pub fn tx_has_trash_component(path: [4096]u8, len: u32) -> bool {
+    var start: u32 = 0;
+    var i: u32 = 0;
+    while (i <= len) {
+        if (i == len or path[i] == TX_SLASH) {
+            var clen: u32 = i - start;
+            if (clen == 6 or clen == 8) {
+                var same: bool = true;
+                var k: u32 = 0;
+                while (k < clen) {
+                    var expected: u8 = TX_W_TRASHES[k];
+                    if (k < 6) { expected = TX_W_TRASH[k]; }
+                    if (path[start + k] != expected) { same = false; }
+                    k = k + 1;
+                }
+                if (same) { return true; }
+            }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+; Swift's pathComponents of an absolute path: "/", then each non-empty part. On an external volume
+; components[1] is "Volumes" and there are at least four components (/, Volumes, name, item).
+pub fn tx_component_count(path: [4096]u8, len: u32) -> u32 {
+    if (len == 0) { return 0; }
+    var count: u32 = 0;
+    if (path[0] == TX_SLASH) { count = 1; }
+    var in_part: bool = false;
+    var i: u32 = 0;
+    while (i < len) {
+        if (path[i] == TX_SLASH) {
+            in_part = false;
+        } else {
+            if (in_part == false) { count = count + 1; }
+            in_part = true;
+        }
+        i = i + 1;
+    }
+    return count;
+}
+
+pub fn tx_on_external_volume(path: [4096]u8, len: u32) -> bool {
+    if (len < 9 or path[0] != TX_SLASH) { return false; }
+    var i: u32 = 0;
+    while (i < 7) {
+        if (path[1 + i] != TX_W_VOLUMES[i]) { return false; }
+        i = i + 1;
+    }
+    if (path[8] != TX_SLASH) { return false; }
+    return tx_component_count(path, len) >= 4;
+}
+
+; The text starts with "com.apple." / "group." (bundle IDs, compared as given).
+pub fn tx_has_apple_prefix(text: [4096]u8, len: u32) -> bool {
+    if (len < 10) { return false; }
+    var i: u32 = 0;
+    while (i < 10) {
+        if (text[i] != TX_W_COM_APPLE[i]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+pub fn tx_has_group_prefix(text: [4096]u8, len: u32) -> bool {
+    if (len < 6) { return false; }
+    var i: u32 = 0;
+    while (i < 6) {
+        if (text[i] != TX_W_GROUP[i]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+; The extension of the last path component, compared without case, as Foundation reads it: the
+; text after the last dot, none when the part before that dot is empty or only dots (".app", "..app").
+pub fn tx_extension_kind(path: [4096]u8, len: u32) -> u32 {
+    var end: u32 = len;
+    while (end > 0 and path[end - 1] == TX_SLASH) { end = end - 1; }
+    var dot: u32 = end;
+    var i: u32 = end;
+    while (i > 0) {
+        i = i - 1;
+        if (path[i] == TX_SLASH) { return TX_EXT_NONE; }
+        if (path[i] == TX_DOT) { dot = i; i = 0; }
+    }
+    if (dot == end or dot == 0) { return TX_EXT_NONE; }
+    var start: u32 = dot;
+    while (start > 0 and path[start - 1] != TX_SLASH) { start = start - 1; }
+    var stem_has_name: bool = false;
+    var k0: u32 = start;
+    while (k0 < dot) {
+        if (path[k0] != TX_DOT) { stem_has_name = true; }
+        k0 = k0 + 1;
+    }
+    if (stem_has_name == false) { return TX_EXT_NONE; }
+    var elen: u32 = end - dot - 1;
+    var entry: u32 = 0;
+    while (entry < 7) {
+        if (TX_EXT_LENGTHS[entry] == elen) {
+            var same: bool = true;
+            var k: u32 = 0;
+            while (k < elen) {
+                if (tx_lower(path[dot + 1 + k]) != TX_EXT_BYTES[TX_EXT_OFFSETS[entry] + k]) { same = false; }
+                k = k + 1;
+            }
+            if (same) { return entry + 1; }
+        }
+        entry = entry + 1;
+    }
+    return TX_EXT_OTHER;
+}
+
+pub fn tx_has_app_extension(path: [4096]u8, len: u32) -> bool {
+    return tx_extension_kind(path, len) == TX_EXT_APP;
+}
+
+; A bundle ID that extends another by one or more dot-separated parts: A starts with B and a dot.
+pub fn tx_id_extends(a: [4096]u8, alen: u32, b: [4096]u8, blen: u32) -> bool {
+    if (alen <= blen) { return false; }
+    if (a[blen] != TX_DOT) { return false; }
+    var i: u32 = 0;
+    while (i < blen) {
+        if (a[i] != b[i]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+; The length of a name before ".savedState" (exact case), or 0 when it does not end so.
+pub fn tx_saved_state_stem(name: [4096]u8, len: u32) -> u32 {
+    if (len < 11) { return 0; }
+    var start: u32 = len - 11;
+    var i: u32 = 0;
+    while (i < 11) {
+        if (name[start + i] != TX_W_SAVED_STATE[i]) { return 0; }
+        i = i + 1;
+    }
+    return start;
+}
+
+; --- Laws -------------------------------------------------------------------------------------------------
+invariant tx_relations_differ { assert TX_SAME < TX_INSIDE and TX_INSIDE < TX_CONTAINS and TX_CONTAINS < TX_UNRELATED; }
+
+test tx_bytes {
+    assert tx_lower(65) == 97;
+    assert tx_lower(97) == 97;
+    assert tx_lower(48) == 48;
+    assert tx_is_ascii_alnum(57) == true;
+    assert tx_is_ascii_alnum(45) == false;
+    assert tx_is_ascii_lower_letter(122) == true;
+    assert tx_is_ascii_lower_letter(90) == false;
+}
+
+test tx_identifiers {
+    var c: [4096]u8 = [0; 4096];
+    // "a.b" -> alnum dot alnum
+    c[0] = 1; c[1] = 2; c[2] = 1;
+    assert tx_safe_identifier(c, 3, 3) == true;
+    assert tx_safe_identifier(c, 3, 2) == false;
+    c[1] = 1;
+    assert tx_safe_identifier(c, 3, 3) == false;
+    c[0] = 2; c[1] = 1;
+    assert tx_safe_identifier(c, 3, 3) == false;
+    c[0] = 1; c[1] = 2; c[2] = 2;
+    assert tx_safe_identifier(c, 3, 3) == false;
+    c[2] = 0;
+    assert tx_safe_identifier(c, 3, 3) == false;
+    var t: [4096]u8 = [0; 4096];
+    var o: [4096]u8 = [0; 4096];
+    // "A.b-c"
+    t[0] = 65; t[1] = 46; t[2] = 98; t[3] = 45; t[4] = 99;
+    assert tx_is_canonical_id(t, 5) == true;
+    assert tx_canonical_id(t, 5, o) == 5;
+    assert o[0] == 97;
+    t[2] = 45;
+    assert tx_is_canonical_id(t, 5) == false;
+    t[2] = 98; t[4] = 46;
+    assert tx_is_canonical_id(t, 5) == false;
+    assert tx_is_canonical_id(t, 2) == false;
+    // "x.y.z" namespace is "x.y"
+    t[0] = 120; t[1] = 46; t[2] = 121; t[3] = 46; t[4] = 122;
+    assert tx_vendor_namespace_length(t, 5) == 3;
+    assert tx_vendor_namespace_length(t, 3) == 3;
+    assert tx_id_prefix(t, 5, 1, o) == 3;
+    assert o[2] == 121;
+    assert tx_id_prefix(t, 5, 2, o) == 0;
+    assert tx_id_prefix(t, 5, 0, o) == 5;
+}
+
+test tx_display_names {
+    var t: [4096]u8 = [0; 4096];
+    t[0] = 46;
+    assert tx_safe_display_name(t, 1, 1) == false;
+    t[1] = 46;
+    assert tx_safe_display_name(t, 2, 2) == false;
+    t[1] = 65;
+    assert tx_safe_display_name(t, 2, 2) == true;
+    assert tx_safe_display_name(t, 2, 201) == false;
+    t[1] = 47;
+    assert tx_safe_display_name(t, 2, 2) == false;
+    assert tx_safe_display_name(t, 0, 0) == false;
+}
+
+test tx_paths {
+    var a: [4096]u8 = [0; 4096];
+    var b: [4096]u8 = [0; 4096];
+    // a = "/x/y", b = "/x"
+    a[0] = 47; a[1] = 120; a[2] = 47; a[3] = 121;
+    b[0] = 47; b[1] = 120;
+    assert tx_path_relation(a, 4, b, 2) == TX_INSIDE;
+    assert tx_path_relation(b, 2, a, 4) == TX_CONTAINS;
+    assert tx_path_relation(a, 4, a, 4) == TX_SAME;
+    assert tx_path_relation(a, 3, b, 2) == TX_INSIDE;
+    assert tx_path_relation(a, 2, b, 1) == TX_UNRELATED;
+    assert tx_within(a, 4, b, 2) == true;
+    assert tx_path_relation(a, 4097, b, 2) == TX_TOO_LONG;
+    assert tx_component_count(a, 4) == 3;
+    assert tx_component_count(b, 1) == 1;
+    assert tx_strict_descendant(a, 4, b, 1) == true;
+    assert tx_strict_descendant(b, 1, b, 1) == false;
+    assert tx_strict_descendant(a, 4, b, 2) == true;
+    assert tx_strict_descendant(b, 2, a, 4) == false;
+    assert tx_contains(a, 4, b, 2) == true;
+    assert tx_contains(b, 2, a, 4) == false;
+    assert tx_contains(a, 4, b, 0) == true;
+    assert tx_contains(a, 4097, b, 1) == false;
+    assert tx_compare(b, 2, a, 4) == TX_BEFORE;
+    assert tx_compare(a, 4, b, 2) == TX_AFTER;
+    assert tx_compare(a, 4, a, 4) == TX_EQUAL;
+    assert tx_compare(a, 1, b, 2) == TX_BEFORE;
+}
+
+test tx_home_places {
+    var r: [4096]u8 = [0; 4096];
+    // "Library/Caches/x"
+    r[0] = 76; r[1] = 105; r[2] = 98; r[3] = 114; r[4] = 97; r[5] = 114; r[6] = 121;
+    assert tx_library_area(r, 7) == TX_LIB_OTHER;
+    r[7] = 47; r[8] = 67; r[9] = 97; r[10] = 99; r[11] = 104; r[12] = 101; r[13] = 115;
+    assert tx_library_area(r, 14) == TX_LIB_ALLOWED_CACHE;
+    r[14] = 69;
+    assert tx_library_area(r, 15) == TX_LIB_OTHER;
+    r[14] = 47; r[15] = 120;
+    assert tx_library_area(r, 16) == TX_LIB_ALLOWED_CACHE;
+    assert tx_library_area(r, 3) == TX_LIB_NONE;
+    var h: [4096]u8 = [0; 4096];
+    // ".cache" then ".ssh"
+    h[0] = 46; h[1] = 99; h[2] = 97; h[3] = 99; h[4] = 104; h[5] = 101;
+    assert tx_hidden_first_component(h, 6) == false;
+    assert tx_hidden_first_component(h, 5) == true;
+    h[6] = 102;
+    assert tx_hidden_first_component(h, 7) == true;
+    var p: [4096]u8 = [0; 4096];
+    // "/a/.Trash"
+    p[0] = 47; p[1] = 97; p[2] = 47; p[3] = 46; p[4] = 84; p[5] = 114; p[6] = 97; p[7] = 115; p[8] = 104;
+    assert tx_has_trash_component(p, 9) == true;
+    assert tx_has_trash_component(p, 8) == false;
+    var v: [4096]u8 = [0; 4096];
+    // "/Volumes/D/x"
+    v[0] = 47; v[1] = 86; v[2] = 111; v[3] = 108; v[4] = 117; v[5] = 109; v[6] = 101; v[7] = 115; v[8] = 47; v[9] = 68; v[10] = 47; v[11] = 120;
+    assert tx_on_external_volume(v, 12) == true;
+    assert tx_on_external_volume(v, 10) == false;
+}
+
+test tx_prefixes_and_extensions {
+    var t: [4096]u8 = [0; 4096];
+    // "com.apple.x"
+    t[0] = 99; t[1] = 111; t[2] = 109; t[3] = 46; t[4] = 97; t[5] = 112; t[6] = 112; t[7] = 108; t[8] = 101; t[9] = 46; t[10] = 120;
+    assert tx_has_apple_prefix(t, 11) == true;
+    assert tx_has_apple_prefix(t, 9) == false;
+    var g: [4096]u8 = [0; 4096];
+    g[0] = 103; g[1] = 114; g[2] = 111; g[3] = 117; g[4] = 112; g[5] = 46;
+    assert tx_has_group_prefix(g, 6) == true;
+    var p: [4096]u8 = [0; 4096];
+    // "/A.APP"
+    p[0] = 47; p[1] = 65; p[2] = 46; p[3] = 65; p[4] = 80; p[5] = 80;
+    assert tx_has_app_extension(p, 6) == true;
+    assert tx_has_app_extension(p, 5) == false;
+    p[1] = 46;
+    assert tx_has_app_extension(p, 6) == false;
+    p[1] = 65; p[3] = 112; p[4] = 108; p[5] = 105; p[6] = 115; p[7] = 116;
+    assert tx_extension_kind(p, 8) == TX_EXT_PLIST;
+    assert tx_extension_kind(p, 7) == TX_EXT_OTHER;
+    assert tx_extension_kind(p, 2) == TX_EXT_NONE;
+}
+
+test tx_ids_and_saved_state {
+    var a: [4096]u8 = [0; 4096];
+    var b: [4096]u8 = [0; 4096];
+    // a = "x.y.z", b = "x.y"
+    a[0] = 120; a[1] = 46; a[2] = 121; a[3] = 46; a[4] = 122;
+    b[0] = 120; b[1] = 46; b[2] = 121;
+    assert tx_id_extends(a, 5, b, 3) == true;
+    assert tx_id_extends(b, 3, a, 5) == false;
+    assert tx_id_extends(a, 4, b, 3) == true;
+    assert tx_id_extends(a, 3, b, 3) == false;
+    var n: [4096]u8 = [0; 4096];
+    // "a.savedState"
+    n[0] = 97; n[1] = 46; n[2] = 115; n[3] = 97; n[4] = 118; n[5] = 101; n[6] = 100; n[7] = 83; n[8] = 116; n[9] = 97; n[10] = 116; n[11] = 101;
+    assert tx_saved_state_stem(n, 12) == 1;
+    assert tx_saved_state_stem(n, 11) == 0;
+}
+
+test tx_helpers_directly {
+    var a: [4096]u8 = [0; 4096];
+    var b: [4096]u8 = [0; 4096];
+    a[0] = 47; a[1] = 120; b[0] = 47;
+    assert tx_same(a, 2, a, 2) == true;
+    assert tx_same(a, 2, b, 1) == false;
+    assert tx_starts_with_dir(a, 2, b, 0) == true;
+    assert tx_starts_with_dir(a, 2, b, 1) == false;
+    var r: [4096]u8 = [0; 4096];
+    r[0] = 76; r[1] = 105; r[2] = 98; r[3] = 114; r[4] = 97; r[5] = 114; r[6] = 121;
+    assert tx_matches_dir(r, 7, 0) == true;
+    assert tx_matches_dir(r, 7, 1) == false;
+}

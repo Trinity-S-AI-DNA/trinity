@@ -1,0 +1,804 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/t27f/spec_graph_view.t27 -- the T27F graph view: a deterministic layout of a spec graph
+; (gHashTag/t27#10034; epic gHashTag/trinity#1648, RFC gHashTag/trinity#1649). T27F is the visual
+; spec of .t27 (.claude/skills/t27f/SKILL.md, "What T27F is"): one spec -> one graph -> many views.
+; The graph is specs/t27f/spec_graph.t27; this file is its first view, the one that shows the graph
+; itself, not a topic map. It turns a SpecGraph into numbers a host draws, as specs/t27f/reel.t27
+; does for a reel frame: a box per node, a line per edge, colours as 0xRRGGBB. Nothing here draws
+; pixels or writes markup.
+; Rules the layout holds, each with a test below:
+;   - one column per node kind present, in a fixed kind order, and no empty column;
+;   - a node's row order, size, fill, stroke and dash come from its inference label, so a fact, a
+;     derivation and a guess look different before any text is read;
+;   - an UNKNOWN node is drawn alone: in a band below every known node, and no edge ends at it;
+;   - every edge line carries a source line of the spec: its own, or for a DERIVED tested_by edge the
+;     line of the call it is read back from; an edge with no line makes the view refuse the graph;
+;   - each node's widget is spec_graph's node_widget, never a rule of this file;
+;   - a graph validate_graph refuses is refused here with the same code, and is not laid out.
+; Not claimed: t27c has no graph exporter yet, so the only graphs laid out are spec_graph's
+; hand-read fixtures; there is no edge routing around boxes, and no host draws this yet.
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module t27f_spec_graph_view;
+
+use t27f::spec_graph::SpecGraph;
+use t27f::spec_graph::validate_graph;
+use t27f::spec_graph::valid_label;
+use t27f::spec_graph::node_widget;
+use t27f::spec_graph::tutorial_08_graph;
+use t27f::spec_graph::with_suggestion;
+use t27f::spec_graph::with_edge;
+use t27f::spec_graph::with_node;
+use t27f::spec_graph::MAX_NODES;
+use t27f::spec_graph::blank_graph;
+use t27f::spec_graph::GRAPH_OK;
+use t27f::spec_graph::VERDICT_KINDS;
+use t27f::spec_graph::ERR_EDGE_UNKNOWN_NODE;
+use t27f::spec_graph::ERR_SPEC_PATH;
+use t27f::spec_graph::NODE_KINDS;
+use t27f::spec_graph::NODE_MODULE;
+use t27f::spec_graph::NODE_CONST;
+use t27f::spec_graph::NODE_FN;
+use t27f::spec_graph::NODE_TEST;
+use t27f::spec_graph::NODE_INVARIANT;
+use t27f::spec_graph::NODE_BENCH;
+use t27f::spec_graph::NODE_USE;
+use t27f::spec_graph::NODE_OPAQUE;
+use t27f::spec_graph::EDGE_CALLS;
+use t27f::spec_graph::EDGE_TESTED_BY;
+use t27f::spec_graph::EDGE_DATA_FLOW;
+use t27f::spec_graph::EDGE_KINDS;
+use t27f::spec_graph::LABEL_EXACT;
+use t27f::spec_graph::LABEL_DERIVED;
+use t27f::spec_graph::LABEL_SUGGESTED;
+use t27f::spec_graph::LABEL_UNKNOWN;
+use t27f::spec_graph::LABEL_KINDS;
+use t27f::spec_graph::NO_LINE;
+use t27f::spec_graph::NO_INDEX;
+use t27f::ui_plan::WIDGET_HONEYCOMB_CARD;
+use t27f::ui_plan::WIDGET_FORMULA_VIEW;
+use t27f::ui_plan::WIDGET_RUN_BUTTON;
+use t27f::ui_plan::WIDGET_TEXT_BLOCK;
+
+/// Verdicts. VIEW_OK is GRAPH_OK; a graph validate_graph refuses keeps that code; the view adds one
+/// code of its own, the first after spec_graph's.
+pub const VIEW_OK : u8 = 0;
+pub const VIEW_ERR_EDGE_NO_LINE : u8 = 19;
+
+/// Column order by node kind code (module, const, fn, test, invariant, bench, use, opaque): the
+/// module, its imports, then constants, functions and what checks them, and opaque regions last.
+pub const VIEW_KIND_ORDER : [8]u8 = [0, 2, 3, 4, 5, 6, 1, 7];
+
+/// Geometry in pixels. A column is VIEW_COL_W wide and starts every VIEW_COL_STEP; a row starts
+/// every VIEW_ROW_STEP. The UNKNOWN band starts VIEW_BAND_GAP below the last known row.
+pub const VIEW_MARGIN : u32 = 40;
+pub const VIEW_COL_W : u32 = 220;
+pub const VIEW_COL_STEP : u32 = 260;
+pub const VIEW_ROW_STEP : u32 = 64;
+pub const VIEW_BAND_GAP : u32 = 48;
+
+/// Style by inference label (exact, derived, suggested, unknown). A guess and an unknown are
+/// narrower and lower than a fact and sit centred in the column (indent * 2 + width = VIEW_COL_W);
+/// only EXACT is drawn solid. Dash is the dash length in pixels, 0 for a solid line.
+/// Colours are the t27.ai site tokens (apps/website/src/index.css): stroke is accent green for
+/// exact, golden for derived, blue for suggested, muted grey for unknown; each fill is a dark tint
+/// of its stroke, so white text clears 4.5:1 on every box. The dash stays distinct per label, so
+/// the label survives a colour-blind reader.
+pub const VIEW_LABEL_W : [4]u32 = [220, 220, 200, 200];
+pub const VIEW_LABEL_H : [4]u32 = [44, 44, 36, 36];
+pub const VIEW_LABEL_INDENT : [4]u32 = [0, 0, 10, 10];
+pub const VIEW_LABEL_FILL : [4]u32 = [0x0C2A1B, 0x2B2508, 0x0E2236, 0x1A1E1C];
+pub const VIEW_LABEL_STROKE : [4]u32 = [0x00FF88, 0xFFD700, 0x58A6FF, 0x8B9490];
+pub const VIEW_LABEL_DASH : [4]u32 = [0, 6, 3, 2];
+
+/// Text and page colours, and the text size a host uses inside a box.
+pub const VIEW_TEXT : u32 = 0xFFFFFF;
+pub const VIEW_BACKDROP : u32 = 0x0B0D0C;
+pub const VIEW_FONT_PX : u32 = 13;
+
+/// Two edges between the same pair of nodes (uses and data_flow, calls and tested_by) would lie on
+/// one line; each edge kind is shifted by its own lane, VIEW_LANE_STEP * kind - VIEW_LANE_HALF.
+pub const VIEW_LANE_STEP : u32 = 4;
+pub const VIEW_LANE_HALF : u32 = 8;
+
+/// A label this file cannot read is drawn as UNKNOWN, never as a fact.
+pub fn view_is_unknown(label: u8) -> bool {
+    return label == LABEL_UNKNOWN or valid_label(label) == false;
+}
+
+/// The style row a label is drawn with.
+pub fn view_style(label: u8) -> u8 {
+    if (view_is_unknown(label)) { return LABEL_UNKNOWN; }
+    return label;
+}
+
+pub fn view_kind_present(g: SpecGraph, k: u8) -> bool {
+    var n : u32 = 0;
+    while (n < g.node_count) {
+        if (g.node_kind[n as usize] == k) { return true; }
+        n = n + 1;
+    }
+    return false;
+}
+
+/// The column of node kind k: how many kinds present come before it in VIEW_KIND_ORDER. A kind
+/// outside the vocabulary has no column.
+pub fn view_column(g: SpecGraph, k: u8) -> u32 {
+    if (k >= NODE_KINDS) { return NO_INDEX; }
+    var c : u32 = 0;
+    var kk : u32 = 0;
+    while (kk < (NODE_KINDS as u32)) {
+        if (view_kind_present(g, kk as u8) and VIEW_KIND_ORDER[kk as usize] < VIEW_KIND_ORDER[k as usize]) { c = c + 1; }
+        kk = kk + 1;
+    }
+    return c;
+}
+
+pub fn view_column_count(g: SpecGraph) -> u32 {
+    var c : u32 = 0;
+    var kk : u32 = 0;
+    while (kk < (NODE_KINDS as u32)) {
+        if (view_kind_present(g, kk as u8)) { c = c + 1; }
+        kk = kk + 1;
+    }
+    return c;
+}
+
+pub fn view_node_column(g: SpecGraph, n: u32) -> u32 {
+    return view_column(g, g.node_kind[n as usize]);
+}
+
+/// The row of node n inside its column. Known nodes are ordered by label (exact, derived,
+/// suggested), then by node number; UNKNOWN nodes are counted apart, by node number, in the band.
+pub fn view_row(g: SpecGraph, n: u32) -> u32 {
+    let k : usize = n as usize;
+    let ln : u8 = g.node_label[k];
+    let unk : bool = view_is_unknown(ln);
+    var r : u32 = 0;
+    var m : u32 = 0;
+    while (m < g.node_count) {
+        let q : usize = m as usize;
+        let lm : u8 = g.node_label[q];
+        if (m != n and g.node_kind[q] == g.node_kind[k] and view_is_unknown(lm) == unk) {
+            if (unk) {
+                if (m < n) { r = r + 1; }
+            } else {
+                if (lm < ln or (lm == ln and m < n)) { r = r + 1; }
+            }
+        }
+        m = m + 1;
+    }
+    return r;
+}
+
+/// The deepest column of known nodes, in rows.
+pub fn view_known_depth(g: SpecGraph) -> u32 {
+    var d : u32 = 0;
+    var n : u32 = 0;
+    while (n < g.node_count) {
+        if (view_is_unknown(g.node_label[n as usize]) == false) {
+            let r : u32 = view_row(g, n) + 1;
+            if (r > d) { d = r; }
+        }
+        n = n + 1;
+    }
+    return d;
+}
+
+/// The top of the UNKNOWN band.
+pub fn view_band_top(g: SpecGraph) -> u32 {
+    return VIEW_MARGIN + view_known_depth(g) * VIEW_ROW_STEP + VIEW_BAND_GAP;
+}
+
+pub fn view_node_x(g: SpecGraph, n: u32) -> u32 {
+    let s : u8 = view_style(g.node_label[n as usize]);
+    return VIEW_MARGIN + view_node_column(g, n) * VIEW_COL_STEP + VIEW_LABEL_INDENT[s as usize];
+}
+
+pub fn view_node_y(g: SpecGraph, n: u32) -> u32 {
+    if (view_is_unknown(g.node_label[n as usize])) { return view_band_top(g) + view_row(g, n) * VIEW_ROW_STEP; }
+    return VIEW_MARGIN + view_row(g, n) * VIEW_ROW_STEP;
+}
+
+pub fn view_node_w(g: SpecGraph, n: u32) -> u32 {
+    return VIEW_LABEL_W[view_style(g.node_label[n as usize]) as usize];
+}
+
+pub fn view_node_h(g: SpecGraph, n: u32) -> u32 {
+    return VIEW_LABEL_H[view_style(g.node_label[n as usize]) as usize];
+}
+
+pub fn view_node_fill(g: SpecGraph, n: u32) -> u32 {
+    return VIEW_LABEL_FILL[view_style(g.node_label[n as usize]) as usize];
+}
+
+pub fn view_node_stroke(g: SpecGraph, n: u32) -> u32 {
+    return VIEW_LABEL_STROKE[view_style(g.node_label[n as usize]) as usize];
+}
+
+pub fn view_node_dash(g: SpecGraph, n: u32) -> u32 {
+    return VIEW_LABEL_DASH[view_style(g.node_label[n as usize]) as usize];
+}
+
+/// The ui_plan widget of node n: spec_graph's binding, unchanged.
+pub fn view_node_widget(g: SpecGraph, n: u32) -> u8 {
+    let k : usize = n as usize;
+    return node_widget(g.node_kind[k], g.node_label[k]);
+}
+
+/// The canvas: every column, and the lowest box plus a margin.
+pub fn view_width(g: SpecGraph) -> u32 {
+    let c : u32 = view_column_count(g);
+    if (c == 0) { return 2 * VIEW_MARGIN; }
+    return 2 * VIEW_MARGIN + (c - 1) * VIEW_COL_STEP + VIEW_COL_W;
+}
+
+pub fn view_height(g: SpecGraph) -> u32 {
+    var bottom : u32 = VIEW_MARGIN;
+    var n : u32 = 0;
+    while (n < g.node_count) {
+        let b : u32 = view_node_y(g, n) + view_node_h(g, n);
+        if (b > bottom) { bottom = b; }
+        n = n + 1;
+    }
+    return bottom + VIEW_MARGIN;
+}
+
+/// The source line an edge points at: its own line, or for a tested_by edge with none, the line
+/// of the call it is read back from (spec_graph's DERIVED rule). NO_LINE when there is neither.
+pub fn view_edge_line(g: SpecGraph, j: u32) -> u32 {
+    let k : usize = j as usize;
+    if (g.edge_line[k] != NO_LINE) { return g.edge_line[k]; }
+    if (g.edge_kind[k] != EDGE_TESTED_BY) { return NO_LINE; }
+    var i : u32 = 0;
+    while (i < g.edge_count) {
+        let m : usize = i as usize;
+        if (g.edge_kind[m] == EDGE_CALLS and g.edge_from[m] == g.edge_to[k] and g.edge_to[m] == g.edge_from[k]) { return g.edge_line[m]; }
+        i = i + 1;
+    }
+    return NO_LINE;
+}
+
+/// VIEW_OK, or why the graph is not drawn: the validate_graph code, or VIEW_ERR_EDGE_NO_LINE.
+pub fn view_verdict(g: SpecGraph) -> u8 {
+    let v : u8 = validate_graph(g);
+    if (v != GRAPH_OK) { return v; }
+    var j : u32 = 0;
+    while (j < g.edge_count) {
+        if (view_edge_line(g, j) == NO_LINE) { return VIEW_ERR_EDGE_NO_LINE; }
+        j = j + 1;
+    }
+    return VIEW_OK;
+}
+
+/// Edge end points. A line leaves the side of the from-box that faces the to-box and enters the
+/// facing side of the to-box; inside one column both ends are on the right side.
+pub fn view_edge_x1(g: SpecGraph, j: u32) -> u32 {
+    let f : u32 = g.edge_from[j as usize] as u32;
+    let t : u32 = g.edge_to[j as usize] as u32;
+    if (view_node_column(g, f) > view_node_column(g, t)) { return view_node_x(g, f); }
+    return view_node_x(g, f) + view_node_w(g, f);
+}
+
+pub fn view_edge_x2(g: SpecGraph, j: u32) -> u32 {
+    let f : u32 = g.edge_from[j as usize] as u32;
+    let t : u32 = g.edge_to[j as usize] as u32;
+    if (view_node_column(g, f) < view_node_column(g, t)) { return view_node_x(g, t); }
+    return view_node_x(g, t) + view_node_w(g, t);
+}
+
+/// The vertical centre of node n, shifted to the lane of an edge of kind ek.
+pub fn view_lane_y(g: SpecGraph, n: u32, ek: u8) -> u32 {
+    return view_node_y(g, n) + view_node_h(g, n) / 2 + VIEW_LANE_STEP * (ek as u32) - VIEW_LANE_HALF;
+}
+
+pub fn view_edge_y1(g: SpecGraph, j: u32) -> u32 {
+    return view_lane_y(g, g.edge_from[j as usize] as u32, g.edge_kind[j as usize]);
+}
+
+pub fn view_edge_y2(g: SpecGraph, j: u32) -> u32 {
+    return view_lane_y(g, g.edge_to[j as usize] as u32, g.edge_kind[j as usize]);
+}
+
+pub fn view_edge_stroke(g: SpecGraph, j: u32) -> u32 {
+    return VIEW_LABEL_STROKE[view_style(g.edge_label[j as usize]) as usize];
+}
+
+pub fn view_edge_dash(g: SpecGraph, j: u32) -> u32 {
+    return VIEW_LABEL_DASH[view_style(g.edge_label[j as usize]) as usize];
+}
+
+/// Boxes a and b share at least one pixel.
+pub fn view_overlap(g: SpecGraph, a: u32, b: u32) -> bool {
+    let ax : u32 = view_node_x(g, a);
+    let ay : u32 = view_node_y(g, a);
+    let bx : u32 = view_node_x(g, b);
+    let by : u32 = view_node_y(g, b);
+    return ax < bx + view_node_w(g, b) and bx < ax + view_node_w(g, a) and ay < by + view_node_h(g, b) and by < ay + view_node_h(g, a);
+}
+
+pub fn view_overlap_count(g: SpecGraph) -> u32 {
+    var c : u32 = 0;
+    var a : u32 = 0;
+    while (a < g.node_count) {
+        var b : u32 = a + 1;
+        while (b < g.node_count) {
+            if (view_overlap(g, a, b)) { c = c + 1; }
+            b = b + 1;
+        }
+        a = a + 1;
+    }
+    return c;
+}
+
+/// The point (x, y) lies on or inside the box of node n.
+pub fn view_point_in(g: SpecGraph, n: u32, x: u32, y: u32) -> bool {
+    let nx : u32 = view_node_x(g, n);
+    let ny : u32 = view_node_y(g, n);
+    return nx <= x and x <= nx + view_node_w(g, n) and ny <= y and y <= ny + view_node_h(g, n);
+}
+
+/// Edge ends that land on node n's box, counting both ends of every edge.
+pub fn view_ends_on(g: SpecGraph, n: u32) -> u32 {
+    var c : u32 = 0;
+    var j : u32 = 0;
+    while (j < g.edge_count) {
+        if (view_point_in(g, n, view_edge_x1(g, j), view_edge_y1(g, j))) { c = c + 1; }
+        if (view_point_in(g, n, view_edge_x2(g, j), view_edge_y2(g, j))) { c = c + 1; }
+        j = j + 1;
+    }
+    return c;
+}
+
+/// Every edge end lands on the box of its own endpoint.
+pub fn view_edges_attach(g: SpecGraph) -> bool {
+    var j : u32 = 0;
+    while (j < g.edge_count) {
+        let f : u32 = g.edge_from[j as usize] as u32;
+        let t : u32 = g.edge_to[j as usize] as u32;
+        if (view_point_in(g, f, view_edge_x1(g, j), view_edge_y1(g, j)) == false) { return false; }
+        if (view_point_in(g, t, view_edge_x2(g, j), view_edge_y2(g, j)) == false) { return false; }
+        j = j + 1;
+    }
+    return true;
+}
+
+/// The lowest edge of every known box, plus VIEW_BAND_GAP, is above node n.
+pub fn view_alone_below(g: SpecGraph, n: u32) -> bool {
+    let y : u32 = view_node_y(g, n);
+    var m : u32 = 0;
+    while (m < g.node_count) {
+        if (view_is_unknown(g.node_label[m as usize]) == false) {
+            if (view_node_y(g, m) + view_node_h(g, m) + VIEW_BAND_GAP > y) { return false; }
+        }
+        m = m + 1;
+    }
+    return true;
+}
+
+/// --- host entry points ---
+
+/// A wasm export carries scalars only, so these name a fixture instead of taking a graph: 0 is
+/// spec_graph's tutorial_08_graph, 1 the same graph with its suggestion; any other number is the
+/// blank graph, which the view refuses. An index past the graph returns 0.
+pub fn view_fx(which: u32) -> SpecGraph {
+    if (which == 0) { return tutorial_08_graph(); }
+    if (which == 1) { return with_suggestion(); }
+    return blank_graph();
+}
+
+pub fn fx_verdict(which: u32) -> u8 {
+    return view_verdict(view_fx(which));
+}
+
+pub fn fx_node_count(which: u32) -> u32 {
+    return view_fx(which).node_count;
+}
+
+pub fn fx_edge_count(which: u32) -> u32 {
+    return view_fx(which).edge_count;
+}
+
+pub fn fx_width(which: u32) -> u32 {
+    return view_width(view_fx(which));
+}
+
+pub fn fx_height(which: u32) -> u32 {
+    return view_height(view_fx(which));
+}
+
+pub fn fx_node_kind(which: u32, n: u32) -> u8 {
+    let g : SpecGraph = view_fx(which);
+    if (n >= g.node_count) { return 0; }
+    return g.node_kind[n as usize];
+}
+
+pub fn fx_node_label(which: u32, n: u32) -> u8 {
+    let g : SpecGraph = view_fx(which);
+    if (n >= g.node_count) { return 0; }
+    return g.node_label[n as usize];
+}
+
+pub fn fx_node_line_start(which: u32, n: u32) -> u32 {
+    let g : SpecGraph = view_fx(which);
+    if (n >= g.node_count) { return 0; }
+    return g.line_start[n as usize];
+}
+
+pub fn fx_node_line_end(which: u32, n: u32) -> u32 {
+    let g : SpecGraph = view_fx(which);
+    if (n >= g.node_count) { return 0; }
+    return g.line_end[n as usize];
+}
+
+pub fn fx_node_x(which: u32, n: u32) -> u32 {
+    let g : SpecGraph = view_fx(which);
+    if (n >= g.node_count) { return 0; }
+    return view_node_x(g, n);
+}
+
+pub fn fx_node_y(which: u32, n: u32) -> u32 {
+    let g : SpecGraph = view_fx(which);
+    if (n >= g.node_count) { return 0; }
+    return view_node_y(g, n);
+}
+
+pub fn fx_node_w(which: u32, n: u32) -> u32 {
+    let g : SpecGraph = view_fx(which);
+    if (n >= g.node_count) { return 0; }
+    return view_node_w(g, n);
+}
+
+pub fn fx_node_h(which: u32, n: u32) -> u32 {
+    let g : SpecGraph = view_fx(which);
+    if (n >= g.node_count) { return 0; }
+    return view_node_h(g, n);
+}
+
+pub fn fx_node_fill(which: u32, n: u32) -> u32 {
+    let g : SpecGraph = view_fx(which);
+    if (n >= g.node_count) { return 0; }
+    return view_node_fill(g, n);
+}
+
+pub fn fx_node_stroke(which: u32, n: u32) -> u32 {
+    let g : SpecGraph = view_fx(which);
+    if (n >= g.node_count) { return 0; }
+    return view_node_stroke(g, n);
+}
+
+pub fn fx_node_dash(which: u32, n: u32) -> u32 {
+    let g : SpecGraph = view_fx(which);
+    if (n >= g.node_count) { return 0; }
+    return view_node_dash(g, n);
+}
+
+pub fn fx_node_widget(which: u32, n: u32) -> u8 {
+    let g : SpecGraph = view_fx(which);
+    if (n >= g.node_count) { return 0; }
+    return view_node_widget(g, n);
+}
+
+pub fn fx_edge_kind(which: u32, j: u32) -> u8 {
+    let g : SpecGraph = view_fx(which);
+    if (j >= g.edge_count) { return 0; }
+    return g.edge_kind[j as usize];
+}
+
+pub fn fx_edge_label(which: u32, j: u32) -> u8 {
+    let g : SpecGraph = view_fx(which);
+    if (j >= g.edge_count) { return 0; }
+    return g.edge_label[j as usize];
+}
+
+pub fn fx_edge_line(which: u32, j: u32) -> u32 {
+    let g : SpecGraph = view_fx(which);
+    if (j >= g.edge_count) { return 0; }
+    return view_edge_line(g, j);
+}
+
+pub fn fx_edge_x1(which: u32, j: u32) -> u32 {
+    let g : SpecGraph = view_fx(which);
+    if (j >= g.edge_count) { return 0; }
+    return view_edge_x1(g, j);
+}
+
+pub fn fx_edge_y1(which: u32, j: u32) -> u32 {
+    let g : SpecGraph = view_fx(which);
+    if (j >= g.edge_count) { return 0; }
+    return view_edge_y1(g, j);
+}
+
+pub fn fx_edge_x2(which: u32, j: u32) -> u32 {
+    let g : SpecGraph = view_fx(which);
+    if (j >= g.edge_count) { return 0; }
+    return view_edge_x2(g, j);
+}
+
+pub fn fx_edge_y2(which: u32, j: u32) -> u32 {
+    let g : SpecGraph = view_fx(which);
+    if (j >= g.edge_count) { return 0; }
+    return view_edge_y2(g, j);
+}
+
+pub fn fx_edge_stroke(which: u32, j: u32) -> u32 {
+    let g : SpecGraph = view_fx(which);
+    if (j >= g.edge_count) { return 0; }
+    return view_edge_stroke(g, j);
+}
+
+pub fn fx_edge_dash(which: u32, j: u32) -> u32 {
+    let g : SpecGraph = view_fx(which);
+    if (j >= g.edge_count) { return 0; }
+    return view_edge_dash(g, j);
+}
+
+/// --- tests ---
+
+test fixture_is_drawn {
+    let g : SpecGraph = tutorial_08_graph();
+    assert view_verdict(g) == VIEW_OK;
+    // seven kinds are present (no bench), so seven columns
+    assert view_column_count(g) == 7;
+    assert view_width(g) == 1860;
+    assert view_height(g) == 484;
+    assert view_known_depth(g) == 5;
+    // module (node 0), the first const (node 2), power_of_two (node 8), the invariant (node 13)
+    assert view_node_x(g, 0) == 40;
+    assert view_node_y(g, 0) == 40;
+    assert view_node_x(g, 2) == 560;
+    assert view_node_x(g, 8) == 820;
+    assert view_node_y(g, 8) == 104;
+    assert view_node_x(g, 13) == 1340;
+    assert view_node_w(g, 8) == 220;
+    assert view_node_h(g, 8) == 44;
+    // the last const is the deepest known box
+    assert view_node_y(g, 7) == 296;
+    assert view_overlap_count(g) == 0;
+    assert view_edges_attach(g);
+}
+
+test one_column_per_kind {
+    let g : SpecGraph = tutorial_08_graph();
+    assert view_column(g, NODE_MODULE) == 0;
+    assert view_column(g, NODE_USE) == 1;
+    assert view_column(g, NODE_CONST) == 2;
+    assert view_column(g, NODE_FN) == 3;
+    assert view_column(g, NODE_TEST) == 4;
+    assert view_column(g, NODE_INVARIANT) == 5;
+    assert view_column(g, NODE_OPAQUE) == 6;
+    assert view_kind_present(g, NODE_BENCH) == false;
+    assert view_column(g, NODE_KINDS) == NO_INDEX;
+    // nodes share a column exactly when they share a kind
+    var same : u32 = 0;
+    var a : u32 = 0;
+    while (a < g.node_count) {
+        var b : u32 = 0;
+        while (b < g.node_count) {
+            let sk : bool = g.node_kind[a as usize] == g.node_kind[b as usize];
+            let sc : bool = view_node_column(g, a) == view_node_column(g, b);
+            if (sk == sc) { same = same + 1; }
+            b = b + 1;
+        }
+        a = a + 1;
+    }
+    assert same == 225;
+}
+
+test label_sets_size_colour_and_order {
+    // the suggestion (node 15) is an opaque region: same column as std.testing, drawn as a guess
+    let s : SpecGraph = with_suggestion();
+    assert view_verdict(s) == VIEW_OK;
+    assert view_node_x(s, 15) == 1610;
+    assert view_node_y(s, 15) == 40;
+    assert view_node_w(s, 15) == 200;
+    assert view_node_h(s, 15) == 36;
+    assert view_node_fill(s, 15) == 0x0E2236;
+    assert view_node_dash(s, 15) == 3;
+    assert view_overlap_count(s) == 0;
+    // its edge is a guess too, and points at line 67
+    assert view_edge_stroke(s, 16) == VIEW_LABEL_STROKE[LABEL_SUGGESTED as usize];
+    assert view_edge_line(s, 16) == 67;
+    assert view_edge_x1(s, 16) == 780;
+    assert view_edge_y1(s, 16) == 262;
+    assert view_edge_x2(s, 16) == 1610;
+    assert view_edge_y2(s, 16) == 66;
+    // a derived const moves below the exact ones of its column and changes style
+    var d : SpecGraph = tutorial_08_graph();
+    d.node_label[5] = LABEL_DERIVED;
+    assert view_verdict(d) == VIEW_OK;
+    assert view_node_y(d, 5) == 296;
+    assert view_node_y(d, 6) == 168;
+    assert view_node_fill(d, 5) == 0x2B2508;
+    assert view_node_dash(d, 5) == 6;
+    // the name moves nothing: the layout reads kind, label and node number only
+    var r : SpecGraph = tutorial_08_graph();
+    r.node_name[4] = "renamed";
+    assert view_node_x(r, 4) == 820;
+    assert view_node_y(r, 4) == 40;
+}
+
+test unknown_node_is_drawn_alone {
+    let g : SpecGraph = tutorial_08_graph();
+    // std.testing (node 14): in its kind's column, in the band below every known box
+    assert view_node_x(g, 14) == 1610;
+    assert view_band_top(g) == 408;
+    assert view_node_y(g, 14) == 408;
+    assert view_node_fill(g, 14) == 0x1A1E1C;
+    assert view_node_widget(g, 14) == WIDGET_TEXT_BLOCK;
+    assert view_alone_below(g, 14);
+    // no edge end lands on it, while power_of_two (node 8) takes four
+    assert view_ends_on(g, 14) == 0;
+    assert view_ends_on(g, 8) == 4;
+    // relabelled DERIVED it is no longer unknown, so it leaves the band and the canvas shrinks
+    var d : SpecGraph = tutorial_08_graph();
+    d.node_label[14] = LABEL_DERIVED;
+    assert view_verdict(d) == VIEW_OK;
+    assert view_node_y(d, 14) == 40;
+    assert view_alone_below(d, 14) == false;
+    assert view_height(d) == 380;
+    // a label this file cannot read is drawn unknown
+    assert view_style(LABEL_KINDS) == LABEL_UNKNOWN;
+    assert view_is_unknown(LABEL_SUGGESTED) == false;
+}
+
+test every_edge_points_at_a_source_line {
+    let g : SpecGraph = tutorial_08_graph();
+    var lined : u32 = 0;
+    var j : u32 = 0;
+    while (j < g.edge_count) {
+        let l : u32 = view_edge_line(g, j);
+        if (l != NO_LINE and l <= g.line_count) { lined = lined + 1; }
+        j = j + 1;
+    }
+    assert lined == 16;
+    // the uses edge of the `use` statement
+    assert view_edge_line(g, 0) == 22;
+    assert view_edge_x1(g, 0) == 260;
+    assert view_edge_y1(g, 0) == 58;
+    assert view_edge_x2(g, 0) == 300;
+    // tested_by power_of_two -> its test has no line of its own: it points at the call, line 79
+    assert g.edge_line[12] == NO_LINE;
+    assert view_edge_line(g, 12) == 79;
+    assert view_edge_line(g, 14) == 89;
+    assert view_edge_dash(g, 12) == 6;
+    // the call and the tested_by between the same two nodes are drawn on different lanes
+    assert view_edge_y2(g, 9) == 118;
+    assert view_edge_y1(g, 12) == 126;
+    // constrains runs right to left: the invariant's left side to the const's right side
+    assert view_edge_x1(g, 15) == 1340;
+    assert view_edge_x2(g, 15) == 780;
+}
+
+test refused_graphs_are_not_drawn {
+    let g : SpecGraph = tutorial_08_graph();
+    // negative control: an edge into the unknown node is refused with spec_graph's own code
+    assert view_verdict(with_edge(g, EDGE_DATA_FLOW, 14, 10, LABEL_DERIVED, 79)) == ERR_EDGE_UNKNOWN_NODE;
+    // negative control: a tested_by edge with no call behind it passes validate_graph, but has no
+    // line to point at, so the view refuses it
+    let x : SpecGraph = with_edge(g, EDGE_TESTED_BY, 9, 10, LABEL_DERIVED, NO_LINE);
+    assert validate_graph(x) == GRAPH_OK;
+    assert view_edge_line(x, 16) == NO_LINE;
+    assert view_verdict(x) == VIEW_ERR_EDGE_NO_LINE;
+    assert view_verdict(blank_graph()) == ERR_SPEC_PATH;
+}
+
+test a_graph_at_node_capacity_is_drawn_in_a_tall_canvas {
+    let base : SpecGraph = tutorial_08_graph();
+    var g : SpecGraph = base;
+    while (g.node_count < MAX_NODES) {
+        g = with_node(g, NODE_CONST, LABEL_EXACT, "extra", 1, 1);
+    }
+    assert g.node_count == MAX_NODES;
+    assert view_verdict(g) == VIEW_OK;
+    // one column per kind is unchanged by more nodes of a kind already present
+    assert view_column_count(g) == view_column_count(base);
+    assert view_width(g) == view_width(base);
+    // the const column holds at least 177 more rows, so the canvas grows in height only
+    assert view_known_depth(g) >= 177;
+    assert view_height(g) > 11000;
+    assert view_height(g) > view_height(base);
+    // the last two extra nodes share a column on different rows: boxes do not overlap
+    let last : u32 = MAX_NODES - 1;
+    assert view_node_column(g, last) == view_node_column(g, last - 1);
+    assert view_node_y(g, last) == view_node_y(g, last - 1) + VIEW_ROW_STEP;
+    assert view_overlap(g, last, last - 1) == false;
+    // negative control: the same node drawn on top of itself overlaps
+    assert view_overlap(g, last, last);
+}
+
+test nodes_bind_through_spec_graph {
+    let g : SpecGraph = tutorial_08_graph();
+    assert view_node_widget(g, 0) == WIDGET_HONEYCOMB_CARD;
+    assert view_node_widget(g, 8) == WIDGET_FORMULA_VIEW;
+    assert view_node_widget(g, 10) == WIDGET_RUN_BUTTON;
+    var same : u32 = 0;
+    var n : u32 = 0;
+    while (n < g.node_count) {
+        if (view_node_widget(g, n) == node_widget(g.node_kind[n as usize], g.node_label[n as usize])) { same = same + 1; }
+        n = n + 1;
+    }
+    assert same == 15;
+    assert view_node_widget(with_suggestion(), 15) == WIDGET_TEXT_BLOCK;
+}
+
+test host_entry_points_match_the_layout {
+    let g : SpecGraph = tutorial_08_graph();
+    assert fx_verdict(0) == VIEW_OK;
+    assert fx_verdict(1) == VIEW_OK;
+    assert fx_verdict(2) == ERR_SPEC_PATH;
+    assert fx_node_count(0) == 15;
+    assert fx_node_count(1) == 16;
+    assert fx_edge_count(1) == 17;
+    assert fx_width(0) == view_width(g);
+    assert fx_height(0) == view_height(g);
+    assert fx_node_x(0, 14) == 1610;
+    assert fx_node_y(0, 14) == 408;
+    assert fx_node_label(0, 14) == LABEL_UNKNOWN;
+    assert fx_node_kind(0, 14) == NODE_OPAQUE;
+    assert fx_node_line_start(0, 8) == 66;
+    assert fx_node_line_end(0, 8) == 68;
+    assert fx_node_widget(0, 8) == WIDGET_FORMULA_VIEW;
+    assert fx_node_fill(1, 15) == 0x0E2236;
+    assert fx_node_stroke(0, 0) == 0x00FF88;
+    assert fx_node_dash(0, 0) == 0;
+    assert fx_node_w(0, 14) == 200;
+    assert fx_node_h(0, 0) == 44;
+    assert fx_edge_line(0, 12) == 79;
+    assert fx_edge_kind(0, 12) == EDGE_TESTED_BY;
+    assert fx_edge_label(0, 12) == LABEL_DERIVED;
+    assert fx_edge_x1(0, 15) == 1340;
+    assert fx_edge_y1(0, 0) == 58;
+    assert fx_edge_x2(0, 0) == 300;
+    assert fx_edge_y2(1, 16) == 66;
+    assert fx_edge_stroke(0, 12) == 0xFFD700;
+    assert fx_edge_dash(1, 16) == 3;
+    // past the graph, a host gets 0, not a neighbour's numbers
+    assert fx_node_x(0, 15) == 0;
+    assert fx_edge_x1(0, 16) == 0;
+}
+
+invariant label_styles_are_distinct_and_centred {
+    var l : u32 = 0;
+    while (l < (LABEL_KINDS as u32)) {
+        let k : usize = l as usize;
+        assert VIEW_LABEL_INDENT[k] * 2 + VIEW_LABEL_W[k] == VIEW_COL_W;
+        assert VIEW_LABEL_H[k] < VIEW_ROW_STEP;
+        var m : u32 = l + 1;
+        while (m < (LABEL_KINDS as u32)) {
+            assert VIEW_LABEL_FILL[k] != VIEW_LABEL_FILL[m as usize];
+            assert VIEW_LABEL_STROKE[k] != VIEW_LABEL_STROKE[m as usize];
+            assert VIEW_LABEL_DASH[k] != VIEW_LABEL_DASH[m as usize];
+            m = m + 1;
+        }
+        l = l + 1;
+    }
+    // only a fact is drawn solid, and a guess is never larger than a fact
+    assert VIEW_LABEL_DASH[LABEL_EXACT as usize] == 0;
+    assert VIEW_LABEL_W[LABEL_SUGGESTED as usize] < VIEW_LABEL_W[LABEL_EXACT as usize];
+    assert VIEW_LABEL_W[LABEL_UNKNOWN as usize] < VIEW_LABEL_W[LABEL_DERIVED as usize];
+}
+
+invariant kind_order_is_a_permutation {
+    var seen : u32 = 0;
+    var k : u32 = 0;
+    while (k < (NODE_KINDS as u32)) {
+        seen = seen | ((1 as u32) << (VIEW_KIND_ORDER[k as usize] as u32));
+        k = k + 1;
+    }
+    assert seen == 255;
+    assert VIEW_COL_W < VIEW_COL_STEP;
+}
+
+invariant view_codes_follow_spec_graph {
+    assert VIEW_OK == GRAPH_OK;
+    assert VIEW_ERR_EDGE_NO_LINE == VERDICT_KINDS;
+    // the lowest lane stays inside the shortest box, the highest too
+    assert VIEW_LANE_HALF < VIEW_LABEL_H[LABEL_UNKNOWN as usize] / 2;
+    assert VIEW_LANE_STEP * ((EDGE_KINDS as u32) - 1) - VIEW_LANE_HALF < VIEW_LABEL_H[LABEL_UNKNOWN as usize] / 2;
+}
+
+invariant the_fixtures_are_drawn {
+    assert view_verdict(tutorial_08_graph()) == VIEW_OK;
+    assert view_verdict(with_suggestion()) == VIEW_OK;
+}
