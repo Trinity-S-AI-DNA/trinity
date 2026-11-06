@@ -1283,6 +1283,20 @@ Attribution for listed docs and packages is checked by [`src/tri/author_attribut
 
 ---
 
+## Secrets never enter the repository
+
+No password, API key, token or credentials file is committed, not even in docs or examples. Read secrets from the environment or from a gitignored file (firmware Wi-Fi credentials: copy `secrets.h.example` to the gitignored `secrets.h`).
+
+The gate has three layers, all driven by [`.gitleaks.toml`](.gitleaks.toml):
+
+1. **pre-commit** (lefthook) scans staged changes with gitleaks.
+2. **pre-push** (lefthook) scans every commit that is not yet on a remote.
+3. **CI** ([`secret-scan`](.github/workflows/secret-scan.yml)) scans the PR range, so `--no-verify` does not get a secret past it.
+
+Set up once per clone: `brew install gitleaks lefthook && git config core.hooksPath .githooks` (the tracked hooks in `.githooks` call lefthook; on a clone without `core.hooksPath`, `lefthook install` works too).
+
+A secret that was ever pushed is compromised. Removing it from the tree does not unpublish it, so rotate it at the provider.
+
 ## License
 
 MIT -- see [LICENSE](LICENSE)

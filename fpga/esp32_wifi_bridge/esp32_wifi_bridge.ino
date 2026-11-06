@@ -32,8 +32,9 @@
 // ============================================================================
 
 // WiFi Access Point
-const char* AP_SSID = "Trinity-FPGA";
-const char* AP_PASSWORD = "trinity2026";
+// AP_SSID and AP_PASSWORD live in secrets.h, which is gitignored.
+// Copy secrets.h.example to secrets.h and fill it in before flashing.
+#include "secrets.h"
 
 // mDNS hostname
 const char* HOSTNAME = "trinity";
