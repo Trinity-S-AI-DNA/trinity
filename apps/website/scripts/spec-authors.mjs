@@ -52,7 +52,20 @@ if (!TOKEN) {
   process.exit(1)
 }
 
-const OWNER = 'gHashTag'
+/**
+ * WHOSE REPOSITORIES. One owner was enough until 2026-10-22: the corpus lived
+ * under the `gHashTag` account. That day the repositories moved to the
+ * `Trinity-S-AI-DNA` organisation, `/users/gHashTag/repos` stopped listing
+ * them, and a run found three spec paths in two repositories instead of 53 in
+ * eleven - the next refresh would have collapsed the board to near zero.
+ * The owners are read as a list; a commit is still counted once because the
+ * SHAs are deduplicated across every owner and repository below.
+ */
+const OWNERS = (process.env.SPEC_AUTHOR_OWNERS ?? 'Trinity-S-AI-DNA,gHashTag')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean)
+const OWNER = OWNERS[0]
 
 /**
  * WHERE A `.t27` IS A COPY, NOT A SPEC SOMEBODY WROTE THERE.
@@ -145,11 +158,20 @@ async function pool(items, limit, fn) {
 // ---- 1. Sources: every public, non-fork repository with a `.t27` in it. ----
 
 const repos = []
-for (let page = 1; ; page += 1) {
-  const rows = await gh(`users/${OWNER}/repos?type=owner&per_page=100&page=${page}`)
-  if (!rows?.length) break
-  repos.push(...rows.filter((r) => !r.private && !r.fork && !MIRROR_REPOS.has(r.name)))
-  if (rows.length < 100) break
+const seenRepos = new Set()
+for (const owner of OWNERS) {
+  for (let page = 1; ; page += 1) {
+    const rows = await gh(`users/${owner}/repos?type=owner&per_page=100&page=${page}`)
+    if (!rows?.length) break
+    for (const r of rows) {
+      if (r.private || r.fork || MIRROR_REPOS.has(r.name)) continue
+      const key = r.full_name.toLowerCase()
+      if (seenRepos.has(key)) continue
+      seenRepos.add(key)
+      repos.push(r)
+    }
+    if (rows.length < 100) break
+  }
 }
 
 const isMirrorPath = (path) => path.split('/').some((seg) => MIRROR_SEGMENTS.has(seg))
@@ -306,7 +328,7 @@ function credit(login, via, repos) {
   row.commits += 1
   row.via[via] = (row.via[via] ?? 0) + 1
   for (const r of repos) {
-    const short = r.replace(`${OWNER}/`, '')
+    const short = r.replace(/^[^/]+\//, '')
     if (!row.repos.includes(short)) row.repos.push(short)
   }
 }
@@ -344,7 +366,7 @@ process.stdout.write(
     {
       measuredAt: new Date().toISOString(),
       method:
-        'Commits touching a directory that holds .t27 files, in every public gHashTag repository that has one (published mirrors and vendored copies excluded), each commit counted once. Credited to a GitHub account: for a squash of the swarm\'s queen-<issue> pull request, the person whose provider key the accepted bee ran on (the Queen\'s record); otherwise the commit author, else whoever opened the merged pull request carrying it, else the committer. A measure of work on the spec corpus: not every file under those directories is a spec, and a commit is not a file.',
+        'Commits touching a directory that holds .t27 files, in every public repository of the project accounts (Trinity-S-AI-DNA and gHashTag) that has one (published mirrors and vendored copies excluded), each commit counted once. Credited to a GitHub account: for a squash of the swarm\'s queen-<issue> pull request, the person whose provider key the accepted bee ran on (the Queen\'s record); otherwise the commit author, else whoever opened the merged pull request carrying it, else the committer. A measure of work on the spec corpus: not every file under those directories is a spec, and a commit is not a file.',
       laneCredits: { read: laneCreditsRead, source: CREDITS_URL, issues: laneOwner.size, queenSquashes: queenSquash.size },
       sources,
       truncated,
