@@ -12,7 +12,7 @@
 //      and its own testbench as committed in this repository under fpga/openxc7-synth/, run as is;
 //   3. each is compiled by iverilog and run by vvp, one at a time (the machine is shared), with a
 //      size cap on the dump so a runaway testbench cannot fill the disk;
-//   4. each VCD is summarised by public/widgets/vcd-wrapped/vcdstats.js, the parser the page runs;
+//   4. each VCD is summarised by scripts/widget-data/vcd-wrapped-vcdstats.js, the parser the page runs;
 //      the VCD as vvp dumped it (not trimmed: each is under K_MAX_SAMPLE_BYTES) and samples.json
 //      (commands, tool versions, sha256 of every input, the testbench's verdict lines, the summary)
 //      are written beside the page;
@@ -32,7 +32,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { constsOf, loadCompiler, sha256 } from '../agents-from-specs.mjs'
 import { runSpecTests } from '../viewport-from-spec.mjs'
-import { spanUnits, vcdSummary } from '../../public/widgets/vcd-wrapped/vcdstats.js'
+import { spanUnits, vcdSummary } from './vcd-wrapped-vcdstats.js'
 
 const SITE = join(dirname(fileURLToPath(import.meta.url)), '..', '..')
 const REPO = join(SITE, '..', '..')

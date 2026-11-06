@@ -22,7 +22,7 @@
 //   6. the pool is ordered by the sha256 of each spec path (a fixed shuffle nobody chose) and
 //      written to public/widgets/gatle/pool.json with the yosys version, the commands and the date;
 //   7. the spec is then re-checked against the data: K_POOL_SIZE and K_POOL_IDS must equal the
-//      pool, and the page's own rule module (public/widgets/gatle/rule.js) must give the spec's
+//      pool, and the page's own rule module (scripts/widget-data/gatle-rule.js) must give the spec's
 //      fixed answers for the daily index and the 10% rule. Any disagreement exits non-zero.
 //
 // Run (from apps/website):
@@ -44,7 +44,7 @@ const SPEC = 'specs/widgets/gatle.t27'
 const CORPUS = 'public/t27/files/specs'
 const OUT_DIR = 'public/widgets/gatle'
 const OUT_JSON = `${OUT_DIR}/pool.json`
-const RULE = `${OUT_DIR}/rule.js`
+const RULE = 'scripts/widget-data/gatle-rule.js'
 const WORK = '/tmp/widget-gatle/synth'
 const MAX_BYTES = 1024 * 1024
 const YOSYS = process.env.YOSYS || (existsSync('/opt/homebrew/bin/yosys') ? '/opt/homebrew/bin/yosys' : 'yosys')

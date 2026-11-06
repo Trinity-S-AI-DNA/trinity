@@ -33,7 +33,7 @@ BRAND = "Trinity S\u00b3AI"
 
 LINT_JS = r"""
 import { readFileSync } from 'node:fs'
-import { parseXdc, lintXdc, summarize } from './public/widgets/pin-map/xdc.js'
+import { parseXdc, lintXdc, summarize } from './scripts/widget-data/pin-map-xdc.js'
 const P = JSON.parse(readFileSync('public/widgets/pin-map/pins.json', 'utf8'))
 const D = JSON.parse(readFileSync('public/widgets/pin-map/demos.json', 'utf8'))
 const d = D.find((x) => x.id === process.argv[1])

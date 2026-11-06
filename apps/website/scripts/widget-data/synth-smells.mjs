@@ -28,7 +28,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { constsOf, loadCompiler, sha256 } from '../agents-from-specs.mjs'
 import { runSpecTests } from '../viewport-from-spec.mjs'
-import { parseYosysLog, smellCounts, trimLog } from '../../public/widgets/synth-smells/smellparse.js'
+import { parseYosysLog, smellCounts, trimLog } from './synth-smells-smellparse.js'
 
 const SITE = join(dirname(fileURLToPath(import.meta.url)), '..', '..')
 const WASM = 'public/t27/t27_compiler.wasm'

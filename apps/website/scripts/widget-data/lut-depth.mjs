@@ -32,7 +32,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { constsOf, loadCompiler, sha256 } from '../agents-from-specs.mjs'
 import { runSpecTests } from '../viewport-from-spec.mjs'
-import { listsOf, parseLtp } from '../../public/widgets/lut-depth/ltpparse.js'
+import { listsOf, parseLtp } from './lut-depth-ltpparse.js'
 
 const SITE = join(dirname(fileURLToPath(import.meta.url)), '..', '..')
 const REPO = join(SITE, '..', '..')

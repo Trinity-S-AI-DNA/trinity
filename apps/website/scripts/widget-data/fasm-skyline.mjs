@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // SPDX-License-Identifier: Apache-2.0
 // fasm-skyline.mjs -- the data behind public/widgets/fasm-skyline/, counted by the page's own code
-// (public/widgets/fasm-skyline/skyline.js).
+// (scripts/widget-data/fasm-skyline-skyline.js).
 //
 // Read-only on every input. Two jobs:
 //
@@ -24,7 +24,7 @@ import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { constsOf, loadCompiler } from '../agents-from-specs.mjs'
-import { decodeGrid, familyOf, parseFasm, summarize } from '../../public/widgets/fasm-skyline/skyline.js'
+import { decodeGrid, familyOf, parseFasm, summarize } from './fasm-skyline-skyline.js'
 
 const SITE = join(dirname(fileURLToPath(import.meta.url)), '..', '..')
 const HOME = homedir()

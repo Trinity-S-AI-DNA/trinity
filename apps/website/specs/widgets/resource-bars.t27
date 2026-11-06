@@ -119,3 +119,1749 @@ test the_page_reads_files_and_sends_nothing {
     assert SENDS_NOTHING == true;
     assert CATEGORY == "fpga";
 }
+
+
+; =================================================================================================
+; THE NATIVE PAGE (epic gHashTag/t27#10937, issue #10938, stage "page" of specs/t27f/widget_factory.t27)
+; Everything below replaces public/widgets/resource-bars/tool.js (172 lines of hand-written JavaScript).
+; The words and numbers above are unchanged: the view prints SAY_ constants and uses K_ numbers.
+; --
+; NUMBERS AS JAVASCRIPT PRINTS THEM. The bar's width is `${Math.min(100, frac * 100)}%`, which is the
+; shortest decimal that reads back as the same binary64, and the percentage is toFixed(1), toFixed(2)
+; or toPrecision(2) of 100 * used / total. There is no float printing in .t27, so this module has the
+; little big-number arithmetic it takes to do both exactly (the register block below is the one of
+; gf16_calc.t27, copied): the double is split into M * 2^-k with M below 2^53, and every candidate
+; digit string is compared with the rounding interval of the double in whole integers.
+; --
+; THE FILE. The original reads a routed nextpnr JSON of up to 512 MB through FileReader. This page
+; keeps the file in a static buffer of W_FILE_CAP bytes (32 MiB) and reads it with json_scan.t27; a
+; larger file gets the page's own "larger than N MB" sentence with N = 32. The cells are counted as
+; the original counts them; the two sets (occupied LUT6 positions, distinct slice sites) are hash
+; sets of W_SET_CAP entries each (a 200T has 134,600 and 33,650).
+; --
+; Host protocol (host.js; all exports of this module):
+;   w_init(hash)             the page opens
+;   w_data(i, bytes)         resources.json (K_DATA_FILE) was fetched; w_data_failed(i) when not
+;   w_click(i)               button number i in page order: 0 and 1 the packages, 2 the demo design
+;   w_file(z, name, size) -> 1 | 0, w_file_data(z, bytes), w_file_failed(z)   a picked or dropped JSON
+;   w_drag(z, over) -> 1 | 0 the drag entered (1) or left/dropped (0) zone z
+;   w_drop_root() -> 1       a file dropped anywhere on the page is read too (tool.js listens on the root)
+;   w_effect(k, dst) -> len  effect after the last event: 'v', control index, text = set that control's value
+;   w_render(dst)            the page's HTML, length (0 on overflow)
+; Not carried over from JavaScript: counts, totals and file sizes are printed as integers; a NEXTPNR_BEL
+; that is not a string, or a cell type that is not a string, reads as absent / "undefined"; keys with
+; repeated names in the JSON take the first value; the style attribute of a bar is written the way the
+; original's `style.width = ...` leaves it in a browser that accepts max() (happy-dom does not, so
+; the measurement compares the width text from a JavaScript reference instead).
+
+use widgets::html_out::ok;
+use widgets::html_out::OVER;
+use widgets::html_out::put;
+use widgets::html_out::raw;
+use widgets::html_out::put_escaped;
+use widgets::html_out::text;
+use widgets::html_out::num_grouped;
+use widgets::html_out::attr;
+use widgets::html_out::fill;
+use widgets::html_out::dec_to;
+use widgets::html_out::H_LT;
+use widgets::html_out::H_GT;
+use widgets::html_out::H_AMP;
+use widgets::html_out::H_QUOTE;
+use widgets::html_out::H_APOS;
+use widgets::html_out::H_SPACE;
+use widgets::html_out::H_SLASH;
+use widgets::html_out::H_EQ;
+use widgets::html_out::name_is;
+use widgets::html_out::is_word_byte;
+use widgets::json_scan::NO_SPAN;
+use widgets::json_scan::SPAN;
+use widgets::json_scan::J_NONE;
+use widgets::json_scan::J_OBJECT;
+use widgets::json_scan::J_ARRAY;
+use widgets::json_scan::J_STRING;
+use widgets::json_scan::J_NUMBER;
+use widgets::json_scan::J_TRUE;
+use widgets::json_scan::J_FALSE;
+use widgets::json_scan::J_NULL;
+use widgets::json_scan::jspan;
+use widgets::json_scan::span_lo;
+use widgets::json_scan::span_hi;
+use widgets::json_scan::skip_ws;
+use widgets::json_scan::string_end;
+use widgets::json_scan::value_end;
+use widgets::json_scan::root;
+use widgets::json_scan::kind;
+use widgets::json_scan::key_is;
+use widgets::json_scan::obj_get;
+use widgets::json_scan::arr_len;
+use widgets::json_scan::arr_at;
+use widgets::json_scan::hex4;
+use widgets::json_scan::escape_at;
+use widgets::json_scan::cp_utf8_len;
+use widgets::json_scan::cp_utf8_byte;
+use widgets::json_scan::str_len;
+use widgets::json_scan::str_byte;
+use widgets::json_scan::num_f64;
+
+pub const W_FILE_CAP : u32 = 33554432;
+pub const W_DEMO_CAP : u32 = 262144;
+pub const W_SET_CAP : u32 = 163840;
+pub const W_POOL_CAP : u32 = 4194304;
+
+; BIGNUM-BEGIN
+pub var BN : [10240]u32 = [0; 10240];
+pub var BLEN : [16]usize = [0; 16];
+
+; --- the registers --------------------------------------------------------------------------------------
+; 0 W_R_N and 1 W_R_D hold the parsed fraction; 2..9 are scratch for the function that names them; 14 and 15
+; belong to bn_divmod and bn_shl.
+pub const W_R_N : usize = 0;
+pub const W_R_D : usize = 1;
+pub const W_R_T : usize = 15;
+pub const W_R_S : usize = 14;
+
+fn bn_norm(r: usize) -> u32 {
+    var n : usize = BLEN[r];
+    while (n > 0 and BN[r * 640 + n - 1] == 0) { n = n - 1; }
+    BLEN[r] = n;
+    return 0;
+}
+
+fn bn_zero(r: usize) -> u32 {
+    BLEN[r] = 0;
+    return 0;
+}
+
+fn bn_from_u64(r: usize, v: u64) -> u32 {
+    BN[r * 640] = (v & 4294967295) as u32;
+    BN[r * 640 + 1] = (v >> 32) as u32;
+    BLEN[r] = 2;
+    bn_norm(r);
+    return 0;
+}
+
+fn bn_copy(d: usize, s: usize) -> u32 {
+    const n : usize = BLEN[s];
+    var i : usize = 0;
+    while (i < n) {
+        BN[d * 640 + i] = BN[s * 640 + i];
+        i = i + 1;
+    }
+    BLEN[d] = n;
+    return 0;
+}
+
+fn bn_cmp(a: usize, b: usize) -> i32 {
+    const la : usize = BLEN[a];
+    const lb : usize = BLEN[b];
+    if (la < lb) { return -1; }
+    if (la > lb) { return 1; }
+    var i : usize = la;
+    while (i > 0) {
+        i = i - 1;
+        const x : u32 = BN[a * 640 + i];
+        const y : u32 = BN[b * 640 + i];
+        if (x < y) { return -1; }
+        if (x > y) { return 1; }
+    }
+    return 0;
+}
+
+fn bn_add(d: usize, a: usize, b: usize) -> u32 {
+    const la : usize = BLEN[a];
+    const lb : usize = BLEN[b];
+    var n : usize = la;
+    if (lb > n) { n = lb; }
+    var carry : u64 = 0;
+    var i : usize = 0;
+    while (i < n) {
+        var s : u64 = carry;
+        if (i < la) { s = s + (BN[a * 640 + i] as u64); }
+        if (i < lb) { s = s + (BN[b * 640 + i] as u64); }
+        BN[d * 640 + i] = (s & 4294967295) as u32;
+        carry = s >> 32;
+        i = i + 1;
+    }
+    if (carry > 0) {
+        BN[d * 640 + n] = carry as u32;
+        n = n + 1;
+    }
+    BLEN[d] = n;
+    return 0;
+}
+
+/// d = a - b, for a >= b.
+fn bn_sub(d: usize, a: usize, b: usize) -> u32 {
+    const la : usize = BLEN[a];
+    const lb : usize = BLEN[b];
+    var borrow : u64 = 0;
+    var i : usize = 0;
+    while (i < la) {
+        var y : u64 = borrow;
+        if (i < lb) { y = y + (BN[b * 640 + i] as u64); }
+        const x : u64 = (BN[a * 640 + i] as u64) + 4294967296;
+        const t : u64 = x - y;
+        BN[d * 640 + i] = (t & 4294967295) as u32;
+        borrow = 1 - (t >> 32);
+        i = i + 1;
+    }
+    BLEN[d] = la;
+    bn_norm(d);
+    return 0;
+}
+
+fn bn_mul_small(d: usize, a: usize, m: u64) -> u32 {
+    const la : usize = BLEN[a];
+    var carry : u64 = 0;
+    var i : usize = 0;
+    while (i < la) {
+        const t : u64 = (BN[a * 640 + i] as u64) * m + carry;
+        BN[d * 640 + i] = (t & 4294967295) as u32;
+        carry = t >> 32;
+        i = i + 1;
+    }
+    var n : usize = la;
+    if (carry > 0) {
+        BN[d * 640 + n] = carry as u32;
+        n = n + 1;
+    }
+    BLEN[d] = n;
+    bn_norm(d);
+    return 0;
+}
+
+fn bn_add_small(d: usize, a: usize, v: u64) -> u32 {
+    const la : usize = BLEN[a];
+    var carry : u64 = v;
+    var i : usize = 0;
+    while (i < la) {
+        const t : u64 = (BN[a * 640 + i] as u64) + carry;
+        BN[d * 640 + i] = (t & 4294967295) as u32;
+        carry = t >> 32;
+        i = i + 1;
+    }
+    var n : usize = la;
+    while (carry > 0) {
+        BN[d * 640 + n] = (carry & 4294967295) as u32;
+        carry = carry >> 32;
+        n = n + 1;
+    }
+    BLEN[d] = n;
+    return 0;
+}
+
+/// d = a / m, the remainder returned.
+fn bn_divmod_small(d: usize, a: usize, m: u64) -> u64 {
+    const la : usize = BLEN[a];
+    var rem : u64 = 0;
+    var i : usize = la;
+    while (i > 0) {
+        i = i - 1;
+        const cur : u64 = (rem << 32) + (BN[a * 640 + i] as u64);
+        BN[d * 640 + i] = (cur / m) as u32;
+        rem = cur % m;
+    }
+    BLEN[d] = la;
+    bn_norm(d);
+    return rem;
+}
+
+fn bitlen32(x: u32) -> u32 {
+    var n : u32 = 0;
+    var v : u32 = x;
+    while (v > 0) {
+        n = n + 1;
+        v = v >> 1;
+    }
+    return n;
+}
+
+fn bn_bitlen(r: usize) -> u32 {
+    const n : usize = BLEN[r];
+    if (n == 0) { return 0; }
+    return ((n - 1) as u32) * 32 + bitlen32(BN[r * 640 + n - 1]);
+}
+
+/// d = a << sh (alias-safe: it works from the top limb down).
+fn bn_shl(d: usize, a: usize, sh: u32) -> u32 {
+    const la : usize = BLEN[a];
+    if (la == 0) {
+        BLEN[d] = 0;
+        return 0;
+    }
+    const ls : usize = (sh / 32) as usize;
+    const bs : u32 = sh % 32;
+    const nl : usize = la + ls + 1;
+    var i : usize = nl;
+    while (i > 0) {
+        i = i - 1;
+        var v : u64 = 0;
+        if (i >= ls and i - ls < la) {
+            v = (BN[a * 640 + i - ls] as u64) << bs;
+        }
+        if (bs > 0 and i >= ls + 1 and i - ls - 1 < la) {
+            v = v | ((BN[a * 640 + i - ls - 1] as u64) >> (32 - bs));
+        }
+        if (i < ls) { v = 0; }
+        BN[d * 640 + i] = (v & 4294967295) as u32;
+    }
+    BLEN[d] = nl;
+    bn_norm(d);
+    return 0;
+}
+
+/// d = a * b (d must not be a or b).
+fn bn_mul(d: usize, a: usize, b: usize) -> u32 {
+    const la : usize = BLEN[a];
+    const lb : usize = BLEN[b];
+    if (la == 0 or lb == 0) {
+        BLEN[d] = 0;
+        return 0;
+    }
+    var i : usize = 0;
+    while (i < la + lb) {
+        BN[d * 640 + i] = 0;
+        i = i + 1;
+    }
+    i = 0;
+    while (i < la) {
+        var carry : u64 = 0;
+        const x : u64 = BN[a * 640 + i] as u64;
+        var j : usize = 0;
+        while (j < lb) {
+            const t : u64 = x * (BN[b * 640 + j] as u64) + (BN[d * 640 + i + j] as u64) + carry;
+            BN[d * 640 + i + j] = (t & 4294967295) as u32;
+            carry = t >> 32;
+            j = j + 1;
+        }
+        BN[d * 640 + i + lb] = carry as u32;
+        i = i + 1;
+    }
+    BLEN[d] = la + lb;
+    bn_norm(d);
+    return 0;
+}
+
+fn pow10_small(k: u32) -> u64 {
+    var v : u64 = 1;
+    var i : u32 = 0;
+    while (i < k) {
+        v = v * 10;
+        i = i + 1;
+    }
+    return v;
+}
+
+/// d = a * 10^p
+fn bn_mul_pow10(d: usize, a: usize, p: u32) -> u32 {
+    if (d != a) { bn_copy(d, a); }
+    var left : u32 = p;
+    while (left >= 9) {
+        bn_mul_small(d, d, 1000000000);
+        left = left - 9;
+    }
+    if (left > 0) { bn_mul_small(d, d, pow10_small(left)); }
+    return 0;
+}
+
+/// d = base^e for a small base.
+fn bn_set_pow(d: usize, base: u64, e: u32) -> u32 {
+    bn_from_u64(d, 1);
+    var i : u32 = 0;
+    while (i < e) {
+        bn_mul_small(d, d, base);
+        i = i + 1;
+    }
+    return 0;
+}
+
+/// q = a / b and rem = a mod b by binary long division: one shift and one compare per quotient bit.
+/// q, rem, a, b are four different registers; W_R_T is scratch.
+fn bn_divmod(q: usize, rem: usize, a: usize, b: usize) -> u32 {
+    bn_copy(rem, a);
+    const ka : u32 = bn_bitlen(a);
+    const kb : u32 = bn_bitlen(b);
+    if (ka < kb) {
+        BLEN[q] = 0;
+        return 0;
+    }
+    const k : u32 = ka - kb;
+    const nl : usize = ((k / 32) + 1) as usize;
+    var z : usize = 0;
+    while (z < nl) {
+        BN[q * 640 + z] = 0;
+        z = z + 1;
+    }
+    BLEN[q] = nl;
+    var i : u32 = k + 1;
+    while (i > 0) {
+        i = i - 1;
+        bn_shl(W_R_T, b, i);
+        if (bn_cmp(W_R_T, rem) <= 0) {
+            bn_sub(rem, rem, W_R_T);
+            const li : usize = (i / 32) as usize;
+            BN[q * 640 + li] = BN[q * 640 + li] | ((1 as u32) << (i % 32));
+        }
+    }
+    bn_norm(q);
+    return 0;
+}
+
+/// The value as a u64 (the register holds at most two limbs).
+fn bn_u64(r: usize) -> u64 {
+    var v : u64 = 0;
+    if (BLEN[r] > 0) { v = BN[r * 640] as u64; }
+    if (BLEN[r] > 1) { v = v | ((BN[r * 640 + 1] as u64) << 32); }
+    return v;
+}
+
+/// The decimal digits of a register, most significant first, into o at n0; the new length ("0" for zero).
+fn bn_dec(o: []u8, n0: u32, r: usize) -> u32 {
+    var n : u32 = n0;
+    if (BLEN[r] == 0) { return put(o, n, 48); }
+    // peel nine digits at a time off a copy in register 13
+    bn_copy(13, r);
+    var chunks : [100]u32 = [0; 100];
+    var nc : usize = 0;
+    while (BLEN[13] > 0 and nc < 100) {
+        chunks[nc] = bn_divmod_small(13, 13, 1000000000) as u32;
+        nc = nc + 1;
+    }
+    var first : bool = true;
+    while (nc > 0) {
+        nc = nc - 1;
+        var digits : [9]u8 = [48; 9];
+        var v : u32 = chunks[nc];
+        var j : usize = 9;
+        while (j > 0) {
+            j = j - 1;
+            digits[j] = ((v % 10) as u8) + 48;
+            v = v / 10;
+        }
+        var from : usize = 0;
+        if (first) {
+            while (from < 8 and digits[from] == 48) { from = from + 1; }
+            first = false;
+        }
+        while (from < 9) {
+            n = put(o, n, digits[from]);
+            from = from + 1;
+        }
+    }
+    return n;
+}
+
+; BIGNUM-END
+
+pub var FILE : [33554432]u8 = [0; 33554432];
+pub var FILE_N : u32 = 0;
+pub var DEMO : [262144]u8 = [0; 262144];
+pub var DEMO_N : u32 = 0;
+pub var DEMO_OK : bool = false;
+pub var PKG : u32 = 0;
+pub var HAS_USED : bool = false;
+pub var USED : [9]u64 = [0; 9];
+pub var LABEL : [1024]u8 = [0; 1024];
+pub var LABEL_N : u32 = 0;
+pub var CELLS : u64 = 0;
+pub var NEXTPNR : [1024]u8 = [0; 1024];
+pub var NEXTPNR_N : u32 = 0;
+pub var SRCLINE : [4096]u8 = [0; 4096];
+pub var SRCLINE_N : u32 = 0;
+pub var CMDS : [8192]u8 = [0; 8192];
+pub var CMDS_N : u32 = 0;
+pub var CMD_COUNT : u32 = 0;
+pub var CMD_OFF : [64]u32 = [0; 64];
+pub var CMD_LEN : [64]u32 = [0; 64];
+pub var DEMO_HIDDEN : bool = true;
+pub var STATUS : [4096]u8 = [0; 4096];
+pub var STATUS_N : u32 = 0;
+pub var DRAGGING : bool = false;
+pub var EFF_CLEAR : bool = false;
+pub var FNAME : [1024]u8 = [0; 1024];
+pub var FNAME_N : usize = 0;
+pub var FSIZE : u32 = 0;
+pub var T1 : [64]u8 = [0; 64];
+pub var T2 : [64]u8 = [0; 64];
+pub var T3 : [64]u8 = [0; 64];
+
+; the two sets of the counting rule
+pub var POOL : [4194304]u8 = [0; 4194304];
+pub var POOL_N : u32 = 0;
+pub var HT_L : [262144]u32 = [0; 262144];
+pub var HT_S : [262144]u32 = [0; 262144];
+pub var OFF_L : [163840]u32 = [0; 163840];
+pub var LEN_L : [163840]u32 = [0; 163840];
+pub var OFF_S : [163840]u32 = [0; 163840];
+pub var LEN_S : [163840]u32 = [0; 163840];
+pub var NL : u32 = 0;
+pub var NS : u32 = 0;
+pub var BELB : [512]u8 = [0; 512];
+pub var TYPB : [256]u8 = [0; 256];
+pub var KEYB : [1024]u8 = [0; 1024];
+
+fn eq_s(a: []const u8, b: []const u8) -> bool {
+    if (a.len != b.len) { return false; }
+    var k : usize = 0;
+    while (k < a.len) {
+        if (a[k] != b[k]) { return false; }
+        k = k + 1;
+    }
+    return true;
+}
+
+fn starts_s(a: []const u8, p: []const u8) -> bool {
+    if (a.len < p.len) { return false; }
+    var k : usize = 0;
+    while (k < p.len) {
+        if (a[k] != p[k]) { return false; }
+        k = k + 1;
+    }
+    return true;
+}
+
+fn fin(n: u32) -> u32 {
+    if (n == OVER) { return 0; }
+    return n;
+}
+
+fn jstr_copy(dst: []u8, d: []const u8, sp: i64) -> u32 {
+    var len : u32 = str_len(d, sp);
+    if (len > (dst.len as u32)) { len = dst.len as u32; }
+    var k : u32 = 0;
+    while (k < len) {
+        dst[k as usize] = str_byte(d, sp, k);
+        k = k + 1;
+    }
+    return len;
+}
+
+fn dnum(o: []u8, n0: u32, v: u64) -> u32 {
+    var tmp : [24]u8 = [0; 24];
+    const m : u32 = dec_to(tmp[0..], v);
+    return raw(o, n0, tmp[0..(m as usize)]);
+}
+
+; --- printing numbers the way JavaScript does ------------------------------------------------------------------------
+pub var G_M : u64 = 0;
+pub var G_K : u32 = 0;
+pub var DS : [24]u8 = [0; 24];
+pub var DS_N : usize = 0;
+pub var DS_E : i32 = 0;
+
+fn bitlen64(v: u64) -> u32 {
+    var n : u32 = 0;
+    var x : u64 = v;
+    while (x > 0) {
+        n = n + 1;
+        x = x >> 1;
+    }
+    return n;
+}
+
+/// x = G_M * 2^-G_K with G_M an integer below 2^53 (x is a positive double below 2^53).
+fn decompose(x: f64) -> u32 {
+    var m : f64 = x;
+    var k : u32 = 0;
+    while (m != ((m as u64) as f64) and k < 1100) {
+        m = m * 2.0;
+        k = k + 1;
+    }
+    G_M = m as u64;
+    G_K = k;
+    return 0;
+}
+
+/// Is x >= 10^e ?  (x = G_M * 2^-G_K)
+fn x_ge_pow10(e: i32) -> bool {
+    if (e >= 0) {
+        bn_set_pow(2, 10, e as u32);
+        bn_shl(2, 2, G_K);
+        bn_from_u64(3, G_M);
+        return bn_cmp(3, 2) >= 0;
+    }
+    bn_from_u64(2, G_M);
+    bn_mul_pow10(2, 2, (0 - e) as u32);
+    bn_from_u64(3, 1);
+    bn_shl(3, 3, G_K);
+    return bn_cmp(2, 3) >= 0;
+}
+
+/// floor(log10 x)
+fn floor_log10() -> i32 {
+    const q : i64 = (bitlen64(G_M) as i64) - 1 - (G_K as i64);
+    var x : i64 = q * 30103;
+    var rem : i64 = x % 100000;
+    if (rem < 0) { rem = rem + 100000; }
+    var n : i32 = ((x - rem) / 100000) as i32;
+    while (!x_ge_pow10(n)) { n = n - 1; }
+    while (x_ge_pow10(n + 1)) { n = n + 1; }
+    return n;
+}
+
+/// D = round half up of x / 10^s, for x = G_M * 2^-G_K.
+fn round_at(s: i32) -> u64 {
+    if (s <= 0) {
+        bn_from_u64(4, G_M);
+        bn_mul_pow10(4, 4, (0 - s) as u32);
+        bn_from_u64(5, 1);
+        bn_shl(5, 5, G_K);
+    } else {
+        bn_from_u64(4, G_M);
+        bn_from_u64(5, 1);
+        bn_shl(5, 5, G_K);
+        bn_mul_pow10(5, 5, s as u32);
+    }
+    bn_shl(6, 4, 1);
+    bn_add(6, 6, 5);
+    bn_shl(7, 5, 1);
+    bn_divmod(8, 9, 6, 7);
+    return bn_u64(8);
+}
+
+/// The shortest digit string that reads back as x: DS[0..DS_N), and DS_E so that x = 0.DS * 10^DS_E.
+fn shortest(x: f64) -> u32 {
+    decompose(x);
+    const mb : u32 = bitlen64(G_M);
+    const q : i64 = (mb as i64) - 1 - (G_K as i64);
+    const is_pow2 : bool = (G_M & (G_M - 1)) == 0;
+    const u2 : i64 = q - 52;
+    const shift : i64 = 0 - (G_K as i64) - u2;
+    const odd_f : bool = shift == 0 and (G_M & 1) == 1;
+    const w : u32 = (2 - u2) as u32;
+    const n10 : i32 = floor_log10();
+    var p : i32 = 1;
+    var found : bool = false;
+    var best_d : u64 = 0;
+    var best_s : i32 = 0;
+    while (p <= 17 and !found) {
+        const s : i32 = n10 - p + 1;
+        const d : u64 = round_at(s);
+        // C * F and x * F with F = 2^k (s >= 0) or 2^k * 10^-s (s < 0)
+        if (s >= 0) {
+            bn_from_u64(6, d);
+            bn_mul_pow10(6, 6, s as u32);
+            bn_shl(6, 6, G_K);
+            bn_from_u64(7, G_M);
+            bn_from_u64(10, 1);
+            bn_shl(10, 10, G_K);
+        } else {
+            bn_from_u64(6, d);
+            bn_shl(6, 6, G_K);
+            bn_from_u64(7, G_M);
+            bn_mul_pow10(7, 7, (0 - s) as u32);
+            bn_from_u64(10, 1);
+            bn_shl(10, 10, G_K);
+            bn_mul_pow10(10, 10, (0 - s) as u32);
+        }
+        var c_gt : bool = false;
+        if (bn_cmp(6, 7) > 0) {
+            c_gt = true;
+            bn_sub(11, 6, 7);
+        } else {
+            bn_sub(11, 7, 6);
+        }
+        bn_shl(11, 11, w);
+        bn_shl(12, 10, 1);
+        var good : bool = false;
+        var c : i32 = 0;
+        if (c_gt or !is_pow2) {
+            c = bn_cmp(11, 12);
+        } else {
+            c = bn_cmp(11, 10);
+        }
+        if (c < 0 or (c == 0 and !odd_f)) { good = true; }
+        if (good) {
+            found = true;
+            best_d = d;
+            best_s = s;
+        }
+        p = p + 1;
+    }
+    // the digits of best_d, trailing zeros dropped; x = 0.digits * 10^(len + s)
+    var tmp : [24]u8 = [0; 24];
+    const len : u32 = dec_to(tmp[0..], best_d);
+    var e : usize = len as usize;
+    while (e > 1 and tmp[e - 1] == 48) { e = e - 1; }
+    var k : usize = 0;
+    while (k < e) { DS[k] = tmp[k]; k = k + 1; }
+    DS_N = e;
+    DS_E = (len as i32) + best_s;
+    return 0;
+}
+
+/// String(x) for a positive finite double (Number::toString).
+fn js_num(o: []u8, n0: u32, x: f64) -> u32 {
+    var n : u32 = n0;
+    if (x == 0.0) { return put(o, n, 48); }
+    shortest(x);
+    const k : i32 = DS_N as i32;
+    const e : i32 = DS_E;
+    if (k <= e and e <= 21) {
+        var i : usize = 0;
+        while (i < DS_N) { n = put(o, n, DS[i]); i = i + 1; }
+        var z : i32 = e - k;
+        while (z > 0) { n = put(o, n, 48); z = z - 1; }
+        return n;
+    }
+    if (0 < e and e <= 21) {
+        var i2 : usize = 0;
+        while (i2 < DS_N) {
+            if ((i2 as i32) == e) { n = put(o, n, 46); }
+            n = put(o, n, DS[i2]);
+            i2 = i2 + 1;
+        }
+        return n;
+    }
+    if (-6 < e and e <= 0) {
+        n = raw(o, n, "0.");
+        var z2 : i32 = 0 - e;
+        while (z2 > 0) { n = put(o, n, 48); z2 = z2 - 1; }
+        var i3 : usize = 0;
+        while (i3 < DS_N) { n = put(o, n, DS[i3]); i3 = i3 + 1; }
+        return n;
+    }
+    n = put(o, n, DS[0]);
+    if (DS_N > 1) {
+        n = put(o, n, 46);
+        var i4 : usize = 1;
+        while (i4 < DS_N) { n = put(o, n, DS[i4]); i4 = i4 + 1; }
+    }
+    n = put(o, n, 101);
+    var ex : i32 = e - 1;
+    if (ex < 0) {
+        n = put(o, n, 45);
+        ex = 0 - ex;
+    } else {
+        n = put(o, n, 43);
+    }
+    return dnum(o, n, ex as u64);
+}
+
+/// x.toFixed(d) for 0 < x < 1e21 and d of 1 or 2.
+fn to_fixed(o: []u8, n0: u32, x: f64, d: u32) -> u32 {
+    decompose(x);
+    bn_from_u64(4, G_M);
+    bn_mul_pow10(4, 4, d);
+    bn_from_u64(5, 1);
+    bn_shl(5, 5, G_K);
+    bn_shl(6, 4, 1);
+    bn_add(6, 6, 5);
+    bn_shl(7, 5, 1);
+    bn_divmod(8, 9, 6, 7);
+    var v : u64 = bn_u64(8);
+    const scale : u64 = pow10_small(d);
+    var n : u32 = dnum(o, n0, v / scale);
+    n = put(o, n, 46);
+    var f : u64 = v % scale;
+    var div : u64 = scale / 10;
+    while (div > 0) {
+        n = put(o, n, ((f / div) as u8) + 48);
+        f = f % div;
+        div = div / 10;
+    }
+    return n;
+}
+
+/// x.toPrecision(2) for 1e-6 <= x < 0.01 (the only range the page reaches): 0.00ab.
+fn to_precision2(o: []u8, n0: u32, x: f64) -> u32 {
+    decompose(x);
+    var e10 : i32 = floor_log10();
+    var d : u64 = round_at(e10 - 1);
+    if (d >= 100) {
+        d = d / 10;
+        e10 = e10 + 1;
+    }
+    var n : u32 = raw(o, n0, "0.");
+    var z : i32 = 0 - e10 - 1;
+    while (z > 0) { n = put(o, n, 48); z = z - 1; }
+    n = put(o, n, ((d / 10) as u8) + 48);
+    return put(o, n, ((d % 10) as u8) + 48);
+}
+
+
+; --- JSON.parse's yes or no -----------------------------------------------------------------------------------------------
+pub const W_BAD : usize = 4294967295;
+
+fn jv_ws(d: []const u8, p0: usize) -> usize {
+    var p : usize = p0;
+    while (p < d.len and (d[p] == 32 or d[p] == 9 or d[p] == 10 or d[p] == 13)) { p = p + 1; }
+    return p;
+}
+
+fn jv_digits(d: []const u8, p0: usize) -> usize {
+    var p : usize = p0;
+    while (p < d.len and d[p] >= 48 and d[p] <= 57) { p = p + 1; }
+    return p;
+}
+
+fn jv_str(d: []const u8, p0: usize) -> usize {
+    var p : usize = p0 + 1;
+    while (p < d.len) {
+        const c : u8 = d[p];
+        if (c == 34) { return p + 1; }
+        if (c < 32) { return W_BAD; }
+        if (c == 92) {
+            if (p + 1 >= d.len) { return W_BAD; }
+            const e : u8 = d[p + 1];
+            if (e == 117) {
+                if (p + 5 >= d.len) { return W_BAD; }
+                var k : usize = 2;
+                while (k < 6) {
+                    const h : u8 = d[p + k];
+                    if (!((h >= 48 and h <= 57) or (h >= 97 and h <= 102) or (h >= 65 and h <= 70))) { return W_BAD; }
+                    k = k + 1;
+                }
+                p = p + 6;
+            } else {
+                if (!(e == 34 or e == 92 or e == 47 or e == 98 or e == 102 or e == 110 or e == 114 or e == 116)) { return W_BAD; }
+                p = p + 2;
+            }
+        } else {
+            p = p + 1;
+        }
+    }
+    return W_BAD;
+}
+
+fn jv_num(d: []const u8, p0: usize) -> usize {
+    var p : usize = p0;
+    if (p < d.len and d[p] == 45) { p = p + 1; }
+    if (p >= d.len) { return W_BAD; }
+    if (d[p] == 48) {
+        p = p + 1;
+    } else {
+        if (d[p] < 49 or d[p] > 57) { return W_BAD; }
+        p = jv_digits(d, p);
+    }
+    if (p < d.len and d[p] == 46) {
+        const q : usize = jv_digits(d, p + 1);
+        if (q == p + 1) { return W_BAD; }
+        p = q;
+    }
+    if (p < d.len and (d[p] == 101 or d[p] == 69)) {
+        var q2 : usize = p + 1;
+        if (q2 < d.len and (d[q2] == 43 or d[q2] == 45)) { q2 = q2 + 1; }
+        const q3 : usize = jv_digits(d, q2);
+        if (q3 == q2) { return W_BAD; }
+        p = q3;
+    }
+    return p;
+}
+
+fn jv_lit(d: []const u8, p: usize, w: []const u8) -> usize {
+    if (p + w.len > d.len) { return W_BAD; }
+    var k : usize = 0;
+    while (k < w.len) {
+        if (d[p + k] != w[k]) { return W_BAD; }
+        k = k + 1;
+    }
+    return p + w.len;
+}
+
+fn jv_val(d: []const u8, p0: usize, depth: u32) -> usize {
+    if (depth > 400) { return W_BAD; }
+    const p : usize = jv_ws(d, p0);
+    if (p >= d.len) { return W_BAD; }
+    const c : u8 = d[p];
+    if (c == 34) { return jv_str(d, p); }
+    if (c == 116) { return jv_lit(d, p, "true"); }
+    if (c == 102) { return jv_lit(d, p, "false"); }
+    if (c == 110) { return jv_lit(d, p, "null"); }
+    if (c == 123) {
+        var q : usize = jv_ws(d, p + 1);
+        if (q < d.len and d[q] == 125) { return q + 1; }
+        while (true) {
+            q = jv_ws(d, q);
+            if (q >= d.len or d[q] != 34) { return W_BAD; }
+            q = jv_str(d, q);
+            if (q == W_BAD) { return W_BAD; }
+            q = jv_ws(d, q);
+            if (q >= d.len or d[q] != 58) { return W_BAD; }
+            q = jv_val(d, q + 1, depth + 1);
+            if (q == W_BAD) { return W_BAD; }
+            q = jv_ws(d, q);
+            if (q >= d.len) { return W_BAD; }
+            if (d[q] == 125) { return q + 1; }
+            if (d[q] != 44) { return W_BAD; }
+            q = q + 1;
+        }
+    }
+    if (c == 91) {
+        var q : usize = jv_ws(d, p + 1);
+        if (q < d.len and d[q] == 93) { return q + 1; }
+        while (true) {
+            q = jv_val(d, q, depth + 1);
+            if (q == W_BAD) { return W_BAD; }
+            q = jv_ws(d, q);
+            if (q >= d.len) { return W_BAD; }
+            if (d[q] == 93) { return q + 1; }
+            if (d[q] != 44) { return W_BAD; }
+            q = q + 1;
+        }
+    }
+    return jv_num(d, p);
+}
+
+fn json_ok(d: []const u8) -> bool {
+    const e : usize = jv_val(d, 0, 0);
+    if (e == W_BAD) { return false; }
+    return jv_ws(d, e) == d.len;
+}
+
+; --- the counting rule ------------------------------------------------------------------------------------------------
+fn hash_key(s: []const u8) -> u64 {
+    var h : u64 = 7;
+    var k : usize = 0;
+    while (k < s.len) {
+        h = (h * 31 + (s[k] as u64)) % 1000000007;
+        k = k + 1;
+    }
+    return h;
+}
+
+/// Add key to set 0 (LUT6 positions) or 1 (slice sites); true when it was new.
+fn set_add(which: u32, key: []const u8) -> bool {
+    var slot : usize = (hash_key(key) % 262144) as usize;
+    var probes : usize = 0;
+    while (probes < 262144) {
+        var e : u32 = HT_S[slot];
+        if (which == 0) { e = HT_L[slot]; }
+        if (e == 0) {
+            var cnt : u32 = NS;
+            if (which == 0) { cnt = NL; }
+            if (cnt >= W_SET_CAP or POOL_N + (key.len as u32) > W_POOL_CAP) { return false; }
+            var k : usize = 0;
+            while (k < key.len) { POOL[(POOL_N as usize) + k] = key[k]; k = k + 1; }
+            if (which == 0) {
+                OFF_L[cnt as usize] = POOL_N;
+                LEN_L[cnt as usize] = key.len as u32;
+                HT_L[slot] = cnt + 1;
+                NL = NL + 1;
+            } else {
+                OFF_S[cnt as usize] = POOL_N;
+                LEN_S[cnt as usize] = key.len as u32;
+                HT_S[slot] = cnt + 1;
+                NS = NS + 1;
+            }
+            POOL_N = POOL_N + (key.len as u32);
+            return true;
+        }
+        var off : u32 = 0;
+        var len : u32 = 0;
+        if (which == 0) {
+            off = OFF_L[(e - 1) as usize];
+            len = LEN_L[(e - 1) as usize];
+        } else {
+            off = OFF_S[(e - 1) as usize];
+            len = LEN_S[(e - 1) as usize];
+        }
+        if (eq_s(POOL[(off as usize)..((off + len) as usize)], key)) { return false; }
+        slot = (slot + 1) % 262144;
+        probes = probes + 1;
+    }
+    return false;
+}
+
+fn clear_sets() -> u32 {
+    var i : usize = 0;
+    while (i < 262144) {
+        HT_L[i] = 0;
+        HT_S[i] = 0;
+        i = i + 1;
+    }
+    NL = 0;
+    NS = 0;
+    POOL_N = 0;
+    return 0;
+}
+
+pub var DRAWN_PKG : u32 = 0;
+pub var M_KEY : i64 = 0;
+pub var M_VAL : i64 = 0;
+
+/// The member of the object ending at hi that starts at p: M_KEY and M_VAL, and the position after it plus one; 0 at the end.
+fn member(d: []const u8, hi: usize, p: usize) -> usize {
+    if (p >= hi or d[p] != 34) { return 0; }
+    const ke : usize = string_end(d, p);
+    if (ke > hi) { return 0; }
+    const q : usize = skip_ws(d, ke);
+    if (q >= hi or d[q] != 58) { return 0; }
+    const v : usize = skip_ws(d, q + 1);
+    const ve : usize = value_end(d, v);
+    if (ve > hi) { return 0; }
+    M_KEY = jspan(p, ke);
+    M_VAL = jspan(v, ve);
+    var np : usize = skip_ws(d, ve);
+    if (np < hi and d[np] == 44) { np = skip_ws(d, np + 1); }
+    return np + 1;
+}
+
+fn starts_any3(t: []const u8, a: []const u8, b: []const u8, c: []const u8) -> bool {
+    return starts_s(t, a) or starts_s(t, b) or starts_s(t, c);
+}
+
+pub var N_LUTX : u64 = 0;
+pub var N_FFX : u64 = 0;
+pub var N_C4 : u64 = 0;
+
+/// One placed cell: type t, bel text.
+fn count_cell(t: []const u8, bel: []const u8) -> u32 {
+    // [site, belName = ''] = bel.split('/')
+    var sl : usize = 0;
+    while (sl < bel.len and bel[sl] != 47) { sl = sl + 1; }
+    const site : []const u8 = bel[0..sl];
+    var bs : usize = sl + 1;
+    var be : usize = bs;
+    if (sl < bel.len) {
+        while (be < bel.len and bel[be] != 47) { be = be + 1; }
+    } else {
+        bs = bel.len;
+        be = bel.len;
+    }
+    const is_lut : bool = eq_s(t, "SLICE_LUTX");
+    const is_ff : bool = eq_s(t, "SLICE_FFX");
+    const is_c4 : bool = eq_s(t, "CARRY4");
+    if (is_lut) { N_LUTX = N_LUTX + 1; }
+    if (is_ff) { N_FFX = N_FFX + 1; }
+    if (is_c4) { N_C4 = N_C4 + 1; }
+    if (is_lut or is_ff or is_c4) { set_add(1, site); }
+    if (is_lut) {
+        // site + '/' + belName[0]  (the text "undefined" when belName is empty)
+        var kn : u32 = raw(KEYB[0..], 0, site);
+        kn = put(KEYB[0..], kn, 47);
+        if (be > bs) {
+            var cl : usize = 1;
+            const c0 : u8 = bel[bs];
+            if (c0 >= 240) { cl = 4; } else { if (c0 >= 224) { cl = 3; } else { if (c0 >= 192) { cl = 2; } } }
+            var q : usize = 0;
+            while (q < cl and bs + q < be) { kn = put(KEYB[0..], kn, bel[bs + q]); q = q + 1; }
+        } else {
+            kn = raw(KEYB[0..], kn, "undefined");
+        }
+        if (kn != OVER) { set_add(0, KEYB[0..(kn as usize)]); }
+    }
+    if (is_ff) { USED[1] = USED[1] + 1; return 0; }
+    if (is_c4) { USED[2] = USED[2] + 1; return 0; }
+    if (starts_any3(t, K_BRAM36_PREFIX[0], K_BRAM36_PREFIX[1], K_BRAM36_PREFIX[2])) { USED[4] = USED[4] + 1; return 0; }
+    if (starts_s(t, K_BRAM18_PREFIX[0]) or starts_s(t, K_BRAM18_PREFIX[1])) { USED[5] = USED[5] + 1; return 0; }
+    if (starts_s(t, K_DSP_PREFIX)) { USED[6] = USED[6] + 1; return 0; }
+    if (eq_s(t, "PAD")) { USED[7] = USED[7] + 1; return 0; }
+    if (eq_s(t, K_BUFG_TYPES[0]) or eq_s(t, K_BUFG_TYPES[1])) { USED[8] = USED[8] + 1; }
+    return 0;
+}
+
+/// The cells of a routed JSON with a NEXTPNR_BEL, counted. Returns how many there were.
+fn count_file(d: []const u8) -> u64 {
+    clear_sets();
+    var i : usize = 0;
+    while (i < 9) { USED[i] = 0; i = i + 1; }
+    N_LUTX = 0;
+    N_FFX = 0;
+    N_C4 = 0;
+    var cells : u64 = 0;
+    const r : i64 = root(d);
+    const mods : i64 = obj_get(d, r, "modules");
+    if (kind(d, mods) != J_OBJECT) { return 0; }
+    const mhi : usize = span_hi(mods);
+    var mp : usize = skip_ws(d, span_lo(mods) + 1);
+    while (mp > 0) {
+        const nm : usize = member(d, mhi, mp);
+        if (nm == 0) { break; }
+        mp = nm - 1;
+        const module : i64 = M_VAL;
+        const cs : i64 = obj_get(d, module, "cells");
+        if (kind(d, cs) == J_OBJECT) {
+            const chi : usize = span_hi(cs);
+            var cp : usize = skip_ws(d, span_lo(cs) + 1);
+            while (true) {
+                const nc : usize = member(d, chi, cp);
+                if (nc == 0) { break; }
+                cp = nc - 1;
+                const c : i64 = M_VAL;
+                const bel : i64 = obj_get(d, obj_get(d, c, "attributes"), "NEXTPNR_BEL");
+                if (kind(d, bel) == J_STRING and str_len(d, bel) > 0) {
+                    cells = cells + 1;
+                    const bl : u32 = jstr_copy(BELB[0..], d, bel);
+                    const ty : i64 = obj_get(d, c, "type");
+                    var tl : u32 = 0;
+                    if (kind(d, ty) == J_STRING) { tl = jstr_copy(TYPB[0..], d, ty); } else { tl = raw(TYPB[0..], 0, "undefined"); }
+                    count_cell(TYPB[0..(tl as usize)], BELB[0..(bl as usize)]);
+                }
+            }
+        }
+        if (nm - 1 >= mhi) { break; }
+    }
+    USED[0] = NL as u64;
+    USED[3] = NS as u64;
+    return cells;
+}
+
+; --- state of the page -----------------------------------------------------------------------------------------------
+fn status_loading() -> u32 {
+    STATUS_N = fin(text(STATUS[0..], 0, SAY_LOADING));
+    return 0;
+}
+
+fn status_text(t: []const u8) -> u32 {
+    STATUS_N = fin(text(STATUS[0..], 0, t));
+    return 0;
+}
+
+fn status_name(t: []const u8) -> u32 {
+    STATUS_N = fin(fill(STATUS[0..], 0, t, FNAME[0..FNAME_N], "", "", 1));
+    return 0;
+}
+
+fn total_of(i: u32) -> u64 {
+    if (i == (K_IOB_ROW as u32)) { return K_PACKAGE_IOB[DRAWN_PKG as usize] as u64; }
+    return K_TOTALS[i as usize] as u64;
+}
+
+/// pctText(u, t): '-' without a total, else the percentage in the page's words.
+fn pct_text(o: []u8, n0: u32, u: u64, t: u64) -> u32 {
+    if (t == 0) { return put(o, n0, 45); }
+    if (u == 0) { return fill(o, n0, SAY_PCT, "0", "", "", 1); }
+    const p : f64 = (100.0 * (u as f64)) / (t as f64);
+    var v : [64]u8 = [0; 64];
+    var vl : u32 = 0;
+    if (p >= 10.0) {
+        vl = to_fixed(v[0..], 0, p, 1);
+    } else {
+        if (p >= 0.01) { vl = to_fixed(v[0..], 0, p, 2); } else { vl = to_precision2(v[0..], 0, p); }
+    }
+    return fill(o, n0, SAY_PCT, v[0..(vl as usize)], "", "", 1);
+}
+
+/// The status line of render(): label, cells, the LUT share.
+fn status_summary() -> u32 {
+    var c : [32]u8 = [0; 32];
+    var p : [64]u8 = [0; 64];
+    const cl : u32 = num_grouped(c[0..], 0, CELLS);
+    const pl : u32 = pct_text(p[0..], 0, USED[0], total_of(0));
+    STATUS_N = fin(fill(STATUS[0..], 0, SAY_SUMMARY, LABEL[0..(LABEL_N as usize)], c[0..(cl as usize)], p[0..(pl as usize)], 3));
+    return 0;
+}
+
+fn do_render() -> u32 {
+    if (!HAS_USED) { return 0; }
+    DRAWN_PKG = PKG;
+    status_summary();
+    return 0;
+}
+
+fn demo_str(dst: []u8, d: []const u8, obj: i64, key: []const u8) -> u32 {
+    const v : i64 = obj_get(d, obj, key);
+    if (kind(d, v) == J_STRING) { return jstr_copy(dst, d, v); }
+    return 0;
+}
+
+/// showDemo()
+fn show_demo() -> u32 {
+    if (!DEMO_OK) { return 0; }
+    const d : []const u8 = DEMO[0..(DEMO_N as usize)];
+    const r : i64 = root(d);
+    const src : i64 = obj_get(d, r, "source");
+    const used : i64 = obj_get(d, r, "used");
+    // state.used is whatever the file holds under "used"; falsy (absent, null, false, 0, "") draws nothing
+    var truthy : bool = false;
+    const uk : u8 = kind(d, used);
+    if (uk == J_OBJECT or uk == J_ARRAY or uk == J_TRUE) { truthy = true; }
+    if (uk == J_STRING and str_len(d, used) > 0) { truthy = true; }
+    if (uk == J_NUMBER and num_f64(d, used) != 0.0) { truthy = true; }
+    var pb : [256]u8 = [0; 256];
+    const pbl : u32 = demo_str(pb[0..], d, src, "part");
+    PKG = 0;
+    var pi : usize = 0;
+    var found : bool = false;
+    while (pi < 2 and !found) {
+        const pk : []const u8 = K_PACKAGES[pi];
+        var s : usize = 0;
+        while (s + pk.len <= (pbl as usize)) {
+            if (eq_s(pb[s..(s + pk.len)], pk)) { found = true; PKG = pi as u32; break; }
+            s = s + 1;
+        }
+        pi = pi + 1;
+    }
+    DEMO_HIDDEN = true;
+    if (!truthy) { return 0; }
+    HAS_USED = true;
+    var i : usize = 0;
+    while (i < 9 and truthy) {
+        USED[i] = 0;
+        const v : i64 = obj_get(d, used, K_ROWS[i]);
+        if (kind(d, v) == J_NUMBER) {
+            const f : f64 = num_f64(d, v);
+            if (f > 0.0) { USED[i] = f as u64; }
+        }
+        i = i + 1;
+    }
+    LABEL_N = demo_str(LABEL[0..], d, src, "top");
+    // cells ?? the sum of nextpnr_util[*][0]
+    const cv : i64 = obj_get(d, r, "cells");
+    const util : i64 = obj_get(d, r, "nextpnr_util");
+    CELLS = 0;
+    if (kind(d, cv) == J_NUMBER) {
+        const cf : f64 = num_f64(d, cv);
+        if (cf > 0.0) { CELLS = cf as u64; }
+    } else {
+        if (kind(d, util) == J_OBJECT) {
+            const uhi : usize = span_hi(util);
+            var up : usize = skip_ws(d, span_lo(util) + 1);
+            while (true) {
+                const nu : usize = member(d, uhi, up);
+                if (nu == 0) { break; }
+                up = nu - 1;
+                const f0 : f64 = num_f64(d, arr_at(d, M_VAL, 0));
+                if (f0 > 0.0) { CELLS = CELLS + (f0 as u64); }
+            }
+        }
+    }
+    // nextpnr's own count for the three BEL kinds
+    var nn : u32 = 0;
+    if (kind(d, util) == J_OBJECT) {
+        const uhi2 : usize = span_hi(util);
+        var up2 : usize = skip_ws(d, span_lo(util) + 1);
+        while (true) {
+            const nu2 : usize = member(d, uhi2, up2);
+            if (nu2 == 0) { break; }
+            up2 = nu2 - 1;
+            const kn : u32 = jstr_copy(KEYB[0..], d, M_KEY);
+            const key : []const u8 = KEYB[0..(kn as usize)];
+            if (eq_s(key, "SLICE_LUTX") or eq_s(key, "SLICE_FFX") or eq_s(key, "CARRY4")) {
+                if (nn > 0) { nn = raw(NEXTPNR[0..], nn, ", "); }
+                nn = raw(NEXTPNR[0..], nn, key);
+                nn = put(NEXTPNR[0..], nn, 32);
+                nn = num_grouped(NEXTPNR[0..], nn, num_f64(d, arr_at(d, M_VAL, 0)) as u64);
+                nn = put(NEXTPNR[0..], nn, 47);
+                nn = num_grouped(NEXTPNR[0..], nn, num_f64(d, arr_at(d, M_VAL, 1)) as u64);
+            }
+        }
+    }
+    NEXTPNR_N = fin(nn);
+    // SOURCE_DEMO: design, part, nextpnr
+    var a : [512]u8 = [0; 512];
+    var c : [256]u8 = [0; 256];
+    const al : u32 = demo_str(a[0..], d, src, "design");
+    const cl : u32 = demo_str(c[0..], d, src, "nextpnr");
+    SRCLINE_N = fin(fill(SRCLINE[0..], 0, SAY_SOURCE_DEMO, a[0..(al as usize)], pb[0..(pbl as usize)], c[0..(cl as usize)], 3));
+    // commands
+    CMD_COUNT = 0;
+    CMDS_N = 0;
+    const cmds : i64 = obj_get(d, src, "commands");
+    const cn : u32 = arr_len(d, cmds);
+    var j : u32 = 0;
+    while (j < cn and CMD_COUNT < 64) {
+        const e : i64 = arr_at(d, cmds, j);
+        if (kind(d, e) == J_STRING) {
+            const room : usize = CMDS.len - (CMDS_N as usize);
+            var len : u32 = str_len(d, e);
+            if ((len as usize) > room) { len = room as u32; }
+            var k : u32 = 0;
+            while (k < len) {
+                CMDS[(CMDS_N + k) as usize] = str_byte(d, e, k);
+                k = k + 1;
+            }
+            CMD_OFF[CMD_COUNT as usize] = CMDS_N;
+            CMD_LEN[CMD_COUNT as usize] = len;
+            CMDS_N = CMDS_N + len;
+            CMD_COUNT = CMD_COUNT + 1;
+        }
+        j = j + 1;
+    }
+    do_render();
+    return 0;
+}
+
+; --- drawing and events ---------------------------------------------------------------------------------------------------
+fn emit_rows(o: []u8, n0: u32) -> u32 {
+    var n : u32 = n0;
+    var i : u32 = 0;
+    while (i < 9) {
+        const u : u64 = USED[i as usize];
+        const t : u64 = total_of(i);
+        var frac : f64 = 0.0;
+        if (t > 0) { frac = (u as f64) / (t as f64); }
+        var ul : [32]u8 = [0; 32];
+        var tl : [32]u8 = [0; 32];
+        const a : u32 = num_grouped(ul[0..], 0, u);
+        const b : u32 = num_grouped(tl[0..], 0, t);
+        var used_of : [96]u8 = [0; 96];
+        const uo : u32 = fin(fill(used_of[0..], 0, SAY_USED_OF, ul[0..(a as usize)], tl[0..(b as usize)], "", 2));
+        n = raw(o, n, "<div class=\"rb-row\" role=\"group\" aria-label=\"");
+        n = text(o, n, SAY_ROW_NAMES[i as usize]);
+        n = raw(o, n, " ");
+        n = text(o, n, used_of[0..(uo as usize)]);
+        n = raw(o, n, "\"><span class=\"rb-name\">");
+        n = text(o, n, SAY_ROW_NAMES[i as usize]);
+        n = raw(o, n, "<small>");
+        n = text(o, n, SAY_ROW_NOTES[i as usize]);
+        n = raw(o, n, "</small></span><span class=\"rb-track\"><span class=\"rb-fill");
+        if (frac > 1.0) {
+            n = raw(o, n, " is-over");
+        } else {
+            if (frac >= 0.02) { n = raw(o, n, " is-big"); }
+        }
+        n = raw(o, n, "\" style=\"width: ");
+        if (u > 0) {
+            var x : f64 = frac * 100.0;
+            if (x > 100.0) { x = 100.0; }
+            n = raw(o, n, "max(");
+            n = dnum(o, n, K_MIN_BAR_PX as u64);
+            n = raw(o, n, "px, ");
+            n = js_num(o, n, x);
+            n = raw(o, n, "%);");
+        } else {
+            n = raw(o, n, "0px;");
+        }
+        n = raw(o, n, "\"></span></span><span class=\"rb-num\">");
+        n = text(o, n, used_of[0..(uo as usize)]);
+        n = raw(o, n, "<b>");
+        var pt : [64]u8 = [0; 64];
+        const pl : u32 = pct_text(pt[0..], 0, u, t);
+        n = text(o, n, pt[0..(pl as usize)]);
+        n = raw(o, n, "</b></span></div>");
+        i = i + 1;
+    }
+    return n;
+}
+
+pub fn w_render(dst: []u8) -> u32 {
+    var n : u32 = raw(dst, 0, "<div class=\"rb-bar\"><span class=\"rb-label\">");
+    n = text(dst, n, SAY_PACKAGE);
+    n = raw(dst, n, "</span>");
+    var i : u32 = 0;
+    while (i < 2) {
+        n = raw(dst, n, "<button class=\"t27-btn\" type=\"button\" aria-pressed=\"");
+        if (PKG == i) { n = raw(dst, n, "true"); } else { n = raw(dst, n, "false"); }
+        n = raw(dst, n, "\">");
+        n = text(dst, n, K_PACKAGES[i as usize]);
+        n = raw(dst, n, "</button>");
+        i = i + 1;
+    }
+    n = raw(dst, n, "<button class=\"t27-btn\" type=\"button\"");
+    if (DEMO_HIDDEN) { n = raw(dst, n, " hidden=\"\""); }
+    n = raw(dst, n, ">");
+    n = text(dst, n, SAY_DEMO);
+    n = raw(dst, n, "</button></div><p class=\"rb-status\" role=\"status\">");
+    var q : u32 = 0;
+    while (q < STATUS_N) { n = put(dst, n, STATUS[q as usize]); q = q + 1; }
+    n = raw(dst, n, "</p><div class=\"rb-bars\">");
+    if (HAS_USED) { n = emit_rows(dst, n); }
+    n = raw(dst, n, "</div><p class=\"rb-note\">");
+    if (HAS_USED and NEXTPNR_N > 0) { n = fill(dst, n, SAY_NEXTPNR_LINE, NEXTPNR[0..(NEXTPNR_N as usize)], "", "", 1); }
+    n = raw(dst, n, "</p><p class=\"rb-note\">");
+    n = text(dst, n, SAY_TOTALS_NOTE);
+    n = raw(dst, n, "</p><label class=\"t27-drop rb-drop");
+    if (DRAGGING) { n = raw(dst, n, " is-over"); }
+    n = raw(dst, n, "\"><input type=\"file\" accept=\".json,application/json\" class=\"rb-file\"><span>");
+    n = text(dst, n, SAY_DROP);
+    n = raw(dst, n, "</span></label><details class=\"rb-how\"");
+    if (HAS_USED and SRCLINE_N == 0) { n = raw(dst, n, " hidden=\"\""); }
+    n = raw(dst, n, ">");
+    if (HAS_USED) {
+        n = raw(dst, n, "<summary>");
+        n = text(dst, n, SAY_COMMANDS);
+        n = raw(dst, n, "</summary><p>");
+        var sq : u32 = 0;
+        while (sq < SRCLINE_N) { n = put(dst, n, SRCLINE[sq as usize]); sq = sq + 1; }
+        n = raw(dst, n, "</p><ul>");
+        var c : u32 = 0;
+        while (c < CMD_COUNT) {
+            n = raw(dst, n, "<li><code>");
+            const off : usize = CMD_OFF[c as usize] as usize;
+            n = text(dst, n, CMDS[off..(off + (CMD_LEN[c as usize] as usize))]);
+            n = raw(dst, n, "</code></li>");
+            c = c + 1;
+        }
+        n = raw(dst, n, "</ul>");
+    }
+    n = raw(dst, n, "</details>");
+    if (!ok(n)) { return 0; }
+    return n;
+}
+
+pub fn w_init(h: []const u8) -> u32 {
+    DEMO_OK = false;
+    DEMO_N = 0;
+    PKG = 0;
+    DRAWN_PKG = 0;
+    HAS_USED = false;
+    LABEL_N = 0;
+    CELLS = 0;
+    NEXTPNR_N = 0;
+    SRCLINE_N = 0;
+    CMD_COUNT = 0;
+    CMDS_N = 0;
+    DEMO_HIDDEN = true;
+    DRAGGING = false;
+    EFF_CLEAR = false;
+    FNAME_N = 0;
+    status_loading();
+    return 0;
+}
+
+pub fn w_data(i: u32, s: []const u8) -> u32 {
+    EFF_CLEAR = false;
+    if (s.len > (W_DEMO_CAP as usize) or !json_ok(s)) {
+        status_text(SAY_ERR_DEMO);
+        return 0;
+    }
+    var k : usize = 0;
+    while (k < s.len) { DEMO[k] = s[k]; k = k + 1; }
+    DEMO_N = s.len as u32;
+    DEMO_OK = true;
+    show_demo();
+    return 0;
+}
+
+pub fn w_data_failed(i: u32) -> u32 {
+    EFF_CLEAR = false;
+    status_text(SAY_ERR_DEMO);
+    return 0;
+}
+
+pub fn w_click(i: u32) -> u32 {
+    EFF_CLEAR = false;
+    if (i < 2) {
+        PKG = i;
+        do_render();
+    }
+    if (i == 2) { show_demo(); }
+    return 0;
+}
+
+/// takeFile, first half: the name, the size check, "Reading ...".
+pub fn w_file(z: u32, name: []const u8, size: u32) -> u32 {
+    EFF_CLEAR = true;
+    var n : usize = name.len;
+    if (n > 1000) { n = 1000; }
+    var k : usize = 0;
+    while (k < n) { FNAME[k] = name[k]; k = k + 1; }
+    FNAME_N = n;
+    FSIZE = size;
+    if (size > W_FILE_CAP) {
+        var mb : [16]u8 = [0; 16];
+        const ml : u32 = dec_to(mb[0..], (W_FILE_CAP / 1048576) as u64);
+        STATUS_N = fin(fill(STATUS[0..], 0, SAY_ERR_SIZE, FNAME[0..FNAME_N], mb[0..(ml as usize)], "", 2));
+        return 0;
+    }
+    status_name(SAY_READING);
+    return 1;
+}
+
+/// takeFile, second half: the bytes arrived.
+pub fn w_file_data(z: u32, s: []const u8) -> u32 {
+    EFF_CLEAR = false;
+    var k : usize = 0;
+    var from : usize = 0;
+    if (s.len >= 3 and s[0] == 239 and s[1] == 187 and s[2] == 191) { from = 3; }
+    if (s.len - from > (W_FILE_CAP as usize)) {
+        status_name(SAY_ERR_JSON);
+        return 0;
+    }
+    k = from;
+    while (k < s.len) { FILE[k - from] = s[k]; k = k + 1; }
+    FILE_N = (s.len - from) as u32;
+    const d : []const u8 = FILE[0..(FILE_N as usize)];
+    if (!json_ok(d)) {
+        status_name(SAY_ERR_JSON);
+        return 0;
+    }
+    var keep : [9]u64 = [0; 9];
+    var ki : usize = 0;
+    while (ki < 9) { keep[ki] = USED[ki]; ki = ki + 1; }
+    const cells : u64 = count_file(d);
+    if (cells == 0) {
+        ki = 0;
+        while (ki < 9) { USED[ki] = keep[ki]; ki = ki + 1; }
+        status_name(SAY_ERR_NO_BELS);
+        return 0;
+    }
+    HAS_USED = true;
+    CELLS = cells;
+    var ln : u32 = 0;
+    while (ln < (FNAME_N as u32) and ln < 1000) { LABEL[ln as usize] = FNAME[ln as usize]; ln = ln + 1; }
+    LABEL_N = ln;
+    var nn : u32 = 0;
+    if (N_LUTX > 0) {
+        nn = raw(NEXTPNR[0..], nn, "SLICE_LUTX ");
+        nn = num_grouped(NEXTPNR[0..], nn, N_LUTX);
+    }
+    if (N_FFX > 0) {
+        if (nn > 0) { nn = raw(NEXTPNR[0..], nn, ", "); }
+        nn = raw(NEXTPNR[0..], nn, "SLICE_FFX ");
+        nn = num_grouped(NEXTPNR[0..], nn, N_FFX);
+    }
+    if (N_C4 > 0) {
+        if (nn > 0) { nn = raw(NEXTPNR[0..], nn, ", "); }
+        nn = raw(NEXTPNR[0..], nn, "CARRY4 ");
+        nn = num_grouped(NEXTPNR[0..], nn, N_C4);
+    }
+    NEXTPNR_N = fin(nn);
+    // SOURCE_FILE: name, size, creator
+    var cr : [512]u8 = [0; 512];
+    var crl : u32 = 0;
+    const cv : i64 = obj_get(d, root(d), "creator");
+    if (kind(d, cv) == J_STRING) { crl = jstr_copy(cr[0..], d, cv); }
+    var sz : [32]u8 = [0; 32];
+    const szl : u32 = num_grouped(sz[0..], 0, FSIZE as u64);
+    SRCLINE_N = fin(fill(SRCLINE[0..], 0, SAY_SOURCE_FILE, FNAME[0..FNAME_N], sz[0..(szl as usize)], cr[0..(crl as usize)], 3));
+    CMD_COUNT = 0;
+    CMDS_N = 0;
+    DEMO_HIDDEN = false;
+    do_render();
+    return 0;
+}
+
+pub fn w_file_failed(z: u32) -> u32 {
+    EFF_CLEAR = false;
+    status_name(SAY_ERR_JSON);
+    return 0;
+}
+
+pub fn w_drag(z: u32, over: u32) -> u32 {
+    EFF_CLEAR = false;
+    const want : bool = over != 0;
+    if (want == DRAGGING) { return 0; }
+    DRAGGING = want;
+    return 1;
+}
+
+pub fn w_drop_root() -> u32 {
+    return 1;
+}
+
+/// The picked file is forgotten at once: the file input is emptied after a pick.
+pub fn w_effect(k: u32, dst: []u8) -> u32 {
+    if (EFF_CLEAR and k == 0) {
+        dst[0] = 118;
+        dst[1] = 0;
+        return 2;
+    }
+    return 0;
+}
+
+/// The splicer follows only the names a module itself mentions. Never called.
+pub fn imports_anchor(o: []u8, s: []const u8) -> u32 {
+    var n : u32 = put(o, 0, 0);
+    n = put_escaped(o, n, 0);
+    n = n + OVER + ((H_LT + H_GT + H_AMP + H_QUOTE + H_APOS + H_SPACE + H_SLASH + H_EQ) as u32);
+    n = n + (name_is(s, 0, 0, s) as u32) + (is_word_byte(0) as u32);
+    n = n + (hex4(s, 0)) + escape_at(s, 0, 0) + cp_utf8_len(0) + (cp_utf8_byte(0, 0) as u32);
+    n = n + (SPAN as u32) + (J_FALSE as u32) + (J_TRUE as u32) + (J_ARRAY as u32);
+    n = n + (key_is(s, 0, 0, s) as u32) + (NO_SPAN as u32);
+    return n;
+}
+
+; --- Tests of the native page ---------------------------------------------------------------------------------------
+; The expected texts are what node prints for the same doubles (String(x), toFixed, toPrecision).
+
+pub var T_OUT : [262144]u8 = [0; 262144];
+pub const W_RES_T : str = "{\"t27\":\"resource-bars/1\",\"source\":{\"design\":\"gHashTag/trinity-fpga fpga/openxc7-synth/trinity_v3_jtaguart.v @ de4ebda367\",\"xdc\":\"fpga/openxc7-synth/jtaguart.xdc\",\"top\":\"trinity_v3_jtaguart\",\"part\":\"xc7a200tfbg676-1\",\"chipdb\":\"xc7a200tfbg676-1.bin\",\"nextpnr\":\"nextpnr-xilinx 0.9.2-107-g7037c948\",\"yosys\":\"yosys 0.67+post b8e7da6f40\",\"commands\":[\"yosys -q -l yosys.log -p \\\"synth_xilinx -flatten -abc9 -arch xc7 -top trinity_v3_jtaguart; write_json synth.json\\\" trinity_v3_jtaguart.v\",\"nextpnr-xilinx --chipdb ~/openxc7-src/chipdb/xc7a200tfbg676-1.bin --xdc jtaguart.xdc --json synth.json --freq 50 --seed 1 --write routed.json --report report.json --sdf routed.sdf --fasm routed.fasm --log nextpnr.log\"],\"when\":\"2026-10-04 17:16 UTC\",\"prjxray_db\":\"517d66a383\"},\"cells\":373,\"used\":{\"LUT\":155,\"FF\":98,\"CARRY4\":23,\"SLICE\":60,\"BRAM36\":0,\"BRAM18\":0,\"DSP48\":0,\"IOB\":5,\"BUFG\":1,\"LUT_CELLS\":239},\"totals\":{\"LUT\":134600,\"FF\":269200,\"CARRY4\":33650,\"SLICE\":33650,\"BRAM36\":365,\"BRAM18\":730,\"DSP48\":740,\"IOB\":400,\"BUFG\":32},\"checks\":{\"slices_chipdb_carry4\":33650,\"slices_prjxray\":33650,\"lutx_bels_chipdb\":269200,\"ffx_bels_chipdb\":269200,\"ramb36_chipdb\":365,\"ramb36_prjxray\":365,\"ramb18_chipdb\":730,\"ramb18_prjxray\":730,\"dsp48_chipdb\":740,\"dsp48_prjxray\":740,\"bufgctrl_chipdb\":32,\"bufgctrl_prjxray\":32,\"pad_chipdb\":1062,\"iob_die_prjxray\":500,\"iob_bonded_package\":400},\"nextpnr_util\":{\"SLICE_LUTX\":[239,269200],\"SLICE_FFX\":[98,269200],\"CARRY4\":[23,33650],\"PSEUDO_GND\":[1,69165],\"PSEUDO_VCC\":[1,69165],\"PAD\":[5,1062],\"IOB33_OUTBUF\":[3,500],\"IOB33_INBUF_EN\":[2,500],\"BUFGCTRL\":[1,32]}}";
+pub const W_SMALL_T : str = "{\"modules\":{\"top\":{\"cells\":{\"a\":{\"type\":\"SLICE_LUTX\",\"attributes\":{\"NEXTPNR_BEL\":\"SLICE_X1Y2/A6LUT\"}},\"b\":{\"type\":\"SLICE_LUTX\",\"attributes\":{\"NEXTPNR_BEL\":\"SLICE_X1Y2/A5LUT\"}},\"c\":{\"type\":\"SLICE_LUTX\",\"attributes\":{\"NEXTPNR_BEL\":\"SLICE_X1Y2/B6LUT\"}},\"d\":{\"type\":\"SLICE_FFX\",\"attributes\":{\"NEXTPNR_BEL\":\"SLICE_X1Y3/AFF\"}},\"e\":{\"type\":\"CARRY4\",\"attributes\":{\"NEXTPNR_BEL\":\"SLICE_X2Y2/CARRY4\"}},\"f\":{\"type\":\"PAD\",\"attributes\":{\"NEXTPNR_BEL\":\"IOB_X0Y1/PAD\"}},\"g\":{\"type\":\"BUFGCTRL\",\"attributes\":{\"NEXTPNR_BEL\":\"BUFGCTRL_X0Y0/BUFGCTRL\"}},\"h\":{\"type\":\"RAMB36E1\",\"attributes\":{\"NEXTPNR_BEL\":\"RAMB36_X0Y0/RAMB36E1\"}},\"i\":{\"type\":\"FIFO18E1\",\"attributes\":{\"NEXTPNR_BEL\":\"RAMB18_X0Y0/RAMB18E1\"}},\"j\":{\"type\":\"DSP48E1\",\"attributes\":{\"NEXTPNR_BEL\":\"DSP48_X0Y0/DSP48E1\"}},\"k\":{\"type\":\"X\",\"attributes\":{}}}}},\"creator\":\"cr<>\"}";
+
+fn contains(s: []const u8, w: []const u8) -> bool {
+    if (w.len > s.len) { return false; }
+    var p : usize = 0;
+    while (p + w.len <= s.len) {
+        if (starts_s(s[p..s.len], w)) { return true; }
+        p = p + 1;
+    }
+    return false;
+}
+
+fn render() -> u32 {
+    return w_render(T_OUT[0..]);
+}
+
+fn has(n: u32, w: []const u8) -> bool {
+    return contains(T_OUT[0..(n as usize)], w);
+}
+
+fn js(x: f64, want: []const u8) -> bool {
+    var b : [64]u8 = [0; 64];
+    const n : u32 = js_num(b[0..], 0, x);
+    return eq_s(b[0..(n as usize)], want);
+}
+
+fn start() -> u32 {
+    w_init("");
+    w_data(0, W_RES_T);
+    return 0;
+}
+
+test shortest_digits_are_what_javascript_prints {
+    assert js(0.0007429420505200594, "0.0007429420505200594");
+    assert js(0.1, "0.1");
+    assert js(0.30000000000000004, "0.30000000000000004");
+    assert js(100.0, "100");
+    assert js(5.0, "5");
+    assert js(0.5, "0.5");
+    assert js(123456789.123, "123456789.123");
+    assert js(1.5e-7, "1.5e-7");
+    assert js(0.3333333333333333, "0.3333333333333333");
+    assert js(0.11515353115727003, "0.11515353115727003");
+    assert js(99.99999999999999, "99.99999999999999");
+    assert js(4.35, "4.35");
+    assert js(0.000001, "0.000001");
+    assert js(0.036404160475482915, "0.036404160475482915");
+    assert js(1.25, "1.25");
+    assert js(3.125, "3.125");
+    assert js(0.06835066864784546, "0.06835066864784546");
+    assert js(0.17830609212481427, "0.17830609212481427");
+}
+
+test percentages_are_rounded_like_toFixed_and_toPrecision_of_the_exact_double {
+    var b : [64]u8 = [0; 64];
+    var n : u32 = to_fixed(b[0..], 0, 12.25, 1);
+    assert eq_s(b[0..(n as usize)], "12.3");
+    n = to_fixed(b[0..], 0, 0.35, 2);
+    assert eq_s(b[0..(n as usize)], "0.35");
+    n = to_fixed(b[0..], 0, 9.995, 2);
+    assert eq_s(b[0..(n as usize)], "9.99");
+    n = to_fixed(b[0..], 0, 99.95, 1);
+    assert eq_s(b[0..(n as usize)], "100.0");
+    n = to_fixed(b[0..], 0, 0.125, 2);
+    assert eq_s(b[0..(n as usize)], "0.13");
+    n = to_fixed(b[0..], 0, 0.375, 2);
+    assert eq_s(b[0..(n as usize)], "0.38");
+    n = to_precision2(b[0..], 0, 0.005);
+    assert eq_s(b[0..(n as usize)], "0.0050");
+    n = to_precision2(b[0..], 0, 0.0052);
+    assert eq_s(b[0..(n as usize)], "0.0052");
+    n = to_precision2(b[0..], 0, 0.00995);
+    assert eq_s(b[0..(n as usize)], "0.010");
+    n = to_precision2(b[0..], 0, 0.00037147102526002974);
+    assert eq_s(b[0..(n as usize)], "0.00037");
+    PKG = 0;
+    n = pct_text(b[0..], 0, 155, 134600);
+    assert eq_s(b[0..(n as usize)], "0.12%");
+    n = pct_text(b[0..], 0, 0, 5);
+    assert eq_s(b[0..(n as usize)], "0%");
+    n = pct_text(b[0..], 0, 5, 0);
+    assert eq_s(b[0..(n as usize)], "-");
+    n = pct_text(b[0..], 0, 1, 269200);
+    assert eq_s(b[0..(n as usize)], "0.00037%");
+    n = pct_text(b[0..], 0, 5, 32);
+    assert eq_s(b[0..(n as usize)], "15.6%");
+}
+
+test json_is_accepted_or_refused_like_JSON_parse {
+    assert json_ok("{}");
+    assert json_ok(" [1, 2.5e-3, -0, \"a\\u00e9\\n\", null, true, false, {\"k\": []}] ");
+    assert json_ok("\"s\"");
+    assert json_ok("0");
+    assert json_ok("") == false;
+    assert json_ok("{") == false;
+    assert json_ok("not json") == false;
+    assert json_ok("[1,]") == false;
+    assert json_ok("{\"a\":1,}") == false;
+    assert json_ok("{a:1}") == false;
+    assert json_ok("01") == false;
+    assert json_ok("1.") == false;
+    assert json_ok("\"\\x\"") == false;
+    assert json_ok("[1] 2") == false;
+    assert json_ok("'a'") == false;
+    assert json_ok("tru") == false;
+}
+
+test the_demo_counts_draw_nine_bars_with_the_totals_and_the_lut_share {
+    start();
+    assert HAS_USED;
+    assert DEMO_HIDDEN;
+    const n : u32 = render();
+    assert has(n, "<p class=\"rb-status\" role=\"status\">trinity_v3_jtaguart: 373 cells, 0.12% of the LUTs</p>");
+    assert has(n, "<div class=\"rb-row\" role=\"group\" aria-label=\"LUT6 155 / 134,600\"><span class=\"rb-name\">LUT6<small>occupied LUT6 positions (A-D per slice)</small></span><span class=\"rb-track\"><span class=\"rb-fill is-big\"") == false;
+    assert has(n, "aria-label=\"LUT6 155 / 134,600\"");
+    assert has(n, "<span class=\"rb-fill\" style=\"width: max(3px, 0.11515601783060922%);\"></span>");
+    assert has(n, "<span class=\"rb-num\">155 / 134,600<b>0.12%</b></span>");
+    assert has(n, "<span class=\"rb-fill is-big\" style=\"width: max(3px, 3.125%);\"></span>");
+    assert has(n, "<span class=\"rb-fill\" style=\"width: 0px;\"></span>");
+    assert has(n, "<p class=\"rb-note\">nextpnr&#39;s own count: SLICE_LUTX 239/269,200, SLICE_FFX 98/269,200, CARRY4 23/33,650</p>");
+    assert has(n, "<details class=\"rb-how\"><summary>How this was made</summary><p>gHashTag/trinity-fpga fpga/openxc7-synth/trinity_v3_jtaguart.v @ de4ebda367 on xc7a200tfbg676-1, placed by nextpnr-xilinx 0.9.2-107-g7037c948</p><ul><li><code>yosys -q -l yosys.log");
+    assert has(n, "<button class=\"t27-btn\" type=\"button\" hidden=\"\">Demo design</button>");
+    assert has(n, "aria-pressed=\"true\">fbg676</button><button class=\"t27-btn\" type=\"button\" aria-pressed=\"false\">fbg484</button>");
+}
+
+test the_package_changes_the_io_total_and_a_failed_demo_says_so {
+    start();
+    w_click(1);
+    var n : u32 = render();
+    assert has(n, "aria-label=\"Bonded IOB 5 / 285\"");
+    assert has(n, "<span class=\"rb-num\">5 / 285<b>1.75%</b></span>");
+    assert has(n, "aria-pressed=\"true\">fbg484</button>");
+    w_click(0);
+    n = render();
+    assert has(n, "aria-label=\"Bonded IOB 5 / 400\"");
+    w_init("");
+    w_data_failed(0);
+    n = render();
+    assert has(n, "role=\"status\">The demo counts did not load.</p>");
+    assert has(n, "<div class=\"rb-bars\"></div><p class=\"rb-note\"></p>");
+    w_init("");
+    w_data(0, "nope");
+    n = render();
+    assert has(n, "role=\"status\">The demo counts did not load.</p>");
+}
+
+test a_routed_json_is_counted_by_the_rule {
+    start();
+    assert w_file(0, "my<1>.json", 1234) == 1;
+    var n : u32 = render();
+    assert has(n, "role=\"status\">Reading my&lt;1&gt;.json...</p>");
+    w_file_data(0, W_SMALL_T);
+    assert USED[0] == 2;
+    assert USED[1] == 1 and USED[2] == 1 and USED[3] == 3 and USED[4] == 1 and USED[5] == 1 and USED[6] == 1 and USED[7] == 1 and USED[8] == 1;
+    assert CELLS == 10;
+    assert N_LUTX == 3;
+    assert EFF_CLEAR == false;
+    n = render();
+    assert has(n, "role=\"status\">my&lt;1&gt;.json: 10 cells, 0.0015% of the LUTs</p>");
+    assert has(n, "<button class=\"t27-btn\" type=\"button\">Demo design</button>");
+    assert has(n, "<p class=\"rb-note\">nextpnr&#39;s own count: SLICE_LUTX 3, SLICE_FFX 1, CARRY4 1</p>");
+    assert has(n, "<p>my&lt;1&gt;.json (1,234 bytes), cr&lt;&gt;</p><ul></ul>");
+    assert has(n, "<span class=\"rb-fill\" style=\"width: max(3px, 0.273972602739726%);\"></span>");
+    w_click(2);
+    n = render();
+    assert has(n, "trinity_v3_jtaguart: 373 cells");
+    assert has(n, "<button class=\"t27-btn\" type=\"button\" hidden=\"\">Demo design</button>");
+}
+
+test files_that_cannot_be_counted_are_named_and_leave_the_bars_alone {
+    start();
+    w_file(0, "a.json", 5);
+    w_file_data(0, "not json");
+    var n : u32 = render();
+    assert has(n, "role=\"status\">a.json is not JSON.</p>");
+    assert has(n, "aria-label=\"LUT6 155 / 134,600\"");
+    w_file(0, "b.json", 2);
+    w_file_data(0, "{}");
+    n = render();
+    assert has(n, "role=\"status\">b.json has no placed cells: no NEXTPNR_BEL attributes. Use the JSON nextpnr writes with --write after routing.</p>");
+    assert USED[0] == 155;
+    assert w_file(0, "big.json", 40000000) == 0;
+    n = render();
+    assert has(n, "role=\"status\">big.json is larger than 32 MB.</p>");
+    w_file_failed(0);
+    n = render();
+    assert has(n, "role=\"status\">big.json is not JSON.</p>");
+}
+
+test dragging_marks_the_drop_zone_and_a_pick_empties_the_file_input {
+    start();
+    assert w_drag(0, 1) == 1;
+    assert w_drag(0, 1) == 0;
+    var n : u32 = render();
+    assert has(n, "<label class=\"t27-drop rb-drop is-over\">");
+    assert w_drag(0, 0) == 1;
+    w_file(0, "a.json", 1);
+    var e : [4]u8 = [0; 4];
+    assert w_effect(0, e[0..]) == 2;
+    assert e[0] == 118 and e[1] == 0;
+    assert w_effect(1, e[0..]) == 0;
+    w_file_data(0, "{}");
+    assert w_effect(0, e[0..]) == 0;
+    assert w_drop_root() == 1;
+}
