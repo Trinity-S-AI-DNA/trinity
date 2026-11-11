@@ -38,7 +38,7 @@ export const TOOL_REQUIRED = {
   CATEGORY: 'str', DATA_SOURCES: 'arr', READS_LOCAL_FILES: 'bool', SENDS_NOTHING: 'bool',
 }
 // The page's own words, from the gallery spec.
-export const PAGE_WORDS = ['TOOL_BRAND', 'TOOL_GALLERY_LINK', 'TOOL_SOURCE_LINK', 'TOOL_DATA_LABEL', 'TOOL_PRIVACY', 'TOOL_PRIVACY_FILES', 'TOOL_NOSCRIPT']
+export const PAGE_WORDS = ['TOOL_BRAND', 'TOOL_GALLERY_LINK', 'TOOL_SOURCE_LINK', 'TOOL_DATA_LABEL', 'TOOL_PRIVACY', 'TOOL_PRIVACY_FILES', 'TOOL_GRADE_PRIVACY', 'TOOL_NOSCRIPT']
 
 // The Russian words of the pages: a contract spec (no Cyrillic) names the bundle that holds them.
 export const RU_SPEC = 'specs/widgets/i18n/widgets-ru.t27'
@@ -205,7 +205,7 @@ export function renderPage(f, g, { specSha, toolSha, cardSha, shared = [], ru = 
 <main id="widget" class="t27-widget-main" aria-live="polite"></main>
 <noscript><p class="t27-widget-noscript">${esc(g.TOOL_NOSCRIPT)}</p></noscript>
 <footer class="t27-widget-foot">
-<p>${esc(f.READS_LOCAL_FILES ? g.TOOL_PRIVACY_FILES : g.TOOL_PRIVACY)}</p>
+<p>${esc(f.SENDS_NOTHING === false ? g.TOOL_GRADE_PRIVACY : f.READS_LOCAL_FILES ? g.TOOL_PRIVACY_FILES : g.TOOL_PRIVACY)}</p>
 <details><summary>${esc(g.TOOL_DATA_LABEL)}</summary><ul>${sources}</ul></details>
 <p><a href="./${esc(f.ID)}.t27" target="_blank" rel="noopener">${esc(g.TOOL_SOURCE_LINK)}</a> &middot; <a href="../../#/queen?tab=widgets" target="_top">${esc(g.TOOL_GALLERY_LINK)}</a></p>
 </footer>
