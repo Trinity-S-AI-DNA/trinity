@@ -140,7 +140,13 @@ export function toolProblems(f, file, root = SITE) {
     if (!String(f[name] ?? '').trim()) p.push(`${file}: ${name} is empty`)
     else if (f[name].length > max) p.push(`${file}: ${name} is ${f[name].length} characters, over ${max}`)
   }
-  if (f.SENDS_NOTHING !== true) p.push(`${file}: SENDS_NOTHING must be true; a widget sends the reader's data nowhere`)
+  // A GRADED widget may send the reader's answer to exactly one named road;
+  // anything else still must send nothing.
+  if (f.SENDS_NOTHING !== true && f.SENDS_NOTHING !== false) {
+    p.push(`${file}: SENDS_NOTHING must be true or false`)
+  } else if (f.SENDS_NOTHING === false && (typeof f.GRADE_ROAD !== 'string' || !f.GRADE_ROAD.trim())) {
+    p.push(`${file}: SENDS_NOTHING false requires GRADE_ROAD, the one road the answer takes`)
+  }
   if (!f.DATA_SOURCES?.length || f.DATA_SOURCES.some((s) => !s.trim())) p.push(`${file}: DATA_SOURCES must name where every number came from`)
   const dir = `public/widgets/${f.ID}`
   const tool = join(root, dir, 'tool.js')
