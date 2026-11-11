@@ -144,7 +144,7 @@ export function toolProblems(f, file, root = SITE) {
   // anything else still must send nothing.
   if (f.SENDS_NOTHING !== true && f.SENDS_NOTHING !== false) {
     p.push(`${file}: SENDS_NOTHING must be true or false`)
-  } else if (f.SENDS_NOTHING === false && (typeof f.GRADE_ROAD !== 'string' || !f.GRADE_ROAD.trim())) {
+  } else if (f.SENDS_NOTHING === false && (typeof f.K_GRADE_ROAD !== 'string' || !f.GRADE_ROAD.trim())) {
     p.push(`${file}: SENDS_NOTHING false requires GRADE_ROAD, the one road the answer takes`)
   }
   if (!f.DATA_SOURCES?.length || f.DATA_SOURCES.some((s) => !s.trim())) p.push(`${file}: DATA_SOURCES must name where every number came from`)
