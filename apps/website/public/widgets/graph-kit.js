@@ -26,7 +26,10 @@ css.textContent = `
 .sb2-group{display:flex;gap:4px;align-items:center}
 .sb2-group-label{font:11px sans-serif;color:var(--w-muted)}
 .sb2-btn{font:12px sans-serif;padding:2px 10px;border:1px solid var(--w-line);background:var(--w-panel);color:var(--w-text);cursor:pointer}
-.sb2-btn.sb2-on{background:var(--w-green);color:var(--w-bg);border-color:var(--w-green)}
+.sb2-btn:hover{border-color:var(--w-text)}
+.sb2-btn:focus-visible{outline:2px solid var(--w-text);outline-offset:1px}
+/* the selected control inverts: field becomes ink, ink becomes field */
+.sb2-btn.sb2-on{background:var(--w-text);color:var(--w-bg);border-color:var(--w-text)}
 .sb2-viewport{touch-action:none;max-width:640px;margin:0 auto;cursor:grab;user-select:none}
 .sb2-viewport:active{cursor:grabbing}
 .sb2 svg{display:block;width:100%;height:auto;aspect-ratio:1}
@@ -37,7 +40,9 @@ css.textContent = `
 .sb2 .sb2-node{cursor:pointer}
 .sb2 .sb2-disc{fill:var(--w-panel);stroke:var(--w-text);stroke-width:1.5}
 .sb2 .sb2-square{fill:var(--w-panel);stroke:var(--w-text);stroke-width:1.5}
-.sb2 .sb2-on .sb2-disc,.sb2 .sb2-on .sb2-square{fill:var(--w-gold);stroke-width:2.5}
+/* the selected node inverts the same way, its label with it */
+.sb2 .sb2-on .sb2-disc,.sb2 .sb2-on .sb2-square{fill:var(--w-text);stroke-width:2.5}
+.sb2 .sb2-on .sb2-label{fill:var(--w-bg)}
 .sb2 .sb2-label{font:bold 11px sans-serif;fill:var(--w-text)}
 .sb2 .sb2-state{font:12px monospace;text-align:center;color:var(--w-muted);margin:8px 0}
 .sb2 .sb2-note{font:12px sans-serif;color:var(--w-muted);max-width:640px;margin:10px auto 0}
