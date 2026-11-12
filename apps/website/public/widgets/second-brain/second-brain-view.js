@@ -6,6 +6,8 @@
 export const KIND = "view-descriptor";
 export const SHAPE_DISC = 1;
 export const SHAPE_SQUARE = 2;
+export const K_VIEW_PADDING_X = 16;
+export const K_VIEW_PADDING_Y = 12;
 export const K_SELECT_BINDING = [4, 0, 3, 0];
 export const MINI_NODE_COUNT = 2;
 export const SAY_MINI_NODE_TITLES = ["One", "Two"];
@@ -30,10 +32,11 @@ export const SAY_VIEW_EDGE_LABELS = ["relates to", "extends", "contrasts", "refe
 // t27c gen-js: a TestBlock was not emitted -- it is checked by the compiler, not by the artifact.
 // t27c gen-js: a TestBlock was not emitted -- it is checked by the compiler, not by the artifact.
 // t27c gen-js: a TestBlock was not emitted -- it is checked by the compiler, not by the artifact.
+// t27c gen-js: a TestBlock was not emitted -- it is checked by the compiler, not by the artifact.
 
 // Declaration order, which the spec's own laws depend on.
 export const __STRUCT_ORDER__ = [];
-export const __DECL_ORDER__ = ["KIND", "SHAPE_DISC", "SHAPE_SQUARE", "K_SELECT_BINDING", "MINI_NODE_COUNT", "SAY_MINI_NODE_TITLES", "K_MINI_NODE_X", "K_MINI_NODE_Y", "K_MINI_NODE_SHAPES", "K_MINI_EDGE_COUNT", "K_MINI_EDGE_SRC", "K_MINI_EDGE_DST", "SAY_MINI_EDGE_LABELS", "VIEW_NODE_COUNT", "SAY_VIEW_NODE_TITLES", "SAY_VIEW_NODE_KINDS", "K_VIEW_NODE_SHAPES", "K_VIEW_NODE_X", "K_VIEW_NODE_Y", "VIEW_EDGE_COUNT", "K_VIEW_EDGE_SRC", "K_VIEW_EDGE_DST", "SAY_VIEW_EDGE_LABELS"];
+export const __DECL_ORDER__ = ["KIND", "SHAPE_DISC", "SHAPE_SQUARE", "K_VIEW_PADDING_X", "K_VIEW_PADDING_Y", "K_SELECT_BINDING", "MINI_NODE_COUNT", "SAY_MINI_NODE_TITLES", "K_MINI_NODE_X", "K_MINI_NODE_Y", "K_MINI_NODE_SHAPES", "K_MINI_EDGE_COUNT", "K_MINI_EDGE_SRC", "K_MINI_EDGE_DST", "SAY_MINI_EDGE_LABELS", "VIEW_NODE_COUNT", "SAY_VIEW_NODE_TITLES", "SAY_VIEW_NODE_KINDS", "K_VIEW_NODE_SHAPES", "K_VIEW_NODE_X", "K_VIEW_NODE_Y", "VIEW_EDGE_COUNT", "K_VIEW_EDGE_SRC", "K_VIEW_EDGE_DST", "SAY_VIEW_EDGE_LABELS"];
 
 // What this spec holds and this backend did not print. Empty is the whole
 // story most of the time; an entry here is a promise the artifact does not

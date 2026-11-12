@@ -19,6 +19,7 @@ import {
   K_MINI_EDGE_SRC, K_MINI_EDGE_DST, SAY_MINI_EDGE_LABELS,
   SAY_VIEW_NODE_TITLES, SAY_VIEW_NODE_KINDS, K_VIEW_NODE_SHAPES, K_VIEW_NODE_X, K_VIEW_NODE_Y,
   K_VIEW_EDGE_SRC, K_VIEW_EDGE_DST, SAY_VIEW_EDGE_LABELS,
+  K_VIEW_PADDING_X, K_VIEW_PADDING_Y,
 } from './second-brain-view.js'
 
 const W = window.T27_WIDGET || {}
@@ -62,6 +63,7 @@ let mode = viewModes[0]
 const view = graphView(root, {
   nodes, edges, state, transitions: T, kindNames,
   ops: { toggle: viewToggleSelected, zoomIn: viewZoomIn, zoomOut: viewZoomOut },
+  paddingX: Number(K_VIEW_PADDING_X), paddingY: Number(K_VIEW_PADDING_Y),
   note: W.SAY_NOTE, mode: () => mode,
 })
 

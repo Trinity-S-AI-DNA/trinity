@@ -94,7 +94,7 @@ export function applyEvent(state, rows, eventId, payload, ops) {
     const key = keys[field]
     if (op === 1) state[key] = 0
     else if (op === 2) state[key] = (arg === 0 ? payload : arg)
-    else if (op === 3) state[key] = ops.toggle(state[key] ?? 255, payload ?? 0)
+    else if (op === 3) state[key] = ops.toggle(toModel(state[key]), payload ?? 0)
     else if (op === 4) {
       const factor = arg || payload
       state[key] = factor >= 1000
@@ -103,8 +103,23 @@ export function applyEvent(state, rows, eventId, payload, ops) {
     }
     else if (op === 5) { const d = Array.isArray(payload) ? payload[panIdx] : payload; state[key] += d; panIdx++ }
   }
-  if (state.selected === 255) state.selected = null
+  state.selected = toHost(state.selected)
   return state
+}
+
+// --- The model boundary, as named conversions rather than bare literals -------
+// The spec's state is u16 and says `255 = none`; the host says `null`. Every
+// crossing is one of these two functions, and stateBoundaryTest asserts both
+// directions round-trip, so the two forms can never drift apart silently.
+const NONE_IN_MODEL = 255
+const toModel = (v) => (v == null ? NONE_IN_MODEL : v)
+const toHost = (v) => (v === NONE_IN_MODEL ? null : v)
+
+/** Both directions of the 255/null boundary, asserted. True when they hold. */
+export function stateBoundaryTest() {
+  return toHost(toModel(null)) === null
+    && toModel(toHost(NONE_IN_MODEL)) === NONE_IN_MODEL
+    && toModel(2) === 2 && toHost(2) === 2
 }
 
 /**
@@ -113,7 +128,8 @@ export function applyEvent(state, rows, eventId, payload, ops) {
  * names the filter indexes; transitions is the spec's flat row table. Returns {event, applyTheme,
  * draw} — the widget's whole control surface: every change goes through event(), never around it.
  */
-export function graphView(rootEl, { nodes, edges, state, mode, kindNames, transitions, ops, onChange, note }) {
+export function graphView(rootEl, { nodes, edges, state, mode, kindNames, transitions, ops, onChange, note, paddingX, paddingY }) {
+  const options = { paddingX, paddingY }
   rootEl.classList.add('sb2')
 
   const viewport = el('div', 'sb2-viewport')
@@ -169,13 +185,52 @@ export function graphView(rootEl, { nodes, edges, state, mode, kindNames, transi
   const visible = (n) => state.filter === 0 || n.kind === kindNames[state.filter]
   const edgeVisible = (e) => state.filter === 0 || nodes[e.src].kind === kindNames[state.filter] || nodes[e.dst].kind === kindNames[state.filter]
 
+  // Label metrics: the one measurement the host makes. The graph's coordinates,
+  // shapes and the padding that keeps text off the border all come from the
+  // descriptor; the host only turns "this text + this padding" into a node big
+  // enough for both -- the font is never shrunk to fit a fixed node.
+  const canvas = document.createElement('canvas')
+  const measure = (text) => {
+    const ctx = canvas.getContext('2d')
+    ctx.font = 'bold 11px sans-serif'
+    return { w: ctx.measureText(text).width, h: 11 }
+  }
+  const PAD_X = Number(options.paddingX ?? 16)
+  const PAD_Y = Number(options.paddingY ?? 12)
+  if (!(PAD_X >= 0 && PAD_Y >= 0)) throw new Error('graphView: padding must be non-negative graph distances')
+  // A node is at least its label box plus the descriptor's padding, on both
+  // axes. A disc must clear the label's corners, so its radius is that box's
+  // far corner plus padding -- the circular border, not just the text width.
+  // Selection adds a visual ring margin; the padding stays true underneath.
+  const sizeOf = (n, shape, on) => {
+    const { w, h } = measure(n.title)
+    if (shape === 'square') return { kind: 'square', w: Math.ceil(w + PAD_X * 2), h: Math.ceil(h + PAD_Y * 2), on }
+    return { kind: 'disc', r: Math.ceil(Math.hypot(w / 2 + PAD_X, h / 2 + PAD_Y)) + (on ? 4 : 0) }
+  }
+  // Edges attach to the borders the sizes produced: each endpoint is pulled
+  // back from the node centre to that node's boundary along the edge direction.
+  const boundary = (i, towards) => {
+    const p = POS[i]
+    const dx = towards.x - p.x
+    const dy = towards.y - p.y
+    const len = Math.hypot(dx, dy) || 1
+    const s = sizeOf(nodes[i], SHAPE_OF(nodes[i]), false)
+    const reach = s.kind === 'disc' ? s.r : Math.hypot(s.w, s.h) / 2
+    return { x: p.x + (dx * reach) / len, y: p.y + (dy * reach) / len }
+  }
+
   function nodeG(i, shape) {
     const on = state.selected === i
     const p = POS[i]
+    const s = sizeOf(nodes[i], shape, on)
     const g = sv('g', { class: 'sb2-node' + (on ? ' sb2-on' : ''), role: 'button', 'aria-label': nodes[i].title })
-    if (shape === 'square') g.append(sv('rect', { x: p.x - 12, y: p.y - 12, width: 24, height: 24, class: 'sb2-square' }))
-    else g.append(sv('circle', { cx: p.x, cy: p.y, r: on ? 26 : 20, class: 'sb2-disc' }))
-    g.append(sv('text', { x: p.x, y: p.y + (shape === 'square' ? 26 : 4), 'text-anchor': 'middle', class: 'sb2-label' }, nodes[i].title))
+    if (s.kind === 'square') {
+      g.append(sv('rect', { x: p.x - s.w / 2, y: p.y - s.h / 2, width: s.w, height: s.h, class: 'sb2-square' }))
+      g.append(sv('text', { x: p.x, y: p.y, 'text-anchor': 'middle', 'dominant-baseline': 'central', class: 'sb2-label' }, nodes[i].title))
+    } else {
+      g.append(sv('circle', { cx: p.x, cy: p.y, r: s.r, class: 'sb2-disc' }))
+      g.append(sv('text', { x: p.x, y: p.y, 'text-anchor': 'middle', 'dominant-baseline': 'central', class: 'sb2-label' }, nodes[i].title))
+    }
     g.addEventListener('click', () => view.event(4, i))
     return g
   }
@@ -187,8 +242,8 @@ export function graphView(rootEl, { nodes, edges, state, mode, kindNames, transi
     inner.replaceChildren(sv('title', {}, `${nodes.length} nodes, ${edges.length} edges, mode ${m}`))
     for (const e of edges) {
       if (!edgeVisible(e)) continue
-      const a = POS[e.src]
-      const b = POS[e.dst]
+      const a = boundary(e.src, POS[e.dst])
+      const b = boundary(e.dst, POS[e.src])
       inner.append(sv('line', {
         x1: a.x, y1: a.y, x2: b.x, y2: b.y,
         class: 'sb2-edge' + (m === 'squares' ? ' sb2-edge-quiet' : ''),

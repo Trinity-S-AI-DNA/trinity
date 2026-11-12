@@ -56,7 +56,12 @@ test case {
     return { kind: 'value', value: expected }
   } catch (e) {
     const out = String(e.stderr || '') + String(e.stdout || '')
-    if (/signal ABRT/.test(out)) return { kind: 'trap' }
+    // A trap case passes the reference side only when the diagnostic names the
+    // arithmetic cause: t27 aborts a width overflow with `panic: integer
+    // overflow`. A bare ABRT from any other cause (bad spec, missing import)
+    // is an error, not a trap.
+    if (/signal ABRT/.test(out) && /panic: integer overflow/.test(out)) return { kind: 'trap', detail: 'panic: integer overflow' }
+    if (/signal ABRT/.test(out)) return { kind: 'error', detail: out.split('\n').find((l) => l.trim()) || 'ABRT without an overflow diagnostic' }
     return { kind: 'error', detail: out.split('\n').find((l) => l.trim()) || 'unknown reference failure' }
   }
 }
@@ -82,7 +87,7 @@ for (const [input, expected] of CASES) {
   // Kind match first, then the value. A reference build error is never a trap.
   const ok = ref.kind === got.kind && (ref.kind !== 'value' || String(ref.value) === String(got.value))
   if (!ok) failures++
-  console.log(`${ok ? 'PASS' : 'FAIL'} zoom_in(${input}): reference ${ref.kind}${ref.kind === 'value' ? ' ' + ref.value : ''}${ref.kind === 'error' ? ` (${ref.detail})` : ''} | generated ${got.kind}${got.kind === 'value' ? ' ' + got.value : ''}`)
+  console.log(`${ok ? 'PASS' : 'FAIL'} zoom_in(${input}): reference ${ref.kind}${ref.kind === 'value' ? ' ' + ref.value : ''}${ref.detail ? ` [${ref.detail}]` : ''} | generated ${got.kind}${got.kind === 'value' ? ' ' + got.value : ''}`)
 }
 
 rmSync(tmp, { recursive: true, force: true })
