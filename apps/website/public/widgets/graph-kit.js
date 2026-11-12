@@ -7,7 +7,15 @@
 // element and consumes the app's --w-* semantic tokens, it owns no palette values. Switching a
 // theme restyles every screen that reads the tokens and never touches data or interaction state.
 // Trusted kit: changes to this file go through review on their own, like dsp-kit.js and hive-kit.js.
-import { el } from './dsp-kit.js'
+// This kit's own el(tag, className, text). dsp-kit's el(tag, attrs, ...kids) has a different
+// second argument; re-exporting it here made every .sb2-* class silently drop (a string attrs
+// turns into junk attributes), and the graph drew black-on-black. Do not swap them again.
+const el = (tag, cls, text) => {
+  const n = document.createElement(tag)
+  if (cls) n.className = cls
+  if (text != null) n.textContent = String(text)
+  return n
+}
 
 const SVG_NS = 'http://www.w3.org/2000/svg'
 export const THEMES = ['slate', 'paper']
