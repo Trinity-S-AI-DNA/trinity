@@ -6,6 +6,7 @@
 // and passes data through. It holds no renderer and no transition rule of its own. Demo data only:
 // nothing is fetched, sent or stored.
 import { el, graphView, applyTheme } from '../graph-kit.js'
+import { view_zoom_in as viewZoomIn, view_zoom_out as viewZoomOut, view_toggle_selected as viewToggleSelected } from './second-brain-logic.js'
 
 const W = window.T27_WIDGET || {}
 const root = document.getElementById('widget')
@@ -29,8 +30,12 @@ const T = W.K_TRANSITIONS || []
 const state = { selected: null, filter: 0, panX: 0, panY: 0, zoomMilli: 1000 }
 let mode = viewModes[0]
 
+// The transition arithmetic is the generated module's (t27c gen-js over
+// second-brain-view-logic.t27); the kit's interpreter only reads the spec's
+// table and calls these. No second copy of the math lives in hand code.
 const view = graphView(root, {
   nodes, edges, state, transitions: T, kindNames,
+  ops: { toggle: viewToggleSelected, zoomIn: viewZoomIn, zoomOut: viewZoomOut },
   note: W.SAY_NOTE, mode: () => mode,
 })
 

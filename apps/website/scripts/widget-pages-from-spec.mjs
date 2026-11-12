@@ -349,6 +349,26 @@ async function main() {
     process.exit(1)
   }
   let targets = tools.flatMap((t) => [[pageOut(t.fields.ID), t.page], [specOut(t.fields.ID), t.publicSpec]])
+  // A generated logic module a slice depends on must be whole: one announced
+  // omission in __NOT_EMITTED__ fails the build here, before any page ships.
+  // The module itself is emitted by `t27c gen-js` over the logic spec; this is
+  // the check that keeps a partial artifact out of the tree.
+  const logicArtifacts = [
+    ['public/widgets/second-brain/second-brain-logic.js', 'specs/widgets/second-brain-view-logic.t27'],
+  ]
+  for (const [artifact, source] of logicArtifacts) {
+    const p = join(SITE, artifact)
+    if (!existsSync(p)) { problems.push(`${source}: its generated module ${artifact} is missing; run t27c gen-js over the spec`) ; continue }
+    const text = readFileSync(p, 'utf8')
+    const m = text.match(/export const __NOT_EMITTED__ = Object\.freeze\(\[([\s\S]*?)\]\)/)
+    if (!m) problems.push(`${artifact}: no __NOT_EMITTED__ record found -- a generated module without one cannot be trusted`)
+    else if (m[1].trim()) problems.push(`${artifact}: __NOT_EMITTED__ holds ${m[1].trim().split('),').length} unlowered declaration(s) from ${source}; the slice refuses a partial module`)
+  }
+  if (problems.length) {
+    console.error(`widget-pages-from-spec: ${problems.length} problem(s)`)
+    for (const p of problems) console.error('  ' + p)
+    process.exit(1)
+  }
   {
     const header = `/* theme.css -- GENERATED from ${themeFile} by scripts/widget-pages-from-spec.mjs; do not edit.\n   widget.css owns the token names; the spec owns the values. */\n`
     const blocks = templateIds.map((id) => {

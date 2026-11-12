@@ -75,7 +75,15 @@ export function applyTheme(_rootEl, id) {
  * in milli), 5 add the payload (a pan payload is [dx, dy], consumed per row in order). Returns the
  * state; the kit renders whatever the table produced. No rule lives here.
  */
-export function applyEvent(state, rows, eventId, payload) {
+export function applyEvent(state, rows, eventId, payload, ops) {
+  // The arithmetic of ops 3 (toggle) and 4 (zoom) is the generated module's
+  // (viewToggleSelected, viewZoomIn, viewZoomOut, viewResetZoom from
+  // second-brain-view-logic.t27 via t27c gen-js): this interpreter only reads
+  // the table and calls. `ops` carries them; without it the ops refuse, so the
+  // kit can never silently fall back to a second, hand copy of the same math.
+  if (!ops || typeof ops.toggle !== 'function' || typeof ops.zoomIn !== 'function' || typeof ops.zoomOut !== 'function') {
+    throw new Error('applyEvent: the generated transition functions are required; this interpreter holds no math of its own')
+  }
   let panIdx = 0
   for (let i = 0; i + 3 < rows.length; i += 4) {
     if (rows[i] !== eventId) continue
@@ -86,8 +94,13 @@ export function applyEvent(state, rows, eventId, payload) {
     const key = keys[field]
     if (op === 1) state[key] = 0
     else if (op === 2) state[key] = (arg === 0 ? payload : arg)
-    else if (op === 3) state[key] = (state[key] === payload ? 255 : payload)
-    else if (op === 4) state[key] = Math.max(300, Math.min(3000, Math.round(state[key] * ((arg || payload) / 1000))))
+    else if (op === 3) state[key] = ops.toggle(state[key] ?? 255, payload ?? 0)
+    else if (op === 4) {
+      const factor = arg || payload
+      state[key] = factor >= 1000
+        ? ops.zoomIn(state[key])
+        : ops.zoomOut(state[key])
+    }
     else if (op === 5) { const d = Array.isArray(payload) ? payload[panIdx] : payload; state[key] += d; panIdx++ }
   }
   if (state.selected === 255) state.selected = null
@@ -100,7 +113,7 @@ export function applyEvent(state, rows, eventId, payload) {
  * names the filter indexes; transitions is the spec's flat row table. Returns {event, applyTheme,
  * draw} — the widget's whole control surface: every change goes through event(), never around it.
  */
-export function graphView(rootEl, { nodes, edges, state, mode, kindNames, transitions, onChange, note }) {
+export function graphView(rootEl, { nodes, edges, state, mode, kindNames, transitions, ops, onChange, note }) {
   rootEl.classList.add('sb2')
 
   const viewport = el('div', 'sb2-viewport')
@@ -172,7 +185,7 @@ export function graphView(rootEl, { nodes, edges, state, mode, kindNames, transi
   }
 
   const view = {
-    event: (id, payload) => { applyEvent(state, transitions, id, payload); render(); onChange?.() },
+    event: (id, payload) => { applyEvent(state, transitions, id, payload, ops); render(); onChange?.() },
     applyTheme: (id) => applyTheme(rootEl, id),
     draw: render,
   }
