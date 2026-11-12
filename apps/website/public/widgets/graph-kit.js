@@ -21,16 +21,17 @@ document.head.appendChild(themeCss)
 const css = document.createElement('style')
 css.textContent = `
 /* structure only: every colour here is an app token, never a palette value */
-.sb2{background:var(--w-panel);color:var(--w-text);padding:12px;border:1px solid var(--w-line)}
-.sb2-head{display:flex;flex-wrap:wrap;gap:10px;justify-content:center;margin-bottom:10px}
+.sb2{background:var(--w-panel);color:var(--w-text);padding:12px;border:1px solid var(--w-line);font-family:var(--sb2-font,sans-serif);font-size:var(--sb2-fz-base,15px);line-height:var(--sb2-lh-base,1.6);max-width:var(--sb2-max-w,480px);margin:0 auto}
+.sb2-head{display:flex;flex-wrap:wrap;gap:var(--sb2-gap,12px);justify-content:center;margin-bottom:10px}
 .sb2-group{display:flex;gap:4px;align-items:center}
-.sb2-group-label{font:11px sans-serif;color:var(--w-muted)}
-.sb2-btn{font:12px sans-serif;padding:2px 10px;border:1px solid var(--w-line);background:var(--w-panel);color:var(--w-text);cursor:pointer}
+.sb2-group-label{font-size:var(--sb2-fz-sm,13px);color:var(--w-muted)}
+/* the pill button: the reference's own .btn-sm scale, inverted when chosen */
+.sb2-btn{font-family:var(--sb2-font,sans-serif);font-size:var(--sb2-fz-btn,12px);letter-spacing:var(--sb2-letter,0);line-height:var(--sb2-btn-lh,1.2);padding:var(--sb2-btn-pad-y,8px) var(--sb2-btn-pad-x,14px);border:1px solid var(--w-line);border-radius:var(--sb2-radius-pill,980px);background:var(--w-panel);color:var(--w-text);cursor:pointer}
 .sb2-btn:hover{border-color:var(--w-text)}
 .sb2-btn:focus-visible{outline:2px solid var(--w-text);outline-offset:1px}
 /* the selected control inverts: field becomes ink, ink becomes field */
 .sb2-btn.sb2-on{background:var(--w-text);color:var(--w-bg);border-color:var(--w-text)}
-.sb2-viewport{touch-action:none;max-width:640px;margin:0 auto;cursor:grab;user-select:none}
+.sb2-viewport{touch-action:none;max-width:100%;margin:0 auto;cursor:grab;user-select:none}
 .sb2-viewport:active{cursor:grabbing}
 .sb2 svg{display:block;width:100%;height:auto;aspect-ratio:1}
 .sb2 .sb2-edge{stroke:var(--w-line);stroke-width:1.5}
@@ -44,8 +45,8 @@ css.textContent = `
 .sb2 .sb2-on .sb2-disc,.sb2 .sb2-on .sb2-square{fill:var(--w-text);stroke-width:2.5}
 .sb2 .sb2-on .sb2-label{fill:var(--w-bg)}
 .sb2 .sb2-label{font:bold 11px sans-serif;fill:var(--w-text)}
-.sb2 .sb2-state{font:12px monospace;text-align:center;color:var(--w-muted);margin:8px 0}
-.sb2 .sb2-note{font:12px sans-serif;color:var(--w-muted);max-width:640px;margin:10px auto 0}
+.sb2 .sb2-state{font-size:var(--sb2-fz-sm,13px);text-align:center;color:var(--w-muted);margin:8px 0}
+.sb2 .sb2-note{font-size:var(--sb2-fz-sm,13px);color:var(--w-muted);max-width:var(--sb2-max-w,480px);margin:10px auto 0}
 `
 document.head.appendChild(css)
 
