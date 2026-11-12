@@ -306,7 +306,12 @@ export async function buildAll({ analyze, root = SITE }) {
   const tools = []
   if (problems.length) return { problems, tools }
   for (const file of toolSpecs(root)) {
-    const out = buildTool({ file, specText: readFileSync(join(root, file), 'utf8'), analyze, gallery: g, root })
+    const specText = readFileSync(join(root, file), 'utf8')
+    // A spec in this directory that is not a widget tool (the theme templates, say) is a sibling
+    // source, not a tool: skip it here and let its own generator step handle it.
+    const kind = constsOf(analyze(specText)).KIND?.value
+    if (typeof kind === 'string' && kind !== TOOL_KIND) continue
+    const out = buildTool({ file, specText, analyze, gallery: g, root })
     problems.push(...out.problems)
     tools.push({ file, ...out })
   }
@@ -322,13 +327,37 @@ async function main() {
   const json = process.argv.includes('--json')
   const analyze = await loadCompiler(readFileSync(join(SITE, WASM)))
   const { problems, tools } = await buildAll({ analyze })
+  // The app-level theme templates: specs/widgets/themes.t27 owns the token values; this emits
+  // public/widgets/theme.css from them and --check guards it like every generated file. A missing
+  // constant or a failing test in the spec fails the run here, not in a hand-edited stylesheet.
+  const themeFile = 'specs/widgets/themes.t27'
+  const themeConsts = Object.fromEntries(Object.entries(constsOf(analyze(readFileSync(join(SITE, themeFile), 'utf8')))).map(([k, v]) => [k, v.value]))
+  const SUFFIXES = ['BG', 'PANEL', 'LINE', 'GREEN', 'GOLD', 'RED', 'TEXT', 'MUTED', 'SUBTLE']
+  const tokenNames = themeConsts.SAY_TOKEN_NAMES
+  const templateIds = themeConsts.SAY_TEMPLATE_IDS
+  if (!Array.isArray(tokenNames) || tokenNames.length !== SUFFIXES.length) problems.push(`${themeFile}: SAY_TOKEN_NAMES must name exactly ${SUFFIXES.length} tokens in widget.css order`)
+  if (!Array.isArray(templateIds) || templateIds.length !== themeConsts.TEMPLATE_COUNT) problems.push(`${themeFile}: SAY_TEMPLATE_IDS must hold TEMPLATE_COUNT ids`)
+  for (const id of Array.isArray(templateIds) ? templateIds : []) {
+    for (const s of SUFFIXES) {
+      const v = themeConsts[`T_${String(id).toUpperCase()}_${s}`]
+      if (typeof v !== 'string' || !v.trim()) problems.push(`${themeFile}: T_${String(id).toUpperCase()}_${s} is missing or empty`)
+    }
+  }
   if (problems.length) {
     console.error(`widget-pages-from-spec: ${problems.length} problem(s)`)
     for (const p of problems) console.error('  ' + p)
     process.exit(1)
   }
-  if (json) { process.stdout.write(JSON.stringify(Object.fromEntries(tools.map((t) => [t.fields.ID, t.fields])), null, 2) + '\n'); return }
-  const targets = tools.flatMap((t) => [[pageOut(t.fields.ID), t.page], [specOut(t.fields.ID), t.publicSpec]])
+  let targets = tools.flatMap((t) => [[pageOut(t.fields.ID), t.page], [specOut(t.fields.ID), t.publicSpec]])
+  {
+    const header = `/* theme.css -- GENERATED from ${themeFile} by scripts/widget-pages-from-spec.mjs; do not edit.\n   widget.css owns the token names; the spec owns the values. */\n`
+    const blocks = templateIds.map((id) => {
+      const idKey = String(id).toUpperCase()
+      const body = tokenNames.map((tok, i) => `  ${tok}: ${themeConsts[`T_${idKey}_${SUFFIXES[i]}`]};`).join('\n')
+      return `html.sb-theme-${id} {\n${body}\n  color-scheme: ${idKey === 'SLATE' ? 'dark' : 'light'};\n}`
+    }).join('\n\n')
+    targets = [...targets, ['public/widgets/theme.css', header + blocks + '\n']]
+  }
   if (check) {
     const stale = targets.filter(([rel, text]) => !existsSync(join(SITE, rel)) || readFileSync(join(SITE, rel), 'utf8') !== text)
     if (stale.length) {
