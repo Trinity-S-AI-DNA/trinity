@@ -26,6 +26,63 @@ import {
 const W = window.T27_WIDGET || {}
 const root = document.getElementById('widget')
 
+// --- Explorer mode: the real spec index over the demo descriptor --------------------
+// The index is a generated artifact (scripts/spec-index.mjs over the pinned
+// compiler's AST). When it is present the page is a spec explorer: search, the
+// spec graph, an inspector. Without it the page falls back to the demo graph --
+// a missing index is a fallback, not a silently empty screen.
+const explorer = { on: false, specs: [], byId: new Map(), query: '' }
+
+async function loadIndex() {
+  try {
+    const res = await fetch('./spec-index.json')
+    if (!res.ok) throw new Error('http ' + res.status)
+    const idx = JSON.parse(await res.text())
+    explorer.on = true
+    explorer.idx = idx
+    // Grid layout, deterministic: the index's own id order, the compiler's data.
+    const cols = 14
+    explorer.specs = idx.specs.map((s, i) => ({
+      title: s.id, kind: s.id.includes('/') ? s.id.split('/')[0] : 'root',
+      shape: s.counts.tests > 0 ? 1 : 2,
+      x: ((i % cols) - cols / 2) * 26,
+      y: (Math.floor(i / cols) - 6) * 26,
+      rec: s,
+    }))
+    explorer.byId = new Map(explorer.specs.map((n) => [n.title, n]))
+  } catch (e) {
+    console.warn('spec-index unavailable, staying on the demo graph:', e.message)
+  }
+}
+
+function explorerGraph() {
+  const q = explorer.query.trim().toLowerCase()
+  const nodes = explorer.specs.filter((n) => !q || n.title.toLowerCase().includes(q))
+  const ids = new Set(nodes.map((n) => n.title))
+  const edges = (explorer.idx.edges || [])
+    .filter((e) => e.type === 'calls' && ids.has(e.from.split('#')[0]) && ids.has(e.to.split('#')[0]))
+    .map((e, i) => ({ src: nodes.findIndex((n) => n.title === e.from.split('#')[0]), dst: nodes.findIndex((n) => n.title === e.to.split('#')[0]), label: 'calls' }))
+    .filter((e) => e.src >= 0 && e.dst >= 0 && e.src !== e.dst)
+  return { nodes, edges }
+}
+
+const searchBox = el('input', 'sb2-search')
+searchBox.placeholder = 'search specs'
+searchBox.addEventListener('input', () => { explorer.query = searchBox.value; if (explorer.on) view.setGraph(explorerGraph().nodes, explorerGraph().edges) })
+const inspector = el('div', 'sb2-inspector')
+
+function showInspector(title) {
+  const rec = explorer.byId.get(title)?.rec
+  if (!rec) { inspector.replaceChildren(); return }
+  const lines = [
+    `module ${rec.module} (sha ${rec.sha256.slice(0, 12)})`,
+    `consts ${rec.counts.consts} | fns ${rec.counts.fns} | tests ${rec.counts.tests} | uses ${rec.counts.uses} | calls ${rec.counts.calls}`,
+    rec.counts.unresolved ? `UNRESOLVED calls: ${rec.counts.unresolved}` : 'no unresolved calls',
+    rec.fns.length ? 'fns: ' + rec.fns.map((f) => `${f.name}@${f.line}`).join(', ') : '',
+  ].filter(Boolean)
+  inspector.replaceChildren(el('pre', 'sb2-inspect', lines.join('\n')))
+}
+
 // --- View data: from the generated view descriptor (second-brain-view.t27 via gen-js) ---
 // Node names, coordinates, shapes, edge endpoints and the selection binding are the
 // descriptor's constants; this file invents none of them. The descriptor is built for the
@@ -68,6 +125,7 @@ const view = graphView(root, {
   paddingX: Number(K_VIEW_PADDING_X), paddingY: Number(K_VIEW_PADDING_Y),
   note: W.SAY_NOTE, mode: () => mode,
 })
+view.onSelect = (i) => { if (explorer.on) showInspector(view.currentNodes()[i]?.title) }
 
 // --- Controls: spec event ids in, kit interpreter does the rest ----------------------
 const head = el('div', 'sb2-head')
@@ -106,3 +164,15 @@ function sync() {
 
 applyTheme(root, themeIds[0])
 sync()
+
+// --- Explorer: real index in, demo graph out ---------------------------------
+loadIndex().then(() => {
+  if (!explorer.on) return
+  root.classList.add('sb2-wide')
+  head.append(searchBox)
+  root.append(inspector)
+  const g = explorerGraph()
+  view.setGraph(g.nodes, g.edges)
+  view.onSelect = (i) => showInspector(view.currentNodes()[i]?.title)
+  searchBox.addEventListener('input', () => { explorer.query = searchBox.value; const gg = explorerGraph(); view.setGraph(gg.nodes, gg.edges) })
+})

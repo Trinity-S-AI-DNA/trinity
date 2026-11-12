@@ -47,6 +47,10 @@ css.textContent = `
 .sb2 .sb2-label{font:bold 11px sans-serif;fill:var(--w-text)}
 .sb2 .sb2-state{font-size:var(--sb2-fz-sm,13px);text-align:center;color:var(--w-muted);margin:8px 0}
 .sb2 .sb2-note{font-size:var(--sb2-fz-sm,13px);color:var(--w-muted);max-width:var(--sb2-max-w,480px);margin:10px auto 0}
+.sb2.sb2-wide{max-width:1200px}
+.sb2-search{font:var(--sb2-fz-btn,12px) var(--sb2-font,sans-serif);padding:var(--sb2-btn-pad-y,8px) var(--sb2-btn-pad-x,14px);border:1px solid var(--w-line);border-radius:var(--sb2-radius-pill,980px);background:var(--w-panel);color:var(--w-text);width:100%;max-width:420px;display:block;margin:0 auto 10px}
+.sb2-search:focus-visible{outline:2px solid var(--w-text);outline-offset:1px}
+.sb2-inspect{font:11px monospace;color:var(--w-muted);background:var(--w-panel);border:1px solid var(--w-line);padding:8px;white-space:pre-wrap;max-height:180px;overflow:auto}
 `
 document.head.appendChild(css)
 
@@ -151,7 +155,9 @@ export function stateBoundaryTest(noneValue) {
  * names the filter indexes; transitions is the spec's flat row table. Returns {event, applyTheme,
  * draw} — the widget's whole control surface: every change goes through event(), never around it.
  */
-export function graphView(rootEl, { nodes, edges, state, mode, kindNames, transitions, ops, geo, onChange, note, paddingX, paddingY }) {
+export function graphView(rootEl, { nodes: initialNodes, edges: initialEdges, state, mode, kindNames, transitions, ops, geo, onChange, note, paddingX, paddingY, onSelect }) {
+  let nodes = initialNodes
+  let edges = initialEdges
   const options = { paddingX, paddingY }
   // The geometry functions and the model's none constant are the generated
   // contract, injected like ops; without them the kit refuses -- it holds no
@@ -178,11 +184,16 @@ export function graphView(rootEl, { nodes, edges, state, mode, kindNames, transi
   // (SHAPE_DISC=1, SHAPE_SQUARE=2): an unknown shape number is a loud error,
   // never a guessed circle.
   const R = 110
-  const POS = nodes.map((n, i) => {
-    if (n.x != null && n.y != null) return { x: n.x, y: n.y }
-    const a = (i / nodes.length) * Math.PI * 2 - Math.PI / 2
-    return { x: Math.cos(a) * R, y: Math.sin(a) * R }
-  })
+  // Recomputed on every render: setGraph swaps the node list, and stale
+  // positions from a previous graph are how explorer nodes ended up undefined.
+  let POS = []
+  const layout = () => {
+    POS = nodes.map((n, i) => {
+      if (n.x != null && n.y != null) return { x: n.x, y: n.y }
+      const a = (i / nodes.length) * Math.PI * 2 - Math.PI / 2
+      return { x: Math.cos(a) * R, y: Math.sin(a) * R }
+    })
+  }
   const SHAPE_OF = (n) => {
     if (n.shape == null) return 'disc'
     if (n.shape === 1) return 'disc'
@@ -275,13 +286,14 @@ export function graphView(rootEl, { nodes, edges, state, mode, kindNames, transi
       g.append(sv('circle', { cx: p.x, cy: p.y, r: s.r, class: 'sb2-disc' }))
       g.append(sv('text', { x: p.x, y: p.y, 'text-anchor': 'middle', 'dominant-baseline': 'central', class: 'sb2-label' }, nodes[i].title))
     }
-    g.addEventListener('click', () => view.event(4, i))
+    g.addEventListener('click', () => { view.onSelect?.(i); view.event(4, i) })
     return g
   }
 
   /** Draw straight into `inner`: a nested <svg> here would open its own viewport at (0,0) of the
    *  outer coordinate space and fall outside the outer viewBox -- an empty graph area. */
   function render() {
+    layout()
     const m = mode()
     inner.replaceChildren(sv('title', {}, `${nodes.length} nodes, ${edges.length} edges, mode ${m}`))
     // The shape each node is drawn with THIS render. Edges must trim to these
@@ -344,6 +356,11 @@ export function graphView(rootEl, { nodes, edges, state, mode, kindNames, transi
     event: (id, payload) => { applyEvent(state, transitions, id, payload, ops); render(); onChange?.() },
     applyTheme: (id) => applyTheme(rootEl, id),
     draw: render,
+    // The explorer rebinding: search and type filters swap the visible graph
+    // without rebuilding the chrome or losing state. Unknown kinds stay the
+    // caller's business; the kit just draws what it is handed.
+    setGraph: (nextNodes, nextEdges) => { nodes = nextNodes; edges = nextEdges; render() },
+    currentNodes: () => nodes,
   }
 
   render()
