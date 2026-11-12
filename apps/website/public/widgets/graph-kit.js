@@ -125,11 +125,30 @@ export function graphView(rootEl, { nodes, edges, state, mode, kindNames, transi
   const noteEl = note ? el('p', 'sb2-note', note) : null
   rootEl.append(viewport, status, ...(noteEl ? [noteEl] : []))
 
+  // A node whose descriptor carries explicit geometry is drawn exactly there;
+  // one without falls back to the shared circle. The SHAPES are the descriptor's
+  // (SHAPE_DISC=1, SHAPE_SQUARE=2): an unknown shape number is a loud error,
+  // never a guessed circle.
   const R = 110
-  const POS = nodes.map((_, i) => {
+  const POS = nodes.map((n, i) => {
+    if (n.x != null && n.y != null) return { x: n.x, y: n.y }
     const a = (i / nodes.length) * Math.PI * 2 - Math.PI / 2
     return { x: Math.cos(a) * R, y: Math.sin(a) * R }
   })
+  const SHAPE_OF = (n) => {
+    if (n.shape == null) return 'disc'
+    if (n.shape === 1) return 'disc'
+    if (n.shape === 2) return 'square'
+    throw new Error(`graphView: node "${n.title}" declares shape ${n.shape}; the descriptor knows 1 (disc) and 2 (square)`)
+  }
+  // The select binding the widget passes must name the node-click event (4) on
+  // the selected field (0) with the toggle op (3): the descriptor and the table
+  // have to agree, and disagreement stops here, loudly.
+  if (nodes.some((n) => n.shape != null) &&
+      !transitions.some((_, i) => i + 3 < transitions.length &&
+        transitions[i] === 4 && transitions[i + 1] === 0 && transitions[i + 2] === 3)) {
+    throw new Error('graphView: the transition table carries no toggle-select binding for node clicks (event 4, field 0, op 3)')
+  }
 
   let drag = null
   viewport.addEventListener('pointerdown', (ev) => {
@@ -178,7 +197,9 @@ export function graphView(rootEl, { nodes, edges, state, mode, kindNames, transi
         x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 - 5, 'text-anchor': 'middle', class: 'sb2-edge-label',
       }, e.label))
     }
-    nodes.forEach((n, i) => { if (visible(n)) inner.append(nodeG(i, m === 'squares' ? 'square' : 'disc')) })
+    // squares-mode shows every node as a square (the mode owns the look);
+    // discs-mode uses each node's descriptor shape, data over guesswork.
+    nodes.forEach((n, i) => { if (visible(n)) inner.append(nodeG(i, m === 'squares' ? 'square' : SHAPE_OF(n))) })
     inner.setAttribute('transform', `translate(${state.panX} ${state.panY}) scale(${state.zoomMilli / 1000})`)
     const sel = state.selected == null ? 'none' : `${state.selected}: ${nodes[state.selected].title}`
     status.textContent = `mode ${m} | selected ${sel} | filter ${kindNames[state.filter]} | zoom ${(state.zoomMilli / 1000).toFixed(2)} | pan ${Math.round(state.panX)},${Math.round(state.panY)}`

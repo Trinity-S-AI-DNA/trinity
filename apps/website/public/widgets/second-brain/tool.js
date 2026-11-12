@@ -13,20 +13,40 @@ import {
   K_TRANSITIONS,
   K_EVENT_THEME, K_EVENT_MODE, K_EVENT_RESET, K_EVENT_FILTER, K_EVENT_NODE, K_EVENT_WHEEL, K_EVENT_PAN,
 } from './second-brain-logic.js'
+import {
+  K_SELECT_BINDING,
+  SAY_MINI_NODE_TITLES, K_MINI_NODE_X, K_MINI_NODE_Y, K_MINI_NODE_SHAPES,
+  K_MINI_EDGE_SRC, K_MINI_EDGE_DST, SAY_MINI_EDGE_LABELS,
+  SAY_VIEW_NODE_TITLES, SAY_VIEW_NODE_KINDS, K_VIEW_NODE_SHAPES, K_VIEW_NODE_X, K_VIEW_NODE_Y,
+  K_VIEW_EDGE_SRC, K_VIEW_EDGE_DST, SAY_VIEW_EDGE_LABELS,
+} from './second-brain-view.js'
 
 const W = window.T27_WIDGET || {}
 const root = document.getElementById('widget')
 
-// --- Data: straight from the spec's constants --------------------------------------
-const nodes = (W.SAY_NODE_TITLES || []).map((title, i) => ({
+// --- View data: from the generated view descriptor (second-brain-view.t27 via gen-js) ---
+// Node names, coordinates, shapes, edge endpoints and the selection binding are the
+// descriptor's constants; this file invents none of them. The descriptor is built for the
+// full graph; the MINI descriptor (same module) is the two-node vertical example.
+const nodes = (SAY_VIEW_NODE_TITLES || []).map((title, i) => ({
   title,
-  kind: (W.SAY_NODE_KINDS || [])[i] || 'concept',
+  kind: (SAY_VIEW_NODE_KINDS || [])[i] || 'concept',
+  x: Number((K_VIEW_NODE_X || [])[i]),
+  y: Number((K_VIEW_NODE_Y || [])[i]),
+  shape: Number((K_VIEW_NODE_SHAPES || [])[i]),
 }))
-const edges = (W.K_EDGE_SRC || []).map((src, i) => ({
+const edges = (K_VIEW_EDGE_SRC || []).map((src, i) => ({
   src: Number(src),
-  dst: Number((W.K_EDGE_DST || [])[i]),
-  label: (W.SAY_EDGE_LABELS || [])[i] || '',
+  dst: Number((K_VIEW_EDGE_DST || [])[i]),
+  label: (SAY_VIEW_EDGE_LABELS || [])[i] || '',
 }))
+// The descriptor's own binding must be a row of the transition table; a view
+// whose select binding the table does not carry is refused here, loudly.
+const bindingKnown = K_TRANSITIONS.some((_, i) =>
+  i + 3 < K_TRANSITIONS.length &&
+  K_TRANSITIONS[i] === K_SELECT_BINDING[0] && K_TRANSITIONS[i + 1] === K_SELECT_BINDING[1] &&
+  K_TRANSITIONS[i + 2] === K_SELECT_BINDING[2] && K_TRANSITIONS[i + 3] === K_SELECT_BINDING[3])
+if (!bindingKnown) throw new Error('the view descriptor binds an event the transition table does not carry')
 const viewModes = W.SAY_VIEW_MODES || ['discs', 'squares']
 const themeIds = W.SAY_THEME_IDS || ['slate', 'paper']
 const kindNames = ['all', ...new Set(nodes.map((n) => n.kind))]

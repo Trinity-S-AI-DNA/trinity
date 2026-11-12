@@ -307,9 +307,13 @@ export async function buildAll({ analyze, root = SITE }) {
   if (problems.length) return { problems, tools }
   for (const file of toolSpecs(root)) {
     const specText = readFileSync(join(root, file), 'utf8')
-    // A spec in this directory that is not a widget tool (the theme templates, say) is a sibling
-    // source, not a tool: skip it here and let its own generator step handle it.
-    const kind = constsOf(analyze(specText)).KIND?.value
+    // A spec in this directory that is not a widget tool (the view descriptors, say) is a
+    // sibling source, not a tool: skip it here and let its own generator step handle it.
+    // KIND is read off its const node directly -- constsOf would evaluate the whole spec,
+    // and a logic spec's test blocks hold calls and identifiers it refuses.
+    const analysis = analyze(specText)
+    const kindNode = analysis.ast?.children?.find((n) => n.kind === 'ConstDecl' && n.name === 'KIND')
+    const kind = kindNode ? String(kindNode.children?.[0]?.value ?? '') : undefined
     if (typeof kind === 'string' && kind !== TOOL_KIND) continue
     const out = buildTool({ file, specText, analyze, gallery: g, root })
     problems.push(...out.problems)
@@ -355,9 +359,26 @@ async function main() {
   // the check that keeps a partial artifact out of the tree.
   const logicArtifacts = [
     ['public/widgets/second-brain/second-brain-logic.js', 'specs/widgets/second-brain-view-logic.t27'],
+    ['public/widgets/second-brain/second-brain-view.js', 'specs/widgets/second-brain-view.t27'],
   ]
   const { execFileSync } = await import('node:child_process')
-  const t27c = process.env.T27C || '/Users/playra/t27/target/release/t27c'
+  const { createHash } = await import('node:crypto')
+  const manifest = JSON.parse(readFileSync(new URL('./t27c-manifest.json', import.meta.url), 'utf8'))
+  const t27c = manifest.path
+  // Identity, not convenience: the manifest pins the exact binary this slice's
+  // artifacts were generated with (sha256 + compiler commit). Any other t27c
+  // -- a rebuild, a different clone, whatever PATH offers today -- refuses to
+  // run, because a silently different lowering is worse than a failed build.
+  let binaryOk = existsSync(t27c)
+  if (binaryOk) {
+    const digest = createHash('sha256').update(readFileSync(t27c)).digest('hex')
+    if (digest !== manifest.sha256) {
+      problems.push(`t27c at ${t27c} is sha256 ${digest.slice(0, 16)}..., but this slice was generated with ${manifest.sha256.slice(0, 16)}... (compiler commit ${manifest.commit.slice(0, 10)}); rebuild the pinned commit or refresh t27c-manifest.json together with the artifacts`)
+      binaryOk = false
+    }
+  } else {
+    problems.push(`the pinned t27c is missing at ${t27c} (manifest expects sha256 ${manifest.sha256.slice(0, 16)}..., compiler commit ${manifest.commit.slice(0, 10)})`)
+  }
   for (const [artifact, source] of logicArtifacts) {
     const p = join(SITE, artifact)
     if (!existsSync(p)) { problems.push(`${source}: its generated module ${artifact} is missing; run t27c gen-js over the spec`) ; continue }
@@ -368,11 +389,9 @@ async function main() {
     // Freshness by regenerating, not by trusting the committed bytes: the
     // artifact must equal what the pinned compiler emits from the spec right
     // now. A stale module (spec moved, compiler moved) fails here.
-    try {
+    if (binaryOk) {
       const fresh = execFileSync(t27c, ['gen-js', join(SITE, source)], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })
       if (fresh !== text) problems.push(`${artifact}: does not match a fresh t27c gen-js run over ${source} (compiler ${t27c}); regenerate it`)
-    } catch (e) {
-      problems.push(`${source}: the pinned compiler at ${t27c} failed or is missing (${e.message.split('\n')[0]}); set T27C to the t27c that built this slice`)
     }
   }
   if (problems.length) {
