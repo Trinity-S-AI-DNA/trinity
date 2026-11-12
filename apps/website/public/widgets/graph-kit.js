@@ -37,7 +37,7 @@ css.textContent = `
 .sb2-btn.sb2-on{background:var(--w-green);color:var(--w-bg);border-color:var(--w-green)}
 .sb2-viewport{touch-action:none;max-width:640px;margin:0 auto;cursor:grab;user-select:none}
 .sb2-viewport:active{cursor:grabbing}
-.sb2 svg{display:block;width:100%;height:auto}
+.sb2 svg{display:block;width:100%;height:auto;aspect-ratio:1}
 .sb2 .sb2-edge{stroke:var(--w-line);stroke-width:1.5}
 .sb2 .sb2-edge-quiet{stroke:var(--w-subtle);stroke-dasharray:4 3}
 .sb2 .sb2-edge-label{font:10px sans-serif;fill:var(--w-muted)}
@@ -129,23 +129,24 @@ export function graphView(rootEl, { nodes, edges, state, mode, draw, onChange, n
   /** The two view modes the kit ships: discs with quiet edges, or squares with labelled edges. */
   function render() {
     const m = mode()
-    svg.replaceChildren(sv('title', {}, `${nodes.length} nodes, ${edges.length} edges, mode ${m}`))
+    // Draw straight into `inner`: a nested <svg> here would open its own viewport at (0,0) of the
+    // outer coordinate space and fall outside the outer viewBox -- an empty graph area.
+    inner.replaceChildren(sv('title', {}, `${nodes.length} nodes, ${edges.length} edges, mode ${m}`))
     if (m === 'squares') {
       for (const e of edges) {
         if (!edgeVisible(e)) continue
         const a = POS[e.src], b = POS[e.dst]
-        svg.append(sv('line', { x1: a.x, y1: a.y, x2: b.x, y2: b.y, class: 'sb2-edge sb2-edge-quiet' }))
-        svg.append(sv('text', { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 - 5, 'text-anchor': 'middle', class: 'sb2-edge-label' }, e.label))
+        inner.append(sv('line', { x1: a.x, y1: a.y, x2: b.x, y2: b.y, class: 'sb2-edge sb2-edge-quiet' }))
+        inner.append(sv('text', { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 - 5, 'text-anchor': 'middle', class: 'sb2-edge-label' }, e.label))
       }
     } else {
       for (const e of edges) {
         if (!edgeVisible(e)) continue
         const a = POS[e.src], b = POS[e.dst]
-        svg.append(sv('line', { x1: a.x, y1: a.y, x2: b.x, y2: b.y, class: 'sb2-edge' }))
+        inner.append(sv('line', { x1: a.x, y1: a.y, x2: b.x, y2: b.y, class: 'sb2-edge' }))
       }
     }
-    nodes.forEach((n, i) => { if (visible(n)) svg.append(nodeG(i, m === 'squares' ? 'square' : 'disc')) })
-    inner.replaceChildren(svg)
+    nodes.forEach((n, i) => { if (visible(n)) inner.append(nodeG(i, m === 'squares' ? 'square' : 'disc')) })
     inner.setAttribute('transform', `translate(${state.panX} ${state.panY}) scale(${state.zoom})`)
     const sel = state.selected == null ? 'none' : `${state.selected}: ${nodes[state.selected].title}`
     status.textContent = `mode ${m} | selected ${sel} | filter ${state.filter} | zoom ${state.zoom.toFixed(2)} | pan ${Math.round(state.panX)},${Math.round(state.panY)}`
