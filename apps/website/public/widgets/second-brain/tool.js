@@ -5,7 +5,7 @@
 // kit's mechanical interpreter; this file only maps buttons and browser events to spec event ids
 // and passes data through. It holds no renderer and no transition rule of its own. Demo data only:
 // nothing is fetched, sent or stored.
-import { el, graphView, applyTheme } from '../graph-kit.js'
+import { el, graphView, applyTheme, renderFlow } from '../graph-kit.js'
 import {
   view_zoom_in as viewZoomIn,
   view_zoom_out as viewZoomOut,
@@ -71,16 +71,30 @@ searchBox.placeholder = 'search specs'
 searchBox.addEventListener('input', () => { explorer.query = searchBox.value; if (explorer.on) view.setGraph(explorerGraph().nodes, explorerGraph().edges) })
 const inspector = el('div', 'sb2-inspector')
 
-function showInspector(title) {
+async function showInspector(title) {
   const rec = explorer.byId.get(title)?.rec
   if (!rec) { inspector.replaceChildren(); return }
+  // The flowchart projection: only for specs whose flow was extracted. A spec
+  // with no flow record shows nothing invented -- the empty inspector is the
+  // explicit unknown.
+  try {
+    if (!showInspector.flow) showInspector.flow = JSON.parse(await (await fetch('./flow.json')).text())
+    const f = showInspector.flow
+    renderFlow(inspector, f.flows.filter((x) => title.endsWith(x.spec)), f.obj)
+  } catch (e) {
+    inspector.append(el('p', 'sb2-meta', 'flow unavailable: ' + e.message))
+  }
   const lines = [
     `module ${rec.module} (sha ${rec.sha256.slice(0, 12)})`,
     `consts ${rec.counts.consts} | fns ${rec.counts.fns} | tests ${rec.counts.tests} | uses ${rec.counts.uses} | calls ${rec.counts.calls}`,
     rec.counts.unresolved ? `UNRESOLVED calls: ${rec.counts.unresolved}` : 'no unresolved calls',
     rec.fns.length ? 'fns: ' + rec.fns.map((f) => `${f.name}@${f.line}`).join(', ') : '',
   ].filter(Boolean)
-  inspector.replaceChildren(el('pre', 'sb2-inspect', lines.join('\n')))
+  const pre = el('pre', 'sb2-inspect', lines.join('\n'))
+  inspector.replaceChildren(pre)
+  renderFlow(inspector, [], null) // no-op shape: keeps kit import used for chrome only
+  inspector.querySelectorAll('.sb2-flow').forEach((n) => n.remove()) // renderFlow target is the inspector body below
+  renderFlow(inspector, showInspectorFlows, showInspectorObj)
 }
 
 // --- View data: from the generated view descriptor (second-brain-view.t27 via gen-js) ---

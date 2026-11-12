@@ -360,6 +360,8 @@ async function main() {
   const logicArtifacts = [
     ['public/widgets/second-brain/second-brain-logic.js', 'specs/widgets/second-brain-view-logic.t27'],
     ['public/widgets/second-brain/second-brain-view.js', 'specs/widgets/second-brain-view.t27'],
+    ['public/widgets/second-brain/second-brain-kit.js', 'specs/widgets/second-brain-kit.t27'],
+    ['public/widgets/second-brain/second-brain-flow.js', 'specs/widgets/second-brain-flow.t27'],
   ]
   const { execFileSync } = await import('node:child_process')
   const { createHash } = await import('node:crypto')
@@ -406,7 +408,20 @@ async function main() {
       const body = tokenNames.map((tok, i) => `  ${tok}: ${themeConsts[`T_${idKey}_${SUFFIXES[i]}`]};`).join('\n')
       return `html.sb-theme-${id} {\n${body}\n  color-scheme: ${idKey === 'SLATE' ? 'dark' : 'light'};\n}`
     }).join('\n\n')
-    targets = [...targets, ['public/widgets/theme.css', header + blocks + '\n']]
+    const metrics = [
+      ['--sb2-font', 'SB2_FONT_STACK'], ['--sb2-fz-base', 'SB2_FONT_SIZE_BASE'],
+      ['--sb2-fz-sm', 'SB2_FONT_SIZE_SM'], ['--sb2-fz-btn', 'SB2_FONT_SIZE_BTN'],
+      ['--sb2-letter', 'SB2_LETTER_SPACING'], ['--sb2-radius-pill', 'SB2_RADIUS_PILL'],
+      ['--sb2-btn-pad-y', 'SB2_BTN_PAD_Y'], ['--sb2-btn-pad-x', 'SB2_BTN_PAD_X'],
+      ['--sb2-btn-lh', 'SB2_BTN_LINE_H'], ['--sb2-gap', 'SB2_GAP'],
+      ['--sb2-max-w', 'SB2_MAX_W'], ['--sb2-lh-base', 'SB2_LINE_H_BASE'],
+    ]
+    const metricBlock = '.sb2 {\n' + metrics.map(([tok, key]) => {
+      const v = themeConsts[key]
+      if (typeof v !== 'string' || !v.trim()) problems.push(`${themeFile}: ${key} is missing or empty`)
+      return `  ${tok}: ${v};`
+    }).join('\n') + '\n}\n'
+    targets = [...targets, ['public/widgets/theme.css', header + blocks + '\n' + metricBlock]]
   }
   if (check) {
     const stale = targets.filter(([rel, text]) => !existsSync(join(SITE, rel)) || readFileSync(join(SITE, rel), 'utf8') !== text)

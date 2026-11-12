@@ -41,10 +41,10 @@ let hy = ((label_h / 2) + pad_y);
 return ((hx * hx) + (hy * hy));
 }
 export function square_w(label_w, pad_x) {
-return (label_w + (pad_x * 2));
+return ((label_w + pad_x) + pad_x);
 }
 export function square_h(label_h, pad_y) {
-return (label_h + (pad_y * 2));
+return ((label_h + pad_y) + pad_y);
 }
 export function square_reach_t(hw, hh, dx, dy) {
 if ((dx === 0)) {

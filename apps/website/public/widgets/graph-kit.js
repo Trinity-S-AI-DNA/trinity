@@ -50,6 +50,18 @@ css.textContent = `
 .sb2.sb2-wide{max-width:1200px}
 .sb2-search{font:var(--sb2-fz-btn,12px) var(--sb2-font,sans-serif);padding:var(--sb2-btn-pad-y,8px) var(--sb2-btn-pad-x,14px);border:1px solid var(--w-line);border-radius:var(--sb2-radius-pill,980px);background:var(--w-panel);color:var(--w-text);width:100%;max-width:420px;display:block;margin:0 auto 10px}
 .sb2-search:focus-visible{outline:2px solid var(--w-text);outline-offset:1px}
+/* the GOST 19.701-90 shapes, monochrome: shape carries the meaning, colour none */
+.sb2-gost{display:inline-block;min-height:14px;padding:1px 6px;border:1px solid var(--w-text);color:var(--w-text);font-size:var(--sb2-fz-sm,13px)}
+.sb2-ellipse{border-radius:980px}
+.sb2-diamond{transform:skewX(-18deg)}
+.sb2-diamond>*{display:inline-block;transform:skewX(18deg)}
+.sb2-para{transform:skewX(-12deg)}
+.sb2-para>*{display:inline-block;transform:skewX(12deg)}
+.sb2-rect2{outline:1px solid var(--w-text);outline-offset:-3px}
+.sb2-flow{margin-top:8px;border-top:1px solid var(--w-line);padding-top:6px}
+.sb2-flow table{border-collapse:collapse}
+.sb2-flow td{padding:1px 6px 1px 0;vertical-align:top}
+.sb2-meta{font-size:10px;color:var(--w-muted)}
 .sb2-inspect{font:11px monospace;color:var(--w-muted);background:var(--w-panel);border:1px solid var(--w-line);padding:8px;white-space:pre-wrap;max-height:180px;overflow:auto}
 `
 document.head.appendChild(css)
@@ -137,6 +149,44 @@ const toModel = (v) => {
 const toHost = (v) => {
   if (MODEL_NONE == null) throw new Error('graphView: setModelNone has not been called; the model boundary is unknown')
   return v === MODEL_NONE ? null : v
+}
+
+/**
+ * The GOST 19.701-90 projection of extracted flows: one table per flow, one row
+ * per node (shape by kind: oval terminator, rect process, diamond decision,
+ * parallelogram io, double-bordered call), then the edges with their branches.
+ * Generic: it renders whatever extracted flows it is handed and invents none.
+ */
+export function renderFlow(container, flows, obj) {
+  const shapes = { entry: ['sb2-ellipse'], exit: ['sb2-ellipse'], action: ['sb2-rect'], call: ['sb2-rect2'], decision: ['sb2-diamond'], io: ['sb2-para'], loop: ['sb2-rect'], error: ['sb2-rect'] }
+  for (const fl of flows) {
+    const box = h('div', 'sb2-flow')
+    box.append(h('b', null, fl.fn))
+    const table = h('table')
+    for (const nd of fl.nodes ?? []) {
+      const tr = h('tr')
+      const cls = (shapes[nd.kind] || shapes.action)[0]
+      const shape = h('span', `sb2-gost ${cls}`, nd.label)
+      const td1 = h('td')
+      td1.append(shape)
+      tr.append(td1, h('td', 'sb2-meta', `${nd.kind}${nd.line != null ? ' @' + nd.line : ''}`))
+      table.append(tr)
+    }
+    for (const e of fl.edges ?? []) {
+      const tr = h('tr')
+      tr.append(h('td', 'sb2-meta', `-> ${e.branch || 'next'}${e.kind !== 'normal' ? ' (' + e.kind + ')' : ''}`))
+      tr.append(h('td', 'sb2-meta', `${e.from} -> ${e.to}`))
+      table.append(tr)
+    }
+    box.append(table)
+    container.append(box)
+  }
+  if (obj?.exists) {
+    const box = h('div', 'sb2-flow')
+    box.append(h('b', null, `.o (${obj.symbols.length} symbols)`))
+    box.append(h('span', 'sb2-meta', 'unknown in .o: ' + (obj.unknown ?? []).join(', ')))
+    container.append(box)
+  }
 }
 
 /** Both directions of the none boundary, asserted for a given contract value. */
