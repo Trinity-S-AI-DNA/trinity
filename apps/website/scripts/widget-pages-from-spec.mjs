@@ -37,6 +37,15 @@ export const TOOL_REQUIRED = {
   KIND: 'str', ID: 'str', TITLE: 'str', DESCRIPTION: 'str', IMAGE_ALT: 'str', HOOK: 'str',
   CATEGORY: 'str', DATA_SOURCES: 'arr', READS_LOCAL_FILES: 'bool', SENDS_NOTHING: 'bool',
 }
+// Named debt: these tools predate the render-through-a-shared-kit rule and still write their own
+// SVG in tool.js. The rule holds for every new tool; each of these moves to dsp-kit, hive-kit or
+// graph-kit in its own review, and leaves this list one by one. Adding an id here is an edit to
+// this hand-owned generator script, visible in the diff and gated by PR review -- there is no
+// in-band way for a widget to exempt itself.
+const LEGACY_SVG_TOOLS = new Set(['build-receipt', 'cost-curves', 'eye-isi', 'fsm-sketch', 'line-bounce', 'pin-map', 't27-cell', 'uart-bucket'])
+// The only shared renderers a tool.js may import from outside its own directory. A widget's own
+// files (./logic.js and friends) are always allowed; anything else is rejected by name.
+const TRUSTED_KITS = new Set(['dsp-kit.js', 'hive-kit.js', 'graph-kit.js', 'infographic.js', 'ternary-kit.js', 'nn-kit.js'])
 // The page's own words, from the gallery spec.
 export const PAGE_WORDS = ['TOOL_BRAND', 'TOOL_GALLERY_LINK', 'TOOL_SOURCE_LINK', 'TOOL_DATA_LABEL', 'TOOL_PRIVACY', 'TOOL_PRIVACY_FILES', 'TOOL_GRADE_PRIVACY', 'TOOL_NOSCRIPT']
 
@@ -155,6 +164,11 @@ export function toolProblems(f, file, root = SITE) {
     const js = readFileSync(tool, 'utf8')
     if (/\b(fetch|import)\s*\(\s*['"`]https?:/.test(js) || /\bfrom\s+['"]https?:/.test(js)) p.push(`${file}: ${dir}/tool.js loads from another host; a widget reads only its own files`)
     if (/\b(localStorage|document\.cookie)\b/.test(js)) p.push(`${file}: ${dir}/tool.js keeps state in the reader's browser; the page sets nothing`)
+    // Origin of the tool: these are string scans of the file, not a parse of its behaviour -- the
+    // strong half of the rule is the import check, the weak half is the drawing-primitive scan.
+    const outside = [...js.matchAll(/\bfrom\s+['"](\.[^'"]+)['"]/g)].map((m) => m[1]).filter((p) => !p.startsWith('./') && !TRUSTED_KITS.has(p.split('/').pop()))
+    if (outside.length) p.push(`${file}: ${dir}/tool.js imports ${outside.join(', ')}; a widget imports only its own files and the shared kits (${[...TRUSTED_KITS].sort().join(', ')})`)
+    if (!LEGACY_SVG_TOOLS.has(f.ID) && /\b(createElementNS|innerHTML|insertAdjacentHTML)\b/.test(js)) p.push(`${file}: ${dir}/tool.js draws or writes markup itself; a widget renders through the shared kit it imports (dsp-kit, hive-kit, graph-kit), never its own SVG or DOM writer`)
   }
   const card = join(root, dir, 'card.png')
   if (!existsSync(card)) p.push(`${file}: ${dir}/card.png is missing`)
