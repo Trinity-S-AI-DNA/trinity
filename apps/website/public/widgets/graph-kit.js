@@ -242,9 +242,9 @@ export function graphView(rootEl, { nodes, edges, state, mode, kindNames, transi
   }
   // Edges attach to the borders the sizes produced: each endpoint is pulled
   // back from the node centre to that node's boundary along the edge direction.
-  const boundary = (i, towards) => {
+  const boundary = (i, towards, effShape) => {
     const p = POS[i]
-    const s = sizeOf(nodes[i], SHAPE_OF(nodes[i]), false)
+    const s = sizeOf(nodes[i], effShape, false)
     const dx = towards.x - p.x
     const dy = towards.y - p.y
     if (s.kind === 'disc') {
@@ -278,21 +278,57 @@ export function graphView(rootEl, { nodes, edges, state, mode, kindNames, transi
   function render() {
     const m = mode()
     inner.replaceChildren(sv('title', {}, `${nodes.length} nodes, ${edges.length} edges, mode ${m}`))
+    // The shape each node is drawn with THIS render. Edges must trim to these
+    // same shapes: trimming a squares-mode edge to the descriptor's disc shape
+    // leaves the line ending inside the drawn border -- the exact gap the
+    // Beta-Gamma and Zeta-Epsilon edges showed.
+    const effShapes = nodes.map((n) => (m === 'squares' ? 'square' : SHAPE_OF(n)))
+    // How far a connection label sits off its line, perpendicular, so it never
+    // lies on the stroke or under a border.
+    const LABEL_OFF = 12
     for (const e of edges) {
       if (!edgeVisible(e)) continue
-      const a = boundary(e.src, POS[e.dst])
-      const b = boundary(e.dst, POS[e.src])
+      const a = boundary(e.src, POS[e.dst], effShapes[e.src])
+      const b = boundary(e.dst, POS[e.src], effShapes[e.dst])
       inner.append(sv('line', {
         x1: a.x, y1: a.y, x2: b.x, y2: b.y,
         class: 'sb2-edge' + (m === 'squares' ? ' sb2-edge-quiet' : ''),
       }))
-      if (m === 'squares') inner.append(sv('text', {
-        x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 - 5, 'text-anchor': 'middle', class: 'sb2-edge-label',
-      }, e.label))
+      if (m === 'squares') {
+        // The label sits at the middle of the VISIBLE segment (border to
+        // border), pushed sideways along the perpendicular. How far: the
+        // smallest offset from LABEL_OFF upward whose label box overlaps no
+        // drawn node -- measured, not guessed; a segment that cannot hold the
+        // label at any offset carries none, since overlap is refused, not
+        // squeezed.
+        const mx = (a.x + b.x) / 2
+        const my = (a.y + b.y) / 2
+        const len = Math.hypot(b.x - a.x, b.y - a.y)
+        const lm = measure(e.label)
+        const hw = lm.w / 2 + 1
+        const hh = lm.h / 2 + 1
+        const hits = (x, y) => nodes.some((n, i) => {
+          if (!visible(n)) return false
+          const s = sizeOf(n, effShapes[i], false)
+          const p = POS[i]
+          return x + hw > p.x - s.w / 2 && x - hw < p.x + s.w / 2 && y + hh > p.y - s.h / 2 && y - hh < p.y + s.h / 2
+        })
+        if (len >= 24) {
+          const nx = -((b.y - a.y) / len)
+          const ny = (b.x - a.x) / len
+          let spot = null
+          for (const off of [LABEL_OFF, 24, 36, 48, 60]) {
+            if (!hits(mx + nx * off, my + ny * off)) { spot = { x: mx + nx * off, y: my + ny * off }; break }
+            if (!hits(mx - nx * off, my - ny * off)) { spot = { x: mx - nx * off, y: my - ny * off }; break }
+          }
+          if (spot) inner.append(sv('text', {
+            x: spot.x, y: spot.y,
+            'text-anchor': 'middle', 'dominant-baseline': 'central', class: 'sb2-edge-label',
+          }, e.label))
+        }
+      }
     }
-    // squares-mode shows every node as a square (the mode owns the look);
-    // discs-mode uses each node's descriptor shape, data over guesswork.
-    nodes.forEach((n, i) => { if (visible(n)) inner.append(nodeG(i, m === 'squares' ? 'square' : SHAPE_OF(n))) })
+    nodes.forEach((n, i) => { if (visible(n)) inner.append(nodeG(i, effShapes[i])) })
     inner.setAttribute('transform', `translate(${state.panX} ${state.panY}) scale(${state.zoomMilli / 1000})`)
     const sel = state.selected == null ? 'none' : `${state.selected}: ${nodes[state.selected].title}`
     status.textContent = `mode ${m} | selected ${sel} | filter ${kindNames[state.filter]} | zoom ${(state.zoomMilli / 1000).toFixed(2)} | pan ${Math.round(state.panX)},${Math.round(state.panY)}`
