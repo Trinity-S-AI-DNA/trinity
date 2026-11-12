@@ -356,6 +356,8 @@ async function main() {
   const logicArtifacts = [
     ['public/widgets/second-brain/second-brain-logic.js', 'specs/widgets/second-brain-view-logic.t27'],
   ]
+  const { execFileSync } = await import('node:child_process')
+  const t27c = process.env.T27C || '/Users/playra/t27/target/release/t27c'
   for (const [artifact, source] of logicArtifacts) {
     const p = join(SITE, artifact)
     if (!existsSync(p)) { problems.push(`${source}: its generated module ${artifact} is missing; run t27c gen-js over the spec`) ; continue }
@@ -363,6 +365,15 @@ async function main() {
     const m = text.match(/export const __NOT_EMITTED__ = Object\.freeze\(\[([\s\S]*?)\]\)/)
     if (!m) problems.push(`${artifact}: no __NOT_EMITTED__ record found -- a generated module without one cannot be trusted`)
     else if (m[1].trim()) problems.push(`${artifact}: __NOT_EMITTED__ holds ${m[1].trim().split('),').length} unlowered declaration(s) from ${source}; the slice refuses a partial module`)
+    // Freshness by regenerating, not by trusting the committed bytes: the
+    // artifact must equal what the pinned compiler emits from the spec right
+    // now. A stale module (spec moved, compiler moved) fails here.
+    try {
+      const fresh = execFileSync(t27c, ['gen-js', join(SITE, source)], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })
+      if (fresh !== text) problems.push(`${artifact}: does not match a fresh t27c gen-js run over ${source} (compiler ${t27c}); regenerate it`)
+    } catch (e) {
+      problems.push(`${source}: the pinned compiler at ${t27c} failed or is missing (${e.message.split('\n')[0]}); set T27C to the t27c that built this slice`)
+    }
   }
   if (problems.length) {
     console.error(`widget-pages-from-spec: ${problems.length} problem(s)`)

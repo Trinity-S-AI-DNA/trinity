@@ -3,16 +3,18 @@
 // Every name and every value here comes from that spec. Change the spec and
 // regenerate; an edit made here is lost the next time anyone builds.
 
+// t27 trap semantics: an integer value outside its declared width is a runtime error.
+function __chk_u16(v) { if (!(Number.isInteger(v) && v >= 0 && v <= 65535)) throw new RangeError("u16 overflow"); return v }
 export const KIND = "view-logic";
 export function view_zoom_in(zoom_milli) {
   if (!(Number.isInteger(zoom_milli) && zoom_milli >= 0 && zoom_milli <= 65535)) throw new RangeError("zoom_milli out of u16");
-  const __r = Math.trunc((zoom_milli * 12) / 10);
+  const __r = __chk_u16(Math.trunc(__chk_u16((zoom_milli * 12)) / 10));
 if (!(Number.isInteger(__r) && __r >= 0 && __r <= 65535)) throw new RangeError("result out of u16");
   return __r;
 }
 export function view_zoom_out(zoom_milli) {
   if (!(Number.isInteger(zoom_milli) && zoom_milli >= 0 && zoom_milli <= 65535)) throw new RangeError("zoom_milli out of u16");
-  const __r = Math.trunc((zoom_milli * 10) / 12);
+  const __r = __chk_u16(Math.trunc(__chk_u16((zoom_milli * 10)) / 12));
 if (!(Number.isInteger(__r) && __r >= 0 && __r <= 65535)) throw new RangeError("result out of u16");
   return __r;
 }
@@ -26,13 +28,40 @@ if ((selected === node)) {
 if (!(Number.isInteger(__r) && __r >= 0 && __r <= 65535)) throw new RangeError("result out of u16");
   return __r;
 }
+export const K_FIELD_SELECTED = 0;
+export const K_FIELD_FILTER = 1;
+export const K_FIELD_PAN_X = 2;
+export const K_FIELD_PAN_Y = 3;
+export const K_FIELD_ZOOM = 4;
+export const K_EVENT_THEME = 0;
+export const K_EVENT_MODE = 1;
+export const K_EVENT_RESET = 2;
+export const K_EVENT_FILTER = 3;
+export const K_EVENT_NODE = 4;
+export const K_EVENT_WHEEL = 5;
+export const K_EVENT_PAN = 6;
+export const K_T_THEME_ROWS = 0;
+export const K_T_MODE_ROWS = 0;
+export const K_T_RESET_ROWS = 4;
+export const K_T_FILTER_ROWS = 2;
+export const K_T_NODE_ROWS = 1;
+export const K_T_WHEEL_ROWS = 1;
+export const K_T_PAN_ROWS = 2;
+export const K_T_ROWS_TOTAL = 10;
+export const K_TRANSITIONS = [2, 0, 2, 255, 2, 2, 1, 0, 2, 3, 1, 0, 2, 4, 2, 1000, 3, 0, 2, 255, 3, 1, 2, 0, 4, 0, 3, 0, 5, 4, 4, 0, 6, 2, 5, 0, 6, 3, 5, 0];
+// t27c gen-js: a TestBlock was not emitted -- it is checked by the compiler, not by the artifact.
+// t27c gen-js: a TestBlock was not emitted -- it is checked by the compiler, not by the artifact.
+// t27c gen-js: a TestBlock was not emitted -- it is checked by the compiler, not by the artifact.
+// t27c gen-js: a TestBlock was not emitted -- it is checked by the compiler, not by the artifact.
+// t27c gen-js: a TestBlock was not emitted -- it is checked by the compiler, not by the artifact.
+// t27c gen-js: a TestBlock was not emitted -- it is checked by the compiler, not by the artifact.
 // t27c gen-js: a TestBlock was not emitted -- it is checked by the compiler, not by the artifact.
 // t27c gen-js: a TestBlock was not emitted -- it is checked by the compiler, not by the artifact.
 // t27c gen-js: a TestBlock was not emitted -- it is checked by the compiler, not by the artifact.
 
 // Declaration order, which the spec's own laws depend on.
 export const __STRUCT_ORDER__ = [];
-export const __DECL_ORDER__ = ["KIND", "view_zoom_in", "view_zoom_out", "view_toggle_selected"];
+export const __DECL_ORDER__ = ["KIND", "view_zoom_in", "view_zoom_out", "view_toggle_selected", "K_FIELD_SELECTED", "K_FIELD_FILTER", "K_FIELD_PAN_X", "K_FIELD_PAN_Y", "K_FIELD_ZOOM", "K_EVENT_THEME", "K_EVENT_MODE", "K_EVENT_RESET", "K_EVENT_FILTER", "K_EVENT_NODE", "K_EVENT_WHEEL", "K_EVENT_PAN", "K_T_THEME_ROWS", "K_T_MODE_ROWS", "K_T_RESET_ROWS", "K_T_FILTER_ROWS", "K_T_NODE_ROWS", "K_T_WHEEL_ROWS", "K_T_PAN_ROWS", "K_T_ROWS_TOTAL", "K_TRANSITIONS"];
 
 // What this spec holds and this backend did not print. Empty is the whole
 // story most of the time; an entry here is a promise the artifact does not

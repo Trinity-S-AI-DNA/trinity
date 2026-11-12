@@ -6,7 +6,13 @@
 // and passes data through. It holds no renderer and no transition rule of its own. Demo data only:
 // nothing is fetched, sent or stored.
 import { el, graphView, applyTheme } from '../graph-kit.js'
-import { view_zoom_in as viewZoomIn, view_zoom_out as viewZoomOut, view_toggle_selected as viewToggleSelected } from './second-brain-logic.js'
+import {
+  view_zoom_in as viewZoomIn,
+  view_zoom_out as viewZoomOut,
+  view_toggle_selected as viewToggleSelected,
+  K_TRANSITIONS,
+  K_EVENT_THEME, K_EVENT_MODE, K_EVENT_RESET, K_EVENT_FILTER, K_EVENT_NODE, K_EVENT_WHEEL, K_EVENT_PAN,
+} from './second-brain-logic.js'
 
 const W = window.T27_WIDGET || {}
 const root = document.getElementById('widget')
@@ -24,7 +30,7 @@ const edges = (W.K_EDGE_SRC || []).map((src, i) => ({
 const viewModes = W.SAY_VIEW_MODES || ['discs', 'squares']
 const themeIds = W.SAY_THEME_IDS || ['slate', 'paper']
 const kindNames = ['all', ...new Set(nodes.map((n) => n.kind))]
-const T = W.K_TRANSITIONS || []
+const T = K_TRANSITIONS
 
 // --- One interaction state, in the spec's own field order ---------------------------
 const state = { selected: null, filter: 0, panX: 0, panY: 0, zoomMilli: 1000 }
@@ -55,16 +61,16 @@ const button = (parent, label, on) => {
 }
 
 const modeGroup = group('view')
-const modeBtns = viewModes.map((m) => button(modeGroup, m, () => { view.event(W.K_EVENT_MODE); mode = m; view.draw() }))
+const modeBtns = viewModes.map((m) => button(modeGroup, m, () => { view.event(K_EVENT_MODE); mode = m; view.draw() }))
 let theme = themeIds[0]
 const themeGroup = group('theme')
-const themeBtns = themeIds.map((t) => button(themeGroup, t, () => { theme = t; view.event(W.K_EVENT_THEME); view.applyTheme(t) }))
+const themeBtns = themeIds.map((t) => button(themeGroup, t, () => { theme = t; view.event(K_EVENT_THEME); view.applyTheme(t) }))
 const filterGroup = group('filter')
-const filterBtns = kindNames.map((f, i) => button(filterGroup, f, () => view.event(W.K_EVENT_FILTER, i)))
+const filterBtns = kindNames.map((f, i) => button(filterGroup, f, () => view.event(K_EVENT_FILTER, i)))
 const zoomGroup = group('zoom')
-button(zoomGroup, '+', () => view.event(W.K_EVENT_WHEEL, 1200))
-button(zoomGroup, '-', () => view.event(W.K_EVENT_WHEEL, 833))
-button(zoomGroup, 'reset', () => view.event(W.K_EVENT_RESET))
+button(zoomGroup, '+', () => view.event(K_EVENT_WHEEL, 1200))
+button(zoomGroup, '-', () => view.event(K_EVENT_WHEEL, 833))
+button(zoomGroup, 'reset', () => view.event(K_EVENT_RESET))
 
 root.prepend(head)
 
