@@ -111,15 +111,32 @@ export function applyEvent(state, rows, eventId, payload, ops) {
 // The spec's state is u16 and says `255 = none`; the host says `null`. Every
 // crossing is one of these two functions, and stateBoundaryTest asserts both
 // directions round-trip, so the two forms can never drift apart silently.
-const NONE_IN_MODEL = 255
-const toModel = (v) => (v == null ? NONE_IN_MODEL : v)
-const toHost = (v) => (v === NONE_IN_MODEL ? null : v)
+// `none` is the generated contract's value, delivered by setModelNone from the
+// injected geo contract. Conversions refuse to run before it arrives: a
+// hardcoded number here would be a second statement of the spec's own.
+let MODEL_NONE = null
+export function setModelNone(v) {
+  const n = Number(v)
+  if (!(Number.isInteger(n) && n >= 0)) throw new Error('graphView: the model none value must be a non-negative integer from the contract')
+  MODEL_NONE = n
+}
+const toModel = (v) => {
+  if (MODEL_NONE == null) throw new Error('graphView: setModelNone has not been called; the model boundary is unknown')
+  return v == null ? MODEL_NONE : v
+}
+const toHost = (v) => {
+  if (MODEL_NONE == null) throw new Error('graphView: setModelNone has not been called; the model boundary is unknown')
+  return v === MODEL_NONE ? null : v
+}
 
-/** Both directions of the 255/null boundary, asserted. True when they hold. */
-export function stateBoundaryTest() {
-  return toHost(toModel(null)) === null
-    && toModel(toHost(NONE_IN_MODEL)) === NONE_IN_MODEL
+/** Both directions of the none boundary, asserted for a given contract value. */
+export function stateBoundaryTest(noneValue) {
+  setModelNone(noneValue)
+  const ok = toHost(toModel(null)) === null
+    && toModel(toHost(noneValue)) === noneValue
     && toModel(2) === 2 && toHost(2) === 2
+  MODEL_NONE = null
+  return ok
 }
 
 /**
@@ -128,8 +145,17 @@ export function stateBoundaryTest() {
  * names the filter indexes; transitions is the spec's flat row table. Returns {event, applyTheme,
  * draw} — the widget's whole control surface: every change goes through event(), never around it.
  */
-export function graphView(rootEl, { nodes, edges, state, mode, kindNames, transitions, ops, onChange, note, paddingX, paddingY }) {
+export function graphView(rootEl, { nodes, edges, state, mode, kindNames, transitions, ops, geo, onChange, note, paddingX, paddingY }) {
   const options = { paddingX, paddingY }
+  // The geometry functions and the model's none constant are the generated
+  // contract, injected like ops; without them the kit refuses -- it holds no
+  // geometric math of its own.
+  if (!geo || typeof geo.discReachSq !== 'function' || typeof geo.squareW !== 'function'
+    || typeof geo.squareH !== 'function' || typeof geo.squareReachT !== 'function'
+    || geo.selectedNone == null) {
+    throw new Error('graphView: the generated geometry contract is required; this kit computes no geometry itself')
+  }
+  setModelNone(geo.selectedNone)
   rootEl.classList.add('sb2')
 
   const viewport = el('div', 'sb2-viewport')
@@ -190,10 +216,15 @@ export function graphView(rootEl, { nodes, edges, state, mode, kindNames, transi
   // descriptor; the host only turns "this text + this padding" into a node big
   // enough for both -- the font is never shrunk to fit a fixed node.
   const canvas = document.createElement('canvas')
+  // The same face the label CSS draws with; the ink height is measured, not
+  // assumed -- a taller glyph makes the node grow, never clip.
+  const LABEL_FONT = 'bold 11px sans-serif'
   const measure = (text) => {
     const ctx = canvas.getContext('2d')
-    ctx.font = 'bold 11px sans-serif'
-    return { w: ctx.measureText(text).width, h: 11 }
+    ctx.font = LABEL_FONT
+    const m = ctx.measureText(text)
+    const h = (m.actualBoundingBoxAscent ?? 8) + (m.actualBoundingBoxDescent ?? 3)
+    return { w: m.width, h }
   }
   const PAD_X = Number(options.paddingX ?? 16)
   const PAD_Y = Number(options.paddingY ?? 12)
@@ -204,19 +235,26 @@ export function graphView(rootEl, { nodes, edges, state, mode, kindNames, transi
   // Selection adds a visual ring margin; the padding stays true underneath.
   const sizeOf = (n, shape, on) => {
     const { w, h } = measure(n.title)
-    if (shape === 'square') return { kind: 'square', w: Math.ceil(w + PAD_X * 2), h: Math.ceil(h + PAD_Y * 2), on }
-    return { kind: 'disc', r: Math.ceil(Math.hypot(w / 2 + PAD_X, h / 2 + PAD_Y)) + (on ? 4 : 0) }
+    if (shape === 'square') {
+      return { kind: 'square', w: Math.ceil(geo.squareW(w, PAD_X)), h: Math.ceil(geo.squareH(h, PAD_Y)) }
+    }
+    return { kind: 'disc', r: Math.ceil(Math.sqrt(geo.discReachSq(w, h, PAD_X, PAD_Y))) + (on ? 4 : 0) }
   }
   // Edges attach to the borders the sizes produced: each endpoint is pulled
   // back from the node centre to that node's boundary along the edge direction.
   const boundary = (i, towards) => {
     const p = POS[i]
+    const s = sizeOf(nodes[i], SHAPE_OF(nodes[i]), false)
     const dx = towards.x - p.x
     const dy = towards.y - p.y
-    const len = Math.hypot(dx, dy) || 1
-    const s = sizeOf(nodes[i], SHAPE_OF(nodes[i]), false)
-    const reach = s.kind === 'disc' ? s.r : Math.hypot(s.w, s.h) / 2
-    return { x: p.x + (dx * reach) / len, y: p.y + (dy * reach) / len }
+    if (s.kind === 'disc') {
+      const len = Math.hypot(dx, dy) || 1
+      return { x: p.x + (dx * s.r) / len, y: p.y + (dy * s.r) / len }
+    }
+    // Rectangle: the generated ray-rect parameter lands the point on whichever
+    // side the direction hits -- x-side, y-side, or the corner between.
+    const t = geo.squareReachT(s.w / 2, s.h / 2, dx, dy)
+    return { x: p.x + dx * t, y: p.y + dy * t }
   }
 
   function nodeG(i, shape) {

@@ -12,6 +12,7 @@ import {
   view_toggle_selected as viewToggleSelected,
   K_TRANSITIONS,
   K_EVENT_THEME, K_EVENT_MODE, K_EVENT_RESET, K_EVENT_FILTER, K_EVENT_NODE, K_EVENT_WHEEL, K_EVENT_PAN,
+  disc_reach_sq, square_w, square_h, square_reach_t, K_SELECTED_NONE,
 } from './second-brain-logic.js'
 import {
   K_SELECT_BINDING,
@@ -63,6 +64,7 @@ let mode = viewModes[0]
 const view = graphView(root, {
   nodes, edges, state, transitions: T, kindNames,
   ops: { toggle: viewToggleSelected, zoomIn: viewZoomIn, zoomOut: viewZoomOut },
+  geo: { discReachSq: disc_reach_sq, squareW: square_w, squareH: square_h, squareReachT: square_reach_t, selectedNone: Number(K_SELECTED_NONE) },
   paddingX: Number(K_VIEW_PADDING_X), paddingY: Number(K_VIEW_PADDING_Y),
   note: W.SAY_NOTE, mode: () => mode,
 })
