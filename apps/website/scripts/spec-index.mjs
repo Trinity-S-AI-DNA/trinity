@@ -139,7 +139,6 @@ const index = {
   provenance: {
     compiler: { path: manifest.path, sha256: manifest.sha256, commit: manifest.commit },
     commit: execFileSync('git', ['rev-parse', 'HEAD'], { cwd: SITE, encoding: 'utf8' }).trim(),
-    generatedAt: new Date().toISOString(),
     extractor: 'scripts/spec-index.mjs',
     root: 'apps/website/specs',
   },
