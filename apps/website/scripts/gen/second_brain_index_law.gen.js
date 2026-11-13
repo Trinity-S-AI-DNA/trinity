@@ -62,10 +62,14 @@ if (!(Number.isInteger(__r) && __r >= 0 && __r <= 4294967295)) throw new RangeEr
 // t27c gen-js: a TestBlock was not emitted -- it is checked by the compiler, not by the artifact.
 // t27c gen-js: a TestBlock was not emitted -- it is checked by the compiler, not by the artifact.
 // t27c gen-js: a TestBlock was not emitted -- it is checked by the compiler, not by the artifact.
+export function uses_resolves(module_name, spec_module) {
+return (module_name === spec_module);
+}
+// t27c gen-js: a TestBlock was not emitted -- it is checked by the compiler, not by the artifact.
 
 // Declaration order, which the spec's own laws depend on.
 export const __STRUCT_ORDER__ = [];
-export const __DECL_ORDER__ = ["V_HARNESS", "V_TEST_CALL", "V_SELF_LOOP", "V_FN_EDGE", "V_UNRESOLVED", "CALL_SITES_SQUARE_REACH_ABS_F", "UNIQUE_RELATIONS_SQUARE_REACH_ABS_F", "TEST_CALLS_CORPUS", "SELF_LOOPS_ALLOWED", "is_harness", "same_name", "call_verdict", "is_edge", "relations_from_sites", "artifacts_for_tool"];
+export const __DECL_ORDER__ = ["V_HARNESS", "V_TEST_CALL", "V_SELF_LOOP", "V_FN_EDGE", "V_UNRESOLVED", "CALL_SITES_SQUARE_REACH_ABS_F", "UNIQUE_RELATIONS_SQUARE_REACH_ABS_F", "TEST_CALLS_CORPUS", "SELF_LOOPS_ALLOWED", "is_harness", "same_name", "call_verdict", "is_edge", "relations_from_sites", "artifacts_for_tool", "uses_resolves"];
 
 // What this spec holds and this backend did not print. Empty is the whole
 // story most of the time; an entry here is a promise the artifact does not
