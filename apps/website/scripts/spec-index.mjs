@@ -60,6 +60,8 @@ for (const file of files) {
     id: specId,
     module: ast.name,
     sha256: sha,
+    kind: undefined,
+    toolId: undefined,
     counts: {
       consts: 0, fns: 0, tests: 0, uses: 0, calls: 0, unresolved: 0,
     },
@@ -72,6 +74,8 @@ for (const file of files) {
     switch (n.kind) {
       case 'ConstDecl':
         if (n.name) record.consts.push({ name: n.name, line: n.line })
+        if (n.name === 'KIND') record.kind = n.children?.[0]?.value
+        if (n.name === 'ID') record.toolId = n.children?.[0]?.value
         record.counts.consts++
         break
       case 'FnDecl':
@@ -114,6 +118,23 @@ for (const e of edges) {
 // calls edges: normalize the to-field (drop the accidental concat artifact)
 for (const e of edges) if (e.type === 'calls') e.to = e.to.split('#').slice(0, 2).join('#')
 
+// Artifact provenance: every tool spec (KIND = widget-tool) is generated into
+// public/widgets/<ID>/index.html plus a byte-for-byte copy of the spec, by
+// widget-pages-from-spec.mjs (pageOut/specOut). Those are the only inter-node
+// relations the generator itself proves, so they become artifact nodes and
+// `generated_from` edges; nothing here is inferred from prose.
+const artifacts = []
+for (const s of specs) {
+  if (s.kind !== 'widget-tool' || !s.toolId) continue
+  for (const rel of [`public/widgets/${s.toolId}/index.html`, `public/widgets/${s.toolId}/${s.toolId}.t27`]) {
+    artifacts.push({ id: `artifact:${rel}`, kind: 'artifact', generatedFrom: s.id })
+    edges.push({ type: 'generated_from', from: s.id, to: `artifact:${rel}`, resolved: true })
+  }
+}
+const callsEdges = edges.filter((e) => e.type === 'calls')
+const counts_intra = callsEdges.filter((e) => e.from.split('#')[0] === e.to.split('#')[0]).length
+const counts_inter = callsEdges.length - counts_intra
+
 const index = {
   provenance: {
     compiler: { path: manifest.path, sha256: manifest.sha256, commit: manifest.commit },
@@ -131,15 +152,19 @@ const index = {
     edges: edges.length,
     unresolved: unresolved.length,
     refused: problems.length,
+    inter_spec_edges: counts_inter,
+    intra_spec_calls: counts_intra,
+    use_decls_in_corpus: specs.reduce((n, s) => n + s.counts.uses, 0),
   },
   specs,
   edges,
   unresolved,
+  artifacts,
   problems,
 }
 
 writeFileSync(OUT, JSON.stringify(index))
-console.log(`spec-index: ${specs.length} specs, ${index.counts.fns} fns, ${index.counts.tests} tests, ${index.counts.uses} use-decls, ${index.counts.edges} edges, ${index.counts.unresolved} unresolved calls, ${problems.length} refused -> ${OUT.slice(SITE.length + 1)}`)
+console.log(`spec-index: ${specs.length} specs, ${index.counts.fns} fns, ${index.counts.tests} tests, ${index.counts.uses} use-decls, ${index.counts.edges} edges (${index.counts.intra_spec_calls} intra-spec calls, ${index.counts.inter_spec_edges} inter-spec), ${artifacts.length} artifacts, ${index.counts.unresolved} unresolved calls, ${problems.length} refused -> ${OUT.slice(SITE.length + 1)}`)
 if (problems.length) {
   console.error('refused specs:')
   for (const p of problems.slice(0, 10)) console.error('  ' + p)

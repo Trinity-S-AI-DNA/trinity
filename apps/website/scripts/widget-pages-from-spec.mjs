@@ -419,10 +419,24 @@ async function main() {
     ]
     const metricBlock = '.sb2 {\n' + metrics.map(([tok, key]) => {
       const v = themeConsts[key]
-      if (typeof v !== 'string' || !v.trim()) problems.push(`${themeFile}: ${key} is missing or empty`)
+      if (v == null || (typeof v === 'string' && !v.trim())) problems.push(`${themeFile}: ${key} is missing or empty`)
       return `  ${tok}: ${v};`
     }).join('\n') + '\n}\n'
     targets = [...targets, ['public/widgets/theme.css', header + blocks + '\n' + metricBlock]]
+  }
+  // The index and flow extracts are deterministic scripts over the same pinned
+  // compiler; run them here so the explorer's data is as fresh as the pages.
+  for (const script of ['spec-index.mjs', 'flow-extract.mjs']) {
+    try {
+      execFileSync(process.execPath, [join(SITE, 'scripts', script)], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
+    } catch (e) {
+      problems.push(`scripts/${script} failed: ${String(e.message).split('\n')[0]}`)
+    }
+  }
+  if (problems.length) {
+    console.error(`widget-pages-from-spec: ${problems.length} problem(s)`)
+    for (const p of problems) console.error('  ' + p)
+    process.exit(1)
   }
   if (check) {
     const stale = targets.filter(([rel, text]) => !existsSync(join(SITE, rel)) || readFileSync(join(SITE, rel), 'utf8') !== text)

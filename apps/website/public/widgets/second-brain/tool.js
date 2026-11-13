@@ -31,7 +31,7 @@ const root = document.getElementById('widget')
 // compiler's AST). When it is present the page is a spec explorer: search, the
 // spec graph, an inspector. Without it the page falls back to the demo graph --
 // a missing index is a fallback, not a silently empty screen.
-const explorer = { on: false, specs: [], byId: new Map(), query: '' }
+const explorer = { on: false, specs: [], byId: new Map(), query: '', expanded: new Set(), showArtifacts: false }
 
 async function loadIndex() {
   try {
@@ -71,21 +71,104 @@ async function loadIndex() {
   }
 }
 
+// The explorer model: visible specs, plus fn nodes for expanded specs, plus
+// artifact nodes when provenance is on. Stable ids only: spec ids (path minus
+// .t27), `specId#fn`, `artifact:<rel>` -- never a label or a title guess.
 function explorerGraph() {
   const q = explorer.query.trim().toLowerCase()
-  const nodes = explorer.specs.filter((n) => !q || n.title.toLowerCase().includes(q))
-  const ids = new Set(nodes.map((n) => n.title))
-  const edges = (explorer.idx.edges || [])
-    .filter((e) => e.type === 'calls' && ids.has(e.from.split('#')[0]) && ids.has(e.to.split('#')[0]))
-    .map((e, i) => ({ src: nodes.findIndex((n) => n.title === e.from.split('#')[0]), dst: nodes.findIndex((n) => n.title === e.to.split('#')[0]), label: 'calls' }))
-    .filter((e) => e.src >= 0 && e.dst >= 0 && e.src !== e.dst)
-  return { nodes, edges }
+  const specs = explorer.specs.filter((n) => !q || n.title.toLowerCase().includes(q))
+  const ids = new Set(specs.map((n) => n.title))
+  const nodes = [...specs]
+  const idxOf = new Map(nodes.map((n, i) => [n.title, i]))
+  const edges = []
+  const allEdges = explorer.idx.edges || []
+  // Inter-spec calls: in this corpus there are none, but the counter is honest
+  // arithmetic over the index, not a constant.
+  let interSpec = 0
+  let selfLoopsHidden = 0
+  const unresolvedVisible = (explorer.idx.unresolved || []).filter((u) => ids.has(u.spec))
+  const provTotal = (explorer.idx.artifacts || [])
+    .filter((a) => ids.has(a.generatedFrom))
+    .reduce((n, a) => n + 1, 0)
+  for (const e of allEdges) {
+    if (e.type !== 'calls') continue
+    const fs = e.from.split('#')[0]
+    const ts = e.to.split('#')[0]
+    if (!ids.has(fs) || !ids.has(ts)) continue
+    if (fs !== ts) {
+      interSpec++
+      edges.push({ src: idxOf.get(fs), dst: idxOf.get(ts), label: 'calls' })
+    } else if (!explorer.expanded.has(fs)) {
+      // Intra-spec: hidden at spec level, shown when the spec is expanded.
+      selfLoopsHidden++
+    }
+  }
+  // EXPANSION: fn nodes + the spec's own call graph, only for expanded visible specs.
+  for (const specTitle of [...explorer.expanded].filter((t) => ids.has(t))) {
+    const rec = explorer.byId.get(specTitle)?.rec
+    if (!rec) continue
+    for (const f of rec.fns) {
+      const id = `${specTitle}#${f.name}`
+      if (idxOf.has(id)) continue
+      idxOf.set(id, nodes.length)
+      nodes.push({ title: id, label: f.name, kind: 'fn', shape: 2, fnOf: specTitle })
+    }
+  }
+  for (const e of allEdges) {
+    if (e.type !== 'calls') continue
+    const fs = e.from
+    const ts = e.to
+    const fsSpec = fs.split('#')[0]
+    if (fsSpec !== ts.split('#')[0] || !explorer.expanded.has(fsSpec) || !ids.has(fsSpec)) continue
+    if (!idxOf.has(fs) || !idxOf.has(ts)) continue
+    if (fs === ts) continue // a recursive call would draw a zero-length line
+    edges.push({ src: idxOf.get(fs), dst: idxOf.get(ts), label: 'calls' })
+  }
+  // Provenance: artifact nodes + generated_from edges, toggleable, default OFF.
+  let provDrawn = 0
+  if (explorer.showArtifacts) {
+    for (const a of explorer.idx.artifacts || []) {
+      if (!ids.has(a.generatedFrom) || idxOf.has(a.id)) continue
+      idxOf.set(a.id, nodes.length)
+      nodes.push({ title: a.id, label: a.id.split('/').slice(-2).join('/'), kind: 'artifact', shape: 2, artifactOf: a.generatedFrom })
+    }
+    for (const e of allEdges) {
+      if (e.type !== 'generated_from' || !ids.has(e.from)) continue
+      if (!idxOf.has(e.from) || !idxOf.has(e.to)) continue
+      edges.push({ src: idxOf.get(e.from), dst: idxOf.get(e.to), label: 'generated_from' })
+      provDrawn++
+    }
+  }
+  return {
+    nodes, edges,
+    counters: { interSpec, selfLoopsHidden, unresolved: unresolvedVisible.length, provTotal, provDrawn },
+  }
 }
 
 const searchBox = el('input', 'sb2-search')
 searchBox.placeholder = 'search specs'
-searchBox.addEventListener('input', () => { explorer.query = searchBox.value; if (explorer.on) view.setGraph(explorerGraph().nodes, explorerGraph().edges) })
 const inspector = el('div', 'sb2-inspector')
+const metaLine = el('div', 'sb2-meta')
+
+function refreshExplorer() {
+  const g = explorerGraph()
+  view.setGraph(g.nodes, g.edges)
+  const c = g.counters
+  const parts = [
+    `inter-spec edges: ${c.interSpec}`,
+    `self-loop calls hidden: ${c.selfLoopsHidden}${c.selfLoopsHidden ? ' (expand a spec to see them)' : ''}`,
+    explorer.showArtifacts ? `provenance edges drawn: ${c.provDrawn}` : `provenance edges: ${c.provTotal} (toggle 'artifacts')`,
+  ]
+  if (c.unresolved) parts.push(`unresolved calls: ${c.unresolved}`)
+  if (explorer.expanded.size) parts.push(`expanded: ${[...explorer.expanded].sort().join(', ')}`)
+  metaLine.textContent = parts.join(' | ')
+  return g
+}
+
+function toggleExpand(title) {
+  if (explorer.expanded.has(title)) explorer.expanded.delete(title)
+  else explorer.expanded.add(title)
+}
 
 async function showInspector(title) {
   const rec = explorer.byId.get(title)?.rec
@@ -201,9 +284,24 @@ loadIndex().then(() => {
   if (!explorer.on) return
   root.classList.add('sb2-wide')
   head.append(searchBox)
-  root.append(inspector)
-  const g = explorerGraph()
-  view.setGraph(g.nodes, g.edges)
-  view.onSelect = (i) => showInspector(view.currentNodes()[i]?.title)
-  searchBox.addEventListener('input', () => { explorer.query = searchBox.value; const gg = explorerGraph(); view.setGraph(gg.nodes, gg.edges) })
+  const explorerGroup = group('explorer')
+  const syncExplorerBtns = () => artifactsBtn.classList.toggle('sb2-on', explorer.showArtifacts)
+  button(explorerGroup, 'expand', () => { if (state.selected != null) toggleExpand(view.currentNodes()[state.selected]?.title) })
+  button(explorerGroup, 'collapse', () => { if (state.selected != null) explorer.expanded.delete(view.currentNodes()[state.selected]?.title) })
+  const artifactsBtn = button(explorerGroup, 'artifacts', () => { explorer.showArtifacts = !explorer.showArtifacts; syncExplorerBtns(); refreshExplorer() })
+  root.append(metaLine, inspector)
+  // First click selects + inspects; a second click on the same spec expands or
+  // collapses its internal call graph. Counters always reflect what is drawn.
+  view.onSelect = (i) => {
+    const title = view.currentNodes()[i]?.title
+    // First click selects + inspects; a second click on the same spec toggles
+    // the expansion of its internal call graph.
+    if (title && explorer._lastSelected === title) toggleExpand(title)
+    explorer._lastSelected = title
+    showInspector(title)
+    syncExplorerBtns()
+    refreshExplorer()
+  }
+  searchBox.addEventListener('input', () => { explorer.query = searchBox.value; refreshExplorer() })
+  refreshExplorer()
 })
