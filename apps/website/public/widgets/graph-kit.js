@@ -160,31 +160,31 @@ const toHost = (v) => {
 export function renderFlow(container, flows, obj) {
   const shapes = { entry: ['sb2-ellipse'], exit: ['sb2-ellipse'], action: ['sb2-rect'], call: ['sb2-rect2'], decision: ['sb2-diamond'], io: ['sb2-para'], loop: ['sb2-rect'], error: ['sb2-rect'] }
   for (const fl of flows) {
-    const box = h('div', 'sb2-flow')
-    box.append(h('b', null, fl.fn))
-    const table = h('table')
+    const box = el('div', 'sb2-flow')
+    box.append(el('b', null, fl.fn))
+    const table = el('table')
     for (const nd of fl.nodes ?? []) {
-      const tr = h('tr')
+      const tr = el('tr')
       const cls = (shapes[nd.kind] || shapes.action)[0]
-      const shape = h('span', `sb2-gost ${cls}`, nd.label)
-      const td1 = h('td')
+      const shape = el('span', `sb2-gost ${cls}`, nd.label)
+      const td1 = el('td')
       td1.append(shape)
-      tr.append(td1, h('td', 'sb2-meta', `${nd.kind}${nd.line != null ? ' @' + nd.line : ''}`))
+      tr.append(td1, el('td', 'sb2-meta', `${nd.kind}${nd.line != null ? ' @' + nd.line : ''}`))
       table.append(tr)
     }
     for (const e of fl.edges ?? []) {
-      const tr = h('tr')
-      tr.append(h('td', 'sb2-meta', `-> ${e.branch || 'next'}${e.kind !== 'normal' ? ' (' + e.kind + ')' : ''}`))
-      tr.append(h('td', 'sb2-meta', `${e.from} -> ${e.to}`))
+      const tr = el('tr')
+      tr.append(el('td', 'sb2-meta', `-> ${e.branch || 'next'}${e.kind !== 'normal' ? ' (' + e.kind + ')' : ''}`))
+      tr.append(el('td', 'sb2-meta', `${e.from} -> ${e.to}`))
       table.append(tr)
     }
     box.append(table)
     container.append(box)
   }
   if (obj?.exists) {
-    const box = h('div', 'sb2-flow')
-    box.append(h('b', null, `.o (${obj.symbols.length} symbols)`))
-    box.append(h('span', 'sb2-meta', 'unknown in .o: ' + (obj.unknown ?? []).join(', ')))
+    const box = el('div', 'sb2-flow')
+    box.append(el('b', null, `.o (${obj.symbols.length} symbols)`))
+    box.append(el('span', 'sb2-meta', 'unknown in .o: ' + (obj.unknown ?? []).join(', ')))
     container.append(box)
   }
 }
@@ -205,10 +205,10 @@ export function stateBoundaryTest(noneValue) {
  * names the filter indexes; transitions is the spec's flat row table. Returns {event, applyTheme,
  * draw} — the widget's whole control surface: every change goes through event(), never around it.
  */
-export function graphView(rootEl, { nodes: initialNodes, edges: initialEdges, state, mode, kindNames, transitions, ops, geo, onChange, note, paddingX, paddingY, onSelect }) {
+export function graphView(rootEl, { nodes: initialNodes, edges: initialEdges, state, mode, kindNames, transitions, ops, geo, onChange, note, paddingX, paddingY, layoutGapX, layoutGapY, onSelect }) {
   let nodes = initialNodes
   let edges = initialEdges
-  const options = { paddingX, paddingY }
+  const options = { paddingX, paddingY, layoutGapX, layoutGapY }
   // The geometry functions and the model's none constant are the generated
   // contract, injected like ops; without them the kit refuses -- it holds no
   // geometric math of its own.
@@ -235,20 +235,51 @@ export function graphView(rootEl, { nodes: initialNodes, edges: initialEdges, st
   rootEl.append(viewport, status, ...(noteEl ? [noteEl] : []))
 
   // A node whose descriptor carries explicit geometry is drawn exactly there;
-  // one without falls back to the shared circle. The SHAPES are the descriptor's
-  // (SHAPE_DISC=1, SHAPE_SQUARE=2): an unknown shape number is a loud error,
-  // never a guessed circle.
-  const R = 110
+  // one without is placed by shelf-packing over its measured size. The SHAPES
+  // are the descriptor's (SHAPE_DISC=1, SHAPE_SQUARE=2): an unknown shape
+  // number is a loud error, never a guessed circle.
   // Recomputed on every render: setGraph swaps the node list, and stale
   // positions from a previous graph are how explorer nodes ended up undefined.
   let POS = []
   let VIEW = null // the fit-to-content camera; null until first layout
+  // Layout gaps are theme parameters from specs/widgets/themes.t27 (SB2_LAYOUT_GAP_*,
+  // generated into theme.css as --sb2-layout-gap-*). They arrive here as numbers passed by
+  // the tool; reading them back out of computed styles is not a host op yet, so the tool
+  // restates them with a comment naming the spec -- the only duplication allowed, and the
+  // test layout_gaps_are_theme_parameters pins the spec's own values.
+  const LAYOUT_GAP_X = Number(options.layoutGapX ?? 24)
+  const LAYOUT_GAP_Y = Number(options.layoutGapY ?? 40)
+  if (!(LAYOUT_GAP_X >= 0 && LAYOUT_GAP_Y >= 0)) throw new Error('graphView: layout gaps must be non-negative graph distances')
+  // Shelf-packing over measured bounds for nodes that carry no explicit geometry: each
+  // row advances x by the actual widths plus the gap; a row that would pass the width
+  // limit closes and rowY grows by that row's tallest box plus the gap. Zero overlaps
+  // is a property of the algorithm over measured sizes, not of a fixed grid step -- any
+  // input (a giant node next to a small one, long labels, one node, none) packs by the
+  // same rule. Nodes WITH explicit x/y (a descriptor's own coordinates) are never moved.
+  const SHELF_MAX_W = 2200
+  const packRows = () => {
+    let rowY = 0
+    let x = 0
+    let rowH = 0
+    for (let i = 0; i < nodes.length; i++) {
+      const n = nodes[i]
+      if (n.x != null && n.y != null) continue
+      const s = sizeOf(n, effShapeOf(n), false)
+      const w = s.kind === 'disc' ? s.r * 2 : s.w
+      const h = s.kind === 'disc' ? s.r * 2 : s.h
+      if (!(Number.isFinite(w) && w > 0 && Number.isFinite(h) && h > 0)) throw new Error(`graphView: node "${n.title}" produced a non-finite size`)
+      if (rowH > 0 && x + w > SHELF_MAX_W) { rowY += rowH + LAYOUT_GAP_Y; x = 0; rowH = 0 }
+      POS[i] = { x: x + w / 2, y: rowY + h / 2 }
+      x += w + LAYOUT_GAP_X
+      rowH = Math.max(rowH, h)
+    }
+  }
   const layout = () => {
     POS = nodes.map((n, i) => {
       if (n.x != null && n.y != null) return { x: n.x, y: n.y }
-      const a = (i / nodes.length) * Math.PI * 2 - Math.PI / 2
-      return { x: Math.cos(a) * R, y: Math.sin(a) * R }
+      return { x: 0, y: 0 } // placeholder; packRows fills measured positions below
     })
+    packRows()
   }
   // The camera fits the content, not a hardcoded window: whatever the layout
   // and the label-fit sizes produced, the whole graph is visible on load and

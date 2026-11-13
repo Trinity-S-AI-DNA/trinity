@@ -40,19 +40,24 @@ async function loadIndex() {
     const idx = JSON.parse(await res.text())
     explorer.on = true
     explorer.idx = idx
-    // Grid layout, deterministic: the index's own id order, the compiler's data.
-    const cols = 14
+    // No fixed grid here: nodes without explicit x/y are placed by the kit's
+    // shelf-packing over their measured label bounds, so the old defect (a
+    // fixed 70px row step under a 128px disc diameter) cannot recur.
     // The drawn label is the short segment name, capped: the label-fit size is
     // content-driven, and a 34-character id would draw a disc of radius 128 in
     // a 400-unit window (measured: the giant-arc failure). The full id stays on
     // the title (aria, inspector); the drawn label is the readable part.
-    const cap = (s) => { const t = s.split('/').pop(); return t.length > 14 ? t.slice(0, 13) + '…' : t }
-    const STEP_X = 150, STEP_Y = 70, COLS = 18
-    explorer.specs = idx.specs.map((s, i) => ({
+    // The cap is the spec's SB2_LABEL_CAP (generated into theme.css as
+    // --sb2-label-cap). Reading it back numerically is the named temporary
+    // duplicate until style resolution is a host op.
+    const cap = (s) => {
+      const t = s.split('/').pop()
+      const limit = Number(getComputedStyle(document.documentElement).getPropertyValue('--sb2-label-cap')) || 14
+      return t.length > limit ? t.slice(0, limit - 1) + '…' : t
+    }
+    explorer.specs = idx.specs.map((s) => ({
       title: s.id, label: cap(s.id), kind: s.id.includes('/') ? s.id.split('/')[0] : 'root',
       shape: s.counts.tests > 0 ? 1 : 2,
-      x: ((i % COLS) - COLS / 2) * STEP_X,
-      y: (Math.floor(i / COLS) - COLS / 4) * STEP_Y,
       rec: s,
     }))
     explorer.byId = new Map(explorer.specs.map((n) => [n.title, n]))
@@ -80,16 +85,6 @@ const inspector = el('div', 'sb2-inspector')
 async function showInspector(title) {
   const rec = explorer.byId.get(title)?.rec
   if (!rec) { inspector.replaceChildren(); return }
-  // The flowchart projection: only for specs whose flow was extracted. A spec
-  // with no flow record shows nothing invented -- the empty inspector is the
-  // explicit unknown.
-  try {
-    if (!showInspector.flow) showInspector.flow = JSON.parse(await (await fetch('./flow.json')).text())
-    const f = showInspector.flow
-    renderFlow(inspector, f.flows.filter((x) => title.endsWith(x.spec)), f.obj)
-  } catch (e) {
-    inspector.append(el('p', 'sb2-meta', 'flow unavailable: ' + e.message))
-  }
   const lines = [
     `module ${rec.module} (sha ${rec.sha256.slice(0, 12)})`,
     `consts ${rec.counts.consts} | fns ${rec.counts.fns} | tests ${rec.counts.tests} | uses ${rec.counts.uses} | calls ${rec.counts.calls}`,
@@ -97,10 +92,18 @@ async function showInspector(title) {
     rec.fns.length ? 'fns: ' + rec.fns.map((f) => `${f.name}@${f.line}`).join(', ') : '',
   ].filter(Boolean)
   const pre = el('pre', 'sb2-inspect', lines.join('\n'))
-  inspector.replaceChildren(pre)
-  renderFlow(inspector, [], null) // no-op shape: keeps kit import used for chrome only
-  inspector.querySelectorAll('.sb2-flow').forEach((n) => n.remove()) // renderFlow target is the inspector body below
-  renderFlow(inspector, showInspectorFlows, showInspectorObj)
+  const flowBox = el('div')
+  inspector.replaceChildren(pre, flowBox)
+  try {
+    if (!showInspector.flow) showInspector.flow = JSON.parse(await (await fetch('./flow.json')).text())
+    const f = showInspector.flow
+    // Node titles carry 'widgets/<id>'; flow records carry '<id>.t27' -- match
+    // on the base id either way, so the flows always find their spec.
+    const base = title.split('/').pop()
+    renderFlow(flowBox, f.flows.filter((x) => base === x.spec || base + '.t27' === x.spec), f.obj)
+  } catch (e) {
+    inspector.append(el('p', 'sb2-meta', 'flow unavailable: ' + e.message))
+  }
 }
 
 // --- View data: from the generated view descriptor (second-brain-view.t27 via gen-js) ---
@@ -143,6 +146,9 @@ const view = graphView(root, {
   ops: { toggle: viewToggleSelected, zoomIn: viewZoomIn, zoomOut: viewZoomOut },
   geo: { discReachSq: disc_reach_sq, squareW: square_w, squareH: square_h, squareReachT: square_reach_t, selectedNone: Number(K_SELECTED_NONE) },
   paddingX: Number(K_VIEW_PADDING_X), paddingY: Number(K_VIEW_PADDING_Y),
+  // values from themes.t27 SB2_LAYOUT_GAP_* (generated into theme.css); read back numerically
+  // until style resolution is a host op -- pinned there by layout_gaps_are_theme_parameters.
+  layoutGapX: 24, layoutGapY: 40,
   note: W.SAY_NOTE, mode: () => mode,
 })
 view.onSelect = (i) => { if (explorer.on) showInspector(view.currentNodes()[i]?.title) }

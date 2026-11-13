@@ -414,7 +414,8 @@ async function main() {
       ['--sb2-letter', 'SB2_LETTER_SPACING'], ['--sb2-radius-pill', 'SB2_RADIUS_PILL'],
       ['--sb2-btn-pad-y', 'SB2_BTN_PAD_Y'], ['--sb2-btn-pad-x', 'SB2_BTN_PAD_X'],
       ['--sb2-btn-lh', 'SB2_BTN_LINE_H'], ['--sb2-gap', 'SB2_GAP'],
-      ['--sb2-max-w', 'SB2_MAX_W'], ['--sb2-lh-base', 'SB2_LINE_H_BASE'],
+      ['--sb2-max-w', 'SB2_MAX_W'], ['--sb2-lh-base', 'SB2_LINE_H_BASE'], ['--sb2-label-cap', 'SB2_LABEL_CAP'],
+      ['--sb2-layout-gap-x', 'SB2_LAYOUT_GAP_X'], ['--sb2-layout-gap-y', 'SB2_LAYOUT_GAP_Y'],
     ]
     const metricBlock = '.sb2 {\n' + metrics.map(([tok, key]) => {
       const v = themeConsts[key]
