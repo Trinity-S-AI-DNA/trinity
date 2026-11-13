@@ -225,6 +225,11 @@ export function graphView(rootEl, { nodes: initialNodes, edges: initialEdges, st
   const inner = sv('g', {})
   svg.append(inner)
   viewport.append(svg)
+  // The camera lives here: render() rewrites the viewBox to the fitted content
+  // window; pan/zoom remain a transform inside it.
+  const applyView = () => {
+    if (VIEW) svg.setAttribute('viewBox', `${VIEW.x} ${VIEW.y} ${VIEW.w} ${VIEW.h}`)
+  }
   const status = el('div', 'sb2-state')
   const noteEl = note ? el('p', 'sb2-note', note) : null
   rootEl.append(viewport, status, ...(noteEl ? [noteEl] : []))
@@ -237,12 +242,31 @@ export function graphView(rootEl, { nodes: initialNodes, edges: initialEdges, st
   // Recomputed on every render: setGraph swaps the node list, and stale
   // positions from a previous graph are how explorer nodes ended up undefined.
   let POS = []
+  let VIEW = null // the fit-to-content camera; null until first layout
   const layout = () => {
     POS = nodes.map((n, i) => {
       if (n.x != null && n.y != null) return { x: n.x, y: n.y }
       const a = (i / nodes.length) * Math.PI * 2 - Math.PI / 2
       return { x: Math.cos(a) * R, y: Math.sin(a) * R }
     })
+  }
+  // The camera fits the content, not a hardcoded window: whatever the layout
+  // and the label-fit sizes produced, the whole graph is visible on load and
+  // after Reset. Sizes are asserted finite and positive first -- a NaN radius
+  // must stop the render, not shrink silently.
+  const fitView = () => {
+    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity
+    nodes.forEach((n, i) => {
+      const s = sizeOf(n, effShapeOf(n), false)
+      const r = s.kind === 'disc' ? s.r : Math.hypot(s.w, s.h) / 2
+      if (!(Number.isFinite(r) && r > 0)) throw new Error(`graphView: node "${n.title}" produced a non-finite size`)
+      const p = POS[i]
+      x0 = Math.min(x0, p.x - r); y0 = Math.min(y0, p.y - r)
+      x1 = Math.max(x1, p.x + r); y1 = Math.max(y1, p.y + r)
+    })
+    if (!nodes.length) { VIEW = { x: -200, y: -200, w: 400, h: 400 }; return }
+    const pad = Math.max(30, (x1 - x0) * 0.06)
+    VIEW = { x: x0 - pad, y: y0 - pad, w: x1 - x0 + pad * 2, h: y1 - y0 + pad * 2 }
   }
   const SHAPE_OF = (n) => {
     if (n.shape == null) return 'disc'
@@ -301,7 +325,7 @@ export function graphView(rootEl, { nodes: initialNodes, edges: initialEdges, st
   // far corner plus padding -- the circular border, not just the text width.
   // Selection adds a visual ring margin; the padding stays true underneath.
   const sizeOf = (n, shape, on) => {
-    const { w, h } = measure(n.title)
+    const { w, h } = measure(n.label ?? n.title)
     if (shape === 'square') {
       return { kind: 'square', w: Math.ceil(geo.squareW(w, PAD_X)), h: Math.ceil(geo.squareH(h, PAD_Y)) }
     }
@@ -331,10 +355,10 @@ export function graphView(rootEl, { nodes: initialNodes, edges: initialEdges, st
     const g = sv('g', { class: 'sb2-node' + (on ? ' sb2-on' : ''), role: 'button', 'aria-label': nodes[i].title })
     if (s.kind === 'square') {
       g.append(sv('rect', { x: p.x - s.w / 2, y: p.y - s.h / 2, width: s.w, height: s.h, class: 'sb2-square' }))
-      g.append(sv('text', { x: p.x, y: p.y, 'text-anchor': 'middle', 'dominant-baseline': 'central', class: 'sb2-label' }, nodes[i].title))
+      g.append(sv('text', { x: p.x, y: p.y, 'text-anchor': 'middle', 'dominant-baseline': 'central', class: 'sb2-label' }, nodes[i].label ?? nodes[i].title))
     } else {
       g.append(sv('circle', { cx: p.x, cy: p.y, r: s.r, class: 'sb2-disc' }))
-      g.append(sv('text', { x: p.x, y: p.y, 'text-anchor': 'middle', 'dominant-baseline': 'central', class: 'sb2-label' }, nodes[i].title))
+      g.append(sv('text', { x: p.x, y: p.y, 'text-anchor': 'middle', 'dominant-baseline': 'central', class: 'sb2-label' }, nodes[i].label ?? nodes[i].title))
     }
     g.addEventListener('click', () => { view.onSelect?.(i); view.event(4, i) })
     return g
@@ -342,8 +366,11 @@ export function graphView(rootEl, { nodes: initialNodes, edges: initialEdges, st
 
   /** Draw straight into `inner`: a nested <svg> here would open its own viewport at (0,0) of the
    *  outer coordinate space and fall outside the outer viewBox -- an empty graph area. */
+  const effShapeOf = (n) => (mode() === 'squares' ? 'square' : SHAPE_OF(n))
   function render() {
     layout()
+    fitView()
+    applyView()
     const m = mode()
     inner.replaceChildren(sv('title', {}, `${nodes.length} nodes, ${edges.length} edges, mode ${m}`))
     // The shape each node is drawn with THIS render. Edges must trim to these

@@ -42,11 +42,17 @@ async function loadIndex() {
     explorer.idx = idx
     // Grid layout, deterministic: the index's own id order, the compiler's data.
     const cols = 14
+    // The drawn label is the short segment name, capped: the label-fit size is
+    // content-driven, and a 34-character id would draw a disc of radius 128 in
+    // a 400-unit window (measured: the giant-arc failure). The full id stays on
+    // the title (aria, inspector); the drawn label is the readable part.
+    const cap = (s) => { const t = s.split('/').pop(); return t.length > 14 ? t.slice(0, 13) + '…' : t }
+    const STEP_X = 150, STEP_Y = 70, COLS = 18
     explorer.specs = idx.specs.map((s, i) => ({
-      title: s.id, kind: s.id.includes('/') ? s.id.split('/')[0] : 'root',
+      title: s.id, label: cap(s.id), kind: s.id.includes('/') ? s.id.split('/')[0] : 'root',
       shape: s.counts.tests > 0 ? 1 : 2,
-      x: ((i % cols) - cols / 2) * 26,
-      y: (Math.floor(i / cols) - 6) * 26,
+      x: ((i % COLS) - COLS / 2) * STEP_X,
+      y: (Math.floor(i / COLS) - COLS / 4) * STEP_Y,
       rec: s,
     }))
     explorer.byId = new Map(explorer.specs.map((n) => [n.title, n]))
