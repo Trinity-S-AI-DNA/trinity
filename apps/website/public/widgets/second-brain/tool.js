@@ -47,12 +47,17 @@ async function loadIndex() {
     // content-driven, and a 34-character id would draw a disc of radius 128 in
     // a 400-unit window (measured: the giant-arc failure). The full id stays on
     // the title (aria, inspector); the drawn label is the readable part.
-    // The cap is the spec's SB2_LABEL_CAP (generated into theme.css as
-    // --sb2-label-cap). Reading it back numerically is the named temporary
-    // duplicate until style resolution is a host op.
+    // The cap is the spec's SB2_LABEL_CAP, emitted into theme.css as
+    // --sb2-label-cap. Read it back from the document when styles are
+    // available; a non-browser host (or a stylesheet-less one) falls back to
+    // 14, which is the same value the spec pins -- the duplicate is the named
+    // temporary until style resolution is a host op.
     const cap = (s) => {
       const t = s.split('/').pop()
-      const limit = Number(getComputedStyle(document.documentElement).getPropertyValue('--sb2-label-cap')) || 14
+      let limit = 14
+      try {
+        limit = Number(getComputedStyle(document.documentElement).getPropertyValue('--sb2-label-cap')) || 14
+      } catch { /* no style resolution in this host */ }
       return t.length > limit ? t.slice(0, limit - 1) + '…' : t
     }
     explorer.specs = idx.specs.map((s) => ({
