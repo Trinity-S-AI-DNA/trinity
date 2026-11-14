@@ -118,6 +118,7 @@ const ProviderExplorer = lazy(() => import('./pages/ProviderExplorer.tsx'))
 // frames it with ?embed=1.
 const SystemDocs = lazy(() => import('./pages/SystemDocs.tsx'))
 const ClientsConsole = lazy(() => import('./pages/ClientsConsole.tsx'))
+const UIKit = lazy(() => import('./pages/UIKit.tsx'))
 
 const RouteFallback = () => (
   // spinSlow, not spin — index.css only defines the former.
@@ -189,6 +190,7 @@ createRoot(document.getElementById('root')!).render(
             {/* Not in the navigation: the console shows one person's
                 correspondence and opens only for the owner. */}
             <Route path="/clients" element={<ClientsConsole />} />
+            <Route path="/uikit" element={<UIKit />} />
             <Route path="/viz/*" element={<Navigate to="/quantum" replace />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>
