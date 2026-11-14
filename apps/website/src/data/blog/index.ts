@@ -3,6 +3,35 @@ import type { PostMeta } from './types'
 /** Индекс блога: список и метаданные без тяжёлых тел публикаций. */
 export const postsIndex: PostMeta[] = [
   {
+    slug: "vibecoding-lesson-texts-fill-chat-budget",
+    title: "Vibecoding course: lesson texts expanded to fill the chat grounding budget",
+    summary: "[lengths are from course-from-spec --check on eb7d0c2a7; API probes done in-browser] All 27 English lesson texts in the Vibecoding from Zero course were expanded from 361–685 bytes to 1170–1403 bytes each to fill the 1500-byte CHAT_BODY_MAX slot that course-chat.t27 injects into the system prompt. Nine Russian texts were updated for number parity, and eight superlative phrases were rephrased.",
+    date: "2026-11-14",
+    readingMinutes: 2,
+    tags: ["t27", "Course", "Vibecoding"],
+    receipts: [
+      { label: "trinity#1874: expand vibecoding lesson texts goal", href: "https://github.com/Trinity-S-AI-DNA/trinity/issues/1874" },
+      { label: "trinity pull request 1876: the expansion and this post", href: "https://github.com/Trinity-S-AI-DNA/trinity/pull/1876" },
+      { label: "The course: Vibecoding from zero", href: "https://t27.ai/#/vibecoding" },
+      { label: "course-chat.t27: system_prompt injects lesson_body at line 325", href: "https://t27.ai/learn/vibecoding.t27" },
+    ],
+    openQuestions: [
+      "Live API probes confirmed grounded responses for lessons 1 through 22; lessons 23–27 were covered by code audit only due to the IP rate limit of 20 requests per hour.",
+      "The number parity rule requires the same digit multiset in EN and RU fields; the nine updated Russian texts were verified by course-from-spec --check, not by a native speaker.",
+      "The superlative rule flags 'the first' and 'the only'; rephrasing was checked for meaning equivalence but not reviewed.",
+    ],
+    published: true,
+    ru: {
+      title: "Курс Вайбкодинг: тексты уроков расширены до бюджета заземления чата",
+      summary: "[длины получены из course-from-spec --check на eb7d0c2a7; API-пробы сделаны в браузере] Все 27 английских текстов уроков курса Вайбкодинг с нуля расширены с 361–685 байт до 1170–1403 байт каждый, чтобы заполнить слот CHAT_BODY_MAX = 1500, который course-chat.t27 встраивает в системный промпт. Девять русских текстов обновлены для числового паритета, восемь фраз в превосходной степени перефразированы.",
+      openQuestions: [
+        "Живые API-пробы подтвердили заземлённые ответы для уроков 1–22; уроки 23–27 покрыты только аудитом кода из-за ограничения IP в 20 запросов в час.",
+        "Правило числового паритета требует одинакового набора цифр в EN и RU полях; девять обновлённых русских текстов проверены course-from-spec --check, но не носителем языка.",
+        "Правило превосходных степеней помечает 'the first' и 'the only'; перефразировки проверены на эквивалентность смысла, но не на редактуру.",
+      ],
+    },
+  },
+  {
     slug: "the-course-names-its-bench-board",
     title: "The FPGA course names its bench board",
     summary: "[the board is the one identified on the bench on 2026-10-08; the still was checked by decoding the PNG, not in a browser] Two lessons of the FPGA course now name the board on our bench, an ALINX AX7203 with the XC7A200T in the 484-ball FBG484 package, and the course lead lists the two X accounts.",
