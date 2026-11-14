@@ -11,14 +11,14 @@ const TOKENS = {
   t27: {
     bg: '#000000', text: '#FFFFFF', muted: '#888888',
     accent: '#00FF88', accentDark: '#00CC66', gold: '#FFD700',
-    border: '#141414', cardBorder: '#333333', cardBorderHover: '#FFFFFF',
-    cardDesc: '#A6A6A6', cardFoot: '#8A8A8A', surfaceInput: '#333333',
-    surfaceCard: '#141414',
+    border: 'rgba(255,255,255,0.08)', cardBorder: '#333333', cardBorderHover: '#FFFFFF',
+    cardDesc: '#A6A6A6', cardFoot: '#8A8A8A', surfaceInput: '#1A1A1A',
+    surfaceCard: '#0A0A0A',
   },
   paper: {
     bg: '#FFFFFF', text: '#000000', muted: '#666666',
     accent: '#00A35C', accentDark: '#007A45', gold: '#B38F00',
-    border: '#EBEBEB', cardBorder: '#CCCCCC', cardBorderHover: '#000000',
+    border: 'rgba(0,0,0,0.08)', cardBorder: '#CCCCCC', cardBorderHover: '#000000',
     cardDesc: '#4D4D4D', cardFoot: '#666666', surfaceInput: '#F5F5F5',
     surfaceCard: '#FAFAFA',
   },
@@ -33,29 +33,32 @@ type BtnState = 'default' | 'hover' | 'disabled'
 
 function buttonStyle(theme: Theme, variant: BtnVariant, state: BtnState): CSSProperties {
   const t = tok(theme)
+  // B&W brand: primary inverts bg/text between themes (white-on-black ↔ black-on-white)
+  const primaryBg = t.text   // text color becomes bg — white in dark, black in light
+  const primaryText = t.bg   // bg becomes text — black in dark, white in light
   const fills: Record<BtnVariant, string> = {
-    primary: t.accent, secondary: 'transparent', ghost: 'transparent',
+    primary: primaryBg, secondary: 'transparent', ghost: 'transparent',
     success: t.accentDark, warn: t.gold,
   }
   const borders: Record<BtnVariant, string> = {
-    primary: t.accent, secondary: t.accent, ghost: 'transparent',
+    primary: t.text, secondary: t.text, ghost: 'transparent',
     success: t.accentDark, warn: t.gold,
   }
   const textColors: Record<BtnVariant, string> = {
-    primary: '#000000', secondary: t.accent, ghost: t.muted,
+    primary: primaryText, secondary: t.text, ghost: t.muted,
     success: '#000000', warn: '#000000',
   }
   const fill = state === 'hover'
-    ? (variant === 'secondary' ? t.accent + '22' : fills[variant] + 'CC')
+    ? (variant === 'secondary' ? t.text + '18' : fills[variant] + 'CC')
     : fills[variant]
   return {
     display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
-    padding: '10px 20px', borderRadius: '8px', border: `1.5px solid ${borders[variant]}`,
+    padding: '12px 20px', borderRadius: '999px', border: `1px solid ${borders[variant]}`,
     background: fill, color: textColors[variant],
-    fontFamily: 'Outfit, system-ui, sans-serif', fontSize: '14px', fontWeight: 500,
+    fontFamily: 'Outfit, system-ui, sans-serif', fontSize: '15px', fontWeight: 400,
     cursor: state === 'disabled' ? 'not-allowed' : 'pointer',
     opacity: state === 'disabled' ? 0.4 : 1,
-    minHeight: '44px', letterSpacing: '0.02em', transition: 'none',
+    minHeight: '44px', letterSpacing: 'normal', transition: 'none',
   }
 }
 
@@ -69,9 +72,9 @@ function UiCard({ theme, state }: { theme: Theme; state: 'default' | 'hover' }) 
   const border = state === 'hover' ? t.cardBorderHover : t.cardBorder
   return (
     <div style={{ background: t.surfaceCard, border: `1px solid ${border}`, borderRadius: '12px', padding: '20px', maxWidth: '560px', width: '100%' }}>
-      <div style={{ color: t.text, fontSize: '17px', fontWeight: 700, marginBottom: '8px' }}>Card title</div>
-      <div style={{ color: t.cardDesc, fontSize: '14px', lineHeight: 1.5, marginBottom: '16px' }}>Card description — a short paragraph of body text that spans two lines for context.</div>
-      <div style={{ color: t.cardFoot, fontSize: '12px', letterSpacing: '0.05em' }}>Author · 2026-11-14</div>
+      <div style={{ color: t.text, fontSize: '15.2px', fontWeight: 600, marginBottom: '8px' }}>Card title</div>
+      <div style={{ color: t.cardDesc, fontSize: '15.2px', fontWeight: 400, lineHeight: 1.5, marginBottom: '16px' }}>Card description — a short paragraph of body text that spans two lines for context.</div>
+      <div style={{ color: t.cardFoot, fontSize: '11px', fontWeight: 600, letterSpacing: '3.52px', textTransform: 'uppercase' }}>Author · 2026-11-14</div>
     </div>
   )
 }
@@ -199,9 +202,18 @@ function UiTaskCard({ theme }: { theme: Theme }) {
 function UiText({ theme, variant }: { theme: Theme; variant: 'heading' | 'body' }) {
   const t = tok(theme)
   if (variant === 'heading') {
-    return <h2 style={{ color: t.text, fontSize: '28px', fontWeight: 800, letterSpacing: '-0.02em', lineHeight: 1.2 }}>t27 — the language of three</h2>
+    return (
+      <div>
+        {/* H2 section label — 11px 500 uppercase LS=1.76px */}
+        <div style={{ color: t.muted, fontSize: '11px', fontWeight: 500, letterSpacing: '1.76px', textTransform: 'uppercase', marginBottom: '8px' }}>Section</div>
+        {/* H1 hero — 800 weight, large, LS=-4.84px */}
+        <h1 style={{ color: t.text, fontSize: 'clamp(40px, 8vw, 108px)', fontWeight: 800, letterSpacing: '-4.84px', lineHeight: 0.95, margin: 0 }}>t27</h1>
+        {/* H3 sub-label — 12.8px 500 uppercase LS=1.28px muted */}
+        <div style={{ color: t.muted, fontSize: '12.8px', fontWeight: 500, letterSpacing: '1.28px', textTransform: 'uppercase', marginTop: '12px' }}>The language of three</div>
+      </div>
+    )
   }
-  return <p style={{ color: t.text, fontSize: '15px', lineHeight: 1.6, maxWidth: '480px' }}>φ² = φ + 1 — the golden constraint. Ternary logic fits the universe better than binary. Every spec is a theorem; every test is a proof.</p>
+  return <p style={{ color: t.text, fontSize: '15.2px', fontWeight: 400, lineHeight: 1.6, maxWidth: '480px', margin: 0 }}>φ² = φ + 1 — the golden constraint. Ternary logic fits the universe better than binary. Every spec is a theorem; every test is a proof.</p>
 }
 
 function UiContainer({ theme }: { theme: Theme }) {
