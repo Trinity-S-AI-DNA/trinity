@@ -110,7 +110,9 @@ export default function CourseChat(p: Props) {
           <button type="submit" className="cc-go" disabled={!up || capped || busy || text.trim().length < 1}>{G.CHAT_SEND}</button>
         </form>
       </aside>
-      <button type="button" className="cc-open" onClick={() => setOpen(true)}>{G.CHAT_OPEN}</button>
+      <button type="button" className="cc-open" aria-label={G.CHAT_OPEN} onClick={() => setOpen(true)}>
+        <img src={`${import.meta.env.BASE_URL}${G.CHAT_AVATAR}`} alt="" width={G.CHAT_AVATAR_PX} height={G.CHAT_AVATAR_PX} />
+      </button>
     </>
   )
 }
