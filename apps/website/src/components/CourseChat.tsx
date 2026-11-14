@@ -47,6 +47,58 @@ async function call(p: Props, extra: Record<string, unknown>): Promise<Reply> {
   }
 }
 
+// Message calls stream NDJSON: {"delta":"tok"}\n lines then {"ok":true}\n or {"ok":false,...}\n
+async function callStream(p: Props, extra: Record<string, unknown>, onDelta: (token: string) => void): Promise<Reply> {
+  const ctl = new AbortController()
+  let timedOut = false
+  const timer = setTimeout(() => { timedOut = true; ctl.abort() }, G.CHAT_TIMEOUT_MS)
+  try {
+    const r = await fetch(LADDER.renderBase + G.CHAT_ROUTE, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      signal: ctl.signal,
+      body: JSON.stringify({ course: p.course, lesson: p.lesson ?? '', title: (p.title ?? '').slice(0, G.CHAT_TITLE_MAX), key: p.ckey, ...extra }),
+    })
+    if (r.status !== 200) return { reached: true, timedOut, status: r.status, answer: '' }
+    const reader = r.body?.getReader()
+    if (!reader) return { reached: true, timedOut, status: r.status, answer: '' }
+    const dec = new TextDecoder()
+    let buf = ''
+    let answer = ''
+    let finalOk = false
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buf += dec.decode(value, { stream: true })
+      const parts = buf.split('\n')
+      buf = parts.pop() ?? ''
+      for (const raw of parts) {
+        const line = raw.trim()
+        if (!line) continue
+        try {
+          const obj = JSON.parse(line) as Record<string, unknown>
+          if (typeof obj.delta === 'string') { onDelta(obj.delta); answer += obj.delta }
+          else if (obj.ok === true) finalOk = true
+          else if (obj.ok === false) return { reached: true, timedOut, status: 503, answer: '' }
+        } catch { /* skip malformed */ }
+      }
+    }
+    if (buf.trim()) {
+      try {
+        const obj = JSON.parse(buf.trim()) as Record<string, unknown>
+        if (typeof obj.delta === 'string') { onDelta(obj.delta); answer += obj.delta }
+        else if (obj.ok === false) return { reached: true, timedOut, status: 503, answer: '' }
+        else if (obj.ok === true) finalOk = true
+      } catch { /* skip */ }
+    }
+    return { reached: true, timedOut, status: finalOk ? 200 : 503, answer: answer.slice(0, G.CHAT_ANSWER_MAX) }
+  } catch {
+    return { reached: timedOut, timedOut, status: 0, answer: '' }
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
 export default function CourseChat(p: Props) {
   const [open, setOpen] = useState(false)
   const [text, setText] = useState('')
@@ -56,6 +108,7 @@ export default function CourseChat(p: Props) {
   const [why, setWhy] = useState(-1)
   const [wide, setWide] = useState(false)
   const [sent, setSent] = useState(0)
+  const [streamingText, setStreamingText] = useState<string | null>(null)
   const flight = useRef(false)
   const allowed = (G.CHAT_COURSES as readonly string[]).includes(p.course)
 
@@ -107,7 +160,11 @@ export default function CourseChat(p: Props) {
     }
     setBusy(true)
     setSent(sent + 1)
-    const r = await call(p, { message, turn: sent })
+    setStreamingText('')
+    const r = await callStream(p, { message, turn: sent }, (token) => {
+      setStreamingText((prev) => (prev ?? '') + token)
+    })
+    setStreamingText(null)
     const reason = clientReason(r.reached, r.timedOut, r.status, r.answer.length)
     setLines((l) => [...l, reason === G.REASON_NONE ? { who: 'bot', text: r.answer } : { who: 'off', text: unansweredText(reason) }])
     if (reason === G.REASON_UNREACHABLE || reason === G.REASON_TIMEOUT || reason === G.REASON_STATUS) { setWhy(reason); setUp(false) }
@@ -126,7 +183,7 @@ export default function CourseChat(p: Props) {
         <p className="cc-hint">{G.CHAT_HINT}</p>
         <div className="cc-log" role="log" aria-live="polite">
           {lines.map((l, i) => <p key={i} className={l.who === 'you' ? 'cc-m cc-you' : l.who === 'off' ? 'cc-m cc-off' : 'cc-m'}>{l.text}</p>)}
-          {busy ? <p className="cc-m cc-off">{G.CHAT_WORKING}</p> : null}
+          {streamingText !== null ? <p className="cc-m">{streamingText || G.CHAT_WORKING}</p> : busy ? <p className="cc-m cc-off">{G.CHAT_WORKING}</p> : null}
           {!up && why > G.REASON_NONE && lines.length === 0 ? <p className="cc-m cc-off">{offlineText(why)}</p> : null}
           {capped ? <p className="cc-m cc-off">{offlineText(G.REASON_LIMIT)}</p> : null}
         </div>
