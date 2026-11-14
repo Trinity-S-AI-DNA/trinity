@@ -83,7 +83,7 @@ function UiCard({ theme, state }: { theme: Theme; state: 'default' | 'hover' }) 
 
 type InputState = 'default' | 'error' | 'focus' | 'disabled'
 
-function UiInput({ theme, state }: { theme: Theme; state: InputState }) {
+function UiInput({ theme, state, 'data-testid': testId, onFocus, onBlur }: { theme: Theme; state: InputState; 'data-testid'?: string; onFocus?: () => void; onBlur?: () => void }) {
   const t = tok(theme)
   const borderColor = state === 'error' ? '#ff4444' : state === 'focus' ? t.accent : t.cardBorder
   const shadow = state === 'focus' ? `0 0 0 2px ${t.accent}44` : 'none'
@@ -93,8 +93,9 @@ function UiInput({ theme, state }: { theme: Theme; state: InputState }) {
         {state === 'error' ? 'Email (error)' : 'Email'}
       </label>
       <input
-        readOnly
-        disabled={state === 'disabled'}
+        readOnly disabled={state === 'disabled'}
+        data-testid={testId} data-state={state}
+        onFocus={onFocus} onBlur={onBlur}
         value={state === 'error' ? 'invalid@' : state === 'disabled' ? 'disabled@t27.ai' : 'hello@t27.ai'}
         style={{
           background: t.surfaceInput, border: `1.5px solid ${borderColor}`,
@@ -106,6 +107,11 @@ function UiInput({ theme, state }: { theme: Theme; state: InputState }) {
       {state === 'error' && <span style={{ color: '#ff4444', fontSize: '12px' }}>Invalid email address</span>}
     </div>
   )
+}
+function InteractiveInput({ theme }: { theme: Theme }) {
+  const [s, setS] = useState<InputState>('default')
+  return <UiInput theme={theme} state={s} data-testid="input-default"
+    onFocus={() => setS('focus')} onBlur={() => setS('default')} />
 }
 
 type BadgeVariant = 'primary' | 'secondary' | 'ghost' | 'success' | 'warn'
@@ -284,7 +290,10 @@ const STORIES: Story[] = [
   { id: 'button-warn-disabled',      title: 'Button / Warn / Disabled',      component: 'button',    render: t => <UiButton theme={t} variant="warn"      state="disabled" />, specPath: 'specs/t27f/vf_storybook.t27', pngPath: 'stories/s14_t0.png' },
   { id: 'card-default',              title: 'Card / Default',                component: 'card',      render: t => <UiCard theme={t} state="default" />,   specPath: 'specs/t27f/vf_storybook.t27', pngPath: 'stories/s15_t0.png' },
   { id: 'card-hover',                title: 'Card / Hover',                  component: 'card',      render: t => <UiCard theme={t} state="hover" />,     specPath: 'specs/t27f/vf_storybook.t27', pngPath: 'stories/s16_t0.png' },
-  { id: 'input-default',             title: 'Input / Default',               component: 'input',     render: t => <UiInput theme={t} state="default" />,  specPath: 'specs/t27f/vf_storybook.t27', pngPath: 'stories/s17_t0.png' },
+  { id: 'input-default',             title: 'Input / Default',               component: 'input',
+    render: t => <InteractiveInput theme={t} />,
+    specPath: 'specs/uikit/stories.t27', pngPath: 'stories/s17_t0.png',
+    interactions: [{ action: 'focus', expect: 'focus' }] },
   { id: 'input-error',               title: 'Input / Error',                 component: 'input',     render: t => <UiInput theme={t} state="error" />,    specPath: 'specs/t27f/vf_storybook.t27', pngPath: 'stories/s18_t0.png' },
   { id: 'input-focus',               title: 'Input / Focus',                 component: 'input',     render: t => <UiInput theme={t} state="focus" />,    specPath: 'specs/t27f/vf_storybook.t27', pngPath: 'stories/s19_t0.png' },
   { id: 'badge-primary',             title: 'Badge / Primary / Default',     component: 'badge',
