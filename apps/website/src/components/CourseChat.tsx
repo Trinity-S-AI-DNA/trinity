@@ -1,19 +1,26 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { LADDER } from '../lib/courseLadder.generated'
 import * as G from '../lib/courseChat.gen'
 
 // The helper chat beside a course (trinity#1813). The words, the numbers, the limits and the
 // styles are specs/chat/course-chat.t27, through src/lib/courseChat.gen.ts; the branching below
-// mirrors that spec's client_reason and offline_text. Nothing is stored: the lines live in state.
+// mirrors that spec's client_reason, probe_reason, turn_reason and offline_text (t27c gen-ts
+// lowers declarations, not function bodies). Nothing is stored: the lines live in state.
+// When the panel opens it probes the route and goes live by itself, and while it shows offline
+// it probes again every CHAT_PROBE_RETRY_MS.
 
 type Line = { who: 'you' | 'bot' | 'off'; text: string }
 type Props = { course: string; lesson?: string; title?: string; ckey?: string }
+type Reply = { reached: boolean; timedOut: boolean; status: number; answer: string }
 
-const offlineText = (r: number) => (r === G.REASON_LIMIT ? G.CHAT_OFFLINE_LIMIT : r === G.REASON_BAD_REQUEST ? G.CHAT_OFFLINE_BAD : G.CHAT_OFFLINE)
+const offlineText = (r: number) =>
+  r === G.REASON_LIMIT ? G.CHAT_OFFLINE_LIMIT : r === G.REASON_BUSY ? G.CHAT_OFFLINE_BUSY : r === G.REASON_BAD_REQUEST ? G.CHAT_OFFLINE_BAD : G.CHAT_OFFLINE
 const clientReason = (reached: boolean, timedOut: boolean, status: number, len: number) =>
-  !reached ? G.REASON_UNREACHABLE : timedOut ? G.REASON_TIMEOUT : status === 429 ? G.REASON_LIMIT : status !== 200 ? G.REASON_STATUS : len === 0 ? G.REASON_EMPTY : G.REASON_NONE
+  !reached ? G.REASON_UNREACHABLE : timedOut ? G.REASON_TIMEOUT : status === 429 ? G.REASON_LIMIT : status === 503 ? G.REASON_BUSY : status !== 200 ? G.REASON_STATUS : len === 0 ? G.REASON_EMPTY : G.REASON_NONE
+const probeReason = (r: Reply) => clientReason(r.reached, r.timedOut, r.status, 1)
+const turnReason = (turn: number) => (turn >= G.CHAT_TURNS_MAX ? G.REASON_LIMIT : G.REASON_NONE)
 
-async function ask(p: Props, message: string): Promise<{ reason: number; answer: string }> {
+async function call(p: Props, extra: Record<string, unknown>): Promise<Reply> {
   const ctl = new AbortController()
   let timedOut = false
   const timer = setTimeout(() => { timedOut = true; ctl.abort() }, G.CHAT_TIMEOUT_MS)
@@ -22,13 +29,13 @@ async function ask(p: Props, message: string): Promise<{ reason: number; answer:
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       signal: ctl.signal,
-      body: JSON.stringify({ course: p.course, lesson: p.lesson ?? '', title: (p.title ?? '').slice(0, G.CHAT_TITLE_MAX), message, key: p.ckey }),
+      body: JSON.stringify({ course: p.course, lesson: p.lesson ?? '', title: (p.title ?? '').slice(0, G.CHAT_TITLE_MAX), key: p.ckey, ...extra }),
     })
     const body = r.status === 200 ? await r.json().catch(() => null) : null
     const answer = typeof body?.answer === 'string' ? body.answer.slice(0, G.CHAT_ANSWER_MAX) : ''
-    return { reason: clientReason(true, timedOut, r.status, answer.length), answer }
+    return { reached: true, timedOut, status: r.status, answer }
   } catch {
-    return { reason: clientReason(timedOut, timedOut, 0, 0), answer: '' }
+    return { reached: timedOut, timedOut, status: 0, answer: '' }
   } finally {
     clearTimeout(timer)
   }
@@ -39,15 +46,48 @@ export default function CourseChat(p: Props) {
   const [text, setText] = useState('')
   const [busy, setBusy] = useState(false)
   const [lines, setLines] = useState<Line[]>([])
-  if (!(G.CHAT_COURSES as readonly string[]).includes(p.course)) return null
+  const [up, setUp] = useState(false)
+  const [why, setWhy] = useState(-1)
+  const [wide, setWide] = useState(false)
+  const allowed = (G.CHAT_COURSES as readonly string[]).includes(p.course)
+
+  useEffect(() => {
+    const m = window.matchMedia(`(min-width:${G.CHAT_WIDE_MIN}px)`)
+    const on = () => setWide(m.matches)
+    on()
+    m.addEventListener('change', on)
+    return () => m.removeEventListener('change', on)
+  }, [])
+
+  useEffect(() => {
+    if (!allowed || !(open || wide) || up) return
+    let dead = false
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const run = async () => {
+      const reason = probeReason(await call(p, { probe: true }))
+      if (dead) return
+      if (reason === G.REASON_NONE) { setWhy(G.REASON_NONE); setUp(true); return }
+      setWhy(reason)
+      timer = setTimeout(run, G.CHAT_PROBE_RETRY_MS)
+    }
+    void run()
+    return () => { dead = true; if (timer) clearTimeout(timer) }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [allowed, open, wide, up, p.course])
+
+  if (!allowed) return null
+  const turn = lines.filter((l) => l.who === 'you').length
+  const capped = turnReason(turn) !== G.REASON_NONE
   const send = async () => {
     const message = text.trim()
-    if (busy || message.length < 1 || message.length > G.CHAT_MSG_MAX) return
+    if (!up || busy || capped || message.length < 1 || message.length > G.CHAT_MSG_MAX) return
     setText('')
     setBusy(true)
     setLines((l) => [...l, { who: 'you', text: message }])
-    const { reason, answer } = await ask(p, message)
-    setLines((l) => [...l, reason === G.REASON_NONE ? { who: 'bot', text: answer } : { who: 'off', text: offlineText(reason) }])
+    const r = await call(p, { message, turn })
+    const reason = clientReason(r.reached, r.timedOut, r.status, r.answer.length)
+    setLines((l) => [...l, reason === G.REASON_NONE ? { who: 'bot', text: r.answer } : { who: 'off', text: offlineText(reason) }])
+    if (reason === G.REASON_UNREACHABLE || reason === G.REASON_TIMEOUT || reason === G.REASON_STATUS) { setWhy(reason); setUp(false) }
     setBusy(false)
   }
   return (
@@ -62,10 +102,12 @@ export default function CourseChat(p: Props) {
         <div className="cc-log" role="log" aria-live="polite">
           {lines.map((l, i) => <p key={i} className={l.who === 'you' ? 'cc-m cc-you' : l.who === 'off' ? 'cc-m cc-off' : 'cc-m'}>{l.text}</p>)}
           {busy ? <p className="cc-m cc-off">{G.CHAT_WORKING}</p> : null}
+          {!up && why > G.REASON_NONE ? <p className="cc-m cc-off">{offlineText(why)}</p> : null}
+          {capped ? <p className="cc-m cc-off">{offlineText(G.REASON_LIMIT)}</p> : null}
         </div>
         <form className="cc-form" onSubmit={(e) => { e.preventDefault(); void send() }}>
-          <textarea className="cc-in" value={text} maxLength={G.CHAT_MSG_MAX} placeholder={G.CHAT_PLACEHOLDER} aria-label={G.CHAT_PLACEHOLDER} onChange={(e) => setText(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); void send() } }} />
-          <button type="submit" className="cc-go" disabled={busy || text.trim().length < 1}>{G.CHAT_SEND}</button>
+          <textarea className="cc-in" value={text} maxLength={G.CHAT_MSG_MAX} disabled={!up || capped} placeholder={G.CHAT_PLACEHOLDER} aria-label={G.CHAT_PLACEHOLDER} onChange={(e) => setText(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); void send() } }} />
+          <button type="submit" className="cc-go" disabled={!up || capped || busy || text.trim().length < 1}>{G.CHAT_SEND}</button>
         </form>
       </aside>
       <button type="button" className="cc-open" onClick={() => setOpen(true)}>{G.CHAT_OPEN}</button>
