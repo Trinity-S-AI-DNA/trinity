@@ -4,7 +4,7 @@
 // themselves run from src/lib/courseAccess.logic.ts; their numbers are in src/lib/courseAccess.gen.ts.
 
 export const LADDER = {
-  "renderBase": "https://vibee-render-production.up.railway.app",
+  "renderBase": "https://t27ai-130-17-9-230.sslip.io",
   "openKey": "t27-course-open",
   "keysKey": "t27-course-keys",
   "say": {
