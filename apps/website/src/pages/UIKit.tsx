@@ -33,20 +33,23 @@ type BtnState = 'default' | 'hover' | 'disabled'
 
 function buttonStyle(theme: Theme, variant: BtnVariant, state: BtnState): CSSProperties {
   const t = tok(theme)
+  // B&W brand: primary inverts bg/text between themes (white-on-black ↔ black-on-white)
+  const primaryBg = t.text   // text color becomes bg — white in dark, black in light
+  const primaryText = t.bg   // bg becomes text — black in dark, white in light
   const fills: Record<BtnVariant, string> = {
-    primary: t.accent, secondary: 'transparent', ghost: 'transparent',
+    primary: primaryBg, secondary: 'transparent', ghost: 'transparent',
     success: t.accentDark, warn: t.gold,
   }
   const borders: Record<BtnVariant, string> = {
-    primary: t.accent, secondary: t.accent, ghost: 'transparent',
+    primary: t.text, secondary: t.text, ghost: 'transparent',
     success: t.accentDark, warn: t.gold,
   }
   const textColors: Record<BtnVariant, string> = {
-    primary: '#000000', secondary: t.accent, ghost: t.muted,
+    primary: primaryText, secondary: t.text, ghost: t.muted,
     success: '#000000', warn: '#000000',
   }
   const fill = state === 'hover'
-    ? (variant === 'secondary' ? t.accent + '22' : fills[variant] + 'CC')
+    ? (variant === 'secondary' ? t.text + '18' : fills[variant] + 'CC')
     : fills[variant]
   return {
     display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
