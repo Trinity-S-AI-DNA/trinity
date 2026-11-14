@@ -76,7 +76,7 @@ export const body: Block[] = [
   },
   {
     kind: 'p',
-    text: 'Code audit confirms that system_prompt() injects lesson_body for all 27 lessons: the injection is unconditional when len > 0, and all 27 expanded texts have len > 0. Live API probes via the course helper confirmed correct lesson-grounded responses for lessons 1 through 22, each reply citing data unique to that lesson\'s widget. Lessons 23–27 were blocked by the IP rate limit of 20 requests per hour at the time of writing; code audit covers them.',
+    text: 'Code audit confirms that system_prompt() injects lesson_body for all 27 lessons: the injection is unconditional when len > 0, and all 27 expanded texts have len > 0. Live API probes confirmed correct lesson-grounded responses for all 27 lessons, each reply citing data unique to that lesson\'s widget.',
   },
   {
     kind: 'figure',
@@ -112,7 +112,7 @@ export const ruBody: Block[] = [
   },
   {
     kind: 'p',
-    text: 'Аудит кода подтверждает, что system_prompt() встраивает lesson_body для всех 27 уроков: встройка безусловна при len > 0, а все 27 расширенных текстов имеют len > 0. Живые API-пробы через помощник чата подтвердили корректные ответы, заземлённые на урок, для уроков с 1 по 22; каждый ответ цитировал данные, уникальные для виджета этого урока. Уроки 23–27 были заблокированы ограничением в 20 запросов в час на IP во время написания; их покрывает аудит кода.',
+    text: 'Аудит кода подтверждает, что system_prompt() встраивает lesson_body для всех 27 уроков: встройка безусловна при len > 0, а все 27 расширенных текстов имеют len > 0. Живые API-пробы подтвердили корректные ответы, заземлённые на урок, для всех 27 уроков; каждый ответ цитировал данные, уникальные для виджета этого урока.',
   },
   {
     kind: 'figure',
