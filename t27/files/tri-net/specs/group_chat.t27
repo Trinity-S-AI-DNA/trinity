@@ -1,0 +1,160 @@
+// Persistent group chat membership and message policy.
+// HTTP, SQLite, and UI adapters are outside this specification.
+// phi^2 + phi^-2 = 3
+
+module GroupChat {
+    use base::types;
+
+    const MIN_GROUP_MEMBERS: u8 = 2;
+    const MAX_GROUP_MEMBERS: u8 = 32;
+    const MAX_GROUP_TITLE_BYTES: u16 = 80;
+    const MAX_MESSAGE_BYTES: u16 = 4096;
+    const MAX_MESSAGE_PAGE: u16 = 100;
+
+    // requested/resolved/unique count only the invited accounts. The creator
+    // is always inserted separately and must own a verified nickname.
+    fn group_may_be_created(creator_valid: bool, requested: u8, resolved: u8, unique: u8) -> bool {
+        if (!creator_valid || requested == 0) {
+            return false;
+        }
+        if (requested != resolved || requested != unique) {
+            return false;
+        }
+        // The creator is the extra member, so at most MAX-1 invitations fit.
+        // Avoid `requested + 1`: requested is u8 and an attacker can send 255.
+        return requested < MAX_GROUP_MEMBERS;
+    }
+
+    fn title_is_valid(byte_length: u16) -> bool {
+        return byte_length > 0 && byte_length <= MAX_GROUP_TITLE_BYTES;
+    }
+
+    fn member_may_read(active_member: bool, device_valid: bool) -> bool {
+        return active_member && device_valid;
+    }
+
+    fn message_may_be_sent(active_member: bool, device_valid: bool, byte_length: u16) -> bool {
+        return member_may_read(active_member, device_valid) &&
+               byte_length > 0 &&
+               byte_length <= MAX_MESSAGE_BYTES;
+    }
+
+    fn message_page_size(requested: u16) -> u16 {
+        if (requested == 0) {
+            return 1;
+        }
+        if (requested > MAX_MESSAGE_PAGE) {
+            return MAX_MESSAGE_PAGE;
+        }
+        return requested;
+    }
+
+    // Read progress is account-scoped and can only move forward. A delayed
+    // device must never make messages unread again on the user's other devices.
+    fn advance_read_cursor(current_message_id: u64, observed_message_id: u64) -> u64 {
+        if (observed_message_id > current_message_id) {
+            return observed_message_id;
+        }
+        return current_message_id;
+    }
+
+    // Messages sent by this account are already known to the sender and never
+    // contribute to its unread total.
+    fn message_counts_as_unread(message_id: u64, read_cursor: u64, sender_is_self: bool) -> bool {
+        return !sender_is_self && message_id > read_cursor;
+    }
+
+    // A foreground chat consumes its own updates. Local alerts are reserved for
+    // a real unread increase in another chat.
+    fn unread_alert_is_eligible(previous_unread: u32, current_unread: u32, chat_is_active: bool) -> bool {
+        return !chat_is_active && current_unread > previous_unread;
+    }
+
+    // Push fanout is only for a newly committed message, never for the sender,
+    // departed members, unregistered devices, or an idempotent retry.
+    fn push_alert_may_be_sent(sender_is_recipient: bool, active_member: bool, token_valid: bool, inserted_new_message: bool) -> bool {
+        return !sender_is_recipient &&
+               active_member &&
+               token_valid &&
+               inserted_new_message;
+    }
+
+    test complete_unique_roster_is_required {
+        assert(group_may_be_created(true, 2, 2, 2) == true, "creator plus two invitees");
+        assert(group_may_be_created(true, 2, 1, 2) == false, "unresolved nickname");
+        assert(group_may_be_created(true, 2, 2, 1) == false, "duplicate account");
+        assert(group_may_be_created(false, 2, 2, 2) == false, "creator needs nickname");
+    }
+
+    test membership_gates_history {
+        assert(member_may_read(true, true) == true, "active account device");
+        assert(member_may_read(false, true) == false, "not a member");
+        assert(member_may_read(true, false) == false, "invalid device");
+    }
+
+    test messages_are_bounded {
+        assert(message_may_be_sent(true, true, 1) == true, "small message");
+        assert(message_may_be_sent(true, true, 4096) == true, "boundary accepted");
+        assert(message_may_be_sent(true, true, 4097) == false, "oversized rejected");
+        assert(message_may_be_sent(false, true, 10) == false, "non-member rejected");
+    }
+
+    test page_size_is_clamped {
+        assert(message_page_size(0) == 1, "non-empty page");
+        assert(message_page_size(50) == 50, "requested page");
+        assert(message_page_size(500) == 100, "bounded page");
+    }
+
+    test read_cursor_is_monotonic {
+        assert(advance_read_cursor(7, 12) == 12, "new progress advances");
+        assert(advance_read_cursor(12, 7) == 12, "delayed device cannot regress");
+        assert(advance_read_cursor(12, 12) == 12, "same progress is idempotent");
+    }
+
+    test own_messages_are_never_unread {
+        assert(message_counts_as_unread(12, 7, false) == true, "new remote message");
+        assert(message_counts_as_unread(12, 7, true) == false, "own message excluded");
+        assert(message_counts_as_unread(7, 7, false) == false, "read boundary excluded");
+        assert(message_counts_as_unread(6, 7, false) == false, "older message excluded");
+    }
+
+    test unread_alert_requires_inactive_increase {
+        assert(unread_alert_is_eligible(2, 3, false) == true, "new unread in background chat");
+        assert(unread_alert_is_eligible(2, 3, true) == false, "active chat consumes update");
+        assert(unread_alert_is_eligible(3, 3, false) == false, "same total does not repeat");
+        assert(unread_alert_is_eligible(3, 2, false) == false, "read progress is not an alert");
+    }
+
+    test push_alert_requires_new_remote_message {
+        assert(push_alert_may_be_sent(false, true, true, true) == true, "eligible recipient");
+        assert(push_alert_may_be_sent(true, true, true, true) == false, "sender excluded");
+        assert(push_alert_may_be_sent(false, false, true, true) == false, "departed member excluded");
+        assert(push_alert_may_be_sent(false, true, false, true) == false, "missing token excluded");
+        assert(push_alert_may_be_sent(false, true, true, false) == false, "retry excluded");
+    }
+
+    invariant member_bounds_are_ordered
+        assert MIN_GROUP_MEMBERS < MAX_GROUP_MEMBERS
+
+    invariant message_limit_is_positive
+        assert MAX_MESSAGE_BYTES > 0
+
+    invariant page_fits_message_limit
+        assert MAX_MESSAGE_PAGE < MAX_MESSAGE_BYTES
+
+    invariant read_cursor_never_regresses
+        assert advance_read_cursor(12, 7) >= 12
+
+    invariant own_message_is_not_unread
+        assert message_counts_as_unread(12, 7, true) == false
+
+    invariant active_chat_is_not_alerted
+        assert unread_alert_is_eligible(0, 1, true) == false
+
+    invariant sender_does_not_receive_push
+        assert push_alert_may_be_sent(true, true, true, true) == false
+
+    bench message_policy_latency
+        measure: nanoseconds to message_may_be_sent(true, true, 128)
+        target: < 1000ns
+}

@@ -1,0 +1,433 @@
+// TRI-NET DePIN challenge game: decentralized dispute resolution, so no TRUSTED
+// settlement is needed to catch a lying node. Any node (the challenger) may dispute
+// another node's (the defender's) claimed receipt seal by posting a bond and its own
+// independently computed seal. The dispute is resolved by ANYONE re-metering the same
+// relayed stream to get the truth seal; the party whose seal disagrees with the truth
+// LOSES and forfeits its bond to the winner. This makes challenging a liar profitable
+// and challenging an honest node costly -- so honest receipts survive and false
+// receipts are caught, without a trusted arbiter.
+
+module TriChallenge {
+    use base::types;
+
+    const DEFENDER_HONEST: u32 = 1; // defender's seal matches truth -> challenger loses
+    const DEFENDER_LIED:   u32 = 2; // defender's seal disagrees with truth -> defender loses
+
+    // A dispute is only valid if the two parties actually disagree.
+    fn is_valid_challenge(defender_seal: u32, challenger_seal: u32) -> bool {
+        return defender_seal != challenger_seal;
+    }
+
+    // Resolve by comparing the defender's seal to the independently recomputed truth.
+    // If the defender matches the truth, the challenge fails (the challenger was wrong
+    // or frivolous); otherwise the defender lied.
+    fn resolve(defender_seal: u32, truth_seal: u32) -> u32 {
+        if (defender_seal == truth_seal) {
+            return DEFENDER_HONEST;
+        } else {
+            return DEFENDER_LIED;
+        }
+    }
+
+    // Settle bonds after a verdict: the loser forfeits its whole bond to the winner
+    // (conservation -- total bond is transferred, not burned). Split into two scalar
+    // functions because t27c's gen-rust silently drops tuple-returning functions.
+    fn defender_bond_after(verdict: u32, defender_bond: u32, challenger_bond: u32) -> u32 {
+        if (verdict == DEFENDER_HONEST) {
+            return defender_bond + challenger_bond; // wins the challenger's bond
+        } else {
+            return 0;                               // slashed
+        }
+    }
+
+    fn challenger_bond_after(verdict: u32, defender_bond: u32, challenger_bond: u32) -> u32 {
+        if (verdict == DEFENDER_HONEST) {
+            return 0;                               // frivolous/wrong -> slashed
+        } else {
+            return challenger_bond + defender_bond; // wins the defender's bond
+        }
+    }
+
+    // ---- Tests / invariants ----
+
+    // A dispute requires genuine disagreement (can't challenge an identical seal).
+    test challenge_needs_disagreement {
+        assert(is_valid_challenge(0x6EAC3F90, 0xDEADBEEF) == true, "different seals -> valid");
+        assert(is_valid_challenge(0x6EAC3F90, 0x6EAC3F90) == false, "same seal -> no dispute");
+    }
+
+    // Defender honest: challenger challenged a truthful receipt -> challenger loses.
+    test honest_defender_wins {
+        v = resolve(0x6EAC3F90, 0x6EAC3F90); // defender == truth
+        assert(v == DEFENDER_HONEST, "defender honest");
+    }
+
+    // Defender lied: its seal disagrees with the recomputed truth -> defender loses.
+    test lying_defender_slashed {
+        v = resolve(0xBADBAD00, 0x6EAC3F90); // defender != truth
+        assert(v == DEFENDER_LIED, "defender lied");
+    }
+
+    // Bond conservation + direction, honest defender: challenger's bond goes to defender.
+    test bonds_honest_defender {
+        da = defender_bond_after(DEFENDER_HONEST, 100, 100);
+        ca = challenger_bond_after(DEFENDER_HONEST, 100, 100);
+        assert(da == 200, "defender gains challenger's bond");
+        assert(ca == 0, "challenger loses its bond");
+        assert(da + ca == 200, "total bond conserved");
+    }
+
+    // Bond conservation + direction, lying defender: defender's bond goes to challenger
+    // (so catching a liar is profitable -> incentive to police the network).
+    test bonds_lying_defender {
+        da = defender_bond_after(DEFENDER_LIED, 100, 100);
+        ca = challenger_bond_after(DEFENDER_LIED, 100, 100);
+        assert(da == 0, "defender is slashed");
+        assert(ca == 200, "challenger gains defender's bond");
+        assert(da + ca == 200, "total bond conserved");
+    }
+
+    // Griefing is unprofitable: challenging an honest node costs the challenger its bond.
+    test griefing_unprofitable {
+        v = resolve(0x11223344, 0x11223344); // honest defender
+        ca = challenger_bond_after(v, 100, 100);
+        assert(ca < 100, "frivolous challenger ends with less than it posted");
+    }
+
+    // ---- Challenge window: the time dimension of the dispute game ----
+    // A dispute has to bind to the optimistic finality window (tri_compute_optimistic):
+    // a challenge may only OPEN while the receipt is still PENDING, and an OPEN
+    // dispute that nobody resolves within the resolution timeout EXPIRES with the
+    // challenge failing. Expiry must side with the DEFENDER: without a recomputed
+    // truth seal there is no proof, and a system that slashed on an unresolved
+    // dispute would let a challenger freeze-and-slash any node by simply never
+    // resolving -- the burden of driving resolution is on the party that opened it.
+
+    const RESOLVE_TIMEOUT: u32 = 27; // epochs an OPEN dispute may stay unresolved
+
+    // A challenge is admissible exactly while the receipt's optimistic window is
+    // open: (now - receipt_epoch) < window, the SAME edge as
+    // tri_compute_optimistic.window_open (now < settled_at + window). The first
+    // cut of this gate used <=, which admitted a challenge in the very epoch the
+    // receipt already finalizes -- a one-epoch seam between the two layers,
+    // caught when composing them. Epochs are monotone (now >= receipt_epoch); a
+    // stale clock (now < receipt_epoch) is inadmissible fail-closed.
+    fn challenge_admissible(now_epoch: u32, receipt_epoch: u32, window: u32) -> bool {
+        if (now_epoch < receipt_epoch) {
+            return now_epoch > now_epoch; // fail closed on a non-monotone clock
+        }
+        return (now_epoch - receipt_epoch) < window;
+    }
+
+    // An OPEN dispute expires once the resolution timeout has fully elapsed.
+    fn dispute_expired(opened_epoch: u32, now_epoch: u32) -> bool {
+        if (now_epoch < opened_epoch) {
+            return opened_epoch < opened_epoch; // fail closed on a non-monotone clock
+        }
+        return (now_epoch - opened_epoch) > RESOLVE_TIMEOUT;
+    }
+
+    // The verdict for an expired (never-resolved) dispute: the challenge fails as
+    // if the defender were honest -- no proof, no slash, and the challenger's bond
+    // moves to the defender exactly like a lost challenge (griefing stays costly).
+    fn expired_verdict() -> u32 {
+        return DEFENDER_HONEST;
+    }
+
+    // ---- Rung-aware admissibility ----
+    // The window is not one-size-fits-all: a wide-rung result is more expensive to
+    // RECOMPUTE (the datapath widens with the mantissa) and worth more, so it gets
+    // more scrutiny epochs. These constants MIRROR tri_compute_optimistic's window
+    // ladder (GFT16_ET / BASE_WINDOW / WINDOW_PER_TRIT); the cross-spec constant
+    // parity and the edge identity are pinned by the challenge_rung_window guard,
+    // so the two specs cannot drift apart silently.
+    const CH_GFT16_ET: u32 = 4;
+    const CH_BASE_WINDOW: u32 = 64;
+    const CH_WINDOW_PER_TRIT: u32 = 16;
+
+    fn challenge_window_for_rung(gf_et: u32) -> u32 {
+        if (gf_et <= CH_GFT16_ET) {
+            return CH_BASE_WINDOW;
+        } else {
+            return CH_BASE_WINDOW + (gf_et - CH_GFT16_ET) * CH_WINDOW_PER_TRIT;
+        }
+    }
+
+    fn challenge_admissible_rung(now_epoch: u32, receipt_epoch: u32, gf_et: u32) -> bool {
+        return challenge_admissible(now_epoch, receipt_epoch, challenge_window_for_rung(gf_et));
+    }
+
+    // ---- Witness quorum: WHO establishes the truth seal ----
+    // resolve() compares the defender's seal to "the" recomputed truth -- but in
+    // a distributed setting a SINGLE recomputer is a trust point: one malicious
+    // witness could submit a fabricated truth seal and slash an honest defender
+    // (or save a fraudster). The truth is therefore the MAJORITY seal of three
+    // independent witnesses; with no majority there is NO verdict -- the dispute
+    // simply stays open (and, if nobody ever agrees, settles by expiry FOR the
+    // defender, consistent with the no-proof-no-slash rule).
+
+    const VERDICT_NONE: u32 = 0; // no quorum -> dispute stays open
+
+    fn witness_majority(s0: u32, s1: u32, s2: u32) -> u32 {
+        if (s0 == s1) { return s0; }
+        if (s0 == s2) { return s0; }
+        if (s1 == s2) { return s1; }
+        return 0;
+    }
+
+    fn witness_verdict(defender_seal: u32, s0: u32, s1: u32, s2: u32) -> u32 {
+        let truth: u32 = witness_majority(s0, s1, s2);
+        if (truth == 0) {
+            return VERDICT_NONE;
+        }
+        return resolve(defender_seal, truth);
+    }
+
+    // A 2-of-3 majority survives one corrupt witness in either direction, and
+    // three disagreeing witnesses produce NO verdict rather than a wrong one.
+    test witness_quorum {
+        v_unanimous = witness_verdict(0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA);
+        v_one_liar = witness_verdict(0xAAAA, 0xAAAA, 0xDEAD, 0xAAAA);
+        v_frame = witness_verdict(0xAAAA, 0xBBBB, 0xAAAA, 0xAAAA);
+        v_caught = witness_verdict(0xBAD0, 0xAAAA, 0xAAAA, 0xDEAD);
+        v_none = witness_verdict(0xAAAA, 0x1111, 0x2222, 0x3333);
+        assert(v_unanimous == DEFENDER_HONEST, "unanimous truth clears the defender");
+        assert(v_one_liar == DEFENDER_HONEST, "one lying witness cannot flip an honest majority");
+        assert(v_frame == DEFENDER_HONEST, "one framing witness cannot slash an honest defender");
+        assert(v_caught == DEFENDER_LIED, "a real lie is caught by the majority");
+        assert(v_none == VERDICT_NONE, "no quorum -> no verdict, dispute stays open");
+    }
+
+    // ---- Witness economics: quorum incentives ----
+    // A witness posts a stake to vote. After a quorum verdict, minority voters
+    // forfeit their stakes into a pot split equally among the majority (floor
+    // division; the dust smaller than the majority count is burnt, never
+    // minted). With NO quorum every stake is refunded -- punishing a 1-1-1
+    // split would let an attacker grief honest witnesses into losses by merely
+    // disagreeing. Rewards come ONLY from minority forfeits: an all-honest
+    // unanimous round pays nothing extra, so echoing the majority for profit
+    // is not a strategy -- but voting AGAINST a majority strictly loses.
+
+    fn witness_is_majority(seal: u32, majority: u32) -> bool {
+        return (majority != 0) && (seal == majority);
+    }
+
+    fn majority_count_3(s0: u32, s1: u32, s2: u32, majority: u32) -> u32 {
+        let c0: u32 = if_seal(s0, majority);
+        let c1: u32 = if_seal(s1, majority);
+        let c2: u32 = if_seal(s2, majority);
+        return c0 + c1 + c2;
+    }
+
+    fn if_seal(seal: u32, majority: u32) -> u32 {
+        if (witness_is_majority(seal, majority)) {
+            return 1;
+        } else {
+            return 0;
+        }
+    }
+
+    // Total forfeited by the minority (stake per minority voter).
+    fn minority_pot_3(s0: u32, s1: u32, s2: u32, majority: u32, stake: u32) -> u32 {
+        return (3 - majority_count_3(s0, s1, s2, majority)) * stake;
+    }
+
+    // One witness's balance after settlement: majority voters take their stake
+    // back plus an equal floor-share of the pot; minority voters forfeit; with
+    // no quorum (majority == 0) everyone is refunded.
+    fn witness_payout(voted: u32, s0: u32, s1: u32, s2: u32, stake: u32) -> u32 {
+        let majority: u32 = witness_majority(s0, s1, s2);
+        if (majority == 0) {
+            return stake;
+        }
+        if (witness_is_majority(voted, majority)) {
+            let pot: u32 = minority_pot_3(s0, s1, s2, majority, stake);
+            return stake + (pot / majority_count_3(s0, s1, s2, majority));
+        }
+        return 0;
+    }
+
+    // Unanimity pays nothing extra; a 2-1 split pays the majority from the
+    // minority's forfeit only; no quorum refunds everyone; the lone dissenter
+    // strictly loses.
+    test witness_economics {
+        u = witness_payout(0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA, 100);
+        m = witness_payout(0xAAAA, 0xAAAA, 0xAAAA, 0xDEAD, 100);
+        l = witness_payout(0xDEAD, 0xAAAA, 0xAAAA, 0xDEAD, 100);
+        n = witness_payout(0x1111, 0x1111, 0x2222, 0x3333, 100);
+        assert(u == 100, "unanimous round: stake back, no free reward");
+        assert(m == 150, "majority of two splits the one forfeited stake");
+        assert(l == 0, "the dissenter forfeits");
+        assert(n == 100, "no quorum refunds everyone");
+        assert((m + m + l) == 300, "2-1 round conserves the three stakes");
+    }
+
+    // ---- Concurrent disputes: one defender, many challengers ----
+    // Without a cap and a risk ledger, a challenger swarm could (a) pile
+    // unbounded simultaneous disputes on one defender (grief: every dispute
+    // escrows attention and delays finality) or (b) open disputes whose summed
+    // value-at-risk exceeds the defender's bond, so a multi-loss could not be
+    // paid in full. The scalar risk ledger mirrors tri_compute_bond's
+    // collateral discipline: required = outstanding * min_bps / 10000 with the
+    // same u64 mulDiv shape; the parity is pinned by the dispute_concurrency
+    // cargo guard.
+
+    const MAX_OPEN_DISPUTES: u32 = 3;
+    const CH_BPS_UNIT: u32 = 10000;
+
+    fn dispute_slots_ok(open_count: u32) -> bool {
+        return open_count < MAX_OPEN_DISPUTES;
+    }
+
+    // Saturating risk accumulator: the summed reward-at-risk of OPEN disputes.
+    fn risk_after_open(risk: u32, reward: u32) -> u32 {
+        // The probe add MUST wrap (+%): plain '+' is checked and dies on
+        // overflow before the saturation guard can run (Zig execution level).
+        let sum: u32 = risk +% reward;
+        if (sum < risk) {
+            return 0xFFFFFFFF;
+        } else {
+            return sum;
+        }
+    }
+    fn risk_after_close(risk: u32, reward: u32) -> u32 {
+        if (reward >= risk) {
+            return 0;
+        } else {
+            return risk - reward;
+        }
+    }
+
+    // Same mulDiv shape as tri_compute_bond.required_bond.
+    fn dispute_required_bond(outstanding: u32, min_bps: u32) -> u32 {
+        let need: u64 = (outstanding as u64) * (min_bps as u64);
+        return (need / (CH_BPS_UNIT as u64)) as u32;
+    }
+
+    // Admission: a new dispute may open iff a slot is free AND the defender's
+    // bond still covers the risk ledger INCLUDING the new dispute's reward.
+    fn may_open_dispute(open_count: u32, risk: u32, reward: u32, bond: u32, min_bps: u32) -> bool {
+        if (dispute_slots_ok(open_count) == false) {
+            return false;
+        }
+        return bond >= dispute_required_bond(risk_after_open(risk, reward), min_bps);
+    }
+
+    // Rung-aware admission: a wide-rung dispute carries a higher-value result,
+    // so its coverage requirement grows with the rung exactly like the bond
+    // layer's collateral premium (tri_compute_bond.rung_min_bps: +CH_BOND_BPS_
+    // PER_TRIT per exponent trit above the flagship). Mirrored constant; the
+    // parity is pinned by the dispute_concurrency guard.
+    const CH_BOND_BPS_PER_TRIT: u32 = 500;
+
+    fn dispute_rung_min_bps(min_bps: u32, gf_et: u32) -> u32 {
+        if (gf_et <= CH_GFT16_ET) {
+            return min_bps;
+        } else {
+            return min_bps + (gf_et - CH_GFT16_ET) * CH_BOND_BPS_PER_TRIT;
+        }
+    }
+
+    fn may_open_dispute_rung(open_count: u32, risk: u32, reward: u32, bond: u32, min_bps: u32, gf_et: u32) -> bool {
+        return may_open_dispute(open_count, risk, reward, bond, dispute_rung_min_bps(min_bps, gf_et));
+    }
+
+    // The same bond that admits a dispute at the flagship rung refuses it on a
+    // wide rung: GF-T64 (Et9) adds 5 trits * 500 bps = +25% coverage.
+    test rung_aware_admission {
+        p4 = dispute_rung_min_bps(2000, 4);
+        p9 = dispute_rung_min_bps(2000, 9);
+        f0 = may_open_dispute_rung(0, 400, 100, 100, 2000, 4);
+        w0 = may_open_dispute_rung(0, 400, 100, 100, 2000, 9);
+        w1 = may_open_dispute_rung(0, 400, 100, 225, 2000, 9);
+        assert(p4 == 2000, "at the flagship the base premium applies");
+        assert(p9 == 4500, "Et9 adds 2500 bps");
+        assert(f0 == true, "bond 100 covers 500 at 20% on the flagship");
+        assert(w0 == false, "the SAME bond fails the SAME dispute at Et9 (needs 45%)");
+        assert(w1 == true, "225 covers 500 at 45% on the wide rung");
+    }
+
+    // The slot cap is exact and the risk ledger conserves: open then close
+    // returns to the baseline, close never underflows.
+    test dispute_slots_and_risk_ledger {
+        s0 = dispute_slots_ok(0);
+        s2 = dispute_slots_ok(2);
+        s3 = dispute_slots_ok(3);
+        r1 = risk_after_open(100, 40);
+        r0 = risk_after_close(140, 40);
+        ru = risk_after_close(30, 40);
+        rs = risk_after_open(0xFFFFFFF0, 0x100);
+        assert(s0 == true, "empty ledger has slots");
+        assert(s2 == true, "slot 3 of 3 may open");
+        assert(s3 == false, "the cap is exact at MAX_OPEN_DISPUTES");
+        assert(r1 == 140, "open adds the reward at risk");
+        assert(r0 == 100, "close returns to the baseline");
+        assert(ru == 0, "close floors at zero, never wraps");
+        assert(rs == 0xFFFFFFFF, "an overflowing open saturates");
+    }
+
+    // Admission composes slots AND coverage; closing a dispute re-admits.
+    test dispute_admission_gate {
+        a0 = may_open_dispute(0, 0, 400, 100, 2000);
+        a1 = may_open_dispute(0, 0, 600, 100, 2000);
+        a2 = may_open_dispute(3, 0, 10, 1000000, 2000);
+        a3 = may_open_dispute(1, 400, 100, 100, 2000);
+        a4 = may_open_dispute(1, 450, 100, 100, 2000);
+        assert(a0 == true, "bond 100 covers 20% of 400");
+        assert(a1 == false, "bond 100 cannot cover 20% of 600");
+        assert(a2 == false, "no slot, no dispute, whatever the bond");
+        assert(a3 == true, "risk 400 + 100 = 500 requires exactly the full bond -- exact cover admits");
+        assert(a4 == false, "risk 450 + 100 = 550 requires 110 > bond 100 -- rejected");
+    }
+
+    // A wide rung stays challengeable at an epoch where the flagship rung has
+    // already finalized; both edges stay strict.
+    test rung_window_edges {
+        f0 = challenge_admissible_rung(1063, 1000, 4);
+        f1 = challenge_admissible_rung(1064, 1000, 4);
+        w0 = challenge_admissible_rung(1064, 1000, 9);
+        w1 = challenge_admissible_rung(1143, 1000, 9);
+        w2 = challenge_admissible_rung(1144, 1000, 9);
+        assert(f0 == true, "flagship: epoch 63 of 64 is challengeable");
+        assert(f1 == false, "flagship: the finalization epoch admits nothing");
+        assert(w0 == true, "GF-T64 (Et9) is still challengeable where GF-T16 finalized");
+        assert(w1 == true, "GF-T64: epoch 143 of 144 is challengeable");
+        assert(w2 == false, "GF-T64: its own finalization epoch admits nothing");
+    }
+
+    // The window gate is exact at both edges: admissible at the last in-window
+    // epoch, inadmissible one epoch later, and fail-closed on a clock that runs
+    // backwards.
+    test window_edges {
+        a0 = challenge_admissible(100, 100, 8);
+        a1 = challenge_admissible(107, 100, 8);
+        a2 = challenge_admissible(108, 100, 8);
+        a3 = challenge_admissible(99, 100, 8);
+        assert(a0 == true, "fresh receipt is challengeable");
+        assert(a1 == true, "last in-window epoch (window - 1) is challengeable");
+        assert(a2 == false, "the finalization epoch itself admits no challenge");
+        assert(a3 == false, "a backwards clock admits nothing");
+    }
+
+    // Expiry is exact at the timeout edge and fail-closed on a backwards clock.
+    test expiry_edges {
+        e0 = dispute_expired(50, 77);
+        e1 = dispute_expired(50, 78);
+        e2 = dispute_expired(50, 49);
+        assert(e0 == false, "at the timeout the dispute is still live");
+        assert(e1 == true, "one epoch past the timeout it expires");
+        assert(e2 == false, "a backwards clock never expires a dispute");
+    }
+
+    // An expired dispute settles exactly like a failed challenge: defender keeps
+    // its bond plus the challenger's, total conserved, griefing unprofitable.
+    test expired_dispute_settles_for_defender {
+        v = expired_verdict();
+        da = defender_bond_after(v, 150, 100);
+        ca = challenger_bond_after(v, 150, 100);
+        assert(v == DEFENDER_HONEST, "no proof -> no slash");
+        assert(da == 250, "defender keeps both bonds");
+        assert(ca == 0, "the non-resolving challenger forfeits");
+        assert(da + ca == 250, "total bond conserved on the expiry path");
+    }
+}

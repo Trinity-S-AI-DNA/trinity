@@ -1,0 +1,1052 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/fpga/dsp/signals.t27 -- signals on an FPGA: quantization noise, sampling, the NCO, the DFT, FIR and CIC filters, multirate and the FFT
+// Host: gHashTag/trinity apps/website public/widgets/{sqnr,alias-fold,nco,dft-bin,fir-response,
+//       fir-design,fir-cost,decimator,cic-growth,polyphase,fft-butterfly,bit-reverse,fft-scaling,
+//       fir-fit,fir-on-board}/ (modules 3 and 5 to 9 of the course arithmetic-and-dsp): each
+//       widget's logic.js is these fn bodies compiled to wasm (scripts/t27-logic.mjs in
+//       gHashTag/999-multibots-telegraf, types stripped); the pages write no formula of their own.
+//
+// WHY ONE FILE: every section below needs a sine or a decibel. They are written once, here
+// (sine by a range-reduced Taylor series, ln by the atanh series), instead of once per topic.
+//
+// QUANTIZATION NOISE (W. Kester, Analog Devices MT-001). An ideal N-bit quantizer driven by a
+// full-scale sine has SQNR = 20 log10(2^N) + 10 log10(3/2) = 6.02 N + 1.76 dB: signal power
+// FSR^2 / 8 against noise Delta^2 / 12. sqnr_measured() quantizes a real sine (a mid-rise
+// quantizer, levels at (k + 1/2) Delta) over `samples` points holding `cycles` whole periods and
+// divides the powers; at few bits the noise is not uniform and the formula is optimistic.
+//
+// SAMPLING. A tone at f sampled at fs is seen at |f - fs round(f / fs)| (the alias), in the
+// first Nyquist zone 0 .. fs/2. A numerically controlled oscillator adds a tuning word M to an
+// N-bit phase accumulator each clock: f_out = M f_clk / 2^N, resolution f_clk / 2^N (Analog
+// Devices MT-085, the DDS tutorial: 100 MHz, N = 32, M = 2^30 gives 25 MHz in steps of
+// 0.0233 Hz). The top P bits of the phase address a sine table of A-bit words. A DFT of length
+// L puts a tone of f at bin f L / fs; a tone between bins leaks into all of them (dft_power
+// is normalised so that a full-scale tone on a bin reads 0 dB).
+//
+// FIR FILTERS. The L-point moving average has |H(f)| = |sin(pi f L) / (L sin(pi f))|, with nulls
+// at multiples of 1/L (L = 4 at f = 1/8: 0.65328). Windowed-sinc design: tap k of an odd-length
+// low-pass of cutoff fc is 2 fc sinc(2 fc (k - c)), c = (taps - 1) / 2, times a window
+// (Hamming 0.54 - 0.46 cos(2 pi k / (taps - 1)), Blackman 0.42 - 0.5 cos + 0.08 cos 2x), scaled
+// to a DC gain of 1, then rounded to B-bit integers (2^(B-1) is 1.0). Symmetric taps share a
+// multiplier through the DSP48E1 pre-adder, and a slice clocked C times per sample serves C
+// taps: DSP slices = ceil(ceil(taps / 2 or taps) / C).
+//
+// MULTIRATE (E. B. Hogenauer, "An economical class of digital filters for decimation and
+// interpolation", IEEE Trans. ASSP 29(2), 1981). Keeping every R-th sample moves the rate to
+// fs / R and folds everything within `band` of a multiple of fs / R onto the band. An N-stage
+// CIC decimator with differential delay M has DC gain (R M)^N, grows ceil(N log2(R M)) bits
+// (B_in = 16, N = 4, R = 8, M = 1: gain 4096, 12 bits, 28-bit registers) and the response
+// |sin(pi R M f) / (R M sin(pi f))|^N. A polyphase decimator splits the taps into R phases of
+// ceil(taps / R) and spends taps MACs per output, against taps * R for filtering at the input
+// rate and throwing R - 1 of R outputs away.
+//
+// THE FFT (J. W. Cooley, J. W. Tukey, Math. Comp. 19, 1965). A radix-2 FFT of L = 2^s points
+// runs s stages of L/2 butterflies, (L/2) log2 L in all against L^2 multiplies for the direct
+// DFT. Decimation in time takes its input in bit-reversed order (L = 8: 1 -> 4, 3 -> 6). Stage s
+// pairs i with i XOR 2^s and multiplies by the twiddle W_L^t, t = (i mod 2^s) (L / 2^(s+1)).
+// fft_value() runs the whole FFT in integers (each product rounded) on one of four inputs and
+// optionally halves every stage: unscaled, a full-scale DC input grows log2 L bits; the
+// conservative unscaled word is B_in + log2 L + 1 (AMD/Xilinx PG109, the FFT LogiCORE).
+//
+// THE BENCH. The XC7A200T has 740 DSP48E1 slices (Xilinx DS180). hw_fir_out() runs the FIR of
+// fir_tap_q() the way RTL does: Q1.15 input, integer taps, a wide accumulator, round half up
+// and saturate to 16 bits; ref_fir_out() is the same filter in f64.
+//
+// WHAT IT DOES NOT CLAIM: no device timing (path_ps only adds delays the reader sets), no
+// floating-point DSP, and the 1.76 dB, the NCO spur rule and the PG109 width are the textbook
+// figures, recomputed here, not measured on a board.
+// Claim status: checked by the tests below; every vector was recomputed in Python first.
+// phi^2 + 1/phi^2 = 3 | TRINITY
+
+module fpga::dsp::signals {
+
+    pub const KIND : str = "widget-logic";
+    pub const ID : str = "signals";
+    pub const VERSION : u8 = 1;
+    pub const PI : f64 = 3.141592653589793;
+    pub const TWO_PI : f64 = 6.283185307179586;
+    pub const HALF_PI : f64 = 1.5707963267948966;
+    pub const LN2 : f64 = 0.6931471805599453;
+    pub const LN10 : f64 = 2.302585092994046;
+    pub const DB_FLOOR : f64 = -300.0;
+    pub const DSP48_ON_200T : u16 = 740;
+    pub const WIN_RECT : u8 = 0;
+    pub const WIN_HAMMING : u8 = 1;
+    pub const WIN_BLACKMAN : u8 = 2;
+    pub const WIN_HANN : u8 = 3;
+    pub const MAX_TAPS : u8 = 127;
+    pub const MAX_FFT : u16 = 256;
+    pub const PAT_DC : u8 = 0;
+    pub const PAT_TONE : u8 = 1;
+    pub const PAT_NYQUIST : u8 = 2;
+    pub const PAT_NOISE : u8 = 3;
+    pub const LFSR_SEED : u16 = 44257;
+    pub const Q15_ONE : i32 = 32768;
+    pub const HW_AMPLITUDE : f64 = 0.45;
+
+    // ---- Shared: sine, cosine, logarithms -------------------------------------------------
+
+    // floor() for |v| < 2^62.
+    fn floor_of(v: f64) -> f64 {
+        var t : f64 = (v as i64) as f64;
+        if (t > v) {
+            t = t - 1.0;
+        }
+        return t;
+    }
+
+    // sin(x): reduce to [-pi/2, pi/2], then the Taylor series to x^25.
+    fn sine(x: f64) -> f64 {
+        var r : f64 = x - TWO_PI * floor_of((x + PI) / TWO_PI);
+        if (r > HALF_PI) {
+            r = PI - r;
+        }
+        if (r < 0.0 - HALF_PI) {
+            r = 0.0 - PI - r;
+        }
+        const r2 = r * r;
+        var term : f64 = r;
+        var sum : f64 = r;
+        var k : f64 = 1.0;
+        while (k < 12.5) {
+            term = 0.0 - term * r2 / ((2.0 * k) * (2.0 * k + 1.0));
+            sum = sum + term;
+            k = k + 1.0;
+        }
+        return sum;
+    }
+
+    fn cosine(x: f64) -> f64 {
+        return sine(x + HALF_PI);
+    }
+
+    // ln(v) for v > 0: v = m 2^e with m in [1, 2), ln m = 2 atanh((m - 1) / (m + 1)).
+    fn ln_pos(v: f64) -> f64 {
+        var m : f64 = v;
+        var e : f64 = 0.0;
+        while (m >= 2.0) {
+            m = m / 2.0;
+            e = e + 1.0;
+        }
+        while (m < 1.0) {
+            m = m * 2.0;
+            e = e - 1.0;
+        }
+        const t = (m - 1.0) / (m + 1.0);
+        const t2 = t * t;
+        var power : f64 = t;
+        var sum : f64 = 0.0;
+        var odd : f64 = 1.0;
+        while (power > 0.000000000000000001) {
+            sum = sum + power / odd;
+            power = power * t2;
+            odd = odd + 2.0;
+        }
+        return 2.0 * sum + e * LN2;
+    }
+
+    // A power ratio in dB, with a floor for a true zero.
+    fn db_power(p: f64) -> f64 {
+        if (p <= 0.000000000000000000000000000001) {
+            return DB_FLOOR;
+        }
+        return 10.0 * ln_pos(p) / LN10;
+    }
+
+    // sin(2 pi f t): a tone, for drawing.
+    fn tone(f: f64, t: f64) -> f64 {
+        return sine(TWO_PI * f * t);
+    }
+
+    // ---- Quantization noise --------------------------------------------------------------
+
+    // 6.02 N + 1.76 dB, as 10 log10(1.5 * 4^N).
+    fn sqnr_ideal(bits: u8) -> f64 {
+        var p : f64 = 1.5;
+        var i : u8 = 0;
+        while (i < bits) {
+            p = p * 4.0;
+            i = i + 1;
+        }
+        return db_power(p);
+    }
+
+    // A mid-rise quantizer of full scale +-1: levels at (k + 1/2) Delta, Delta = 2 / 2^N.
+    fn quantize(x: f64, bits: u8) -> f64 {
+        const top = ((1 as i64) << (bits - 1)) as f64;
+        const delta = 1.0 / top;
+        var k : f64 = floor_of(x / delta);
+        if (k > top - 1.0) {
+            k = top - 1.0;
+        }
+        if (k < 0.0 - top) {
+            k = 0.0 - top;
+        }
+        return (k + 0.5) * delta;
+    }
+
+    // Sample k of a full-scale sine holding `cycles` periods in `samples` points.
+    fn test_sine(k: u16, samples: u16, cycles: u16) -> f64 {
+        return sine(TWO_PI * (cycles as f64) * (k as f64) / (samples as f64));
+    }
+
+    // Signal power over noise power, in dB, of that sine through the quantizer.
+    fn sqnr_measured(bits: u8, samples: u16, cycles: u16) -> f64 {
+        var ps : f64 = 0.0;
+        var pn : f64 = 0.0;
+        var k : u16 = 0;
+        while (k < samples) {
+            const s = test_sine(k, samples, cycles);
+            const e = quantize(s, bits) - s;
+            ps = ps + s * s;
+            pn = pn + e * e;
+            k = k + 1;
+        }
+        return db_power(ps / pn);
+    }
+
+    // ---- Sampling ------------------------------------------------------------------------
+
+    // Where a tone at f lands when sampled at fs: |f - fs round(f / fs)|.
+    fn alias_freq(f: f64, fs: f64) -> f64 {
+        const d = f - fs * floor_of(f / fs + 0.5);
+        if (d < 0.0) {
+            return 0.0 - d;
+        }
+        return d;
+    }
+
+    // +1 when the alias keeps the tone's phase, -1 when the fold mirrors it (f above the
+    // nearest multiple of fs: +1; below: -1).
+    fn alias_sign(f: f64, fs: f64) -> i8 {
+        if (f - fs * floor_of(f / fs + 0.5) < 0.0) {
+            return -1;
+        }
+        return 1;
+    }
+
+    // The Nyquist zone of f: 1 for 0 .. fs/2, 2 for fs/2 .. fs, and so on.
+    fn nyquist_zone(f: f64, fs: f64) -> u16 {
+        return (floor_of(2.0 * f / fs) as u16) + 1;
+    }
+
+    // 2^n as f64, n <= 64.
+    fn two_to(n: u8) -> f64 {
+        var r : f64 = 1.0;
+        var i : u8 = 0;
+        while (i < n) {
+            r = r * 2.0;
+            i = i + 1;
+        }
+        return r;
+    }
+
+    // The NCO: output frequency, resolution and the tuning word for a wanted frequency.
+    fn nco_fout(fclk: f64, nbits: u8, word: u32) -> f64 {
+        return (word as f64) * fclk / two_to(nbits);
+    }
+
+    fn nco_resolution(fclk: f64, nbits: u8) -> f64 {
+        return fclk / two_to(nbits);
+    }
+
+    fn nco_word(fclk: f64, nbits: u8, fout: f64) -> u32 {
+        var w : f64 = floor_of(fout * two_to(nbits) / fclk + 0.5);
+        const top = two_to(nbits) - 1.0;
+        if (w > top) {
+            w = top;
+        }
+        if (w < 0.0) {
+            w = 0.0;
+        }
+        return w as u32;
+    }
+
+    // The accumulator after k clocks: (k M) mod 2^N.
+    fn nco_phase(word: u32, k: u32, nbits: u8) -> f64 {
+        const p = (word as f64) * (k as f64);
+        const span = two_to(nbits);
+        return p - span * floor_of(p / span);
+    }
+
+    // The output sample after k clocks: the top P phase bits address an A-bit sine table.
+    fn nco_sample(word: u32, k: u32, nbits: u8, pbits: u8, abits: u8) -> f64 {
+        const addr = floor_of(nco_phase(word, k, nbits) / two_to(nbits - pbits));
+        const scale = two_to(abits - 1) - 1.0;
+        return floor_of(sine(TWO_PI * addr / two_to(pbits)) * scale + 0.5) / scale;
+    }
+
+    // The rule of thumb for phase truncation: the worst spur sits about 6.02 dB per kept phase
+    // bit below the carrier.
+    fn nco_spur_db(pbits: u8) -> f64 {
+        return 0.0 - db_power(two_to(2 * pbits));
+    }
+
+    // ---- The DFT -------------------------------------------------------------------------
+
+    // Window value at point k of len: rect, Hamming, Blackman, Hann; symmetric for a FIR
+    // (denominator len - 1), periodic for a DFT (denominator len).
+    fn window(kind: u8, k: u16, len: u16, symmetric: bool) -> f64 {
+        if (kind == WIN_RECT) {
+            return 1.0;
+        }
+        var den : f64 = len as f64;
+        if (symmetric) {
+            den = den - 1.0;
+        }
+        const a = TWO_PI * (k as f64) / den;
+        if (kind == WIN_HAMMING) {
+            return 0.54 - 0.46 * cosine(a);
+        }
+        if (kind == WIN_BLACKMAN) {
+            return 0.42 - 0.5 * cosine(a) + 0.08 * cosine(2.0 * a);
+        }
+        return 0.5 - 0.5 * cosine(a);
+    }
+
+    // The bin a frequency falls in, and the width of one bin.
+    fn bin_of(f: f64, fs: f64, len: u16) -> f64 {
+        return f * (len as f64) / fs;
+    }
+
+    fn bin_width(fs: f64, len: u16) -> f64 {
+        return fs / (len as f64);
+    }
+
+    // Point n of the DFT's input: a sine of k0 cycles per len points, windowed.
+    fn dft_input(len: u16, k0: f64, n: u16, win: u8) -> f64 {
+        return window(win, n, len, false) * sine(TWO_PI * k0 * (n as f64) / (len as f64));
+    }
+
+    // |X_k|^2 of a windowed sine at k0 cycles per len points, over (sum w / 2)^2.
+    fn dft_power(len: u16, k0: f64, k: u16, win: u8) -> f64 {
+        var re : f64 = 0.0;
+        var im : f64 = 0.0;
+        var sw : f64 = 0.0;
+        var n : u16 = 0;
+        while (n < len) {
+            const w = window(win, n, len, false);
+            const x = dft_input(len, k0, n, win);
+            const a = TWO_PI * (k as f64) * (n as f64) / (len as f64);
+            re = re + x * cosine(a);
+            im = im - x * sine(a);
+            sw = sw + w;
+            n = n + 1;
+        }
+        return (re * re + im * im) / ((sw / 2.0) * (sw / 2.0));
+    }
+
+    fn dft_db(len: u16, k0: f64, k: u16, win: u8) -> f64 {
+        return db_power(dft_power(len, k0, k, win));
+    }
+
+    // ---- FIR filters ---------------------------------------------------------------------
+
+    // |H(f)| of the len-point moving average.
+    fn ma_gain(len: u8, f: f64) -> f64 {
+        var den : f64 = (len as f64) * sine(PI * f);
+        if (den < 0.0) {
+            den = 0.0 - den;
+        }
+        if (den < 0.000000000001) {
+            return 1.0;
+        }
+        var num : f64 = sine(PI * f * (len as f64));
+        if (num < 0.0) {
+            num = 0.0 - num;
+        }
+        return num / den;
+    }
+
+    // Output sample k of the len-point moving average of the tone sin(2 pi f n), n >= 0.
+    fn ma_out(len: u8, f: f64, k: i32) -> f64 {
+        var s : f64 = 0.0;
+        var j : u8 = 0;
+        while (j < len) {
+            const n = k - (j as i32);
+            if (n >= 0) {
+                s = s + tone(f, n as f64);
+            }
+            j = j + 1;
+        }
+        return s / (len as f64);
+    }
+
+    // The raw windowed-sinc tap k of an odd-length low-pass with cutoff fc (cycles/sample).
+    fn sinc_tap(taps: u8, k: u8, fc: f64, win: u8) -> f64 {
+        const t = (k as f64) - ((taps as f64) - 1.0) / 2.0;
+        var h : f64 = 2.0 * fc;
+        if (t > 0.0000001 || t < -0.0000001) {
+            h = sine(TWO_PI * fc * t) / (PI * t);
+        }
+        return h * window(win, k as u16, taps as u16, true);
+    }
+
+    // The sum of the raw taps: dividing by it sets the DC gain to 1.
+    fn tap_sum(taps: u8, fc: f64, win: u8) -> f64 {
+        var s : f64 = 0.0;
+        var j : u8 = 0;
+        while (j < taps) {
+            s = s + sinc_tap(taps, j, fc, win);
+            j = j + 1;
+        }
+        return s;
+    }
+
+    // Tap k scaled so that the taps sum to 1 (DC gain 1).
+    fn fir_tap(taps: u8, k: u8, fc: f64, win: u8) -> f64 {
+        return sinc_tap(taps, k, fc, win) / tap_sum(taps, fc, win);
+    }
+
+    // The integer a B-bit tap holds: round(raw / sum * 2^(B-1)), 2^(B-1) standing for 1.0.
+    fn quant_tap(raw: f64, sum: f64, bits: u8) -> i32 {
+        const v : f64 = floor_of(raw / sum * two_to(bits - 1) + 0.5);
+        return v as i32;
+    }
+
+    // Tap k as a B-bit integer.
+    fn fir_tap_q(taps: u8, k: u8, fc: f64, win: u8, bits: u8) -> i32 {
+        return quant_tap(sinc_tap(taps, k, fc, win), tap_sum(taps, fc, win), bits);
+    }
+
+    // |H(f)|^2 of the designed filter; bits = 0 keeps the taps in f64.
+    fn fir_power(taps: u8, fc: f64, win: u8, bits: u8, f: f64) -> f64 {
+        const s = tap_sum(taps, fc, win);
+        var re : f64 = 0.0;
+        var im : f64 = 0.0;
+        var k : u8 = 0;
+        while (k < taps) {
+            const raw = sinc_tap(taps, k, fc, win);
+            var c : f64 = raw / s;
+            if (bits > 0) {
+                c = (quant_tap(raw, s, bits) as f64) / two_to(bits - 1);
+            }
+            const a = TWO_PI * f * (k as f64);
+            re = re + c * cosine(a);
+            im = im - c * sine(a);
+            k = k + 1;
+        }
+        return re * re + im * im;
+    }
+
+    fn fir_db(taps: u8, fc: f64, win: u8, bits: u8, f: f64) -> f64 {
+        return db_power(fir_power(taps, fc, win, bits, f));
+    }
+
+    // The highest response from fstop to 1/2, on 201 points: the stopband the filter keeps.
+    fn fir_stop_db(taps: u8, fc: f64, win: u8, bits: u8, fstop: f64) -> f64 {
+        var worst : f64 = DB_FLOOR;
+        var j : u16 = 0;
+        while (j <= 200) {
+            const f = fstop + (0.5 - fstop) * (j as f64) / 200.0;
+            const d = fir_db(taps, fc, win, bits, f);
+            if (d > worst) {
+                worst = d;
+            }
+            j = j + 1;
+        }
+        return worst;
+    }
+
+    // Multipliers a FIR needs: half (rounded up) when the taps are symmetric.
+    fn fir_mults(taps: u8, symmetric: bool) -> u8 {
+        if (symmetric) {
+            return (taps + 1) / 2;
+        }
+        return taps;
+    }
+
+    // DSP48E1 slices when each slice runs `clocks` times per sample.
+    fn fir_dsps(taps: u8, symmetric: bool, clocks: u32) -> u32 {
+        const m = fir_mults(taps, symmetric) as u32;
+        return (m + clocks - 1) / clocks;
+    }
+
+    // The slice tap k runs on: symmetric taps k and taps-1-k share a multiplier (the pre-adder),
+    // and each slice serves `clocks` multipliers one after another.
+    fn fir_tap_dsp(taps: u8, k: u8, symmetric: bool, clocks: u32) -> u32 {
+        var m : u8 = k;
+        if (symmetric && taps - 1 - k < k) {
+            m = taps - 1 - k;
+        }
+        return (m as u32) / clocks;
+    }
+
+    // Clocks per sample: floor(f_clk / f_s), at least 1.
+    fn clocks_per_sample(fclk: f64, fs: f64) -> u32 {
+        const c : f64 = floor_of(fclk / fs);
+        if (c < 1.0) {
+            return 1;
+        }
+        if (c > 1000000.0) {
+            return 1000000;
+        }
+        return c as u32;
+    }
+
+    // How many such filters the XC7A200T's 740 slices hold.
+    fn filters_on_200t(dsps: u32) -> u32 {
+        if (dsps == 0) {
+            return 0;
+        }
+        return (DSP48_ON_200T as u32) / dsps;
+    }
+
+    // Adder levels between registers: a direct-form adder tree has ceil(log2 taps); a
+    // systolic chain (one adder per slice, the cascade between them) has one.
+    fn adder_levels(taps: u8, systolic: bool) -> u8 {
+        if (systolic) {
+            return 1;
+        }
+        var lv : u8 = 0;
+        var cap : u16 = 1;
+        while (cap < (taps as u16)) {
+            cap = cap * 2;
+            lv = lv + 1;
+        }
+        return lv;
+    }
+
+    // A register-to-register path: a fixed part plus one adder delay per level (all set by
+    // the reader); the slack against the clock period.
+    fn path_ps(levels: u8, level_ps: u16, fixed_ps: u16) -> u32 {
+        return (fixed_ps as u32) + (levels as u32) * (level_ps as u32);
+    }
+
+    fn slack_ps(fclk_mhz: f64, levels: u8, level_ps: u16, fixed_ps: u16) -> f64 {
+        return 1000000.0 / fclk_mhz - (path_ps(levels, level_ps, fixed_ps) as f64);
+    }
+
+    // ---- Multirate -----------------------------------------------------------------------
+
+    // The rate after keeping every r-th sample, and where a tone at f lands at that rate.
+    fn decim_rate(fs: f64, r: u16) -> f64 {
+        return fs / (r as f64);
+    }
+
+    fn decim_alias(f: f64, fs: f64, r: u16) -> f64 {
+        return alias_freq(f, decim_rate(fs, r));
+    }
+
+    // True when a tone at f lands inside 0 .. band after decimating fs by r.
+    fn folds_into(f: f64, fs: f64, r: u16, band: f64) -> bool {
+        return alias_freq(f, fs / (r as f64)) <= band;
+    }
+
+    // The CIC: DC gain (R M)^N, bit growth, output width and the response at f (cycles per
+    // input sample).
+    fn cic_gain(n: u8, r: u16, m: u8) -> f64 {
+        var g : f64 = 1.0;
+        var i : u8 = 0;
+        while (i < n) {
+            g = g * (r as f64) * (m as f64);
+            i = i + 1;
+        }
+        return g;
+    }
+
+    fn cic_growth(n: u8, r: u16, m: u8) -> u8 {
+        const g = cic_gain(n, r, m);
+        var b : u8 = 0;
+        var cap : f64 = 1.0;
+        while (cap < g) {
+            cap = cap * 2.0;
+            b = b + 1;
+        }
+        return b;
+    }
+
+    fn cic_out_bits(bin: u8, n: u8, r: u16, m: u8) -> u8 {
+        return bin + cic_growth(n, r, m);
+    }
+
+    fn cic_response(n: u8, r: u16, m: u8, f: f64) -> f64 {
+        const rm = (r as f64) * (m as f64);
+        var den : f64 = rm * sine(PI * f);
+        if (den < 0.0) {
+            den = 0.0 - den;
+        }
+        if (den < 0.000000000001) {
+            return 1.0;
+        }
+        var one : f64 = sine(PI * rm * f);
+        if (one < 0.0) {
+            one = 0.0 - one;
+        }
+        one = one / den;
+        var out : f64 = 1.0;
+        var i : u8 = 0;
+        while (i < n) {
+            out = out * one;
+            i = i + 1;
+        }
+        return out;
+    }
+
+    fn cic_db(n: u8, r: u16, m: u8, f: f64) -> f64 {
+        const a = cic_response(n, r, m, f);
+        return db_power(a * a);
+    }
+
+    // Polyphase: taps per phase, which phase tap k sits in, MACs per output either way.
+    fn poly_taps(taps: u8, r: u8) -> u8 {
+        return (taps + r - 1) / r;
+    }
+
+    fn poly_phase(k: u8, r: u8) -> u8 {
+        return k % r;
+    }
+
+    fn macs_per_output(taps: u8, r: u8, polyphase: bool) -> u32 {
+        if (polyphase) {
+            return taps as u32;
+        }
+        return (taps as u32) * (r as u32);
+    }
+
+    // ---- The FFT -------------------------------------------------------------------------
+
+    fn fft_stages(len: u16) -> u8 {
+        var s : u8 = 0;
+        var m : u16 = len;
+        while (m > 1) {
+            m = m / 2;
+            s = s + 1;
+        }
+        return s;
+    }
+
+    fn fft_butterflies(len: u16) -> u32 {
+        return ((len as u32) / 2) * (fft_stages(len) as u32);
+    }
+
+    fn dft_mults(len: u16) -> u32 {
+        return (len as u32) * (len as u32);
+    }
+
+    // i with its low `bits` bits in reverse order.
+    fn bit_reverse(i: u16, bits: u8) -> u16 {
+        var r : u16 = 0;
+        var v : u16 = i;
+        var b : u8 = 0;
+        while (b < bits) {
+            r = (r << 1) | (v & 1);
+            v = v >> 1;
+            b = b + 1;
+        }
+        return r;
+    }
+
+    // Stage s of a decimation-in-time FFT: i's partner and the twiddle exponent t of W_L^t.
+    fn bf_partner(i: u16, s: u8) -> u16 {
+        return i ^ ((1 as u16) << s);
+    }
+
+    fn bf_twiddle(i: u16, s: u8, len: u16) -> u16 {
+        return (i & (((1 as u16) << s) - 1)) * (len >> (s + 1));
+    }
+
+    fn twiddle_re(t: u16, len: u16) -> f64 {
+        return cosine(TWO_PI * (t as f64) / (len as f64));
+    }
+
+    fn twiddle_im(t: u16, len: u16) -> f64 {
+        return 0.0 - sine(TWO_PI * (t as f64) / (len as f64));
+    }
+
+    // The 16-bit Fibonacci LFSR with taps 16, 14, 13, 11 (seed 0xACE1 -> 0x5670).
+    fn lfsr_next(s: u16) -> u16 {
+        const bit = (s ^ (s >> 2) ^ (s >> 3) ^ (s >> 5)) & 1;
+        return (s >> 1) | (bit << 15);
+    }
+
+    // An LFSR state as a sample in -max .. max.
+    fn noise_value(state: u16, bits: u8) -> f64 {
+        const mx = two_to(bits - 1) - 1.0;
+        const span = 2.0 * mx + 1.0;
+        const v = state as f64;
+        return v - span * floor_of(v / span) - mx;
+    }
+
+    // Input sample n of a pattern at B bits: DC, one cycle of cosine, +-max alternating,
+    // or LFSR noise; max = 2^(B-1) - 1.
+    fn fft_input(pattern: u8, len: u16, bits: u8, n: u16) -> f64 {
+        const mx = two_to(bits - 1) - 1.0;
+        if (pattern == PAT_DC) {
+            return mx;
+        }
+        if (pattern == PAT_TONE) {
+            return floor_of(mx * cosine(TWO_PI * (n as f64) / (len as f64)) + 0.5);
+        }
+        if (pattern == PAT_NYQUIST) {
+            if (n % 2 == 0) {
+                return mx;
+            }
+            return 0.0 - mx;
+        }
+        var s : u16 = LFSR_SEED;
+        var k : u16 = 0;
+        while (k <= n) {
+            s = lfsr_next(s);
+            k = k + 1;
+        }
+        return noise_value(s, bits);
+    }
+
+    // An integer radix-2 DIT FFT of the pattern run for `stage` stages: bit-reversed input,
+    // every product rounded, optionally halved (and rounded) after each stage. `what` picks
+    // the answer: 0 the real part of element idx, 1 its imaginary part, 2 the largest |re|
+    // or |im| of any element.
+    fn fft_core(pattern: u8, len: u16, bits: u8, scaled: bool, stage: u8, idx: u16, what: u8) -> f64 {
+        var re : [256]f64 = [0.0; 256];
+        var im : [256]f64 = [0.0; 256];
+        const lb = fft_stages(len);
+        var state : u16 = LFSR_SEED;
+        var n : u16 = 0;
+        while (n < len) {
+            var x : f64 = 0.0;
+            if (pattern == PAT_NOISE) {
+                state = lfsr_next(state);
+                x = noise_value(state, bits);
+            } else {
+                x = fft_input(pattern, len, bits, n);
+            }
+            re[bit_reverse(n, lb)] = x;
+            n = n + 1;
+        }
+        var s : u8 = 0;
+        while (s < stage && s < lb) {
+            const half = (1 as u16) << s;
+            var i : u16 = 0;
+            while (i < len) {
+                if ((i & half) == 0) {
+                    const j = i + half;
+                    const t = bf_twiddle(i, s, len);
+                    const c = twiddle_re(t, len);
+                    const d = twiddle_im(t, len);
+                    const tr = floor_of(re[j] * c - im[j] * d + 0.5);
+                    const ti = floor_of(re[j] * d + im[j] * c + 0.5);
+                    const ar = re[i];
+                    const ai = im[i];
+                    re[i] = ar + tr;
+                    im[i] = ai + ti;
+                    re[j] = ar - tr;
+                    im[j] = ai - ti;
+                    if (scaled) {
+                        re[i] = floor_of(re[i] / 2.0 + 0.5);
+                        im[i] = floor_of(im[i] / 2.0 + 0.5);
+                        re[j] = floor_of(re[j] / 2.0 + 0.5);
+                        im[j] = floor_of(im[j] / 2.0 + 0.5);
+                    }
+                }
+                i = i + 1;
+            }
+            s = s + 1;
+        }
+        if (what == 0) {
+            return re[idx];
+        }
+        if (what == 1) {
+            return im[idx];
+        }
+        var worst : f64 = 0.0;
+        var k : u16 = 0;
+        while (k < len) {
+            var a : f64 = re[k];
+            var b : f64 = im[k];
+            if (a < 0.0) {
+                a = 0.0 - a;
+            }
+            if (b < 0.0) {
+                b = 0.0 - b;
+            }
+            if (a > worst) {
+                worst = a;
+            }
+            if (b > worst) {
+                worst = b;
+            }
+            k = k + 1;
+        }
+        return worst;
+    }
+
+    // Element idx (the imaginary part when imag) after `stage` stages.
+    fn fft_value(pattern: u8, len: u16, bits: u8, scaled: bool, stage: u8, idx: u16, imag: bool) -> f64 {
+        if (imag) {
+            return fft_core(pattern, len, bits, scaled, stage, idx, 1);
+        }
+        return fft_core(pattern, len, bits, scaled, stage, idx, 0);
+    }
+
+    // The largest |re| or |im| after `stage` stages.
+    fn fft_peak(pattern: u8, len: u16, bits: u8, scaled: bool, stage: u8) -> f64 {
+        return fft_core(pattern, len, bits, scaled, stage, 0, 2);
+    }
+
+    // Two's complement bits that hold +-peak.
+    fn bits_for(peak: f64) -> u8 {
+        var b : u8 = 1;
+        var cap : f64 = 1.0;
+        while (cap <= peak && b < 64) {
+            cap = cap * 2.0;
+            b = b + 1;
+        }
+        return b;
+    }
+
+    // The conservative unscaled output width: B_in + log2 L + 1.
+    fn fft_unscaled_bits(bits: u8, len: u16) -> u8 {
+        return bits + fft_stages(len) + 1;
+    }
+
+    // ---- The capstone: a FIR as RTL runs it ----------------------------------------------
+
+    // Input sample k (Q1.15): HW_AMPLITUDE times the sum of two tones, rounded and saturated.
+    fn hw_input(k: i32, fa: f64, fb: f64) -> i32 {
+        if (k < 0) {
+            return 0;
+        }
+        const t = k as f64;
+        var v : f64 = floor_of(HW_AMPLITUDE * (tone(fa, t) + tone(fb, t)) * (Q15_ONE as f64) + 0.5);
+        if (v > 32767.0) {
+            v = 32767.0;
+        }
+        if (v < -32768.0) {
+            v = -32768.0;
+        }
+        return v as i32;
+    }
+
+    // Output sample k: integer taps, a wide accumulator, round half up, saturate to 16 bits.
+    fn hw_fir_out(k: i32, taps: u8, fc: f64, win: u8, bits: u8, fa: f64, fb: f64) -> i32 {
+        const s = tap_sum(taps, fc, win);
+        var acc : i64 = 0;
+        var j : u8 = 0;
+        while (j < taps) {
+            const q = quant_tap(sinc_tap(taps, j, fc, win), s, bits) as i64;
+            acc = acc + q * (hw_input(k - (j as i32), fa, fb) as i64);
+            j = j + 1;
+        }
+        const half = (1 as i64) << (bits - 2);
+        var y : i64 = (acc + half) >> (bits - 1);
+        if (y > 32767) {
+            y = 32767;
+        }
+        if (y < -32768) {
+            y = -32768;
+        }
+        return y as i32;
+    }
+
+    // The same filter in f64 on the unrounded input, in output LSBs.
+    fn ref_fir_out(k: i32, taps: u8, fc: f64, win: u8, fa: f64, fb: f64) -> f64 {
+        const s = tap_sum(taps, fc, win);
+        var acc : f64 = 0.0;
+        var j : u8 = 0;
+        while (j < taps) {
+            const n = k - (j as i32);
+            if (n >= 0) {
+                const t = n as f64;
+                acc = acc + sinc_tap(taps, j, fc, win) / s * HW_AMPLITUDE * (tone(fa, t) + tone(fb, t)) * (Q15_ONE as f64);
+            }
+            j = j + 1;
+        }
+        return acc;
+    }
+
+    // How far the RTL output sits from the f64 filter, in output LSBs.
+    fn hw_error(k: i32, taps: u8, fc: f64, win: u8, bits: u8, fa: f64, fb: f64) -> f64 {
+        return (hw_fir_out(k, taps, fc, win, bits, fa, fb) as f64) - ref_fir_out(k, taps, fc, win, fa, fb);
+    }
+
+    // Accumulator bits for the worst case: sum |q| * 32768, signed.
+    fn hw_acc_bits(taps: u8, fc: f64, win: u8, bits: u8) -> u8 {
+        const s = tap_sum(taps, fc, win);
+        var m : f64 = 0.0;
+        var j : u8 = 0;
+        while (j < taps) {
+            var q : f64 = quant_tap(sinc_tap(taps, j, fc, win), s, bits) as f64;
+            if (q < 0.0) {
+                q = 0.0 - q;
+            }
+            m = m + q;
+            j = j + 1;
+        }
+        return bits_for(m * (Q15_ONE as f64));
+    }
+
+    fn near(a: f64, b: f64, tol: f64) -> bool {
+        return a - b < tol && b - a < tol;
+    }
+
+    // ---- Tests ---------------------------------------------------------------------------
+
+    test "sine, cosine and the logarithm agree with their tables" {
+        assert(near(sine(PI / 6.0), 0.5, 0.000000000001));
+        assert(near(sine(0.0 - 2.0), -0.9092974268, 0.0000000001));
+        assert(near(sine(100.0), -0.5063656411, 0.0000000001));
+        assert(near(cosine(PI), -1.0, 0.000000000001));
+        assert(near(ln_pos(10.0), LN10, 0.000000000001));
+        assert(near(ln_pos(0.001), -6.9077552790, 0.0000000001));
+        assert(near(db_power(2.0), 3.0103, 0.0001));
+        assert(db_power(0.0) == DB_FLOOR);
+    }
+
+    test "each bit buys about 6 dB" {
+        assert(near(sqnr_ideal(16), 98.0905, 0.0001));
+        assert(near(sqnr_ideal(1), 7.7815, 0.0001));
+        assert(near(sqnr_measured(1, 4096, 127), 6.4443, 0.0001));
+        assert(near(sqnr_measured(8, 4096, 127), 49.7937, 0.0001));
+        assert(near(sqnr_measured(12, 4096, 127), 74.0046, 0.0001));
+        assert(near(quantize(1.0, 3), 0.875, 0.000000001));
+        assert(near(quantize(0.0, 3), 0.125, 0.000000001));
+    }
+
+    test "a tone above fs/2 comes back lower" {
+        assert(alias_freq(70.0, 100.0) == 30.0);
+        assert(alias_freq(130.0, 100.0) == 30.0);
+        assert(alias_freq(240.0, 100.0) == 40.0);
+        assert(alias_freq(25.0, 100.0) == 25.0);
+        assert(alias_sign(70.0, 100.0) == -1);
+        assert(alias_sign(130.0, 100.0) == 1);
+        assert(nyquist_zone(70.0, 100.0) == 2);
+        assert(nyquist_zone(130.0, 100.0) == 3);
+        assert(nyquist_zone(49.9, 100.0) == 1);
+    }
+
+    test "the NCO: 100 MHz, N = 32, M = 2^30 is 25 MHz" {
+        assert(nco_fout(100000000.0, 32, 1073741824) == 25000000.0);
+        assert(near(nco_resolution(100000000.0, 32), 0.0232830644, 0.0000000001));
+        assert(nco_word(100000000.0, 32, 25000000.0) == 1073741824);
+        assert(nco_word(100000000.0, 32, 1000000.0) == 42949673);
+        assert(nco_phase(1073741824, 5, 32) == 1073741824.0);
+        assert(near(nco_sample(1073741824, 1, 32, 12, 16), 1.0, 0.000000001));
+        assert(near(nco_spur_db(12), -72.2472, 0.0001));
+    }
+
+    test "a tone between bins leaks" {
+        assert(near(dft_db(64, 8.0, 8, WIN_RECT), 0.0, 0.000001));
+        assert(near(dft_db(64, 8.5, 8, WIN_RECT), -3.7235, 0.0001));
+        assert(near(dft_db(64, 8.5, 8, WIN_HANN), -1.4243, 0.0001));
+        assert(dft_db(64, 8.0, 9, WIN_RECT) < -200.0);
+        assert(near(dft_db(64, 8.5, 20, WIN_RECT), -33.1660, 0.0001));
+        assert(near(dft_db(64, 8.5, 20, WIN_HANN), -73.8682, 0.0001));
+        assert(bin_of(1000.0, 8000.0, 64) == 8.0);
+        assert(near(dft_input(64, 8.0, 2, WIN_RECT), 1.0, 0.000000000001));
+        assert(dft_input(64, 8.0, 0, WIN_HANN) == 0.0);
+        assert(bin_width(8000.0, 64) == 125.0);
+    }
+
+    test "the moving average and its nulls" {
+        assert(near(ma_gain(4, 0.125), 0.65328, 0.00001));
+        assert(ma_gain(4, 0.25) < 0.0000001);
+        assert(near(ma_gain(5, 0.1), 0.6472135955, 0.0000000001));
+        assert(ma_gain(8, 0.0) == 1.0);
+        assert(near(ma_out(4, 0.125, 10), 0.6532814824 * sine(TWO_PI * 0.125 * 8.5), 0.0000000001));
+        assert(near(ma_out(2, 0.25, 0), 0.0, 0.0000000001));
+    }
+
+    test "a windowed-sinc low-pass and its integer taps" {
+        assert(fir_tap_q(31, 15, 0.1, WIN_HAMMING, 16) == 6542);
+        assert(fir_tap_q(31, 11, 0.1, WIN_HAMMING, 16) == 1297);
+        assert(fir_tap_q(31, 8, 0.1, WIN_HAMMING, 16) == -832);
+        assert(fir_tap_q(31, 0, 0.1, WIN_HAMMING, 16) == 0);
+        assert(near(fir_db(31, 0.1, WIN_HAMMING, 0, 0.0), 0.0, 0.0000001));
+        assert(near(fir_db(31, 0.1, WIN_HAMMING, 0, 0.1), -6.0518, 0.0001));
+        assert(near(fir_stop_db(31, 0.1, WIN_RECT, 0, 0.2), -32.8291, 0.0001));
+        assert(near(fir_stop_db(31, 0.1, WIN_HAMMING, 0, 0.2), -62.6372, 0.0001));
+        assert(near(fir_stop_db(31, 0.1, WIN_BLACKMAN, 0, 0.2), -76.1229, 0.0001));
+        assert(near(fir_stop_db(31, 0.1, WIN_HAMMING, 8, 0.2), -32.8362, 0.0001));
+    }
+
+    test "folding the taps onto slices" {
+        assert(fir_mults(31, true) == 16);
+        assert(fir_mults(31, false) == 31);
+        assert(fir_dsps(31, true, 1) == 16);
+        assert(fir_dsps(31, true, 4) == 4);
+        assert(fir_dsps(31, false, 4) == 8);
+        assert(fir_tap_dsp(31, 30, true, 4) == 0);
+        assert(fir_tap_dsp(31, 15, true, 4) == 3);
+        assert(fir_tap_dsp(31, 30, false, 4) == 7);
+        assert(clocks_per_sample(200000000.0, 48000.0) == 4166);
+        assert(clocks_per_sample(100000000.0, 200000000.0) == 1);
+        assert(filters_on_200t(16) == 46);
+        assert(adder_levels(31, false) == 5);
+        assert(adder_levels(31, true) == 1);
+        assert(path_ps(5, 400, 900) == 2900);
+        assert(near(slack_ps(250.0, 5, 400, 900), 1100.0, 0.000001));
+    }
+
+    test "decimation folds, the CIC grows" {
+        assert(folds_into(95.0, 400.0, 4, 10.0));
+        assert(folds_into(205.0, 400.0, 4, 10.0));
+        assert(!folds_into(50.0, 400.0, 4, 10.0));
+        assert(decim_rate(400.0, 4) == 100.0);
+        assert(decim_alias(130.0, 400.0, 4) == 30.0);
+        assert(cic_gain(4, 8, 1) == 4096.0);
+        assert(cic_growth(4, 8, 1) == 12);
+        assert(cic_out_bits(16, 4, 8, 1) == 28);
+        assert(cic_growth(4, 10, 1) == 14);
+        assert(cic_growth(5, 64, 2) == 35);
+        assert(cic_growth(8, 4096, 2) == 104);
+        assert(near(cic_db(4, 8, 1, 0.0625), -15.4661, 0.0001));
+        assert(cic_response(4, 8, 1, 0.125) < 0.0000001);
+    }
+
+    test "polyphase does the work at the low rate" {
+        assert(poly_taps(31, 4) == 8);
+        assert(poly_taps(32, 4) == 8);
+        assert(poly_phase(13, 4) == 1);
+        assert(macs_per_output(31, 4, false) == 124);
+        assert(macs_per_output(31, 4, true) == 31);
+    }
+
+    test "the FFT counts, the order and the twiddles" {
+        assert(fft_stages(256) == 8);
+        assert(fft_butterflies(256) == 1024);
+        assert(dft_mults(256) == 65536);
+        assert(bit_reverse(1, 3) == 4);
+        assert(bit_reverse(3, 3) == 6);
+        assert(bit_reverse(11, 5) == 26);
+        assert(bf_partner(5, 1) == 7);
+        assert(bf_twiddle(3, 1, 8) == 2);
+        assert(bf_twiddle(6, 2, 8) == 2);
+        assert(near(twiddle_im(2, 8), -1.0, 0.000000000001));
+        assert(lfsr_next(44257) == 22128);
+    }
+
+    test "FFT words grow, and halving every stage holds them" {
+        assert(fft_value(PAT_DC, 8, 8, false, 3, 0, false) == 1016.0);
+        assert(fft_value(PAT_TONE, 8, 8, false, 3, 1, false) == 509.0);
+        assert(fft_value(PAT_TONE, 8, 8, false, 3, 7, false) == 509.0);
+        assert(fft_peak(PAT_DC, 16, 12, false, 4) == 32752.0);
+        assert(fft_peak(PAT_DC, 16, 12, true, 4) == 2047.0);
+        assert(fft_peak(PAT_TONE, 16, 12, false, 4) == 16374.0);
+        assert(fft_peak(PAT_TONE, 16, 12, true, 4) == 1024.0);
+        assert(fft_peak(PAT_NOISE, 16, 12, false, 4) == 5826.0);
+        assert(fft_peak(PAT_NOISE, 16, 12, true, 4) == 365.0);
+        assert(bits_for(32752.0) == 16);
+        assert(fft_unscaled_bits(16, 256) == 25);
+    }
+
+    test "the capstone FIR follows its f64 twin" {
+        assert(hw_input(5, 0.02, 0.3) == 8667);
+        assert(hw_fir_out(5, 31, 0.1, WIN_HAMMING, 16, 0.02, 0.3) == 57);
+        assert(hw_fir_out(2, 31, 0.1, WIN_HAMMING, 16, 0.02, 0.3) == 19);
+        assert(hw_fir_out(4, 31, 0.1, WIN_HAMMING, 16, 0.02, 0.3) == 50);
+        assert(hw_fir_out(60, 31, 0.1, WIN_HAMMING, 16, 0.02, 0.3) == -8657);
+        assert(hw_fir_out(100, 31, 0.1, WIN_HAMMING, 16, 0.02, 0.3) == -14007);
+        assert(near(ref_fir_out(60, 31, 0.1, WIN_HAMMING, 0.02, 0.3), -8657.0284, 0.0001));
+        assert(near(hw_error(60, 31, 0.1, WIN_HAMMING, 16, 0.02, 0.3), 0.0284, 0.0001));
+        assert(hw_acc_bits(31, 0.1, WIN_HAMMING, 16) == 32);
+        assert(hw_acc_bits(63, 0.05, WIN_BLACKMAN, 18) == 34);
+    }
+
+    test "VERSION says what the header says" {
+        assert(VERSION == 1);
+        assert(filters_on_200t(1) == 740);
+        assert(fft_stages(MAX_FFT) == 8);
+    }
+}
+// phi^2 + 1/phi^2 = 3 | TRINITY

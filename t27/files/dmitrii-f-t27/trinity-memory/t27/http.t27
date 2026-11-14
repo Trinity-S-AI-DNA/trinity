@@ -1,0 +1,318 @@
+// Bounded HTTP envelope validation; sockets and clocks are OS primitives.
+module TrinityMemoryHTTP {
+    struct TMHttpResponse {
+        body_offset: usize,
+        body_size: usize,
+        has_length: bool,
+        chunked: bool,
+        status: i32,
+    }
+    struct TMHttpEnvelope {
+        body_offset: usize,
+        body_size: usize,
+        status: i32,
+        rpc_error: i32,
+    }
+    fn tm_http_lower(value: u8) -> u8 {
+        if (value >= 65 && value <= 90) { return value + 32; }
+        return value;
+    }
+    fn tm_http_equal(data: []u8, start: usize, size: usize, text: str, length: usize, lower: bool) -> bool {
+        if (size != length) { return false; }
+        var i: usize = 0;
+        while (i < length) {
+            var value: u8 = data[start + i];
+            if (lower) { value = tm_http_lower(value); }
+            if (value != (text[i] as u8)) { return false; }
+            i = i + 1;
+        }
+        return true;
+    }
+    fn tm_http_fail(result: *TMHttpEnvelope, status: i32, code: i32) -> i32 {
+        result.body_offset = 0;
+        result.body_size = 0;
+        result.status = status;
+        result.rpc_error = code;
+        return -1;
+    }
+    fn tm_http_port(data: []u8, start: usize, size: usize) -> i32 {
+        if (size == 0 || size > 10) { return -1; }
+        var value: u32 = 0;
+        var i: usize = 0;
+        while (i < size) {
+            if (data[start + i] < 48 || data[start + i] > 57) { return -1; }
+            value = value * 10 + ((data[start + i] - 48) as u32);
+            if (value > 65535) { return -1; }
+            i = i + 1;
+        }
+        if (value == 0) { return -1; }
+        return value as i32;
+    }
+    fn tm_http_host(data: []u8, start: usize, size: usize, port: i32) -> bool {
+        var prefix: usize = 10;
+        if (size < 11) { return false; }
+        if (!tm_http_equal(data, start, 10, "127.0.0.1:", 10, false) &&
+            !tm_http_equal(data, start, 10, "localhost:", 10, false)) { return false; }
+        if (size - prefix > 1 && data[start + prefix] == 48) { return false; }
+        return tm_http_port(data, start + prefix, size - prefix) == port;
+    }
+    // Return the port of an explicit plain loopback URL, or -1.
+    fn tm_http_url(data: []u8, size: usize) -> i32 {
+        if (size < 18 || !tm_http_equal(data, 0, 7, "http://", 7, true)) { return -1; }
+        var end: usize = size;
+        if (data[end - 1] == 47) { end = end - 1; }
+        if (end < 18) { return -1; }
+        if (!tm_http_equal(data, 7, 10, "127.0.0.1:", 10, true) &&
+            !tm_http_equal(data, 7, 10, "localhost:", 10, true)) { return -1; }
+        return tm_http_port(data, 17, end - 17);
+    }
+    // 0 means more header bytes are needed; 1 means a validated header;
+    // -1 reports an HTTP/RPC error in result. No body parsing is performed.
+    fn tm_http_request(data: []u8, size: usize, port: i32,
+                       max_body: usize, result: *TMHttpEnvelope) -> i32 {
+        if (size == 0) { return 0; }
+        var pos: usize = 0;
+        while (pos < size && data[pos] != 10) { pos = pos + 1; }
+        if (pos == size) {
+            if (size > 65536) { return tm_http_fail(result, 431, -32600); }
+            return 0;
+        }
+        var line_end: usize = pos;
+        if (line_end > 0 && data[line_end - 1] == 13) { line_end = line_end - 1; }
+        if (line_end < 15 || !tm_http_equal(data, 0, 5, "POST ", 5, false)) {
+            return tm_http_fail(result, 405, -32600);
+        }
+        if (data[5] != 47 || data[6] != 32) { return tm_http_fail(result, 403, -32600); }
+        if (!tm_http_equal(data, 7, line_end - 7, "HTTP/1.0", 8, false) &&
+            !tm_http_equal(data, 7, line_end - 7, "HTTP/1.1", 8, false)) {
+            return tm_http_fail(result, 400, -32600);
+        }
+        pos = pos + 1;
+        var host_count: usize = 0;
+        var host_valid: bool = false;
+        var content_lengths: usize = 0;
+        var content_length: u64 = 0;
+        var length_valid: bool = false;
+        var type_seen: bool = false;
+        var type_valid: bool = false;
+        var origin: bool = false;
+        var transfer: bool = false;
+        var headers: usize = 0;
+        while (true) {
+            var start: usize = pos;
+            while (pos < size && data[pos] != 10) { pos = pos + 1; }
+            if (pos > 65536) { return tm_http_fail(result, 431, -32600); }
+            if (pos == size) { return 0; }
+            var end: usize = pos;
+            if (end > start && data[end - 1] == 13) { end = end - 1; }
+            pos = pos + 1;
+            if (start == end) {
+                if (host_count != 1 || !host_valid || origin) { return tm_http_fail(result, 403, -32600); }
+                if (transfer || content_lengths != 1 || !length_valid) { return tm_http_fail(result, 400, -32600); }
+                if (content_length > (max_body as u64)) { return tm_http_fail(result, 413, -32010); }
+                if (!type_valid) { return tm_http_fail(result, 415, -32600); }
+                result.body_offset = pos;
+                result.body_size = content_length as usize;
+                result.status = 200;
+                result.rpc_error = 0;
+                return 1;
+            }
+            headers = headers + 1;
+            if (headers > 100) { return tm_http_fail(result, 431, -32600); }
+            var colon: usize = start;
+            while (colon < end && data[colon] != 58) {
+                var ch: u8 = data[colon];
+                if (ch <= 32 || ch >= 127) { return tm_http_fail(result, 400, -32600); }
+                colon = colon + 1;
+            }
+            if (colon == start || colon == end) { return tm_http_fail(result, 400, -32600); }
+            var value: usize = colon + 1;
+            while (value < end && (data[value] == 32 || data[value] == 9)) { value = value + 1; }
+            while (end > value && (data[end - 1] == 32 || data[end - 1] == 9)) { end = end - 1; }
+            var name_size: usize = colon - start;
+            var value_size: usize = end - value;
+            if (tm_http_equal(data, start, name_size, "host", 4, true)) {
+                host_count = host_count + 1;
+                host_valid = tm_http_host(data, value, value_size, port);
+            }
+            if (tm_http_equal(data, start, name_size, "origin", 6, true)) { origin = true; }
+            if (tm_http_equal(data, start, name_size, "transfer-encoding", 17, true)) { transfer = true; }
+            if (tm_http_equal(data, start, name_size, "content-length", 14, true)) {
+                content_lengths = content_lengths + 1;
+                content_length = 0;
+                length_valid = value_size > 0 && value_size <= 10;
+                if (length_valid) {
+                    var i: usize = value;
+                    while (i < end) {
+                        if (data[i] < 48 || data[i] > 57) { length_valid = false; }
+                        if (length_valid) { content_length = content_length * 10 + ((data[i] - 48) as u64); }
+                        i = i + 1;
+                    }
+                }
+            }
+            if (tm_http_equal(data, start, name_size, "content-type", 12, true) && !type_seen) {
+                type_seen = true;
+                var type_end: usize = value;
+                while (type_end < end && data[type_end] != 59) { type_end = type_end + 1; }
+                while (type_end > value && (data[type_end - 1] == 32 || data[type_end - 1] == 9)) { type_end = type_end - 1; }
+                type_valid = tm_http_equal(data, value, type_end - value, "application/json", 16, true);
+            }
+        }
+        return tm_http_fail(result, 400, -32600);
+    }
+    fn tm_http_literal(w: *TMJsonWriter, text: str) -> void {
+        var i: usize = 0;
+        while (text[i] != 0) { tm_json_write_byte(w, text[i] as u8); i = i + 1; }
+    }
+    fn tm_http_crlf(w: *TMJsonWriter) -> void {
+        tm_json_write_byte(w, 13);
+        tm_json_write_byte(w, 10);
+    }
+    fn tm_http_response_header(status: i32, body_size: usize, out: []u8, capacity: usize) -> i64 {
+        var w: TMJsonWriter = TMJsonWriter { .data = out, .capacity = capacity, .used = 0, .error = 0 };
+        tm_http_literal(&w, "HTTP/1.1 "); tm_json_write_i64(&w, status as i64);
+        if (status == 200) { tm_http_literal(&w, " OK"); }
+        else { tm_http_literal(&w, " Error"); }
+        tm_http_crlf(&w);
+        tm_http_literal(&w, "Content-Type: application/json"); tm_http_crlf(&w);
+        tm_http_literal(&w, "Content-Length: ");
+        tm_json_write_u64(&w, body_size as u64);
+        tm_http_crlf(&w); tm_http_literal(&w, "Connection: close");
+        tm_http_crlf(&w); tm_http_literal(&w, "Cache-Control: no-store");
+        tm_http_crlf(&w); tm_http_crlf(&w);
+        if (w.error != 0) { return w.error as i64; }
+        return w.used as i64;
+    }
+    fn tm_http_request_header(port: i32, body_size: usize, out: []u8, capacity: usize) -> i64 {
+        if (port < 1 || port > 65535) { return -1; }
+        var w: TMJsonWriter = TMJsonWriter { .data = out, .capacity = capacity, .used = 0, .error = 0 };
+        tm_http_literal(&w, "POST / HTTP/1.1"); tm_http_crlf(&w);
+        tm_http_literal(&w, "Host: 127.0.0.1:");
+        tm_json_write_i64(&w, port as i64);
+        tm_http_crlf(&w); tm_http_literal(&w, "Content-Type: application/json");
+        tm_http_crlf(&w); tm_http_literal(&w, "Content-Length: ");
+        tm_json_write_u64(&w, body_size as u64);
+        tm_http_crlf(&w); tm_http_literal(&w, "Connection: close");
+        tm_http_crlf(&w); tm_http_crlf(&w);
+        if (w.error != 0) { return w.error as i64; }
+        return w.used as i64;
+    }
+    fn tm_http_response(data: []u8, size: usize, max_body: usize, result: *TMHttpResponse) -> i32 {
+        var pos: usize = 0;
+        while (pos < size && data[pos] != 10) { pos = pos + 1; }
+        if (pos == size) { if (size > 65536) { return -1; } return 0; }
+        var end: usize = pos;
+        if (end > 0 && data[end - 1] == 13) { end = end - 1; }
+        if (end < 12 || !tm_http_equal(data, 0, 7, "HTTP/1.", 7, false) ||
+            (data[7] != 48 && data[7] != 49) || data[8] != 32) { return -1; }
+        var status: i32 = 0;
+        var i: usize = 9;
+        while (i < 12) {
+            if (data[i] < 48 || data[i] > 57) { return -1; }
+            status = status * 10 + ((data[i] - 48) as i32);
+            i = i + 1;
+        }
+        if (end > 12 && data[12] != 32) { return -1; }
+        if (status < 200 || status >= 600 || (status >= 300 && status < 400)) { return -1; }
+        pos = pos + 1;
+        var has_length: bool = false;
+        var body: u64 = 0;
+        var chunked: bool = false;
+        var headers: usize = 0;
+        while (true) {
+            var start: usize = pos;
+            while (pos < size && data[pos] != 10) { pos = pos + 1; }
+            if (pos > 65536) { return -1; }
+            if (pos == size) { return 0; }
+            end = pos;
+            if (end > start && data[end - 1] == 13) { end = end - 1; }
+            pos = pos + 1;
+            if (start == end) {
+                if (chunked && has_length) { return -1; }
+                result.body_offset = pos;
+                result.body_size = body as usize;
+                result.has_length = has_length;
+                result.chunked = chunked;
+                result.status = status;
+                return 1;
+            }
+            headers = headers + 1;
+            if (headers > 100) { return -1; }
+            var colon: usize = start;
+            while (colon < end && data[colon] != 58) { colon = colon + 1; }
+            if (colon == start || colon == end) { return -1; }
+            var value: usize = colon + 1;
+            while (value < end && (data[value] == 32 || data[value] == 9)) { value = value + 1; }
+            while (end > value && (data[end - 1] == 32 || data[end - 1] == 9)) { end = end - 1; }
+            if (tm_http_equal(data, start, colon - start, "content-length", 14, true)) {
+                if (has_length || end == value || end - value > 20) { return -1; }
+                has_length = true;
+                i = value;
+                while (i < end) {
+                    if (data[i] < 48 || data[i] > 57) { return -1; }
+                    var digit: u64 = (data[i] - 48) as u64;
+                    if (body > (0xffffffffffffffff - digit) / 10) { return -1; }
+                    body = body * 10 + digit;
+                    if (body > (max_body as u64)) { return -2; }
+                    i = i + 1;
+                }
+            }
+            if (tm_http_equal(data, start, colon - start, "transfer-encoding", 17, true)) {
+                if (chunked || !tm_http_equal(data, value, end - value, "chunked", 7, true)) { return -1; }
+                chunked = true;
+            }
+        }
+        return -1;
+    }
+    // Decode complete chunked bodies; 0=incomplete, -1=malformed, -2=limit.
+    // On success return 1 and report decoded bytes via written[0].
+    fn tm_http_chunks(data: []u8, size: usize, out: []u8, capacity: usize, written: *usize) -> i32 {
+        var pos: usize = 0;
+        var used: usize = 0;
+        while (true) {
+            var line: usize = pos;
+            while (pos < size && data[pos] != 10) { pos = pos + 1; }
+            if (pos == size) { if (pos - line > 65536) { return -1; } return 0; }
+            if (pos == line || data[pos - 1] != 13) { return -1; }
+            var end: usize = pos - 1;
+            pos = pos + 1;
+            var i: usize = line;
+            var chunk: u64 = 0;
+            var digits: usize = 0;
+            while (i < end && data[i] != 59) {
+                var c: u8 = tm_http_lower(data[i]);
+                var digit: u64 = 16;
+                if (c >= 48 && c <= 57) { digit = (c - 48) as u64; }
+                if (c >= 97 && c <= 102) { digit = (c - 87) as u64; }
+                if (digit >= 16 || digits >= 16) { return -1; }
+                chunk = chunk * 16 + digit;
+                digits = digits + 1;
+                i = i + 1;
+            }
+            if (digits == 0) { return -1; }
+            if (chunk == 0) {
+                var trailers: usize = 0;
+                while (true) {
+                    line = pos;
+                    while (pos < size && data[pos] != 10) { pos = pos + 1; }
+                    if (pos == size) { return 0; }
+                    if (pos == line || data[pos - 1] != 13) { return -1; }
+                    end = pos - 1;
+                    pos = pos + 1;
+                    if (end == line) { written[0] = used; return 1; }
+                    trailers = trailers + 1;
+                    if (trailers > 100 || end - line > 65536) { return -1; }
+                }
+            }
+            if (chunk > ((capacity - used) as u64)) { return -2; }
+            if (chunk > ((size - pos) as u64) || size - pos - (chunk as usize) < 2) { return 0; }
+            var amount: usize = chunk as usize;
+            if (data[pos + amount] != 13 || data[pos + amount + 1] != 10) { return -1; }
+            i = 0;
+            while (i < amount) { out[used + i] = data[pos + i]; i = i + 1; }
+            used = used + amount;
+            pos = pos + amount + 2;
+        }
+        return -1;
+    }
+}

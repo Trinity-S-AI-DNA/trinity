@@ -1,0 +1,1102 @@
+// TRI-NET compute dispute + slash: economic security around the GF compute core.
+// Settlement (tri_compute_settle) pays a fresh, self-consistent receipt -- but
+// self-consistent does NOT mean CORRECT. A dishonest executor can sign a fresh
+// receipt for a WRONG GoldenFloat result and get paid. This spec adds the fraud
+// proof: because GF ops are deterministic and bit-exact (conformance vectors),
+// any challenger can recompute gf_op(a,b) with the golden GF unit and settle the
+// dispute by equality -- no bisection needed for a single op (unlike Gensyn Verde
+// bisection or ZK/TEE). Executor posts a bond; a correct challenge slashes it.
+
+module TriComputeChallenge {
+    use base::types;
+
+    // Resolution outcomes.
+    const RESOLVE_HONEST: u32 = 0;   // executor correct -> challenger loses stake
+    const RESOLVE_SLASH:  u32 = 1;   // executor wrong   -> executor bond slashed
+
+    // The dispute is decided by bit-exact recomputation: the executor is honest
+    // iff its committed result equals what the golden GF unit produces for the
+    // same operands. (recomputed comes from gf16_mul / the GF SSOT.)
+    fn is_honest(claimed_result: u32, recomputed_result: u32) -> bool {
+        return claimed_result == recomputed_result;
+    }
+
+    fn resolve(claimed_result: u32, recomputed_result: u32) -> u32 {
+        if (claimed_result == recomputed_result) {
+            return RESOLVE_HONEST;
+        } else {
+            return RESOLVE_SLASH;
+        }
+    }
+
+    // Executor's bond after resolution: forfeited on a proven wrong result, kept
+    // when honest.
+    fn executor_bond_after(prev_bond: u32, outcome: u32) -> u32 {
+        if (outcome == RESOLVE_SLASH) {
+            return 0;
+        } else {
+            return prev_bond;
+        }
+    }
+
+    // Challenger's payout: wins the slashed bond on a correct challenge, nothing
+    // on a frivolous one.
+    fn challenger_reward(bond: u32, outcome: u32) -> u32 {
+        if (outcome == RESOLVE_SLASH) {
+            return bond;
+        } else {
+            return 0;
+        }
+    }
+
+    // Challenger's stake after resolution: burned on a frivolous challenge
+    // (deters spam), retained on a correct one.
+    fn challenger_stake_after(stake: u32, outcome: u32) -> u32 {
+        if (outcome == RESOLVE_HONEST) {
+            return 0;
+        } else {
+            return stake;
+        }
+    }
+
+    // ---- Binding the fraud proof to the SETTLED receipt leaf ----
+    //
+    // resolve() above decides honesty from two bare results, trusting the caller
+    // to have recomputed on the operands the executor actually committed. That
+    // trust IS the hole: a lying challenger can recompute gf_op on operands the
+    // executor never signed and false-slash it, and a lying executor can answer a
+    // dispute with operands it never committed. The anchor is the receipt leaf
+    // settlement PAID: it binds (fmt,width,op,a,b,result,executor,epoch) -- see
+    // tri_compute_receipt::receipt_leaf_gf_fmt. The challenger recomputes that
+    // leaf from the disputed operands; it must reproduce the settled leaf, or the
+    // dispute is malformed and neither bond moves. (Gensyn/Truebit get this
+    // binding from bisection, ZK from the SNARK, TEE from attestation; a bit-exact
+    // GF op needs no bisection, only this anchor.)
+    const RESOLVE_MALFORMED: u32 = 2;
+
+    // The dispute is anchored iff the leaf recomputed from the disputed operands
+    // equals the leaf settlement paid on.
+    fn challenge_binds(settled_leaf: u32, dispute_leaf: u32) -> bool {
+        return settled_leaf == dispute_leaf;
+    }
+
+    // Bound resolution: reject (MALFORMED) unless the disputed operands reproduce
+    // the settled leaf; only then decide honesty by bit-exact recomputation.
+    fn resolve_bound(settled_leaf: u32, dispute_leaf: u32, claimed_result: u32, recomputed_result: u32) -> u32 {
+        if (settled_leaf != dispute_leaf) {
+            return RESOLVE_MALFORMED;
+        } else {
+            if (claimed_result == recomputed_result) {
+                return RESOLVE_HONEST;
+            } else {
+                return RESOLVE_SLASH;
+            }
+        }
+    }
+
+    // Stake disposition across every bound outcome. Only CHALLENGER-FAULT outcomes
+    // burn the stake to deter griefing: a frivolous HONEST (executor proven
+    // correct), a fabricated MALFORMED (off-leaf operands), a family-confusion
+    // FAMILY_MISMATCH. The stake is KEPT otherwise: a correct SLASH earns it; a
+    // STALE replay is a no-op (the original dispute already moved the bonds); and
+    // an INDETERMINATE (the verifiers did not reach quorum) is NOT the challenger's
+    // fault -- it raised a valid dispute and the verifier set simply split, so
+    // burning its stake would penalize a legitimate challenge for verifier
+    // behavior and chill challenging whenever a quorum is uncertain.
+    fn challenger_stake_after_bound(stake: u32, outcome: u32) -> u32 {
+        if (outcome == RESOLVE_SLASH) {
+            return stake;
+        } else {
+            if (outcome == RESOLVE_STALE) {
+                return stake;
+            } else {
+                if (outcome == RESOLVE_INDETERMINATE) {
+                    return stake;
+                } else {
+                    return 0;
+                }
+            }
+        }
+    }
+
+    // ---- Anti-replay: a resolved dispute must not be replayable ----
+    //
+    // resolve_bound has no notion of time: the same (settled_leaf, dispute_leaf,
+    // results) can be re-submitted forever, and a ledger that applies the outcome
+    // each time double-slashes or double-rewards. Each dispute carries a strictly
+    // increasing epoch (as tri_a2a binds request freshness). A resolver holding a
+    // watermark of the last epoch it processed accepts only a STRICTLY greater
+    // one; a stale-or-equal epoch is a replay -> RESOLVE_STALE, a pure no-op.
+    const RESOLVE_STALE: u32 = 3;
+
+    fn dispute_is_fresh(last_epoch: u32, dispute_epoch: u32) -> bool {
+        return dispute_epoch > last_epoch;
+    }
+
+    // The watermark advances only when the dispute is actually RESOLVED -- a
+    // terminal HONEST or SLASH. A non-terminal outcome (MALFORMED, STALE,
+    // FAMILY_MISMATCH, INDETERMINATE) resolved nothing, so it must NOT advance the
+    // watermark: otherwise a griefer submits a MALFORMED dispute at a high epoch,
+    // jumps the watermark, and every legitimate lower-epoch dispute is then
+    // rejected as stale -- a replay-nonce DoS. Only a committed resolution moves
+    // the high-water mark.
+    fn resolver_epoch_after(last_epoch: u32, dispute_epoch: u32, outcome: u32) -> u32 {
+        if (outcome == RESOLVE_HONEST) {
+            return dispute_epoch;
+        } else {
+            if (outcome == RESOLVE_SLASH) {
+                return dispute_epoch;
+            } else {
+                return last_epoch;
+            }
+        }
+    }
+
+    // ---- GF-T family binding: close the fraud proof on BOTH ladders ----
+    //
+    // receipt_leaf_gf_fmt tags the leaf with the format family (FMT_GF_BINARY for
+    // GF4..GF1024, FMT_GFT for the balanced-ternary GF-T ladder). A family-
+    // confusion attack disputes a binary-committed result as if GF-T (or vice
+    // versa): the leaf differs, so resolve_bound already returns MALFORMED, but
+    // that hides WHY. Carry the family explicitly and reject a mismatch with a
+    // distinct code so operators see family confusion, not a generic bad leaf.
+    const FMT_GF_BINARY: u32 = 0;         // matches tri_compute_receipt
+    const FMT_GFT: u32 = 1;
+    const RESOLVE_FAMILY_MISMATCH: u32 = 4;
+
+    fn family_matches(settled_family: u32, dispute_family: u32) -> bool {
+        return settled_family == dispute_family;
+    }
+
+    // ---- The single correct resolution path ----
+    //
+    // Chains all three guards in the only safe order: freshness first (a stale
+    // replay short-circuits before any bond logic), then family (cross-family is
+    // rejected before the leaf is trusted), then the leaf-anchor + bit-exact
+    // honesty of resolve_bound. Callers should use this, not the bare layers.
+    fn resolve_full(last_epoch: u32, dispute_epoch: u32, settled_family: u32, dispute_family: u32, settled_leaf: u32, dispute_leaf: u32, claimed_result: u32, recomputed_result: u32) -> u32 {
+        if (dispute_epoch > last_epoch) {
+            if (settled_family == dispute_family) {
+                return resolve_bound(settled_leaf, dispute_leaf, claimed_result, recomputed_result);
+            } else {
+                return RESOLVE_FAMILY_MISMATCH;
+            }
+        } else {
+            return RESOLVE_STALE;
+        }
+    }
+
+    // ---- Ladder-rung guard ----
+    //
+    // The GF-T ladder now spans many rungs (GF-T16/32/64/...), each a DIFFERENT
+    // geometry (Et = fib+1; bias/offset_max derive from Et). tri_compute_receipt's
+    // receipt_leaf_gf_rung binds Et into the attestation, so a dispute must recompute
+    // gf_op at the SAME rung the executor committed. A challenger who recomputes at
+    // GF-T16 geometry against a GF-T64 receipt is comparing the wrong numbers and must
+    // NOT slash -- reject it explicitly (the ladder analogue of family_matches), so the
+    // reason is legible instead of hidden inside a leaf miscompare.
+    const RESOLVE_RUNG_MISMATCH: u32 = 6;   // INDETERMINATE took 5
+
+    fn rung_matches(settled_et: u32, dispute_et: u32) -> bool {
+        return settled_et == dispute_et;
+    }
+
+    // resolve_full + the rung guard, in the only safe order: freshness, then family
+    // (coarsest), then rung (which ladder step), then the leaf-anchored recompute.
+    // settled_et / dispute_et are width_to_et(width) from the ladder SSOT. A wrong-rung
+    // dispute is RESOLVE_RUNG_MISMATCH -- no bond moves.
+    fn resolve_full_rung(last_epoch: u32, dispute_epoch: u32, settled_family: u32, dispute_family: u32, settled_et: u32, dispute_et: u32, settled_leaf: u32, dispute_leaf: u32, claimed_result: u32, recomputed_result: u32) -> u32 {
+        if (dispute_epoch > last_epoch) {
+            if (settled_family == dispute_family) {
+                if (settled_et == dispute_et) {
+                    return resolve_bound(settled_leaf, dispute_leaf, claimed_result, recomputed_result);
+                } else {
+                    return RESOLVE_RUNG_MISMATCH;
+                }
+            } else {
+                return RESOLVE_FAMILY_MISMATCH;
+            }
+        } else {
+            return RESOLVE_STALE;
+        }
+    }
+
+    // 256-bit-anchored GF dispute: resolve_bound anchors on the 32-bit receipt leaf
+    // (~2^16 birthday collision), but the receipt carries a 256-bit SHA-256 digest
+    // (tri_compute_receipt.sign_digest / digest_pre). Anchor on it instead -- the
+    // caller precomputes leaf_match = 1 iff all eight digest words of the dispute
+    // equal the settled digest (same flag pattern as resolve_bitnet_d256), a ~2^128
+    // anchor. This is the GF analogue of resolve_bitnet_d256.
+    fn resolve_bound_d256(leaf_match: u32, claimed_result: u32, recomputed_result: u32) -> u32 {
+        if (leaf_match == 1) {
+            if (claimed_result == recomputed_result) {
+                return RESOLVE_HONEST;
+            } else {
+                return RESOLVE_SLASH;
+            }
+        } else {
+            return RESOLVE_MALFORMED;
+        }
+    }
+
+    // Full GF dispute on the 256-bit anchor: freshness -> family -> 256-bit-anchored
+    // honesty, mirroring resolve_full but with the strong digest as the anchor.
+    fn resolve_full_d256(last_epoch: u32, dispute_epoch: u32, settled_family: u32, dispute_family: u32, leaf_match: u32, claimed_result: u32, recomputed_result: u32) -> u32 {
+        if (dispute_epoch > last_epoch) {
+            if (settled_family == dispute_family) {
+                return resolve_bound_d256(leaf_match, claimed_result, recomputed_result);
+            } else {
+                return RESOLVE_FAMILY_MISMATCH;
+            }
+        } else {
+            return RESOLVE_STALE;
+        }
+    }
+
+    // ---- BitNet-layer dispute: verify BOTH the ternary part and the GF value ----
+    //
+    // A BitNet layer is a ternary weight matmul (0-DSP) plus a GF16 accumulate. A
+    // dispute that only checks the GF value misses ternary-weight fraud, and one
+    // that only checks the weights misses a wrong accumulate. Resolve on BOTH:
+    // anchor to the settled leaf first, then require the ternary recompute to pass
+    // (ternary_ok = tri_compute_bitnet.bitnet_balance_matches, a cross-module check
+    // the caller precomputes and passes as a flag -- 1 = canonical weights AND the
+    // claimed sign balance matches). A failed ternary recompute is proven-bad
+    // BitNet compute -> SLASH; only a valid ternary part defers to the GF-value
+    // resolution (resolve_bound). A fabricated dispute stays MALFORMED, no slash.
+    fn resolve_bitnet(settled_leaf: u32, dispute_leaf: u32, claimed_result: u32, recomputed_result: u32, ternary_ok: u32) -> u32 {
+        if (settled_leaf == dispute_leaf) {
+            if (ternary_ok == 1) {
+                return resolve_bound(settled_leaf, dispute_leaf, claimed_result, recomputed_result);
+            } else {
+                return RESOLVE_SLASH;
+            }
+        } else {
+            return RESOLVE_MALFORMED;
+        }
+    }
+
+    // The single correct BitNet resolution path -- the analogue of resolve_full for
+    // the ternary ladder. resolve_bitnet (and _d256/_quorum) are BARE inner resolvers:
+    // they take no epoch, so a BitNet fraud proof already resolved at dispute_epoch E
+    // can be REPLAYED and re-slash the executor every time -- the exact anti-replay
+    // hole resolve_full closes for GF disputes, left open on the ternary side. They
+    // also skip the family check, so a cross-family dispute is not distinguished. Wrap
+    // resolve_bitnet in the same freshness -> family -> resolve order: a stale replay
+    // short-circuits to RESOLVE_STALE before any slash logic, a cross-family dispute is
+    // RESOLVE_FAMILY_MISMATCH, and only a fresh, same-family dispute reaches the leaf +
+    // ternary + GF honesty check. Callers on the BitNet path should use THIS, exactly
+    // as GF callers use resolve_full instead of bare resolve_bound.
+    fn resolve_bitnet_full(last_epoch: u32, dispute_epoch: u32, settled_family: u32, dispute_family: u32, settled_leaf: u32, dispute_leaf: u32, claimed_result: u32, recomputed_result: u32, ternary_ok: u32) -> u32 {
+        if (dispute_epoch > last_epoch) {
+            if (settled_family == dispute_family) {
+                return resolve_bitnet(settled_leaf, dispute_leaf, claimed_result, recomputed_result, ternary_ok);
+            } else {
+                return RESOLVE_FAMILY_MISMATCH;
+            }
+        } else {
+            return RESOLVE_STALE;
+        }
+    }
+
+    // resolve_bitnet anchors on a 32-bit bitnet_leaf (~2^16 birthday collision -- a
+    // griefer could find a colliding dispute leaf). This variant anchors on the
+    // 256-bit BitNet digest instead (tri_compute_bitnet.bitnet_digest_pre +
+    // tri_sha256): the caller precomputes leaf_match = 1 iff all eight digest words
+    // of the dispute equal the settled digest -- the same cross-module-flag pattern
+    // as ternary_ok, giving a ~2^128 anchor. leaf_match == 0 is a fabricated/
+    // colliding dispute -> MALFORMED (no slash); otherwise proceed as resolve_bitnet.
+    fn resolve_bitnet_d256(leaf_match: u32, claimed_result: u32, recomputed_result: u32, ternary_ok: u32) -> u32 {
+        if (leaf_match == 1) {
+            if (ternary_ok == 1) {
+                if (claimed_result == recomputed_result) {
+                    return RESOLVE_HONEST;
+                } else {
+                    return RESOLVE_SLASH;
+                }
+            } else {
+                return RESOLVE_SLASH;
+            }
+        } else {
+            return RESOLVE_MALFORMED;
+        }
+    }
+
+    // Fresh, family-checked 256-bit BitNet dispute -- the last bare BitNet resolver
+    // wrapped, the ternary analogue of resolve_full_d256. resolve_bitnet_d256 carries
+    // the strongest anchor (~2^128 digest) but no epoch, so even a digest-anchored
+    // BitNet fraud proof could be replayed to re-slash. Wrap it in the same freshness
+    // -> family order as resolve_full_d256, so the whole BitNet dispute family (leaf,
+    // 256-bit, quorum) now has the anti-replay the GF family always had.
+    fn resolve_bitnet_d256_full(last_epoch: u32, dispute_epoch: u32, settled_family: u32, dispute_family: u32, leaf_match: u32, claimed_result: u32, recomputed_result: u32, ternary_ok: u32) -> u32 {
+        if (dispute_epoch > last_epoch) {
+            if (settled_family == dispute_family) {
+                return resolve_bitnet_d256(leaf_match, claimed_result, recomputed_result, ternary_ok);
+            } else {
+                return RESOLVE_FAMILY_MISMATCH;
+            }
+        } else {
+            return RESOLVE_STALE;
+        }
+    }
+
+    // Majority of three 0/1 flags: with an odd count a tie is impossible, so the
+    // majority always exists -- 1 iff at least two flags are set.
+    fn majority_flag3(a: u32, b: u32, c: u32) -> u32 {
+        if (a + b + c >= 2) {
+            return 1;
+        } else {
+            return 0;
+        }
+    }
+
+    // BitNet dispute under a 3-verifier quorum: resolve_bitnet trusts ONE
+    // recompute + ONE ternary flag, so a single lying verifier could flip it. Take
+    // the MAJORITY of each field independently -- the recomputed GF value via the
+    // value quorum (quorum_value3), the ternary_ok via majority_flag3 -- so a lone
+    // liar on either field is outvoted. No value quorum (all three differ) proves
+    // nothing -> RESOLVE_INDETERMINATE, no bond moves.
+    fn resolve_bitnet_quorum(settled_leaf: u32, dispute_leaf: u32, claimed_result: u32, v0: u32, v1: u32, v2: u32, t0: u32, t1: u32, t2: u32) -> u32 {
+        if (verifier_quorum3(v0, v1, v2) == 1) {
+            return resolve_bitnet(settled_leaf, dispute_leaf, claimed_result, quorum_result3(v0, v1, v2), majority_flag3(t0, t1, t2));
+        } else {
+            return RESOLVE_INDETERMINATE;
+        }
+    }
+
+    // Majority of five 0/1 flags: 1 iff at least three are set (odd count, no tie).
+    fn majority_flag5(a: u32, b: u32, c: u32, d: u32, e: u32) -> u32 {
+        if (a + b + c + d + e >= 3) {
+            return 1;
+        } else {
+            return 0;
+        }
+    }
+
+    // BitNet dispute under a 5-verifier quorum -- the GF dispute has resolve_quorum5
+    // but the BitNet one stopped at three, so a 5-node pool could not resolve a
+    // BitNet layer with all five votes. Take the 3-of-5 majority of each field: the
+    // recomputed value via quorum_value5, the ternary_ok via majority_flag5. TWO
+    // liars on either field are outvoted; no 3-of-5 value quorum -> INDETERMINATE.
+    fn resolve_bitnet_quorum5(settled_leaf: u32, dispute_leaf: u32, claimed_result: u32, v0: u32, v1: u32, v2: u32, v3: u32, v4: u32, t0: u32, t1: u32, t2: u32, t3: u32, t4: u32) -> u32 {
+        if (has_quorum_k(max_agree5(v0, v1, v2, v3, v4), quorum_threshold(5)) == 1) {
+            return resolve_bitnet(settled_leaf, dispute_leaf, claimed_result, quorum_value5(v0, v1, v2, v3, v4, quorum_threshold(5)), majority_flag5(t0, t1, t2, t3, t4));
+        } else {
+            return RESOLVE_INDETERMINATE;
+        }
+    }
+
+    // Fresh, family-checked BitNet quorum resolvers -- the ternary analogue of
+    // resolve_quorum3 / resolve_quorum5, which reach freshness by calling resolve_full.
+    // resolve_bitnet_quorum / _quorum5 above call BARE resolve_bitnet, so a formed
+    // quorum's BitNet fraud proof carried the same replay hole resolve_bitnet_full
+    // just closed for the single-verifier case: an already-resolved quorum dispute at
+    // dispute_epoch E could be replayed to re-slash. Route the quorum's agreed value
+    // and ternary-majority through resolve_bitnet_full instead, so freshness -> family
+    // guard the quorum path too; a split set is still RESOLVE_INDETERMINATE (nothing
+    // proven), checked before freshness exactly as the bare quorum resolvers order it.
+    fn resolve_bitnet_quorum_full(last_epoch: u32, dispute_epoch: u32, settled_family: u32, dispute_family: u32, settled_leaf: u32, dispute_leaf: u32, claimed_result: u32, v0: u32, v1: u32, v2: u32, t0: u32, t1: u32, t2: u32) -> u32 {
+        if (verifier_quorum3(v0, v1, v2) == 1) {
+            return resolve_bitnet_full(last_epoch, dispute_epoch, settled_family, dispute_family, settled_leaf, dispute_leaf, claimed_result, quorum_result3(v0, v1, v2), majority_flag3(t0, t1, t2));
+        } else {
+            return RESOLVE_INDETERMINATE;
+        }
+    }
+
+    fn resolve_bitnet_quorum5_full(last_epoch: u32, dispute_epoch: u32, settled_family: u32, dispute_family: u32, settled_leaf: u32, dispute_leaf: u32, claimed_result: u32, v0: u32, v1: u32, v2: u32, v3: u32, v4: u32, t0: u32, t1: u32, t2: u32, t3: u32, t4: u32) -> u32 {
+        if (has_quorum_k(max_agree5(v0, v1, v2, v3, v4), quorum_threshold(5)) == 1) {
+            return resolve_bitnet_full(last_epoch, dispute_epoch, settled_family, dispute_family, settled_leaf, dispute_leaf, claimed_result, quorum_value5(v0, v1, v2, v3, v4, quorum_threshold(5)), majority_flag5(t0, t1, t2, t3, t4));
+        } else {
+            return RESOLVE_INDETERMINATE;
+        }
+    }
+
+    // ---- Quorum of verifiers: don't trust a single recomputation ----
+    //
+    // resolve_full takes ONE recomputed_result, as trustworthy as the single node
+    // that produced it -- a dishonest challenger can hand in a wrong value and
+    // false-slash an honest executor. GF ops are deterministic and bit-exact, so
+    // independent HONEST verifiers agree to the bit; require a quorum and a
+    // dishonest MINORITY is outvoted. 2-of-3 majority here (generalizes to k-of-n).
+    // A split set (all three distinct) proves nothing -> RESOLVE_INDETERMINATE, no
+    // slash: the system refuses to move a bond on an unresolved recomputation.
+    const RESOLVE_INDETERMINATE: u32 = 5;
+
+    // 1 iff at least two of three verifier recomputations agree.
+    fn verifier_quorum3(v0: u32, v1: u32, v2: u32) -> u32 {
+        if (v0 == v1) { return 1; }
+        if (v0 == v2) { return 1; }
+        if (v1 == v2) { return 1; }
+        return 0;
+    }
+
+    // The majority-agreed recomputation (valid when verifier_quorum3 == 1). At
+    // least one equal pair defines it; all-distinct falls through to v0, which the
+    // caller never uses because it gates on the quorum first.
+    fn quorum_result3(v0: u32, v1: u32, v2: u32) -> u32 {
+        if (v0 == v1) { return v0; }
+        if (v0 == v2) { return v0; }
+        if (v1 == v2) { return v1; }
+        return v0;
+    }
+
+    // Quorum-gated resolution: resolve on the MAJORITY recomputation, or refuse
+    // (INDETERMINATE, no bond moves) when the verifiers do not reach quorum.
+    fn resolve_quorum3(last_epoch: u32, dispute_epoch: u32, settled_family: u32, dispute_family: u32, settled_leaf: u32, dispute_leaf: u32, claimed_result: u32, v0: u32, v1: u32, v2: u32) -> u32 {
+        if (verifier_quorum3(v0, v1, v2) == 1) {
+            return resolve_full(last_epoch, dispute_epoch, settled_family, dispute_family, settled_leaf, dispute_leaf, claimed_result, quorum_result3(v0, v1, v2));
+        } else {
+            return RESOLVE_INDETERMINATE;
+        }
+    }
+
+    // ---- Verifier accountability: dissent from the quorum has a cost ----
+    //
+    // resolve_quorum3 uses the majority but lets a MINORITY verifier off free: it
+    // reported a recomputation different from the quorum, and since GF is
+    // deterministic the quorum value IS the golden result, so that verifier is
+    // provably wrong. With no cost, lazy or malicious verifiers spam wrong
+    // recomputations. A verifier stakes to vote; dissenting from a FORMED quorum
+    // burns that stake (as UMA slashes voters against the resolved outcome, and
+    // Chainlink OCR penalizes deviation from consensus). No quorum -> nothing is
+    // proven -> no penalty.
+
+    // 1 iff this verifier's vote dissented from a formed quorum (proven wrong).
+    fn verifier_dissented(vote: u32, quorum_value: u32, has_quorum: u32) -> u32 {
+        if (has_quorum == 1) {
+            if (vote == quorum_value) {
+                return 0;
+            } else {
+                return 1;
+            }
+        } else {
+            return 0;
+        }
+    }
+
+    // A dissenting verifier's stake is burned; an agreeing one (or any verifier
+    // when no quorum formed) keeps it.
+    fn verifier_stake_after(stake: u32, dissented: u32) -> u32 {
+        if (dissented == 1) {
+            return 0;
+        } else {
+            return stake;
+        }
+    }
+
+    // Burning a dissenter's stake makes honest verification break-even at best, so
+    // a rational verifier skips the recompute when the result looks fine -- the
+    // "verifier's dilemma" (Truebit) that leaves the fraud proof unmanned. Pay the
+    // agreeing verifiers OUT OF the burned stake (as UMA pays correct voters from
+    // the slashed): each honest verifier's floor-div share of the burned total, so
+    // verification is net-positive and self-funding (no protocol inflation). Floor
+    // division never over-issues (the dust simply stays unminted); guarded against
+    // an empty honest set. u64-widened so burned_total stays exact.
+    fn verifier_reward(burned_total: u32, honest_count: u32) -> u32 {
+        if (honest_count == 0) {
+            return 0;
+        } else {
+            let share: u64 = (burned_total as u64) / (honest_count as u64);
+            return share as u32;
+        }
+    }
+
+    // ---- k-of-n quorum: let the network size the verifier pool ----
+    //
+    // verifier_quorum3 hardcodes a 3-node, 2-of-majority set. Generalize: the
+    // network runs n verifiers and requires a threshold k. quorum_threshold gives
+    // the majority k for a pool of n; has_quorum_k tests an agreement count against
+    // any k; max_agree3 is the concrete 3-node agreement count, and the identity
+    // test below shows verifier_quorum3 is exactly the n=3 majority instance.
+
+    // Majority threshold for a pool of n verifiers: floor(n/2) + 1.
+    fn quorum_threshold(n: u32) -> u32 {
+        return (n >> 1) + 1;
+    }
+
+    // 1 iff at least k verifiers agreed (agree_count is the size of the largest
+    // agreeing group, computed by the caller for arbitrary n).
+    fn has_quorum_k(agree_count: u32, k: u32) -> u32 {
+        if (agree_count >= k) {
+            return 1;
+        } else {
+            return 0;
+        }
+    }
+
+    // Size of the largest agreeing group among three votes (1, 2, or 3) -- the
+    // n=3 agreement count that feeds has_quorum_k.
+    fn max_agree3(v0: u32, v1: u32, v2: u32) -> u32 {
+        if (v0 == v1) {
+            if (v1 == v2) {
+                return 3;
+            } else {
+                return 2;
+            }
+        } else {
+            if (v0 == v2) {
+                return 2;
+            } else {
+                if (v1 == v2) {
+                    return 2;
+                } else {
+                    return 1;
+                }
+            }
+        }
+    }
+
+    // ---- Five-node quorum: the k-of-n counting done on a real 5-vote set ----
+    //
+    // resolve_quorum3 only handles n=3. Generalize the AGREEMENT COUNT to five
+    // votes by counting, for each vote, how many of the five equal it, and taking
+    // the max (max_agree5). The majority value is the one whose count clears the
+    // threshold (unique for k > n/2). resolve_quorum5 then mirrors resolve_quorum3
+    // with quorum_threshold(5) = 3, so a 3-of-5 honest majority outvotes 2 liars.
+
+    fn eq1(a: u32, b: u32) -> u32 {
+        if (a == b) {
+            return 1;
+        } else {
+            return 0;
+        }
+    }
+
+    fn max2(a: u32, b: u32) -> u32 {
+        if (a >= b) {
+            return a;
+        } else {
+            return b;
+        }
+    }
+
+    // How many of the five votes equal x.
+    fn count5(x: u32, v0: u32, v1: u32, v2: u32, v3: u32, v4: u32) -> u32 {
+        return eq1(x, v0) + eq1(x, v1) + eq1(x, v2) + eq1(x, v3) + eq1(x, v4);
+    }
+
+    // Size of the largest agreeing group among five votes (1..5).
+    fn max_agree5(v0: u32, v1: u32, v2: u32, v3: u32, v4: u32) -> u32 {
+        let c0: u32 = count5(v0, v0, v1, v2, v3, v4);
+        let c1: u32 = count5(v1, v0, v1, v2, v3, v4);
+        let c2: u32 = count5(v2, v0, v1, v2, v3, v4);
+        let c3: u32 = count5(v3, v0, v1, v2, v3, v4);
+        let c4: u32 = count5(v4, v0, v1, v2, v3, v4);
+        return max2(max2(max2(c0, c1), max2(c2, c3)), c4);
+    }
+
+    // The value that reaches the threshold k (unique for k > n/2); v0 fallback is
+    // never used because the caller gates on has_quorum_k(max_agree5, k) first.
+    fn quorum_value5(v0: u32, v1: u32, v2: u32, v3: u32, v4: u32, k: u32) -> u32 {
+        if (count5(v0, v0, v1, v2, v3, v4) >= k) { return v0; }
+        if (count5(v1, v0, v1, v2, v3, v4) >= k) { return v1; }
+        if (count5(v2, v0, v1, v2, v3, v4) >= k) { return v2; }
+        if (count5(v3, v0, v1, v2, v3, v4) >= k) { return v3; }
+        if (count5(v4, v0, v1, v2, v3, v4) >= k) { return v4; }
+        return v0;
+    }
+
+    // Quorum-gated resolution over five verifiers: resolve on the majority
+    // recomputation if >= quorum_threshold(5) agree, else RESOLVE_INDETERMINATE.
+    fn resolve_quorum5(last_epoch: u32, dispute_epoch: u32, settled_family: u32, dispute_family: u32, settled_leaf: u32, dispute_leaf: u32, claimed_result: u32, v0: u32, v1: u32, v2: u32, v3: u32, v4: u32) -> u32 {
+        if (has_quorum_k(max_agree5(v0, v1, v2, v3, v4), quorum_threshold(5)) == 1) {
+            return resolve_full(last_epoch, dispute_epoch, settled_family, dispute_family, settled_leaf, dispute_leaf, claimed_result, quorum_value5(v0, v1, v2, v3, v4, quorum_threshold(5)));
+        } else {
+            return RESOLVE_INDETERMINATE;
+        }
+    }
+
+    // Verifier accountability on the 5-node quorum. The honest majority is the
+    // largest agreeing group (max_agree5); the dissenters are the rest (their votes
+    // differ from the quorum value, so they are provably wrong on a deterministic
+    // GF op). Their stake is burned and split among the honest, exactly as the
+    // 3-node case -- verifier_reward is already n-agnostic; these size the sets.
+    // (Valid only when a quorum formed; the caller gates on has_quorum_k first.)
+    fn dissenter_count5(v0: u32, v1: u32, v2: u32, v3: u32, v4: u32) -> u32 {
+        return 5 - max_agree5(v0, v1, v2, v3, v4);
+    }
+
+    // Total stake burned from the dissenters at a per-verifier stake.
+    // SATURATING: dissenter_count5 is 0..5 but `stake` is a full u32 collateral (the
+    // same value space as balances, which cap at 0xFFFFFFFF), so count*stake overflows
+    // u32 for a large stake and WRAPS -- turning a big burn into a tiny number, which
+    // then underpays the honest verifiers (verifier_reward splits the wrapped total)
+    // and breaks the burn == reward-pool conservation. Widen to u64 and cap at u32 max,
+    // the same discipline as tri_compute_payout.weighted / total_weighted3: floor-div
+    // downstream never over-issues, so a capped total under-distributes dust at worst,
+    // never wraps to a value below a single honest share.
+    fn burned_total5(v0: u32, v1: u32, v2: u32, v3: u32, v4: u32, stake: u32) -> u32 {
+        let prod: u64 = (dissenter_count5(v0, v1, v2, v3, v4) as u64) * (stake as u64);
+        if (prod > 4294967295) {
+            return 4294967295;
+        } else {
+            return prod as u32;
+        }
+    }
+
+    // Each honest verifier's share of the burned dissenter stake on a 5-node quorum.
+    fn honest_share5(v0: u32, v1: u32, v2: u32, v3: u32, v4: u32, stake: u32) -> u32 {
+        return verifier_reward(burned_total5(v0, v1, v2, v3, v4, stake), max_agree5(v0, v1, v2, v3, v4));
+    }
+
+    // ---- Tests / invariants ----
+
+    // Honest executor: committed result matches the golden recomputation
+    // (real GF16: gf16_mul(1.5, 2.0) = 0x4100 = 3.0), so no slash and a frivolous
+    // challenge burns the challenger's stake.
+    test honest_executor_survives {
+        outcome = resolve(0x4100, 0x4100);
+        assert(is_honest(0x4100, 0x4100) == true, "matching result is honest");
+        assert(outcome == RESOLVE_HONEST, "honest -> no slash");
+        assert(executor_bond_after(1000, outcome) == 1000, "bond retained");
+        assert(challenger_reward(1000, outcome) == 0, "frivolous challenge earns nothing");
+        assert(challenger_stake_after(50, outcome) == 0, "frivolous challenge burns stake");
+    }
+
+    // Fraud: executor claimed a wrong GF16 result; recomputation slashes the bond
+    // to the challenger, whose stake is safe.
+    test fraud_is_slashed {
+        outcome = resolve(0x9999, 0x4100);
+        assert(is_honest(0x9999, 0x4100) == false, "wrong result is dishonest");
+        assert(outcome == RESOLVE_SLASH, "wrong result -> slash");
+        assert(executor_bond_after(1000, outcome) == 0, "bond forfeited");
+        assert(challenger_reward(1000, outcome) == 1000, "challenger wins the bond");
+        assert(challenger_stake_after(50, outcome) == 50, "correct challenge keeps stake");
+    }
+
+    // Bound dispute on the committed operands: the disputed leaf reproduces the
+    // settled leaf (same op/a/b/result the executor signed), so a wrong result is
+    // slashed exactly as the unbound path -- but now provably on committed data.
+    test bound_dispute_on_committed_operands {
+        outcome = resolve_bound(0x1234ABCD, 0x1234ABCD, 0x9999, 0x4100);
+        assert(challenge_binds(0x1234ABCD, 0x1234ABCD) == true, "same leaf binds");
+        assert(outcome == RESOLVE_SLASH, "wrong result on committed operands -> slash");
+        assert(executor_bond_after(1000, outcome) == 0, "bond forfeited");
+        assert(challenger_reward(1000, outcome) == 1000, "challenger wins the bond");
+        assert(challenger_stake_after_bound(50, outcome) == 50, "correct challenge keeps stake");
+    }
+
+    // Fabricated operands: the challenger recomputes on operands the executor
+    // never committed, so the disputed leaf does NOT reproduce the settled leaf.
+    // The dispute is rejected as malformed -- the honest executor's bond is safe
+    // and the griefer's stake burns.
+    test fabricated_operands_rejected {
+        outcome = resolve_bound(0x1234ABCD, 0x1234ABCE, 0x9999, 0x4100);
+        assert(challenge_binds(0x1234ABCD, 0x1234ABCE) == false, "off-leaf operands do not bind");
+        assert(outcome == RESOLVE_MALFORMED, "unbound dispute -> malformed");
+        assert(executor_bond_after(1000, outcome) == 1000, "honest executor bond safe");
+        assert(challenger_reward(1000, outcome) == 0, "griefer earns nothing");
+        assert(challenger_stake_after_bound(50, outcome) == 0, "griefer stake burned");
+    }
+
+    // Anti-replay: a fresh dispute (epoch beyond the watermark) is processed and
+    // advances the watermark; re-submitting it (epoch == watermark) is STALE and
+    // moves nothing -- bond, reward and stake all untouched (idempotent replay).
+    test replay_is_a_noop {
+        outcome = resolve_full(5, 6, FMT_GF_BINARY, FMT_GF_BINARY, 0x1234ABCD, 0x1234ABCD, 0x9999, 0x4100);
+        assert(dispute_is_fresh(5, 6) == true, "epoch 6 beyond watermark 5 is fresh");
+        assert(outcome == RESOLVE_SLASH, "fresh valid fraud -> slash");
+        assert(resolver_epoch_after(5, 6, outcome) == 6, "watermark advances to 6");
+        replay = resolve_full(6, 6, FMT_GF_BINARY, FMT_GF_BINARY, 0x1234ABCD, 0x1234ABCD, 0x9999, 0x4100);
+        assert(dispute_is_fresh(6, 6) == false, "epoch 6 == watermark is stale");
+        assert(replay == RESOLVE_STALE, "replay -> stale");
+        assert(executor_bond_after(1000, replay) == 1000, "replay does not re-slash bond");
+        assert(challenger_reward(1000, replay) == 0, "replay pays nothing");
+        assert(challenger_stake_after_bound(50, replay) == 50, "replay does not burn stake");
+        assert(resolver_epoch_after(6, 6, replay) == 6, "stale leaves watermark put");
+    }
+
+    // The watermark advances ONLY on a resolved (terminal) dispute. A non-terminal
+    // outcome must not move it, or a griefer's high-epoch MALFORMED dispute would
+    // jump the watermark and stale-block every legitimate lower-epoch dispute.
+    test watermark_advances_only_on_resolution {
+        // Terminal outcomes advance to the dispute epoch.
+        assert(resolver_epoch_after(5, 9, RESOLVE_HONEST) == 9, "HONEST advances the watermark");
+        assert(resolver_epoch_after(5, 9, RESOLVE_SLASH) == 9, "SLASH advances the watermark");
+        // Non-terminal outcomes leave the watermark PUT (the griefing guard).
+        assert(resolver_epoch_after(5, 9999, RESOLVE_MALFORMED) == 5, "a high-epoch MALFORMED does NOT jump the watermark");
+        assert(resolver_epoch_after(5, 9999, RESOLVE_FAMILY_MISMATCH) == 5, "FAMILY_MISMATCH does not advance");
+        assert(resolver_epoch_after(5, 9999, RESOLVE_INDETERMINATE) == 5, "INDETERMINATE does not advance");
+        assert(resolver_epoch_after(5, 9999, RESOLVE_STALE) == 5, "STALE does not advance");
+        // So a legitimate dispute at epoch 6 is still fresh after a griefer's
+        // MALFORMED at epoch 9999 (watermark stayed at 5).
+        w = resolver_epoch_after(5, 9999, RESOLVE_MALFORMED);
+        assert(dispute_is_fresh(w, 6) == true, "epoch 6 stays fresh -- the griefer could not block it");
+    }
+
+    // GF-T ladder: a well-formed GF-T dispute (both sides FMT_GFT, matching leaf)
+    // slashes a wrong result exactly as the binary path -- the fraud proof now
+    // covers the ternary-exponent ladder too.
+    test gft_dispute_slashes {
+        outcome = resolve_full(0, 1, FMT_GFT, FMT_GFT, 0xBEEF01, 0xBEEF01, 0x0050, 0x0028);
+        assert(outcome == RESOLVE_SLASH, "GF-T wrong result on committed operands -> slash");
+        assert(executor_bond_after(1000, outcome) == 0, "GF-T bond forfeited");
+    }
+
+    // Family confusion: a GF-T-committed dispute presented as binary is rejected
+    // with a DISTINCT code (not a generic malformed leaf), and burns the stake.
+    test family_confusion_rejected {
+        outcome = resolve_full(0, 1, FMT_GFT, FMT_GF_BINARY, 0xBEEF01, 0xBEEF01, 0x0050, 0x0028);
+        assert(family_matches(FMT_GFT, FMT_GF_BINARY) == false, "families differ");
+        assert(outcome == RESOLVE_FAMILY_MISMATCH, "cross-family -> family mismatch");
+        assert(executor_bond_after(1000, outcome) == 1000, "executor bond safe under confusion");
+        assert(challenger_stake_after_bound(50, outcome) == 0, "family-confusion griefer stake burned");
+    }
+
+    // A same-family dispute that recomputes at the WRONG ladder rung does not slash: a
+    // GF-T64 receipt (Et 9) challenged by a GF-T16 recompute (Et 4) is the wrong numbers.
+    test rung_confusion_rejected {
+        // Fresh, same family (GF-T), leaves anchored, results differ -- but rungs differ.
+        wrong = resolve_full_rung(5, 6, FMT_GFT, FMT_GFT, 9, 4, 0xAAAA, 0xAAAA, 0x11, 0x22);
+        assert(rung_matches(9, 4) == false, "GF-T64 (Et9) != GF-T16 (Et4)");
+        assert(wrong == RESOLVE_RUNG_MISMATCH, "wrong-rung recompute -> rung mismatch, no slash");
+        assert(executor_bond_after(1000, wrong) == 1000, "executor bond safe under rung confusion");
+        assert(challenger_stake_after_bound(50, wrong) == 0, "rung-confusion griefer stake burned");
+        // Same rung, anchored, results differ -> a real slash still goes through.
+        slash = resolve_full_rung(5, 6, FMT_GFT, FMT_GFT, 9, 9, 0xAAAA, 0xAAAA, 0x11, 0x22);
+        assert(slash == RESOLVE_SLASH, "same rung + anchored + wrong result -> slash");
+        // Same rung, results match -> honest.
+        honest = resolve_full_rung(5, 6, FMT_GFT, FMT_GFT, 9, 9, 0xAAAA, 0xAAAA, 0x33, 0x33);
+        assert(honest == RESOLVE_HONEST, "same rung + matching result -> honest");
+    }
+
+    // Guard precedence: staleness dominates, then family, then rung -- coarsest first.
+    test rung_guard_precedence {
+        stale = resolve_full_rung(6, 6, FMT_GFT, FMT_GFT, 9, 4, 0xAAAA, 0xAAAA, 0x11, 0x22);
+        assert(stale == RESOLVE_STALE, "stale short-circuits before the rung check");
+        fam = resolve_full_rung(5, 6, FMT_GF_BINARY, FMT_GFT, 9, 4, 0xAAAA, 0xAAAA, 0x11, 0x22);
+        assert(fam == RESOLVE_FAMILY_MISMATCH, "family mismatch dominates a rung mismatch");
+    }
+
+    // The 256-bit-anchored GF dispute: leaf_match is the caller's 8-word digest
+    // equality, giving a ~2^128 anchor instead of the 32-bit receipt leaf.
+    test gf_dispute_d256_anchor {
+        // matched digest + correct GF -> honest.
+        assert(resolve_bound_d256(1, 0x4100, 0x4100) == RESOLVE_HONEST, "matched digest + correct result -> honest");
+        assert(resolve_bound_d256(1, 0x9999, 0x4100) == RESOLVE_SLASH, "matched digest + wrong result -> slash");
+        // digest mismatch (a colliding/fabricated dispute the 32-bit leaf could not
+        // distinguish) -> malformed, never slashes.
+        assert(resolve_bound_d256(0, 0x9999, 0x4100) == RESOLVE_MALFORMED, "digest mismatch -> malformed");
+        assert(executor_bond_after(1000, resolve_bound_d256(0, 0x9999, 0x4100)) == 1000, "malformed keeps the bond");
+        // full path: freshness -> family -> 256-bit honesty.
+        assert(resolve_full_d256(0, 1, FMT_GF_BINARY, FMT_GF_BINARY, 1, 0x4100, 0x4100) == RESOLVE_HONEST, "fresh + same family + matched digest -> honest");
+        assert(resolve_full_d256(0, 1, FMT_GF_BINARY, FMT_GF_BINARY, 1, 0x9999, 0x4100) == RESOLVE_SLASH, "wrong GF -> slash");
+        assert(resolve_full_d256(5, 5, FMT_GF_BINARY, FMT_GF_BINARY, 1, 0x4100, 0x4100) == RESOLVE_STALE, "stale epoch -> stale");
+        assert(resolve_full_d256(0, 1, FMT_GF_BINARY, FMT_GFT, 1, 0x4100, 0x4100) == RESOLVE_FAMILY_MISMATCH, "cross-family -> mismatch");
+        assert(resolve_full_d256(0, 1, FMT_GF_BINARY, FMT_GF_BINARY, 0, 0x4100, 0x4100) == RESOLVE_MALFORMED, "digest mismatch -> malformed");
+        // parity with the 32-bit resolve_full on the honest path.
+        assert(resolve_full_d256(0, 1, FMT_GF_BINARY, FMT_GF_BINARY, 1, 0x4100, 0x4100) == resolve_full(0, 1, FMT_GF_BINARY, FMT_GF_BINARY, 0xAB, 0xAB, 0x4100, 0x4100), "d256 matches resolve_full on the honest path");
+    }
+
+    // Quorum primitives: a majority defines the agreed value; all-distinct fails.
+    test verifier_quorum_basics {
+        assert(verifier_quorum3(0x4100, 0x4100, 0x4100) == 1, "unanimous -> quorum");
+        assert(verifier_quorum3(0x4100, 0x4100, 0x9999) == 1, "2-of-3 -> quorum");
+        assert(verifier_quorum3(0x4100, 0x9999, 0x4100) == 1, "2-of-3 (split positions) -> quorum");
+        assert(verifier_quorum3(0x4100, 0x9999, 0xBEEF) == 0, "all distinct -> no quorum");
+        assert(quorum_result3(0x9999, 0x4100, 0x4100) == 0x4100, "majority value wins over the odd one");
+    }
+
+    // A dishonest MINORITY verifier cannot force a wrong verdict: two honest
+    // verifiers recompute the golden 0x4100, one dishonest says 0x9999 -> the
+    // majority 0x4100 is used, so an honest executor that committed 0x4100 is NOT
+    // slashed (would have been if the single dishonest recomputation were trusted).
+    test dishonest_minority_outvoted {
+        outcome = resolve_quorum3(0, 1, FMT_GF_BINARY, FMT_GF_BINARY, 0xAB, 0xAB, 0x4100, 0x4100, 0x4100, 0x9999);
+        assert(outcome == RESOLVE_HONEST, "honest executor survives a lying minority verifier");
+        assert(executor_bond_after(1000, outcome) == 1000, "bond retained");
+    }
+
+    // With a quorum, real fraud is still slashed: executor committed 0x9999, the
+    // majority recomputes the golden 0x4100 -> mismatch -> slash.
+    test quorum_still_slashes_fraud {
+        outcome = resolve_quorum3(0, 1, FMT_GF_BINARY, FMT_GF_BINARY, 0xAB, 0xAB, 0x9999, 0x4100, 0x9999, 0x4100);
+        assert(outcome == RESOLVE_SLASH, "majority recomputation catches the wrong result");
+        assert(executor_bond_after(1000, outcome) == 0, "bond slashed");
+    }
+
+    // No quorum (all three verifiers disagree) refuses to move any bond.
+    test no_quorum_is_indeterminate {
+        outcome = resolve_quorum3(0, 1, FMT_GF_BINARY, FMT_GF_BINARY, 0xAB, 0xAB, 0x4100, 0x1111, 0x2222, 0x3333);
+        assert(outcome == RESOLVE_INDETERMINATE, "split verifiers -> indeterminate");
+        assert(executor_bond_after(1000, outcome) == 1000, "no slash on an unresolved recomputation");
+        assert(challenger_reward(1000, outcome) == 0, "no reward on an unresolved recomputation");
+        // The challenger is NOT at fault for a verifier split -- its stake is kept,
+        // not burned, so a quorum failure never penalizes a legitimate challenge.
+        assert(challenger_stake_after_bound(50, outcome) == 50, "INDETERMINATE keeps the challenger's stake");
+    }
+
+    // Stake disposition over every bound outcome: kept on SLASH/STALE/INDETERMINATE
+    // (correct, no-op, verifier-split), burned only on challenger-fault HONEST/
+    // MALFORMED/FAMILY_MISMATCH.
+    test stake_burns_only_on_challenger_fault {
+        assert(challenger_stake_after_bound(50, RESOLVE_SLASH) == 50, "correct challenge keeps stake");
+        assert(challenger_stake_after_bound(50, RESOLVE_STALE) == 50, "replay keeps stake");
+        assert(challenger_stake_after_bound(50, RESOLVE_INDETERMINATE) == 50, "verifier split keeps stake");
+        assert(challenger_stake_after_bound(50, RESOLVE_HONEST) == 0, "frivolous challenge burns stake");
+        assert(challenger_stake_after_bound(50, RESOLVE_MALFORMED) == 0, "fabricated operands burn stake");
+        assert(challenger_stake_after_bound(50, RESOLVE_FAMILY_MISMATCH) == 0, "family confusion burns stake");
+    }
+
+    // Verifier accountability: with a formed quorum (value 0x4100), the two
+    // agreeing verifiers keep their stake and the lone dissenter (0x9999) is
+    // proven wrong and burned.
+    test dissenting_verifier_is_slashed {
+        assert(verifier_dissented(0x4100, 0x4100, 1) == 0, "agreeing verifier did not dissent");
+        assert(verifier_dissented(0x9999, 0x4100, 1) == 1, "the odd-one-out dissented from the quorum");
+        assert(verifier_stake_after(50, verifier_dissented(0x4100, 0x4100, 1)) == 50, "agreeing verifier keeps its stake");
+        assert(verifier_stake_after(50, verifier_dissented(0x9999, 0x4100, 1)) == 0, "dissenting verifier's stake is burned");
+    }
+
+    // No quorum proves nothing: a verifier is NOT penalized when the set is split,
+    // even though its vote differs from the others (has_quorum == 0).
+    test no_quorum_no_verifier_penalty {
+        assert(verifier_dissented(0x1111, 0x1111, 0) == 0, "no quorum -> no dissent recorded");
+        assert(verifier_stake_after(50, verifier_dissented(0x1111, 0x2222, 0)) == 50, "split set does not burn any verifier stake");
+    }
+
+    // k-of-n: the majority threshold scales with pool size, and has_quorum_k gates
+    // an agreement count against it.
+    test quorum_k_of_n {
+        assert(quorum_threshold(3) == 2, "3 nodes -> majority 2");
+        assert(quorum_threshold(5) == 3, "5 nodes -> majority 3");
+        assert(quorum_threshold(7) == 4, "7 nodes -> majority 4");
+        assert(quorum_threshold(1) == 1, "single node -> 1");
+        assert(has_quorum_k(3, 3) == 1, "3-of-5 clears a 3 threshold");
+        assert(has_quorum_k(2, 3) == 0, "2 agreements miss a 3 threshold");
+        assert(has_quorum_k(4, 3) == 1, "4 clears 3");
+    }
+
+    // The 3-node primitive is exactly the n=3 majority instance: verifier_quorum3
+    // agrees with has_quorum_k(max_agree3(...), quorum_threshold(3)) on every case.
+    test quorum3_is_the_n3_instance {
+        assert(max_agree3(0x41, 0x41, 0x41) == 3, "unanimous -> 3 agree");
+        assert(max_agree3(0x41, 0x41, 0x99) == 2, "2-of-3 -> 2 agree");
+        assert(max_agree3(0x41, 0x99, 0xBE) == 1, "all distinct -> 1 agree");
+        assert(has_quorum_k(max_agree3(0x41, 0x41, 0x99), quorum_threshold(3)) == verifier_quorum3(0x41, 0x41, 0x99), "general == specific on 2-of-3");
+        assert(has_quorum_k(max_agree3(0x41, 0x99, 0xBE), quorum_threshold(3)) == verifier_quorum3(0x41, 0x99, 0xBE), "general == specific on split");
+    }
+
+    // The burned dissenter stake is split floor-div among the honest verifiers, so
+    // verification pays. One dissenter (50 burned), two honest -> 25 each.
+    test verifier_reward_splits_the_burn {
+        assert(verifier_reward(50, 2) == 25, "one 50-burn split between two honest -> 25 each");
+        assert(verifier_reward(100, 2) == 50, "two dissenters (100 burned), two honest -> 50 each");
+        assert(verifier_reward(50, 3) == 16, "50 over 3 honest -> 16 floor (2 dust unminted)");
+        assert(verifier_reward(50, 0) == 0, "no honest verifier -> nothing to pay, no divide-by-zero");
+    }
+
+    // No over-issuance: honest_count * per-share never exceeds the burned total.
+    test verifier_reward_no_over_issuance {
+        assert(2 * verifier_reward(50, 2) == 50, "2 * 25 == 50, exact");
+        assert(3 * verifier_reward(50, 3) == 48, "3 * 16 == 48 <= 50 (floor keeps the dust)");
+    }
+
+    // The verifier's dilemma is solved: an honest verifier is now NET-POSITIVE --
+    // it keeps its own stake AND earns a share of the burned dissenter stake, so
+    // recomputing is strictly better than skipping. Honest verifier staked 50,
+    // one colluder's 50 burned and split among 2 honest -> 25 each: net 75 > 50.
+    test honest_verification_is_profitable {
+        assert(verifier_stake_after(50, 0) + verifier_reward(50, 2) == 75, "honest net = kept 50 + reward 25 = 75 > staked 50");
+        assert(verifier_stake_after(50, 1) == 0, "the colluder loses its whole 50 stake");
+    }
+
+    // Five-node agreement counting: unanimous 5, a 3-of-5 majority, a 2-2-1 split.
+    test max_agree5_counts {
+        assert(count5(0x41, 0x41, 0x41, 0x41, 0x41, 0x41) == 5, "unanimous -> 5 agree");
+        assert(max_agree5(0x41, 0x41, 0x41, 0x99, 0xBE) == 3, "3 of 5 agree on 0x41");
+        assert(max_agree5(0x41, 0x41, 0x99, 0x99, 0xBE) == 2, "2-2-1 -> largest group is 2");
+        assert(max_agree5(0x1, 0x2, 0x3, 0x4, 0x5) == 1, "all distinct -> 1");
+        assert(quorum_value5(0x99, 0x41, 0x41, 0x41, 0xBE, 3) == 0x41, "the value with >= 3 wins");
+    }
+
+    // 3-of-5 quorum resolves on the majority: two colluding verifiers (return the
+    // wrong r_bad) cannot flip a dispute when three honest ones recompute r_ok.
+    test quorum5_outvotes_two_liars {
+        outcome = resolve_quorum5(0, 1, FMT_GF_BINARY, FMT_GF_BINARY, 0xAB, 0xAB, 0x4100, 0x4100, 0x4100, 0x4100, 0x9999, 0x9999);
+        assert(outcome == RESOLVE_HONEST, "3 honest of 5 outvote 2 liars -> honest executor safe");
+        // executor fraud is still caught: 3 honest recompute r_ok, executor claimed r_bad
+        outcome = resolve_quorum5(0, 1, FMT_GF_BINARY, FMT_GF_BINARY, 0xAB, 0xAB, 0x9999, 0x4100, 0x4100, 0x4100, 0x9999, 0x9999);
+        assert(outcome == RESOLVE_SLASH, "the 3-of-5 majority still slashes real fraud");
+    }
+
+    // No 3-of-5 quorum (e.g. 2-2-1) proves nothing -> indeterminate, no bond moves.
+    test quorum5_no_majority_indeterminate {
+        outcome = resolve_quorum5(0, 1, FMT_GF_BINARY, FMT_GF_BINARY, 0xAB, 0xAB, 0x4100, 0x4100, 0x4100, 0x9999, 0x9999, 0xBEEF);
+        assert(outcome == RESOLVE_INDETERMINATE, "2-2-1 split has no 3-of-5 majority -> indeterminate");
+        assert(executor_bond_after(1000, outcome) == 1000, "no slash without a quorum");
+    }
+
+    // 5-node verifier economics: 3 honest (0x41), 2 dissenters (0x99, 0xBE). The two
+    // dissenters' stake (50 each = 100) splits among the 3 honest -> 33 each; every
+    // honest verifier is net-positive (kept 50 + 33 = 83 > 50) and the dissenters
+    // are burned to zero.
+    test verifier_economics_5_two_dissenters {
+        assert(dissenter_count5(0x41, 0x41, 0x41, 0x99, 0xBE) == 2, "2 of 5 dissent from the 3-majority");
+        assert(max_agree5(0x41, 0x41, 0x41, 0x99, 0xBE) == 3, "3 honest form the quorum");
+        assert(burned_total5(0x41, 0x41, 0x41, 0x99, 0xBE, 50) == 100, "two 50-stakes burned");
+        assert(honest_share5(0x41, 0x41, 0x41, 0x99, 0xBE, 50) == 33, "100 split among 3 honest -> 33 each (floor)");
+        assert(verifier_stake_after(50, 0) + honest_share5(0x41, 0x41, 0x41, 0x99, 0xBE, 50) == 83, "honest net 50 + 33 = 83 > 50 staked");
+        assert(verifier_stake_after(50, 1) == 0, "each dissenter's whole stake is burned");
+        assert(3 * honest_share5(0x41, 0x41, 0x41, 0x99, 0xBE, 50) <= burned_total5(0x41, 0x41, 0x41, 0x99, 0xBE, 50), "no over-issuance: 3*33 <= 100");
+    }
+
+    // 4 honest, 1 dissenter: the lone 50 splits among 4 -> 12 each, still net-positive.
+    test verifier_economics_5_one_dissenter {
+        assert(dissenter_count5(0x41, 0x41, 0x41, 0x41, 0x99) == 1, "1 of 5 dissents from the 4-majority");
+        assert(burned_total5(0x41, 0x41, 0x41, 0x41, 0x99, 50) == 50, "one 50-stake burned");
+        assert(honest_share5(0x41, 0x41, 0x41, 0x41, 0x99, 50) == 12, "50 split among 4 -> 12 each (floor)");
+        assert(verifier_stake_after(50, 0) + honest_share5(0x41, 0x41, 0x41, 0x41, 0x99, 50) == 62, "honest net 62 > 50");
+    }
+
+    // burned_total5 SATURATES instead of wrapping. dissenter_count is at most 4 (5
+    // distinct votes -> lone majority), but a per-verifier stake is a full u32, so
+    // count*stake can exceed u32. Wrapping would turn a ~4.4e9 burn into ~1.05e8 and
+    // underpay the honest set; the saturating widen caps it at u32 max instead.
+    test burned_total5_saturates {
+        assert(dissenter_count5(0x41, 0x42, 0x43, 0x44, 0x45) == 4, "5 distinct votes -> 4 dissent from a lone majority");
+        assert(burned_total5(0x41, 0x42, 0x43, 0x44, 0x45, 100) == 400, "small stake exact: 4 * 100 = 400");
+        assert(burned_total5(0x41, 0x42, 0x43, 0x44, 0x45, 1100000000) == 4294967295, "4 * 1.1e9 = 4.4e9 saturates to u32 max, not a wrap to ~1.05e8");
+        assert(honest_share5(0x41, 0x42, 0x43, 0x44, 0x45, 1100000000) == 4294967295, "lone honest verifier gets the whole capped pool, never a wrapped dust value");
+    }
+
+    // BitNet dispute resolves on BOTH the ternary recompute and the GF value. Same
+    // leaf (0xAB) bound both sides; ternary_ok is the caller's bitnet check.
+    test bitnet_dispute_needs_both_parts {
+        // ternary OK + GF value correct (claim == recompute) -> honest.
+        assert(resolve_bitnet(0xAB, 0xAB, 0x4100, 0x4100, 1) == RESOLVE_HONEST, "valid ternary + correct GF -> honest");
+        // ternary OK but GF value wrong -> slash (the accumulate is fraudulent).
+        assert(resolve_bitnet(0xAB, 0xAB, 0x9999, 0x4100, 1) == RESOLVE_SLASH, "valid ternary but wrong GF value -> slash");
+        // ternary FAILS (non-canonical weights or wrong balance) -> slash even if GF matches.
+        assert(resolve_bitnet(0xAB, 0xAB, 0x4100, 0x4100, 0) == RESOLVE_SLASH, "bad ternary recompute -> slash despite a matching GF value");
+        // a fabricated dispute (leaf mismatch) is malformed, never slashes, even with bad ternary.
+        assert(resolve_bitnet(0xAB, 0xAC, 0x4100, 0x4100, 0) == RESOLVE_MALFORMED, "unbound dispute -> malformed, no slash");
+        assert(executor_bond_after(1000, resolve_bitnet(0xAB, 0xAC, 0x4100, 0x4100, 0)) == 1000, "malformed keeps the bond");
+    }
+
+    // resolve_bitnet_full gives the BitNet path the anti-replay + family guards the GF
+    // path (resolve_full) already has. Bare resolve_bitnet re-slashes a replay because
+    // it has no epoch; the full wrapper rejects it as STALE.
+    test bitnet_full_closes_replay_and_family {
+        // fresh (dispute_epoch 6 > last 5), same family, valid ternary + correct GF -> honest.
+        assert(resolve_bitnet_full(5, 6, FMT_GFT, FMT_GFT, 0xAB, 0xAB, 0x4100, 0x4100, 1) == RESOLVE_HONEST, "fresh + same family + valid -> honest");
+        // fresh valid fraud (wrong GF) -> slash.
+        assert(resolve_bitnet_full(5, 6, FMT_GFT, FMT_GFT, 0xAB, 0xAB, 0x9999, 0x4100, 1) == RESOLVE_SLASH, "fresh GF fraud -> slash");
+        // fresh bad-ternary -> slash.
+        assert(resolve_bitnet_full(5, 6, FMT_GFT, FMT_GFT, 0xAB, 0xAB, 0x4100, 0x4100, 0) == RESOLVE_SLASH, "fresh bad ternary -> slash");
+        // THE replay hole: dispute_epoch 6 == last 6 (already resolved) -> STALE, not a
+        // second slash. Bare resolve_bitnet would slash the same fraud again.
+        assert(resolve_bitnet_full(6, 6, FMT_GFT, FMT_GFT, 0xAB, 0xAB, 0x9999, 0x4100, 1) == RESOLVE_STALE, "replayed BitNet fraud -> stale, no re-slash");
+        assert(resolve_bitnet(0xAB, 0xAB, 0x9999, 0x4100, 1) == RESOLVE_SLASH, "contrast: bare resolve_bitnet re-slashes the replay (no epoch)");
+        // cross-family dispute -> family mismatch, distinct from a bad leaf.
+        assert(resolve_bitnet_full(5, 6, FMT_GFT, FMT_GF_BINARY, 0xAB, 0xAB, 0x4100, 0x4100, 1) == RESOLVE_FAMILY_MISMATCH, "cross-family BitNet dispute -> family mismatch");
+        // fresh but fabricated leaf -> malformed (reaches the inner resolver).
+        assert(resolve_bitnet_full(5, 6, FMT_GFT, FMT_GFT, 0xAB, 0xAC, 0x4100, 0x4100, 1) == RESOLVE_MALFORMED, "fresh same-family but unbound leaf -> malformed");
+        // A stale replay never advances the watermark or slashes (composes with resolver_epoch_after).
+        assert(executor_bond_after(1000, resolve_bitnet_full(6, 6, FMT_GFT, FMT_GFT, 0xAB, 0xAB, 0x9999, 0x4100, 1)) == 1000, "replayed BitNet dispute keeps the bond");
+    }
+
+    // The 256-bit-anchored variant: leaf_match is the caller's 8-word digest
+    // equality; the resolution logic matches resolve_bitnet but on a ~2^128 anchor.
+    test bitnet_dispute_d256_anchor {
+        // digests match (leaf_match=1), ternary ok, GF value correct -> honest.
+        assert(resolve_bitnet_d256(1, 0x4100, 0x4100, 1) == RESOLVE_HONEST, "matched digest + valid ternary + correct GF -> honest");
+        // digests match, ternary ok, GF wrong -> slash.
+        assert(resolve_bitnet_d256(1, 0x9999, 0x4100, 1) == RESOLVE_SLASH, "matched digest, wrong GF -> slash");
+        // digests match, ternary bad -> slash regardless of GF.
+        assert(resolve_bitnet_d256(1, 0x4100, 0x4100, 0) == RESOLVE_SLASH, "matched digest, bad ternary -> slash");
+        // digests DON'T match (a colliding/fabricated dispute the 32-bit leaf could
+        // not distinguish) -> malformed, never slashes.
+        assert(resolve_bitnet_d256(0, 0x4100, 0x4100, 0) == RESOLVE_MALFORMED, "digest mismatch -> malformed");
+        assert(executor_bond_after(1000, resolve_bitnet_d256(0, 0x4100, 0x4100, 0)) == 1000, "malformed keeps the bond");
+        // parity with resolve_bitnet when the 32-bit leaves happen to match.
+        assert(resolve_bitnet_d256(1, 0x4100, 0x4100, 1) == resolve_bitnet(0xAB, 0xAB, 0x4100, 0x4100, 1), "d256 matches resolve_bitnet on the honest path");
+    }
+
+    // The 256-bit BitNet resolver gets anti-replay + family too, so the entire BitNet
+    // dispute family (leaf / 256-bit / quorum) is now replay-safe like the GF family.
+    test bitnet_d256_full_closes_replay {
+        // fresh, same family, matched digest, valid ternary + correct GF -> honest.
+        assert(resolve_bitnet_d256_full(5, 6, FMT_GFT, FMT_GFT, 1, 0x4100, 0x4100, 1) == RESOLVE_HONEST, "fresh matched-digest honest -> honest");
+        // fresh matched-digest GF fraud -> slash.
+        assert(resolve_bitnet_d256_full(5, 6, FMT_GFT, FMT_GFT, 1, 0x9999, 0x4100, 1) == RESOLVE_SLASH, "fresh matched-digest GF fraud -> slash");
+        // THE replay: dispute_epoch == last -> STALE, not a re-slash; bare re-slashes.
+        assert(resolve_bitnet_d256_full(6, 6, FMT_GFT, FMT_GFT, 1, 0x9999, 0x4100, 1) == RESOLVE_STALE, "replayed 256-bit fraud -> stale");
+        assert(resolve_bitnet_d256(1, 0x9999, 0x4100, 1) == RESOLVE_SLASH, "contrast: bare resolve_bitnet_d256 re-slashes the replay");
+        // cross-family and digest-mismatch stay distinct.
+        assert(resolve_bitnet_d256_full(5, 6, FMT_GFT, FMT_GF_BINARY, 1, 0x4100, 0x4100, 1) == RESOLVE_FAMILY_MISMATCH, "cross-family -> family mismatch");
+        assert(resolve_bitnet_d256_full(5, 6, FMT_GFT, FMT_GFT, 0, 0x4100, 0x4100, 1) == RESOLVE_MALFORMED, "fresh same-family but digest mismatch -> malformed");
+        // honest-path parity with the GF 256-bit wrapper.
+        assert(resolve_bitnet_d256_full(5, 6, FMT_GFT, FMT_GFT, 1, 0x4100, 0x4100, 1) == resolve_full_d256(5, 6, FMT_GFT, FMT_GFT, 1, 0x4100, 0x4100), "honest-path parity with resolve_full_d256");
+    }
+
+    // Binary-flag majority: 1 iff at least two of three flags are set.
+    test majority_flag_basics {
+        assert(majority_flag3(1, 1, 1) == 1, "unanimous yes");
+        assert(majority_flag3(1, 1, 0) == 1, "2-of-3 yes");
+        assert(majority_flag3(1, 0, 0) == 0, "only one yes -> no");
+        assert(majority_flag3(0, 0, 0) == 0, "unanimous no");
+    }
+
+    // A BitNet dispute under a quorum: a lone liar on EITHER the recomputed value
+    // OR the ternary flag is outvoted. Same leaf 0xAB both sides.
+    test bitnet_quorum_outvotes_a_liar {
+        // 2 honest recompute r_ok(0x4100), 1 liar r_bad; ternary flags all say OK.
+        // Honest executor claimed r_ok -> the value majority is r_ok -> HONEST.
+        assert(resolve_bitnet_quorum(0xAB, 0xAB, 0x4100, 0x4100, 0x4100, 0x9999, 1, 1, 1) == RESOLVE_HONEST, "value liar outvoted -> honest executor safe");
+        // 1 verifier lies that the ternary is BAD (flag 0); the 2-of-3 majority says
+        // OK, so a false ternary accusation cannot force a slash on an honest layer.
+        assert(resolve_bitnet_quorum(0xAB, 0xAB, 0x4100, 0x4100, 0x4100, 0x4100, 0, 1, 1) == RESOLVE_HONEST, "lone false ternary accusation is outvoted");
+        // Real ternary fraud: 2-of-3 verifiers agree the ternary is BAD -> slash.
+        assert(resolve_bitnet_quorum(0xAB, 0xAB, 0x4100, 0x4100, 0x4100, 0x4100, 0, 0, 1) == RESOLVE_SLASH, "ternary-bad majority slashes");
+        // Real GF fraud: executor claimed r_bad, value majority recomputes r_ok -> slash.
+        assert(resolve_bitnet_quorum(0xAB, 0xAB, 0x9999, 0x4100, 0x4100, 0x9999, 1, 1, 1) == RESOLVE_SLASH, "GF fraud caught by the value majority");
+        // No value quorum (all three differ) -> indeterminate, no bond moves.
+        assert(resolve_bitnet_quorum(0xAB, 0xAB, 0x4100, 0x1111, 0x2222, 0x3333, 1, 1, 1) == RESOLVE_INDETERMINATE, "split value set -> indeterminate");
+        assert(executor_bond_after(1000, resolve_bitnet_quorum(0xAB, 0xAB, 0x4100, 0x1111, 0x2222, 0x3333, 1, 1, 1)) == 1000, "indeterminate keeps the bond");
+    }
+
+    // Five-flag majority: 1 iff at least three set.
+    test majority_flag5_basics {
+        assert(majority_flag5(1, 1, 1, 0, 0) == 1, "3-of-5 yes");
+        assert(majority_flag5(1, 1, 0, 0, 0) == 0, "2-of-5 -> no");
+        assert(majority_flag5(1, 1, 1, 1, 1) == 1, "unanimous yes");
+        assert(majority_flag5(0, 0, 0, 0, 0) == 0, "unanimous no");
+    }
+
+    // BitNet dispute under a 5-node quorum: TWO liars on either the value or the
+    // ternary flag are outvoted by the 3-of-5 majority. Leaf 0xAB both sides.
+    test bitnet_quorum5_outvotes_two_liars {
+        // 3 honest recompute r_ok, 2 liars r_bad; ternary all-OK; honest exec claim r_ok -> honest.
+        assert(resolve_bitnet_quorum5(0xAB, 0xAB, 0x4100, 0x4100, 0x4100, 0x4100, 0x9999, 0x9999, 1, 1, 1, 1, 1) == RESOLVE_HONEST, "2 value liars outvoted by 3-of-5");
+        // 2 verifiers falsely say ternary BAD; the 3-of-5 majority says OK -> honest.
+        assert(resolve_bitnet_quorum5(0xAB, 0xAB, 0x4100, 0x4100, 0x4100, 0x4100, 0x4100, 0x4100, 0, 0, 1, 1, 1) == RESOLVE_HONEST, "2 false ternary accusations outvoted");
+        // Real ternary fraud: 3-of-5 agree ternary is BAD -> slash.
+        assert(resolve_bitnet_quorum5(0xAB, 0xAB, 0x4100, 0x4100, 0x4100, 0x4100, 0x4100, 0x4100, 0, 0, 0, 1, 1) == RESOLVE_SLASH, "3-of-5 ternary-bad majority slashes");
+        // Real GF fraud: exec claimed r_bad, value majority recomputes r_ok -> slash.
+        assert(resolve_bitnet_quorum5(0xAB, 0xAB, 0x9999, 0x4100, 0x4100, 0x4100, 0x9999, 0x9999, 1, 1, 1, 1, 1) == RESOLVE_SLASH, "GF fraud caught by the 3-of-5 value majority");
+        // No 3-of-5 value quorum (2-2-1) -> indeterminate.
+        assert(resolve_bitnet_quorum5(0xAB, 0xAB, 0x4100, 0x4100, 0x4100, 0x9999, 0x9999, 0xBEEF, 1, 1, 1, 1, 1) == RESOLVE_INDETERMINATE, "2-2-1 split -> indeterminate");
+    }
+
+    // The BitNet quorum resolvers now carry anti-replay + family, closing the same
+    // hole resolve_bitnet_full closed for the single-verifier case. Fresh disputes
+    // resolve as before; a replay (dispute_epoch == last_epoch) is STALE, not a second
+    // slash; a cross-family dispute is FAMILY_MISMATCH; a split set stays INDETERMINATE.
+    test bitnet_quorum_full_closes_replay {
+        // 3-node: fresh, same family, value majority catches GF fraud -> slash.
+        assert(resolve_bitnet_quorum_full(5, 6, FMT_GFT, FMT_GFT, 0xAB, 0xAB, 0x9999, 0x4100, 0x4100, 0x9999, 1, 1, 1) == RESOLVE_SLASH, "fresh quorum GF fraud -> slash");
+        // replay of that resolved quorum dispute -> STALE, no re-slash.
+        assert(resolve_bitnet_quorum_full(6, 6, FMT_GFT, FMT_GFT, 0xAB, 0xAB, 0x9999, 0x4100, 0x4100, 0x9999, 1, 1, 1) == RESOLVE_STALE, "replayed quorum fraud -> stale");
+        // contrast: the bare quorum resolver re-slashes (no epoch).
+        assert(resolve_bitnet_quorum(0xAB, 0xAB, 0x9999, 0x4100, 0x4100, 0x9999, 1, 1, 1) == RESOLVE_SLASH, "bare quorum re-slashes the replay");
+        // cross-family and split still distinct.
+        assert(resolve_bitnet_quorum_full(5, 6, FMT_GFT, FMT_GF_BINARY, 0xAB, 0xAB, 0x4100, 0x4100, 0x4100, 0x4100, 1, 1, 1) == RESOLVE_FAMILY_MISMATCH, "cross-family quorum dispute -> family mismatch");
+        assert(resolve_bitnet_quorum_full(5, 6, FMT_GFT, FMT_GFT, 0xAB, 0xAB, 0x4100, 0x1111, 0x2222, 0x3333, 1, 1, 1) == RESOLVE_INDETERMINATE, "split value set -> indeterminate (checked before freshness)");
+        // honest-path parity with the GF quorum wrapper.
+        assert(resolve_bitnet_quorum_full(5, 6, FMT_GFT, FMT_GFT, 0xAB, 0xAB, 0x4100, 0x4100, 0x4100, 0x4100, 1, 1, 1) == RESOLVE_HONEST, "fresh honest quorum -> honest");
+        // 5-node: fresh 3-of-5 fraud slashes; its replay is stale.
+        assert(resolve_bitnet_quorum5_full(5, 6, FMT_GFT, FMT_GFT, 0xAB, 0xAB, 0x9999, 0x4100, 0x4100, 0x4100, 0x9999, 0x9999, 1, 1, 1, 1, 1) == RESOLVE_SLASH, "fresh 3-of-5 GF fraud -> slash");
+        assert(resolve_bitnet_quorum5_full(6, 6, FMT_GFT, FMT_GFT, 0xAB, 0xAB, 0x9999, 0x4100, 0x4100, 0x4100, 0x9999, 0x9999, 1, 1, 1, 1, 1) == RESOLVE_STALE, "replayed 3-of-5 fraud -> stale");
+    }
+}

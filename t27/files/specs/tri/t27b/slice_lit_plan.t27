@@ -1,0 +1,226 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/tri/t27b/slice_lit_plan.t27 -- how t27b lowers an array literal that t27c's Zig backend prints as
+; `@constCast(&[_]E{ ... })`: the value of a slice field in a named struct literal, and the value a fn returns
+; as a slice (issue #7680, t27b coverage epic #6063; written in t27 under the port epic #6198).
+; Everything t27b decides about such a literal is in this file and reaches cli/t27b through `t27c gen-rust`
+; (gen/rust/tri/t27b/slice_lit_plan.rs): which shapes it takes, where their elements live, and the names and
+; words of each refusal. The Rust glue in cli/t27b/src/lower/arraylit.rs only reads the shape of the literal,
+; asks `plan`, and builds the answer: a zero-length slice, or a slice of one static object per element type
+; and value.
+; --
+; What the reference does (zig 0.16.0, the default x86_64 Debug backend `t27c test-report` builds with;
+; measured on the t27c lab and pinned by specs/tri/t27b/conformance/static_slice_literal.t27):
+;   - E is the destination's element type. The literal's own type text is not printed: `[]usize{ 0, 1 }`,
+;     `[0, 1]` and a bare `[]usize` (no elements) differ only in their elements. For a slice field of an
+;     anonymous struct literal it prints `.{ ... }`, which Zig refuses for a slice.
+;   - Elements known at compile time make the array a comptime value, and Zig interns it: one object per element
+;     type and value, wherever the literal is written, alive as long as the process. This backend keeps it in
+;     writable memory: a write through the mutable slice succeeds, and every later evaluation of an equal
+;     literal reads what was written (the same site, another site, a `[]const` one). The LLVM backend keeps it
+;     read-only and the write faults; that is not the reference.
+;   - `t27c test-report` runs each test in its own process, so each test starts from the constants.
+;   - Elements known only at run time make the array a temporary in the frame of the fn that writes it. As a
+;     return value its address dangles (#7550); in a field it dangles once a struct holding it is returned.
+; --
+; What t27b does. Compile-time elements (STATIC) live in one writable static object per element type and value:
+; a t27b global, written at load and reset on every host entry exactly as a module-level `var` is, because each
+; reference test is a process of its own. The destination's const-ness does not matter, as it does not to Zig.
+; No elements and no size text (EMPTY): a zero-length slice, whose address is never read. Elements the parser
+; kept as size text (`[a, b]` in some positions) are read back first (PARSE), as t27c's Zig backend pastes them.
+; Refused: a field of an anonymous struct literal, a slice of arrays or slices, a repeat `[v; n]`, a typed
+; literal with a dimension and no elements (the reference prints the dimension as its element, the defect
+; ExprArrayLiteral(reference empty typed) names), elements that hold a `str` (a static is bytes written before
+; the program runs, and a string's address is not known then), and run-time elements (the glue learns that
+; when it cannot write the static object). A `return` the plan does not take (NOT_MINE) goes on to t27b's other return paths,
+; which refuse or lower it as before.
+; Known limit: t27b's types do not tell `usize` from `u64` (or `isize` from `i64`), so a usize literal and a u64
+; literal of one value share an object in t27b and are two in Zig. Only a test that writes through one and reads
+; the other can tell.
+; --
+; Before this plan t27b refused every non-empty field literal (ExprArrayLiteral(to slice field)) and every
+; constant returned as a mutable slice from a fn a test reaches (ExprArrayLiteral(constant to mutable slice)),
+; on the claim that a write through it faults in the reference. On this backend it does not.
+; ASCII only (L3)
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module T27bSliceLitPlan;
+
+// Where the literal is: the value of a slice field in a struct literal, or a `return` in a fn returning a slice.
+pub const AT_FIELD : u8 = 0;
+pub const AT_RETURN : u8 = 1;
+
+// The answer.
+pub const EMPTY : u8 = 0;
+pub const STATIC : u8 = 1;
+pub const NOT_MINE : u8 = 2;
+pub const REFUSE_ANONYMOUS : u8 = 3;
+pub const REFUSE_NESTED : u8 = 4;
+pub const REFUSE_REPEAT : u8 = 5;
+pub const REFUSE_DIMENSION : u8 = 6;
+pub const REFUSE_RUN_TIME : u8 = 7;
+pub const PARSE : u8 = 8;
+pub const REFUSE_STRINGS : u8 = 9;
+
+/// The decision. at: AT_FIELD or AT_RETURN. named: the struct literal names its type (always true for a
+/// return). flat: the element type is a scalar, an enum, a struct or `str`, not an array or slice. repeat: the
+/// literal is the text `v; n`. elements: how many element nodes the literal has. text: it has none, but its
+/// size text is not empty. typed: it names a type (`[4]u8{}`): then that text is its dimension, else its
+/// elements, and PARSE asks the glue to read them back and ask again. strings: the element type holds a `str`.
+pub fn plan(at: u8, named: bool, flat: bool, repeat: bool, elements: usize, text: bool, typed: bool, strings: bool) -> u8 {
+    if (at == AT_FIELD and !named) { return REFUSE_ANONYMOUS; }
+    if (!flat) {
+        if (at == AT_RETURN) { return NOT_MINE; }
+        return REFUSE_NESTED;
+    }
+    if (repeat) {
+        if (at == AT_RETURN) { return NOT_MINE; }
+        return REFUSE_REPEAT;
+    }
+    if (elements > 0 and strings) { return REFUSE_STRINGS; }
+    if (elements > 0) { return STATIC; }
+    if (!text) { return EMPTY; }
+    if (!typed) { return PARSE; }
+    if (at == AT_RETURN) { return NOT_MINE; }
+    return REFUSE_DIMENSION;
+}
+
+/// Is the answer a refusal? Its construct is `what`, its words `why`.
+pub fn refuses(act: u8) -> bool {
+    return (act >= REFUSE_ANONYMOUS and act <= REFUSE_RUN_TIME) or act == REFUSE_STRINGS;
+}
+
+/// The construct a refusal names.
+pub fn what(at: u8, act: u8) -> str {
+    if (act == REFUSE_ANONYMOUS or act == REFUSE_NESTED) { return "ExprArrayLiteral(to slice)"; }
+    if (act == REFUSE_RUN_TIME and at == AT_RETURN) { return "ExprArrayLiteral(run-time slice return)"; }
+    if (act == REFUSE_STRINGS and at == AT_RETURN) { return "ExprArrayLiteral(string slice return)"; }
+    if (refuses(act)) { return "ExprArrayLiteral(to slice field)"; }
+    return "";
+}
+
+/// The words of a refusal.
+pub fn why(at: u8, act: u8) -> str {
+    if (act == REFUSE_ANONYMOUS) {
+        return "an array literal for a slice field of an anonymous struct literal (the reference writes `.{ ... }`)";
+    }
+    if (act == REFUSE_NESTED) {
+        return "an array literal for a slice-of-arrays field (the reference writes `.{ ... }`)";
+    }
+    if (act == REFUSE_REPEAT) { return "a repeated array literal for a slice field"; }
+    if (act == REFUSE_DIMENSION) {
+        return "a typed array literal with a dimension and no elements for a slice field (the reference prints the dimension as its element)";
+    }
+    if (act == REFUSE_RUN_TIME and at == AT_RETURN) {
+        return "an array literal of run-time values returned as a slice (the reference returns an address in its own frame)";
+    }
+    if (act == REFUSE_RUN_TIME) {
+        return "an array literal of run-time values for a slice field (the reference builds it in the frame of the fn that writes it)";
+    }
+    if (act == REFUSE_STRINGS) {
+        return "an array literal whose elements hold a str, for a slice (a t27b static cannot hold a string's address)";
+    }
+    return "";
+}
+
+/// Does the answer need storage of its own, a static object per element type and value?
+pub fn is_static(act: u8) -> bool {
+    return act == STATIC;
+}
+
+// ----------------------------------------------------------------------------------------------------------
+// Tests: the decisions on the shapes the corpus has, then the order of the questions.
+// ----------------------------------------------------------------------------------------------------------
+
+test constants_are_static_in_a_field_and_a_return {
+    // topological_sort.t27's `.order = []usize{ 0, 1, 2, 3 }`, and bellman_ford.t27's
+    // `return []Edge{ ... }` from a fn returning `[]Edge`.
+    assert(plan(AT_FIELD, true, true, false, 4, false, true, false) == STATIC);
+    assert(plan(AT_RETURN, true, true, false, 6, false, true, false) == STATIC);
+    assert(plan(AT_FIELD, true, true, false, 2, false, false, false) == STATIC);
+    assert(is_static(STATIC));
+    assert(!refuses(STATIC));
+}
+
+test no_elements_and_no_size_text_is_empty {
+    // graph.t27's `.nodes = []usize`, and an untyped `[]`.
+    assert(plan(AT_FIELD, true, true, false, 0, false, true, false) == EMPTY);
+    assert(plan(AT_FIELD, true, true, false, 0, false, false, false) == EMPTY);
+    assert(plan(AT_RETURN, true, true, false, 0, false, true, false) == EMPTY);
+    assert(!is_static(EMPTY));
+    assert(!refuses(EMPTY));
+}
+
+test elements_kept_as_text_are_read_back {
+    assert(plan(AT_FIELD, true, true, false, 0, true, false, false) == PARSE);
+    assert(plan(AT_RETURN, true, true, false, 0, true, false, false) == PARSE);
+    assert(!refuses(PARSE));
+    assert(!is_static(PARSE));
+}
+
+test one_element_wins_over_size_text {
+    // The glue asks again after PARSE with the elements it read back; a dimension never has elements.
+    assert(plan(AT_FIELD, true, true, false, 1, false, false, false) == STATIC);
+    assert(plan(AT_RETURN, true, true, false, 1, true, true, false) == STATIC);
+    assert(plan(AT_FIELD, true, true, false, 3, true, false, false) == STATIC);
+}
+
+test elements_that_hold_a_str_are_refused {
+    // wrapup-auto.t27's `files_modified: ["specs/automation/wrapup-auto.t27"]`, and a `[]str` return.
+    assert(plan(AT_FIELD, true, true, false, 1, false, false, true) == REFUSE_STRINGS);
+    assert(plan(AT_RETURN, true, true, false, 2, false, true, true) == REFUSE_STRINGS);
+    assert(plan(AT_FIELD, true, true, false, 0, false, false, true) == EMPTY);
+    assert(plan(AT_FIELD, true, true, false, 0, true, false, true) == PARSE);
+    assert(plan(AT_FIELD, false, true, false, 1, false, false, true) == REFUSE_ANONYMOUS);
+    assert(refuses(REFUSE_STRINGS) and !is_static(REFUSE_STRINGS));
+    assert(std.mem.eql(u8, what(AT_FIELD, REFUSE_STRINGS), "ExprArrayLiteral(to slice field)"));
+    assert(std.mem.eql(u8, what(AT_RETURN, REFUSE_STRINGS), "ExprArrayLiteral(string slice return)"));
+    assert(why(AT_RETURN, REFUSE_STRINGS).len > 0);
+    assert(!std.mem.eql(u8, why(AT_FIELD, REFUSE_STRINGS), why(AT_FIELD, REFUSE_RUN_TIME)));
+}
+
+test a_dimension_without_elements {
+    assert(plan(AT_FIELD, true, true, false, 0, true, true, false) == REFUSE_DIMENSION);
+    assert(plan(AT_RETURN, true, true, false, 0, true, true, false) == NOT_MINE);
+}
+
+test an_anonymous_struct_literal_is_refused_first {
+    assert(plan(AT_FIELD, false, true, false, 2, false, true, false) == REFUSE_ANONYMOUS);
+    assert(plan(AT_FIELD, false, false, true, 0, true, false, false) == REFUSE_ANONYMOUS);
+    assert(plan(AT_FIELD, false, true, false, 0, false, false, false) == REFUSE_ANONYMOUS);
+    assert(plan(AT_RETURN, false, true, false, 2, false, true, false) == STATIC);
+}
+
+test a_slice_of_arrays_is_refused_in_a_field_and_left_alone_in_a_return {
+    assert(plan(AT_FIELD, true, false, false, 2, false, true, false) == REFUSE_NESTED);
+    assert(plan(AT_FIELD, true, false, true, 0, true, false, false) == REFUSE_NESTED);
+    assert(plan(AT_RETURN, true, false, false, 2, false, true, false) == NOT_MINE);
+    assert(plan(AT_RETURN, true, false, false, 0, false, false, false) == NOT_MINE);
+}
+
+test a_repeat_is_refused_in_a_field_and_left_alone_in_a_return {
+    assert(plan(AT_FIELD, true, true, true, 0, true, false, false) == REFUSE_REPEAT);
+    assert(plan(AT_RETURN, true, true, true, 0, true, false, false) == NOT_MINE);
+}
+
+test refusals_and_their_names {
+    assert(refuses(REFUSE_ANONYMOUS) and refuses(REFUSE_NESTED) and refuses(REFUSE_REPEAT));
+    assert(refuses(REFUSE_DIMENSION) and refuses(REFUSE_RUN_TIME));
+    assert(!refuses(NOT_MINE));
+    assert(std.mem.eql(u8, what(AT_FIELD, REFUSE_ANONYMOUS), "ExprArrayLiteral(to slice)"));
+    assert(std.mem.eql(u8, what(AT_FIELD, REFUSE_NESTED), "ExprArrayLiteral(to slice)"));
+    assert(std.mem.eql(u8, what(AT_FIELD, REFUSE_REPEAT), "ExprArrayLiteral(to slice field)"));
+    assert(std.mem.eql(u8, what(AT_FIELD, REFUSE_DIMENSION), "ExprArrayLiteral(to slice field)"));
+    assert(std.mem.eql(u8, what(AT_FIELD, REFUSE_RUN_TIME), "ExprArrayLiteral(to slice field)"));
+    assert(std.mem.eql(u8, what(AT_RETURN, REFUSE_RUN_TIME), "ExprArrayLiteral(run-time slice return)"));
+    assert(std.mem.eql(u8, what(AT_FIELD, STATIC), ""));
+    assert(std.mem.eql(u8, what(AT_RETURN, NOT_MINE), ""));
+}
+
+test refusal_words {
+    assert(why(AT_FIELD, REFUSE_ANONYMOUS).len > 0 and why(AT_FIELD, REFUSE_NESTED).len > 0);
+    assert(std.mem.eql(u8, why(AT_FIELD, REFUSE_REPEAT), "a repeated array literal for a slice field"));
+    assert(!std.mem.eql(u8, why(AT_RETURN, REFUSE_RUN_TIME), why(AT_FIELD, REFUSE_RUN_TIME)));
+    assert(!std.mem.eql(u8, why(AT_FIELD, REFUSE_DIMENSION), why(AT_FIELD, REFUSE_REPEAT)));
+    assert(std.mem.eql(u8, why(AT_FIELD, STATIC), ""));
+    assert(std.mem.eql(u8, why(AT_RETURN, EMPTY), ""));
+}

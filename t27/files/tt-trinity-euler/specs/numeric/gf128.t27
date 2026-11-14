@@ -1,0 +1,505 @@
+// SPDX-License-Identifier: Apache-2.0
+; gf128.t27 — GoldenFloat128 Encode/Decode
+; GF128: 128-bit floating point with 1 sign + 28 exponent + 99 mantissa
+; Bit layout: [S(1) E(28) M(99)] = [127:127][126:99][98:0]
+; Extended range format for high-precision scientific computing
+; φ² + 1/φ² = 3 | TRINITY
+
+module triformat-gf128;
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+pub const SIGN_SHIFT : u8 = 127;
+pub const EXP_SHIFT : u8 = 99;
+pub const MANT_SHIFT : u8 = 0;
+
+// GF128 uses 128-bit representation
+// Since Zig doesn't have u128 constants directly in all contexts,
+// we use u64 pairs for mask constants
+
+pub const SIGN_MASK_HI : u64 = 0x8000000000000000;  // 1 << 63 of high part
+pub const SIGN_MASK_LO : u64 = 0x0000000000000000;
+
+pub const EXP_BITS : u8 = 28;
+pub const MANT_BITS : u8 = 99;
+pub const SIGN_BITS : u8 = 1;
+
+pub const EXP_MAX : u32 = 0x0FFFFFFF;    // 268435455 (all ones in 28 bits)
+pub const EXP_MIN : u32 = 0x00000000;
+
+pub const BIAS : i32 = 134217727;         // Exponent bias for GF128: 2^(28-1) - 1
+pub const SPECIAL_EXP : u32 = 0x0FFFFFFF;  // All ones = special (Inf/NaN)
+
+// MANT_DIVISOR = 2^99 is too large for u64, handled in functions
+
+pub const PHI_BIAS : u32 = 3932160;      // Phi-optimized rounding bias
+
+// ============================================================================
+// Types
+// ============================================================================
+
+// GF128 represented as u128 in Zig 0.15+
+pub const GF128 = u128;
+
+// Helper struct for operations that need high/low parts
+pub struct GF128Parts {
+    hi: u64,
+    lo: u64,
+}
+
+// ============================================================================
+// Conversion Helpers
+// ============================================================================
+
+// gf128_to_parts(gf128: GF128) -> GF128Parts
+// Split GF128 into high and low 64-bit parts
+pub fn gf128_to_parts(gf128: GF128) GF128Parts {
+    return GF128Parts{
+        .hi = @as(u64, @truncate(gf128 >> 64)),
+        .lo = @as(u64, @truncate(gf128)),
+    };
+}
+
+// gf128_from_parts(parts: GF128Parts) -> GF128
+// Combine high and low 64-bit parts into GF128
+pub fn gf128_from_parts(parts: GF128Parts) GF128 {
+    return (@as(GF128, parts.hi) << 64) | @as(GF128, parts.lo);
+}
+
+// ============================================================================
+// Extract Functions
+// ============================================================================
+
+// gf128_extract_sign(gf128: GF128) -> i8
+// Extract sign bit (bit 127)
+// Returns: 0 for positive, -1 for negative
+pub fn gf128_extract_sign(gf128: GF128) i8 {
+    const parts = gf128_to_parts(gf128);
+    const bit = (parts.hi >> 63) & 1;
+    return if (bit != 0) -1 else 0;
+}
+
+// gf128_extract_exponent(gf128: GF128) -> u32
+// Extract exponent bits (bits 126-99)
+// Returns: 0-268435455
+pub fn gf128_extract_exponent(gf128: GF128) u32 {
+    const parts = gf128_to_parts(gf128);
+    // Exponent spans bits 62-35 of high part (28 bits total)
+    // exp = (hi >> 35) & 0x0FFFFFFF
+    return @as(u32, @truncate((parts.hi >> 35) & 0x0FFFFFFF));
+}
+
+// gf128_extract_mantissa(gf128: GF128) -> u128
+// Extract mantissa bits (bits 98-0)
+// Returns: 0-2^99-1
+pub fn gf128_extract_mantissa(gf128: GF128) u128 {
+    const parts = gf128_to_parts(gf128);
+    // Mantissa spans bits 34-0 of high part (35 bits) + all 64 bits of low part
+    // mant = ((hi & 0x00000007FFFFFFFF) << 64) | lo
+    const hi_mant = parts.hi & 0x00000007FFFFFFFF;
+    return (@as(u128, hi_mant) << 64) | @as(u128, parts.lo);
+}
+
+// ============================================================================
+// Assembly Functions
+// ============================================================================
+
+// gf128_from_components(sign: i8, exp: u32, mant: u128) -> GF128
+// Assemble GF128 from sign, exponent, mantissa
+pub fn gf128_from_components(sign: i8, exp: u32, mant: u128) GF128 {
+    const sign_bit = if (sign < 0) 1 else 0;
+    const clamped_exp = exp & EXP_MAX;
+    const clamped_mant = mant & (@as(u128, EXP_MAX) >> 1);  // Mask for 99 bits (2^99 - 1)
+
+    // exp goes at bits 126-99 (hi bits 62-35)
+    const hi_exp = @as(u64, @truncate(clamped_exp)) << 35;
+    // mant spans bits 98-0 (hi bits 34-0 + lo 64 bits)
+    const hi_mant = @as(u64, @truncate(clamped_mant >> 64));
+    const lo_mant = @as(u64, @truncate(clamped_mant));
+
+    const hi = (@as(u64, @intCast(sign_bit)) << 63) | hi_exp | hi_mant;
+    const lo = lo_mant;
+
+    return gf128_from_parts(GF128Parts{ .hi = hi, .lo = lo });
+}
+
+// ============================================================================
+// Special Value Checks
+// ============================================================================
+
+const GF128_ZERO_POS : GF128 = 0;
+const GF128_ZERO_NEG : GF128 = (@as(GF128, 1) << 127);
+const GF128_INF_POS : GF128 = (@as(GF128, EXP_MAX) << 99);
+const GF128_INF_NEG : GF128 = GF128_INF_POS | (@as(GF128, 1) << 127);
+const GF128_NAN : GF128 = GF128_INF_POS | 1;
+
+// gf128_is_zero(gf128: GF128) -> bool
+// Check if GF128 is zero (positive or negative)
+pub fn gf128_is_zero(gf128: GF128) bool {
+    return gf128 == GF128_ZERO_POS or gf128 == GF128_ZERO_NEG;
+}
+
+// gf128_is_special(gf128: GF128) -> bool
+// Check if GF128 is Inf or NaN (exp == 268435455)
+pub fn gf128_is_special(gf128: GF128) bool {
+    return gf128_extract_exponent(gf128) == EXP_MAX;
+}
+
+// gf128_is_inf(gf128: GF128) -> bool
+// Check if GF128 is infinity (exp == max, mant == 0)
+pub fn gf128_is_inf(gf128: GF128) bool {
+    return gf128_is_special(gf128) and gf128_extract_mantissa(gf128) == 0;
+}
+
+// gf128_is_nan(gf128: GF128) -> bool
+// Check if GF128 is NaN (exp == max, mant != 0)
+pub fn gf128_is_nan(gf128: GF128) bool {
+    return gf128_is_special(gf128) and gf128_extract_mantissa(gf128) != 0;
+}
+
+// ============================================================================
+// Encode/Decode Functions
+// ============================================================================
+
+// gf128_encode_f64(f64: f64) -> GF128
+// Encode IEEE 754 double precision to GF128
+pub fn gf128_encode_f64(value: f64) GF128 {
+    // Handle zero
+    if (value == 0.0) {
+        return if (std.math.signbit(value)) GF128_ZERO_NEG else GF128_ZERO_POS;
+    }
+
+    // Handle NaN
+    if (std.math.isNan(value)) {
+        return GF128_NAN;
+    }
+
+    // Handle Infinity
+    if (std.math.isInf(value)) {
+        return if (value < 0.0) GF128_INF_NEG else GF128_INF_POS;
+    }
+
+    // Extract sign
+    const sign = if (value < 0.0) -1 else 0;
+    const abs_value = if (value < 0.0) -value else value;
+
+    // Get f64 components
+    const f64_bits: u64 = @bitCast(abs_value);
+    var f64_exp: i32 = @as(i32, @intCast((f64_bits >> 52) & 0x7FF)) - 1023;
+    var f64_mant: u64 = f64_bits & 0x000FFFFFFFFFFFFF;
+
+    // Convert exp from f64 bias (1023) to GF128 bias (134217727)
+    var gf128_exp = @as(u32, @intCast(f64_exp + BIAS));
+
+    // Clamp exponent
+    if (gf128_exp >= EXP_MAX) {
+        return if (sign < 0) GF128_INF_NEG else GF128_INF_POS;
+    }
+
+    // Extend mantissa to 99 bits (f64 has 52 bits, pad with zeros)
+    const mant = @as(u128, f64_mant) << 47;  // 52 + 47 = 99
+
+    return gf128_from_components(sign, gf128_exp, mant);
+}
+
+// gf128_decode_f64(gf128: GF128) -> f64
+// Decode GF128 to IEEE 754 double precision
+// Note: This may lose precision as f64 has only 52 mantissa bits
+pub fn gf128_decode_f64(gf128: GF128) f64 {
+    // Handle zero
+    if (gf128_is_zero(gf128)) {
+        return if (gf128_extract_sign(gf128) < 0) -0.0 else 0.0;
+    }
+
+    // Handle NaN
+    if (gf128_is_nan(gf128)) {
+        return std.math.nan(f64);
+    }
+
+    // Handle Infinity
+    if (gf128_is_inf(gf128)) {
+        return if (gf128_extract_sign(gf128) < 0) -std.math.inf(f64) else std.math.inf(f64);
+    }
+
+    // Extract components
+    const sign = gf128_extract_sign(gf128);
+    const exp = gf128_extract_exponent(gf128);
+    const mant = gf128_extract_mantissa(gf128);
+
+    // Convert to f64 (may lose precision)
+    // Scale mantissa from 99 bits to 52 bits
+    const mant_f64 = @as(f64, @floatFromInt(mant >> 47)) / 4503599627370496.0;  // 2^52
+    const bias_adjusted = @as(i64, @intCast(exp)) - @as(i64, BIAS);
+
+    if (bias_adjusted < -1022 or bias_adjusted > 1023) {
+        return if (sign < 0) -std.math.inf(f64) else std.math.inf(f64);
+    }
+
+    const value = mant_f64 * std.math.pow(f64, 2.0, @as(f64, @floatFromInt(bias_adjusted)));
+    return if (sign < 0) -value else value;
+}
+
+// gf128_encode_f128(f128: f128) -> GF128
+// Encode IEEE 754 quad precision to GF128 (if available)
+pub fn gf128_encode_f128(value: f128) GF128 {
+    // For systems without f128 support, fall back to f64
+    // This is a placeholder - actual implementation would use f128 bit manipulation
+    const value_f64 = @as(f64, @floatCast(value));
+    return gf128_encode_f64(value_f64);
+}
+
+// gf128_decode_f128(gf128: GF128) -> f128
+// Decode GF128 to IEEE 754 quad precision (if available)
+pub fn gf128_decode_f128(gf128: GF128) f128 {
+    const value_f64 = gf128_decode_f64(gf128);
+    return @as(f128, @floatCast(value_f64));
+}
+
+// ============================================================================
+// Arithmetic Operations (simplified via decode-encode)
+// ============================================================================
+
+// gf128_add(a: GF128, b: GF128) -> GF128
+pub fn gf128_add(a: GF128, b: GF128) GF128 {
+    return gf128_encode_f64(gf128_decode_f64(a) + gf128_decode_f64(b));
+}
+
+// gf128_sub(a: GF128, b: GF128) -> GF128
+pub fn gf128_sub(a: GF128, b: GF128) GF128 {
+    return gf128_encode_f64(gf128_decode_f64(a) - gf128_decode_f64(b));
+}
+
+// gf128_mul(a: GF128, b: GF128) -> GF128
+pub fn gf128_mul(a: GF128, b: GF128) GF128 {
+    return gf128_encode_f64(gf128_decode_f64(a) * gf128_decode_f64(b));
+}
+
+// gf128_div(a: GF128, b: GF128) -> GF128
+pub fn gf128_div(a: GF128, b: GF128) GF128 {
+    const fb = gf128_decode_f64(b);
+    if (fb == 0.0) {
+        const fa = gf128_decode_f64(a);
+        return if (fa < 0.0) GF128_INF_NEG else GF128_INF_POS;
+    }
+    return gf128_encode_f64(gf128_decode_f64(a) / fb);
+}
+
+// ============================================================================
+// Utility Functions
+// ============================================================================
+
+// gf128_abs(gf128: GF128) -> GF128
+pub fn gf128_abs(gf128: GF128) GF128 {
+    return gf128 & ~(@as(GF128, 1) << 127);
+}
+
+// gf128_neg(gf128: GF128) -> GF128
+pub fn gf128_neg(gf128: GF128) GF128 {
+    return gf128 ^ (@as(GF128, 1) << 127);
+}
+
+// gf128_is_equal(a: GF128, b: GF128) -> bool
+pub fn gf128_is_equal(a: GF128, b: GF128) bool {
+    if (gf128_is_nan(a) or gf128_is_nan(b)) {
+        return false;
+    }
+    if (gf128_is_zero(a) and gf128_is_zero(b)) {
+        return true;
+    }
+    return a == b;
+}
+
+// gf128_is_greater(a: GF128, b: GF128) -> bool
+pub fn gf128_is_greater(a: GF128, b: GF128) bool {
+    if (gf128_is_nan(a) or gf128_is_nan(b)) {
+        return false;
+    }
+    const sign_a = gf128_extract_sign(a);
+    const sign_b = gf128_extract_sign(b);
+    if (sign_a != sign_b) {
+        return sign_a > sign_b;
+    }
+    if (sign_a < 0) {
+        return gf128_neg(a) > gf128_neg(b);
+    }
+    return a > b;
+}
+
+// gf128_max(a: GF128, b: GF128) -> GF128
+pub fn gf128_max(a: GF128, b: GF128) GF128 {
+    return if (gf128_is_greater(a, b)) a else b;
+}
+
+// gf128_min(a: GF128, b: GF128) -> GF128
+pub fn gf128_min(a: GF128, b: GF128) GF128 {
+    return if (gf128_is_greater(a, b)) b else a;
+}
+
+// gf128_clamp(value: GF128, min: GF128, max: GF128) -> GF128
+pub fn gf128_clamp(value: GF128, min: GF128, max: GF128) GF128 {
+    return gf128_min(gf128_max(value, min), max);
+}
+
+// ============================================================================
+// TDD Tests
+// ============================================================================
+
+test "gf128_extract_sign_positive" {
+    const value = 0x00000000000000000000000000001234;
+    const sign = gf128_extract_sign(value);
+    assert(sign == 0);
+}
+
+test "gf128_extract_sign_negative" {
+    const value = 0x80000000000000000000000000001234;
+    const sign = gf128_extract_sign(value);
+    assert(sign == -1);
+}
+
+test "gf128_extract_exponent_middle" {
+    const value = 0x00008000000000000000000000000000;  // exp = 134217728
+    const exp = gf128_extract_exponent(value);
+    assert(exp == 134217728);
+}
+
+test "gf128_is_zero_positive" {
+    assert(gf128_is_zero(GF128_ZERO_POS) == true);
+}
+
+test "gf128_is_zero_negative" {
+    assert(gf128_is_zero(GF128_ZERO_NEG) == true);
+}
+
+test "gf128_is_inf_positive" {
+    assert(gf128_is_inf(GF128_INF_POS) == true);
+}
+
+test "gf128_is_nan" {
+    assert(gf128_is_nan(GF128_NAN) == true);
+}
+
+test "gf128_encode_f64_zero" {
+    const gf = gf128_encode_f64(0.0);
+    assert(gf == GF128_ZERO_POS);
+}
+
+test "gf128_encode_f64_one" {
+    const gf = gf128_encode_f64(1.0);
+    const decoded = gf128_decode_f64(gf);
+    assert(abs(decoded - 1.0) < 0.0001);
+}
+
+test "gf128_encode_f64_negative_one" {
+    const gf = gf128_encode_f64(-1.0);
+    const decoded = gf128_decode_f64(gf);
+    assert(abs(decoded + 1.0) < 0.0001);
+}
+
+test "gf128_encode_f64_roundtrip" {
+    const original = 42.5;
+    const gf = gf128_encode_f64(original);
+    const decoded = gf128_decode_f64(gf);
+    assert(abs(decoded - original) < 0.001);
+}
+
+test "gf128_add_simple" {
+    const a = gf128_encode_f64(1.0);
+    const b = gf128_encode_f64(2.0);
+    const result = gf128_add(a, b);
+    const decoded = gf128_decode_f64(result);
+    assert(abs(decoded - 3.0) < 0.01);
+}
+
+test "gf128_mul_simple" {
+    const a = gf128_encode_f64(3.0);
+    const b = gf128_encode_f64(4.0);
+    const result = gf128_mul(a, b);
+    const decoded = gf128_decode_f64(result);
+    assert(abs(decoded - 12.0) < 0.01);
+}
+
+test "gf128_abs_positive" {
+    const value = gf128_encode_f64(5.0);
+    const abs_val = gf128_abs(value);
+    assert(gf128_is_equal(abs_val, value) == true);
+}
+
+test "gf128_abs_negative" {
+    const value = gf128_encode_f64(-5.0);
+    const abs_val = gf128_abs(value);
+    assert(gf128_extract_sign(abs_val) == 0);
+}
+
+test "gf128_neg" {
+    const value = gf128_encode_f64(5.0);
+    const neg_val = gf128_neg(value);
+    const decoded = gf128_decode_f64(neg_val);
+    assert(abs(decoded + 5.0) < 0.01);
+}
+
+test "gf128_is_equal_nan" {
+    assert(gf128_is_equal(GF128_NAN, GF128_NAN) == false);
+}
+
+test "gf128_is_greater_positive" {
+    const a = gf128_encode_f64(5.0);
+    const b = gf128_encode_f64(3.0);
+    assert(gf128_is_greater(a, b) == true);
+}
+
+test "gf128_from_components_roundtrip" {
+    const sign = -1;
+    const exp = 134217728;
+    const mant = 0x8000000000000000000000000;
+    const gf = gf128_from_components(sign, exp, mant);
+    const extracted_sign = gf128_extract_sign(gf);
+    const extracted_exp = gf128_extract_exponent(gf);
+    assert(extracted_sign == sign and extracted_exp == exp);
+}
+
+// ============================================================================
+// Invariants
+// ============================================================================
+
+invariant gf128_bits_total
+    assert SIGN_BITS + EXP_BITS + MANT_BITS == 128
+
+invariant gf128_bias_power_of_two_minus_one
+    assert BIAS + 1 == 134217728  // 2^27
+
+invariant gf128_special_exp_all_ones
+    assert SPECIAL_EXP == EXP_MAX
+
+invariant gf128_zero_pos_no_sign
+    assert (GF128_ZERO_POS & (@as(GF128, 1) << 127)) == 0
+
+invariant gf128_zero_neg_has_sign
+    assert (GF128_ZERO_NEG & (@as(GF128, 1) << 127)) != 0
+
+invariant gf128_abs_removes_sign
+    assert gf128_abs(GF128_ZERO_NEG) == GF128_ZERO_POS
+
+invariant gf128_neg_toggles_sign
+    assert (gf128_neg(GF128_INF_POS) & (@as(GF128, 1) << 127)) != 0
+
+// ============================================================================
+// Benchmarks
+// ============================================================================
+
+bench gf128_extract_sign_latency
+    measure: nanoseconds to gf128_extract_sign(0x123456789ABCDEF0123456789ABCDEF0)
+    target: < 15ns
+
+bench gf128_encode_f64_latency
+    measure: nanoseconds to gf128_encode_f64(123.456)
+    target: < 150ns
+
+bench gf128_decode_f64_latency
+    measure: nanoseconds to gf128_decode_f64(0x3FF0000000000000)
+    target: < 150ns
+
+bench gf128_add_latency
+    measure: nanoseconds to gf128_add(gf128_encode_f64(1.0), gf128_encode_f64(2.0))
+    target: < 300ns

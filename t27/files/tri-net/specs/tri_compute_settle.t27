@@ -1,0 +1,441 @@
+// TRI-NET compute settlement: turn a VERIFIED compute-receipt into $TRI reward.
+// tri_compute_receipt attests the work (device + GoldenFloat op + result, chained);
+// tri_a2a gates freshness (anti-replay). This spec closes the loop to value: a
+// fresh, verified receipt credits the executor's balance (saturating, like
+// tri_ledger.balance_add) and folds the receipt's sign digest into an auditable
+// settlement state root. A replayed or stale receipt pays ZERO.
+//
+// Composition (wired in generated Rust / src): reward is gated on
+// tri_a2a.is_fresh and on a verified tri_compute_receipt.verify_chain3_full.
+
+module TriComputeSettle {
+    use base::types;
+
+    const SETTLE_GENESIS: u32 = 0x54524353;   // "TRCS" -- empty settlement root
+    const S_C: u32 = 0x9E3779B9;              // golden-ratio mixing constant
+    const REWARD_PER_GF_OP: u32 = 1;          // $TRI per verified GoldenFloat op
+    const WORK_BPS_UNIT: u32 = 10000;         // 1.0x work weight, in basis points
+
+    fn rotl(x: u32, k: u32) -> u32 {
+        return ((x << k) | (x >> (32 - k)));
+    }
+
+    fn mix32(x: u32) -> u32 {
+        let a: u32 = x ^ (x >> 16);
+        let b: u32 = a +% (a << 3);
+        let c: u32 = b ^ (b >> 11);
+        let d: u32 = c +% (c << 15);
+        return d ^ (d >> 16);
+    }
+
+    // Saturating balance add (mirrors tri_ledger.balance_add): the tally never
+    // wraps down at the u32 ceiling.
+    fn balance_add(bal: u32, reward: u32) -> u32 {
+        let sum: u32 = bal +% reward;
+        if (sum < bal) {
+            return 0xFFFFFFFF;
+        } else {
+            return sum;
+        }
+    }
+
+    // Reward for a verified compute: proportional to GoldenFloat width (a wider
+    // GF op is more work). A non-fresh (replayed/stale) receipt earns nothing.
+    fn compute_reward(gf_width: u32, fresh: u32) -> u32 {
+        if (fresh == 1) {
+            return gf_width * REWARD_PER_GF_OP;
+        } else {
+            return 0;
+        }
+    }
+
+    // Format-aware reward: the width-proportional base scaled by a per-format work
+    // weight (basis points; WORK_BPS_UNIT = 1.0x). compute_reward is flat -- it
+    // prices a GF-T op (ternary, measured 0 DSP and ~24 exponent decades at width
+    // 16) exactly like a binary GF op (DSP-backed, ~18 decades), so the market
+    // cannot value the formats by their real silicon cost or delivered range. This
+    // supplies the MECHANISM: work_bps is calibrated off-chain from measured LUT/
+    // DSP and range (e.g. the GF-T LUT ladder GF-T4=122..GF-T32=1618, 0 DSP); the
+    // spec only pins that work_bps == WORK_BPS_UNIT reproduces compute_reward
+    // exactly, so the flat schedule is the identity case (nothing changes until a
+    // factor is set). u64-widened so gf_width * work_bps cannot overflow u32.
+    fn compute_reward_fmt(gf_width: u32, fresh: u32, work_bps: u32) -> u32 {
+        if (fresh == 1) {
+            let scaled: u64 = (gf_width as u64) * (work_bps as u64);
+            return (scaled / (WORK_BPS_UNIT as u64)) as u32;
+        } else {
+            return 0;
+        }
+    }
+
+    // Settle one verified receipt into a balance (only fresh receipts pay).
+    fn settle_balance(prev_balance: u32, gf_width: u32, fresh: u32) -> u32 {
+        return balance_add(prev_balance, compute_reward(gf_width, fresh));
+    }
+
+    // Fold the receipt's sign digest into the settlement state root: order-
+    // sensitive and tamper-evident, auditable from one 32-bit value.
+    fn settle_head(prev_head: u32, digest: u32) -> u32 {
+        return mix32(prev_head ^ mix32(digest ^ S_C));
+    }
+
+    // A GF16 result is payable only if FINITE. inf/nan carry an all-ones exponent
+    // field (bits 14:9 == 0x3F) and represent no useful compute. Verified on real
+    // silicon: gf16_mul(inf,0)=0x7E01 (NaN), gf16_mul(inf,2)=0x7E00 (inf) -> both
+    // exp==0x3F; gf16_mul(2,2)=0x4200 is finite.
+    fn is_finite_gf16(gf_result: u32) -> bool {
+        let exp: u32 = (gf_result >> 9) & 0x3F;
+        return exp != 0x3F;
+    }
+
+    // ---- One payability predicate + one settlement choke point ----
+    //
+    // The settle_* variants below each re-inlined the finiteness test and the
+    // gate ordering; the comments even warn how easy it is to misclassify inf
+    // across formats (settle_checked hardcodes GF16's 0x3F). Collapse that single
+    // source of truth here: payable_flag decides finiteness for BOTH ladders, and
+    // settle_canonical is the one gated path. Every older variant is now a fixed-
+    // argument view of settle_canonical, so the classification lives in ONE place.
+    const FMT_GF_BINARY: u32 = 0;         // matches tri_compute_receipt / _challenge
+    const FMT_GFT: u32 = 1;
+
+    // Is a result payable (finite/useful)? Binary GF: special iff the exponent
+    // field is all-ones AND the format actually has Inf/NaN (only GF16 does) --
+    // otherwise every exponent is a normal value. GF-T: gf_result carries the
+    // exponent offset, valid over 0..offset_max where offset_max (= 3^Et - 1) is the
+    // reserved special/Inf row. Payable iff the offset is STRICTLY BELOW that row --
+    // which rejects BOTH the special row (== offset_max) AND any out-of-range garbage
+    // (> offset_max). The old `== offset_max` test only caught the special row, so an
+    // out-of-range offset (a crafted gf_result past the ladder) was classed payable
+    // and PAID -- a garbage-pay hole the binary side's all-ones check does not have.
+    // `gf_result < offset_max` is exactly tri_compute_gfvalid.is_valid_gft. Returns
+    // 1 = pay, 0 = withhold, so it feeds compute_reward's fresh slot directly.
+    fn payable_flag(fmt_family: u32, gf_result: u32, exp_bits: u32, mant_bits: u32, has_inf: u32, offset_max: u32) -> u32 {
+        let exp_mask: u32 = (1 << exp_bits) - 1;
+        let exp: u32 = (gf_result >> mant_bits) & exp_mask;
+        if (fmt_family == FMT_GFT) {
+            if (gf_result < offset_max) {
+                return 1;
+            } else {
+                return 0;
+            }
+        } else {
+            if (has_inf == 1) {
+                if (exp == exp_mask) {
+                    return 0;
+                } else {
+                    return 1;
+                }
+            } else {
+                return 1;
+            }
+        }
+    }
+
+    // The single settlement choke point: credit the width-proportional reward iff
+    // the receipt is authentic (sig_ok), fresh (anti-replay), NOT already settled
+    // (no double-pay), and payable for its format family. Any failed gate pays 0.
+    fn settle_canonical(prev_balance: u32, gf_width: u32, sig_ok: u32, fresh: u32, already_settled: u32, fmt_family: u32, gf_result: u32, exp_bits: u32, mant_bits: u32, has_inf: u32, offset_max: u32) -> u32 {
+        let payable: u32 = payable_flag(fmt_family, gf_result, exp_bits, mant_bits, has_inf, offset_max);
+        if (sig_ok == 1) {
+            if (already_settled == 0) {
+                if (fresh == 1) {
+                    return balance_add(prev_balance, compute_reward(gf_width, payable));
+                } else {
+                    return balance_add(prev_balance, compute_reward(gf_width, 0));
+                }
+            } else {
+                return balance_add(prev_balance, compute_reward(gf_width, 0));
+            }
+        } else {
+            return balance_add(prev_balance, compute_reward(gf_width, 0));
+        }
+    }
+
+    // Format-aware settlement: settle_canonical but the reward is scaled by the
+    // per-format work weight (compute_reward_fmt) instead of the flat width. This
+    // is what makes the format-pricing mechanism actually bite at payout time --
+    // settle_canonical alone always pays flat. All gates are identical; only the
+    // reward magnitude changes, and work_bps == WORK_BPS_UNIT reproduces
+    // settle_canonical exactly (so the flat path is the identity case).
+    fn settle_canonical_fmt(prev_balance: u32, gf_width: u32, sig_ok: u32, fresh: u32, already_settled: u32, fmt_family: u32, gf_result: u32, exp_bits: u32, mant_bits: u32, has_inf: u32, offset_max: u32, work_bps: u32) -> u32 {
+        let payable: u32 = payable_flag(fmt_family, gf_result, exp_bits, mant_bits, has_inf, offset_max);
+        if (sig_ok == 1) {
+            if (already_settled == 0) {
+                if (fresh == 1) {
+                    return balance_add(prev_balance, compute_reward_fmt(gf_width, payable, work_bps));
+                } else {
+                    return balance_add(prev_balance, compute_reward_fmt(gf_width, 0, work_bps));
+                }
+            } else {
+                return balance_add(prev_balance, compute_reward_fmt(gf_width, 0, work_bps));
+            }
+        } else {
+            return balance_add(prev_balance, compute_reward_fmt(gf_width, 0, work_bps));
+        }
+    }
+
+    // Reward gated on freshness AND a FINITE GF16 result: a node that returns
+    // inf/nan (garbage compute) earns nothing, even if fresh.
+    fn settle_checked(prev_balance: u32, gf_width: u32, fresh: u32, gf_result: u32) -> u32 {
+        return settle_canonical(prev_balance, gf_width, 1, fresh, 0, FMT_GF_BINARY, gf_result, 6, 9, 1, 0);
+    }
+
+    // Format-parameterized settlement: settle_checked above hardcodes GF16's
+    // 6-bit exponent (0x3F), so it misclassifies inf/nan of GF8/GF14/etc and could
+    // pay garbage in a non-GF16 format. This takes the format's own exponent width
+    // (GF8=3/4, GF14=5/8, GF16=6/9) and gates on the all-ones-exponent rule for
+    // that format. Pays only a fresh AND finite result.
+    fn settle_checked_gf(prev_balance: u32, gf_width: u32, fresh: u32, gf_result: u32, exp_bits: u32, mant_bits: u32) -> u32 {
+        return settle_canonical(prev_balance, gf_width, 1, fresh, 0, FMT_GF_BINARY, gf_result, exp_bits, mant_bits, 1, 0);
+    }
+
+    // GF-T (ternary-native) settlement: a GF-T result is special not by an
+    // all-ones binary exponent but by its exponent OFFSET hitting the reserved
+    // row (offset == offset_max = 3^Et - 1; e.g. GF-T16 -> 80). Pays fresh+finite.
+    fn settle_checked_gft(prev_balance: u32, gf_width: u32, fresh: u32, offset: u32, offset_max: u32) -> u32 {
+        return settle_canonical(prev_balance, gf_width, 1, fresh, 0, FMT_GFT, offset, 0, 0, 0, offset_max);
+    }
+
+    // The GF-T special-row offset_max for a rung WIDTH (canonical, mirrors
+    // tri_compute_gfvalid.gft_offset_max_for_width per the ratified golden rule:
+    // GF-T4/8/16/32/64/128 -> 8/26/80/728/19682/4782968; GF-T32 is Et6 (3^6-1=728),
+    // NOT the old log2-rule 242).
+    // Inlined here rather than cross-called (this codebase keeps modules self-
+    // contained). FAIL-CLOSED: an unknown width returns 0 so nothing settles.
+    fn gft_offset_max_w(gf_width: u32) -> u32 {
+        if (gf_width == 4) { return 8; }
+        if (gf_width == 8) { return 26; }
+        if (gf_width == 16) { return 80; }
+        if (gf_width == 32) { return 728; }        // Et6 (golden rule), not log2-rule 242
+        if (gf_width == 64) { return 19682; }      // GF-T64  (3^9-1)
+        if (gf_width == 128) { return 4782968; }   // GF-T128 (3^14-1)
+        return 0;
+    }
+
+    // Provenance-safe GF-T settlement: DERIVE offset_max from the assignment-bound
+    // width instead of taking a caller-supplied ceiling. settle_checked_gft trusts its
+    // offset_max argument -- if the runtime fed it an executor-claimed value, a huge
+    // ceiling would make the special/Inf row (and out-of-range garbage) payable via
+    // payable_flag's `offset < offset_max`. Pinning offset_max to the width the ingress
+    // already bound (tri_a2a.skill_width) closes that; an unknown width fails closed
+    // (offset_max 0 -> nothing payable). Callers holding the bound width use THIS.
+    fn settle_checked_gft_w(prev_balance: u32, gf_width: u32, fresh: u32, offset: u32) -> u32 {
+        return settle_checked_gft(prev_balance, gf_width, fresh, offset, gft_offset_max_w(gf_width));
+    }
+
+    // Unified format-aware settlement path: pay iff NOT already settled AND fresh
+    // AND finite (per the format's own exponent). Composes the settle finite-gate
+    // with the safety no-double-pay guard in one call -- the single choke point.
+    fn settle_full(prev_balance: u32, gf_width: u32, fresh: u32, gf_result: u32, exp_bits: u32, mant_bits: u32, already_settled: u32) -> u32 {
+        return settle_canonical(prev_balance, gf_width, 1, fresh, already_settled, FMT_GF_BINARY, gf_result, exp_bits, mant_bits, 1, 0);
+    }
+
+    // has_inf-aware settlement: settle_full above treats an all-ones exponent as
+    // inf/nan (garbage) for EVERY format, but canonically only GF16 has Inf/NaN;
+    // GF4/GF8/GF12/... use every exponent as a normal value. Without has_inf a
+    // valid max-exponent GF8 result would be misclassified as garbage and pay 0.
+    fn settle_full_h(prev_balance: u32, gf_width: u32, fresh: u32, gf_result: u32, exp_bits: u32, mant_bits: u32, has_inf: u32, already_settled: u32) -> u32 {
+        return settle_canonical(prev_balance, gf_width, 1, fresh, already_settled, FMT_GF_BINARY, gf_result, exp_bits, mant_bits, has_inf, 0);
+    }
+
+    // Authenticity gate: settle ONLY a receipt whose 256-bit digest
+    // (tri_compute_receipt.digest_pre + tri_sha256) carries a VALID executor
+    // Ed25519 signature. sig_ok is set by the Rust crate primitive that verifies
+    // the signature (ed25519-dalek, as tri_depin's epoch_seal); this spec fixes the
+    // POLICY -- no valid signature, no payout, even for a fresh finite receipt. It
+    // closes the forgery gap: settle_full trusts the message envelope, sig_ok binds
+    // the payout to the executor's key.
+    fn settle_signed(prev_balance: u32, gf_width: u32, fresh: u32, gf_result: u32, exp_bits: u32, mant_bits: u32, already_settled: u32, sig_ok: u32) -> u32 {
+        return settle_canonical(prev_balance, gf_width, sig_ok, fresh, already_settled, FMT_GF_BINARY, gf_result, exp_bits, mant_bits, 1, 0);
+    }
+
+    // ---- Tests / invariants ----
+
+    // A fresh GF16 receipt pays its width; a replayed one pays zero.
+    test fresh_pays_stale_free {
+        assert(compute_reward(16, 1) == 16, "fresh GF16 op pays 16 $TRI");
+        assert(compute_reward(16, 0) == 0, "replayed/stale receipt pays 0");
+        assert(compute_reward(32, 1) == 32, "wider GF pays more");
+    }
+
+    // Only fresh receipts move the balance; replays cannot inflate it.
+    test balance_only_grows_on_fresh {
+        b0 = settle_balance(100, 16, 1);
+        b1 = settle_balance(b0, 16, 0);
+        assert(b0 == 116, "fresh settle credits the executor");
+        assert(b1 == 116, "a replayed receipt adds nothing");
+    }
+
+    // Balance is saturating: never wraps down at the ceiling.
+    test balance_saturates {
+        assert(settle_balance(0xFFFFFFF0, 32, 1) == 0xFFFFFFFF, "saturates, no wrap");
+    }
+
+    // Settlement root is deterministic, order-sensitive, and tamper-evident.
+    test settle_root_tamper_evident {
+        h0 = settle_head(SETTLE_GENESIS, 0x1111);
+        honest = settle_head(h0, 0x2222);
+        t0 = settle_head(SETTLE_GENESIS, 0x9999);
+        tampered = settle_head(t0, 0x2222);
+        assert(honest != tampered, "tampering a settled digest changes the root");
+        r0 = settle_head(SETTLE_GENESIS, 0x2222);
+        swapped = settle_head(r0, 0x1111);
+        assert(honest != swapped, "reordering settlements changes the root");
+    }
+
+    // The finite gate classifies real silicon GF16 outputs correctly.
+    test finite_gate {
+        assert(is_finite_gf16(0x4200) == true, "4.0 is finite");
+        assert(is_finite_gf16(0x7E01) == false, "NaN (0x7E01) is not finite");
+        assert(is_finite_gf16(0x7E00) == false, "+inf (0x7E00) is not finite");
+        assert(is_finite_gf16(0xFE00) == false, "-inf (0xFE00) is not finite");
+    }
+
+    // Settlement pays only for a fresh, FINITE result; inf/nan/stale earn zero.
+    test settle_rejects_garbage {
+        assert(settle_checked(100, 16, 1, 0x4200) == 116, "fresh finite GF16 pays 16");
+        assert(settle_checked(100, 16, 1, 0x7E01) == 100, "fresh NaN pays nothing");
+        assert(settle_checked(100, 16, 1, 0x7E00) == 100, "fresh inf pays nothing");
+        assert(settle_checked(100, 16, 0, 0x4200) == 100, "stale pays nothing even if finite");
+    }
+
+    // The format-parameterized gate validates each format by its own exponent:
+    // GF16 (6/9) and GF8 (3/4) inf/nan are both correctly rejected.
+    test settle_checked_gf_per_format {
+        assert(settle_checked_gf(100, 16, 1, 0x4200, 6, 9) == 116, "GF16 fresh finite pays");
+        assert(settle_checked_gf(100, 16, 1, 0x7E00, 6, 9) == 100, "GF16 inf pays nothing");
+        assert(settle_checked_gf(100, 8, 1, 0x20, 3, 4) == 108, "GF8 fresh finite pays width 8");
+        assert(settle_checked_gf(100, 8, 1, 0x70, 3, 4) == 100, "GF8 inf (exp=7) pays nothing");
+        assert(settle_checked_gf(100, 8, 0, 0x20, 3, 4) == 100, "stale GF8 pays nothing");
+    }
+
+    // GF-T settlement gates on the offset reserved row (GF-T16 offset_max=80).
+    test settle_gft_offset {
+        assert(settle_checked_gft(100, 16, 1, 40, 80) == 116, "GF-T16 finite (offset 40) pays");
+        assert(settle_checked_gft(100, 16, 1, 80, 80) == 100, "GF-T16 special (offset 80) pays nothing");
+        assert(settle_checked_gft(100, 16, 0, 40, 80) == 100, "stale GF-T16 pays nothing");
+        assert(settle_checked_gft(100, 16, 1, 79, 80) == 116, "GF-T16 boundary (offset 79, just below the special row) pays");
+        assert(settle_checked_gft(100, 16, 1, 100, 80) == 100, "GF-T16 OUT-OF-RANGE offset (100 > 80) pays nothing -- garbage-pay hole closed");
+    }
+
+    // settle_checked_gft_w derives offset_max from the bound width, so the executor
+    // cannot supply the ceiling. GF-T16 (width 16 -> 80) and GF-T8 (width 8 -> 26).
+    test settle_gft_width_derived_offset_max {
+        assert(gft_offset_max_w(8) == 26, "width 8 -> GF-T8 special row 26");
+        assert(gft_offset_max_w(16) == 80, "width 16 -> GF-T16 special row 80");
+        // GF-T16: offset 40 finite pays, 80 special withholds, 100 out-of-range withholds.
+        assert(settle_checked_gft_w(100, 16, 1, 40) == 116, "GF-T16 finite pays, width-derived ceiling");
+        assert(settle_checked_gft_w(100, 16, 1, 80) == 100, "GF-T16 special row withholds");
+        assert(settle_checked_gft_w(100, 16, 1, 100) == 100, "GF-T16 out-of-range withholds");
+        // GF-T8: its OWN special row is 26 -- offset 26 withholds, 25 pays; a GFT16-sized
+        // offset (40) is out of range for width 8 and withholds (no cross-rung leak).
+        assert(settle_checked_gft_w(100, 8, 1, 25) == 108, "GF-T8 finite (offset 25) pays");
+        assert(settle_checked_gft_w(100, 8, 1, 26) == 100, "GF-T8 special row (26) withholds");
+        assert(settle_checked_gft_w(100, 8, 1, 40) == 100, "an offset valid for GF-T16 is out of range for GF-T8 -> withholds");
+        // GF-T32: Et6, special row 728 (the fix). An offset in (242, 728] -- which the real
+        // gft_mul32 silicon produces -- is a NORMAL GF-T32 value and must PAY. The old Et5
+        // rule (offset_max 242) fail-closed it, refusing to pay ~2/3 of the exponent range.
+        assert(gft_offset_max_w(32) == 728, "width 32 -> GF-T32 special row 728 (Et6, not 242)");
+        assert(settle_checked_gft_w(100, 32, 1, 500) == 132, "GF-T32 offset 500 (in (242,728]) is finite and PAYS -- the fix");
+        assert(settle_checked_gft_w(100, 32, 1, 727) == 132, "GF-T32 offset 727 finite pays");
+        assert(settle_checked_gft_w(100, 32, 1, 728) == 100, "GF-T32 special row 728 withholds");
+        // Unknown width fails closed: nothing settles regardless of offset.
+        assert(settle_checked_gft_w(100, 7, 1, 5) == 100, "off-ladder width -> fail-closed, nothing settles");
+    }
+
+    // The wider silicon rungs (GF-T64/128, added to the money layer alongside the GF-T32
+    // Et6 fix) settle through the same width-derived path. Reward is width-proportional
+    // (compute_reward = gf_width): a GF-T64 op is worth 64, a GF-T128 op 128 -- the
+    // economics now reflect the higher-precision rungs the silicon actually runs.
+    test settle_gft64_gft128_new_rungs {
+        assert(gft_offset_max_w(64) == 19682, "width 64 -> GF-T64 special row 19682");
+        assert(gft_offset_max_w(128) == 4782968, "width 128 -> GF-T128 special row 4782968");
+        // GF-T64: finite offset pays the width reward (64); special row / out-of-range withhold.
+        assert(settle_checked_gft_w(100, 64, 1, 9841) == 164, "GF-T64 unity offset 9841 finite -> pays 64");
+        assert(settle_checked_gft_w(100, 64, 1, 19681) == 164, "GF-T64 offset just below the row pays");
+        assert(settle_checked_gft_w(100, 64, 1, 19682) == 100, "GF-T64 special row 19682 withholds");
+        assert(settle_checked_gft_w(100, 64, 1, 19683) == 100, "GF-T64 out-of-range withholds");
+        // GF-T128 settles too, at the wider width reward (128).
+        assert(settle_checked_gft_w(100, 128, 1, 100) == 228, "GF-T128 finite -> pays 128");
+        assert(settle_checked_gft_w(100, 128, 1, 4782968) == 100, "GF-T128 special row withholds");
+        // No cross-rung leak: a GF-T64-range offset is out of range for GF-T32 (row 728).
+        assert(settle_checked_gft_w(100, 32, 1, 15000) == 100, "a GF-T64-range offset is out of range for GF-T32");
+    }
+
+    // The unified path: only fresh + finite + not-already-settled pays.
+    test settle_full_gate {
+        assert(settle_full(100, 16, 1, 0x4200, 6, 9, 0) == 116, "fresh finite new -> pays");
+        assert(settle_full(100, 16, 1, 0x4200, 6, 9, 1) == 100, "already settled -> no double pay");
+        assert(settle_full(100, 16, 1, 0x7E00, 6, 9, 0) == 100, "inf -> pays nothing");
+        assert(settle_full(100, 16, 0, 0x4200, 6, 9, 0) == 100, "stale -> pays nothing");
+    }
+
+    // has_inf settlement: GF16 rejects inf (max-exp); GF8 (no special) pays for
+    // its max-exp result -- the value-layer form of the gfvalid has_inf fix.
+    test settle_full_h_gate {
+        assert(settle_full_h(100, 16, 1, 0x7E00, 6, 9, 1, 0) == 100, "GF16 inf -> pays 0");
+        assert(settle_full_h(100, 16, 1, 0x4200, 6, 9, 1, 0) == 116, "GF16 finite pays");
+        assert(settle_full_h(100, 8, 1, 0x70, 3, 4, 0, 0) == 108, "GF8 max-exp is normal -> pays");
+        assert(settle_full_h(100, 16, 1, 0x4200, 6, 9, 1, 1) == 100, "already settled -> no double pay");
+    }
+
+    // Signature gate: a valid executor signature is REQUIRED to settle. Freshness
+    // and finiteness still apply on top; a valid signature never bypasses them.
+    // (The signature itself is verified in Rust; here sig_ok drives the policy.)
+    test signed_gate {
+        assert(settle_signed(1000, 16, 1, 0x4100, 6, 9, 0, 1) == 1016, "valid sig + fresh + finite settles the reward");
+        assert(settle_signed(1000, 16, 1, 0x4100, 6, 9, 0, 0) == 1000, "no valid sig -> no payout even if fresh+finite");
+        assert(settle_signed(1000, 16, 0, 0x4100, 6, 9, 0, 1) == 1000, "valid sig does not bypass freshness");
+        assert(settle_signed(1000, 16, 1, 0x7E00, 6, 9, 0, 1) == 1000, "valid sig does not bypass the finiteness gate");
+    }
+
+    // Format-aware reward: flat is the identity, a calibrated factor scales it,
+    // and no factor lets a stale receipt pay. u64 widening holds at max width.
+    test format_aware_reward {
+        assert(compute_reward_fmt(16, 1, WORK_BPS_UNIT) == 16, "unit factor == flat compute_reward");
+        assert(compute_reward_fmt(16, 1, WORK_BPS_UNIT) == compute_reward(16, 1), "identity to the flat schedule");
+        assert(compute_reward_fmt(16, 1, 12500) == 20, "1.25x factor earns more (16*1.25)");
+        assert(compute_reward_fmt(16, 1, 8000) == 12, "0.8x factor earns less (16*0.8=12.8 floor 12)");
+        assert(compute_reward_fmt(16, 0, 12500) == 0, "a stale receipt pays 0 at any factor");
+        assert(compute_reward_fmt(1080, 1, 20000) == 2160, "max width * 2x: no u32 overflow (u64 widened)");
+    }
+
+    // payable_flag is the single finiteness truth for both ladders.
+    test payability_predicate {
+        assert(payable_flag(FMT_GF_BINARY, 0x4200, 6, 9, 1, 0) == 1, "GF16 finite payable");
+        assert(payable_flag(FMT_GF_BINARY, 0x7E00, 6, 9, 1, 0) == 0, "GF16 inf not payable");
+        assert(payable_flag(FMT_GF_BINARY, 0x70, 3, 4, 0, 0) == 1, "GF8 max-exp normal (no inf) payable");
+        assert(payable_flag(FMT_GF_BINARY, 0x70, 3, 4, 1, 0) == 0, "GF8 max-exp with has_inf not payable");
+        assert(payable_flag(FMT_GFT, 40, 0, 0, 0, 80) == 1, "GF-T16 offset 40 payable");
+        assert(payable_flag(FMT_GFT, 80, 0, 0, 0, 80) == 0, "GF-T16 reserved offset 80 not payable");
+        assert(payable_flag(FMT_GFT, 79, 0, 0, 0, 80) == 1, "GF-T16 offset 79 (boundary) payable");
+        assert(payable_flag(FMT_GFT, 100, 0, 0, 0, 80) == 0, "GF-T16 out-of-range offset 100 NOT payable (was a garbage-pay hole)");
+        assert(payable_flag(FMT_GFT, 4294967295, 0, 0, 0, 80) == 0, "GF-T16 max-u32 garbage offset not payable");
+    }
+
+    // settle_canonical is the one gated path: every gate (sig, double-pay,
+    // freshness, payability) must hold to credit; both families flow through it.
+    test canonical_all_gates {
+        assert(settle_canonical(100, 16, 1, 1, 0, FMT_GF_BINARY, 0x4200, 6, 9, 1, 0) == 116, "all gates pass -> pays");
+        assert(settle_canonical(100, 16, 0, 1, 0, FMT_GF_BINARY, 0x4200, 6, 9, 1, 0) == 100, "no sig -> pays 0");
+        assert(settle_canonical(100, 16, 1, 1, 1, FMT_GF_BINARY, 0x4200, 6, 9, 1, 0) == 100, "already settled -> no double pay");
+        assert(settle_canonical(100, 16, 1, 0, 0, FMT_GF_BINARY, 0x4200, 6, 9, 1, 0) == 100, "stale -> pays 0");
+        assert(settle_canonical(100, 16, 1, 1, 0, FMT_GF_BINARY, 0x7E00, 6, 9, 1, 0) == 100, "GF16 inf -> pays 0");
+        assert(settle_canonical(100, 8, 1, 1, 0, FMT_GF_BINARY, 0x70, 3, 4, 0, 0) == 108, "GF8 no-inf max-exp -> pays width 8");
+        assert(settle_canonical(100, 16, 1, 1, 0, FMT_GFT, 40, 0, 0, 0, 80) == 116, "GF-T16 finite -> pays");
+        assert(settle_canonical(100, 16, 1, 1, 0, FMT_GFT, 80, 0, 0, 0, 80) == 100, "GF-T16 reserved offset -> pays 0");
+    }
+
+    // Format-aware settlement bites at payout: the unit factor reproduces
+    // settle_canonical exactly, a calibrated factor scales the credited reward,
+    // and every failed gate still pays 0 regardless of the factor.
+    test canonical_fmt_scales_reward {
+        assert(settle_canonical_fmt(100, 16, 1, 1, 0, FMT_GF_BINARY, 0x4200, 6, 9, 1, 0, WORK_BPS_UNIT) == 116, "unit factor == settle_canonical");
+        assert(settle_canonical_fmt(100, 16, 1, 1, 0, FMT_GF_BINARY, 0x4200, 6, 9, 1, 0, WORK_BPS_UNIT) == settle_canonical(100, 16, 1, 1, 0, FMT_GF_BINARY, 0x4200, 6, 9, 1, 0), "identity to the flat path");
+        assert(settle_canonical_fmt(100, 16, 1, 1, 0, FMT_GF_BINARY, 0x4200, 6, 9, 1, 0, 12500) == 120, "1.25x factor credits 20 (100+16*1.25)");
+        assert(settle_canonical_fmt(100, 16, 0, 1, 0, FMT_GF_BINARY, 0x4200, 6, 9, 1, 0, 12500) == 100, "no sig -> pays 0 at any factor");
+        assert(settle_canonical_fmt(100, 16, 1, 1, 0, FMT_GF_BINARY, 0x7E00, 6, 9, 1, 0, 12500) == 100, "inf -> pays 0 at any factor");
+        assert(settle_canonical_fmt(100, 16, 1, 1, 1, FMT_GF_BINARY, 0x4200, 6, 9, 1, 0, 12500) == 100, "already settled -> no double pay at any factor");
+    }
+}

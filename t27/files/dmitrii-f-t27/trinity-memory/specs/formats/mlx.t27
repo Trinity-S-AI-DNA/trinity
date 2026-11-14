@@ -1,0 +1,195 @@
+// SPDX-License-Identifier: Apache-2.0
+// Issue: https://github.com/dmitrii-f-t27/trinity-memory/issues/125
+// Coverage: https://github.com/dmitrii-f-t27/trinity-memory/issues/29
+// Coverage: https://github.com/dmitrii-f-t27/trinity-memory/issues/30
+// Coverage: https://github.com/dmitrii-f-t27/trinity-memory/issues/34
+// specs/formats/mlx.t27 -- MLX 2-bit affine quantization (codes, scales, biases)
+// Restates upstream ml-explore/mlx@0a8e18e034d61b591f53a0616c722d2d9770f379
+// mlx/ops.cpp: :4974-5019 (pack_and_quantize: q = clip(round((w - bias) /
+// scale), 0, 2^bits - 1), packed into uint32 words with shifts 2^(0, bits,
+// 2 bits, ...), :4992), :5022-5037 (affine_quantize: group 32, 64 or 128;
+// bits 2 to 8 except 7), :5076 (packed width cols * bits / 32), :5224
+// (cols divisible by the group), :5240-5315 (affine_dequantize: code k of a
+// word at bits k*bits, w = q * scale + bias per group, :5314-5315).
+// For bits = 2 a row of cols weights is cols/16 uint32 words; stored
+// little-endian, weight k of a row is in byte k/4 at bits 2(k%4). scales and
+// biases have shape [rows, cols/group] in the model dtype (F16 in
+// prism-ml/Ternary-Bonsai-2-27B-mlx-2bit at fcba37d2, group 128). A group
+// holds ternary weights exactly when bias == -scale: then w = (q - 1) * scale,
+// so the trit is q - 1 and code 3 is +2.
+// phi^2 + 1/phi^2 = 3 | TRINITY
+module TrinityFormatsMlxSpec {
+    pub const TFS_MLX_ERR_LENGTH: i32 = -51;
+    pub const TFS_MLX_ERR_CAPACITY: i32 = -52;
+    pub const TFS_MLX_ERR_CODE: i32 = -53;
+    pub const TFS_MLX_ERR_SCALE_NONFINITE: i32 = -58;
+    pub const TFS_MLX_FLAG_OUTSIDE_TERNARY: u32 = 0;
+    pub const TFS_MLX_FLAG_SCALE_NEGATIVE: u32 = 2;
+    pub const TFS_MLX_FLAG_SCALE_ZERO: u32 = 3;
+    pub const TFS_MLX_FLAG_AFFINE_NOT_TERNARY: u32 = 6;
+
+    pub const TFS_MLX_LINEAR2: i32 = 9;
+    pub const TFS_MLX_BITS: u32 = 2;
+    pub const TFS_MLX_CODES_PER_WORD: u32 = 16;
+    pub const TFS_MLX_KIND_F16: i32 = 1;
+    pub const TFS_MLX_KIND_BF16: i32 = 2;
+    pub const TFS_MLX_GROUP_SMALL: u32 = 32;
+    pub const TFS_MLX_GROUP_MEDIUM: u32 = 64;
+    pub const TFS_MLX_GROUP_LARGE: u32 = 128;
+    pub const TFS_MLX_SCALE_BITS: u32 = 16;
+    pub const TFS_MLX_BIAS_BITS: u32 = 16;
+
+    pub fn tfs_mlx_group_valid(cols: usize, group: usize) -> bool {
+        if (group != 32 && group != 64 && group != 128) { return false; }
+        return cols % group == 0;
+    }
+
+    // Code k of row r: word r*(cols/16) + k/16, little-endian, bits 2(k%16).
+    pub fn tfs_mlx_code(data: []u8, cols: usize, r: usize, k: usize) -> u32 {
+        var at: usize = 4 * (r * (cols / 16) + k / 16);
+        var word: u32 = (data[at] as u32) | ((data[at + 1] as u32) << 8) | ((data[at + 2] as u32) << 16) | ((data[at + 3] as u32) << 24);
+        return (word >> (2 * (k % 16))) & 3;
+    }
+
+    // LENGTH (empty shape, group not 32/64/128 or not dividing cols, size not
+    // rows * cols / 4), CAPACITY, else the count of code-3 (+2) weights.
+    // values receive q - 1, the trit of a group whose bias is -scale.
+    pub fn tfs_mlx_decode(data: []u8, size: usize, rows: usize, cols: usize, group: usize,
+                          values: []i32, value_capacity: usize) -> i64 {
+        if (rows == 0 || cols == 0 || !tfs_mlx_group_valid(cols, group)) { return TFS_MLX_ERR_LENGTH as i64; }
+        if (size % (cols / 4) != 0 || size / (cols / 4) != rows) { return TFS_MLX_ERR_LENGTH as i64; }
+        if (rows > value_capacity / cols) { return TFS_MLX_ERR_CAPACITY as i64; }
+        var outside: i64 = 0;
+        var r: usize = 0;
+        while (r < rows) {
+            var k: usize = 0;
+            while (k < cols) {
+                var q: u32 = tfs_mlx_code(data, cols, r, k);
+                if (q == 3) { outside = outside + 1; }
+                values[r * cols + k] = (q as i32) - 1;
+                k = k + 1;
+            }
+            r = r + 1;
+        }
+        return outside;
+    }
+
+    // Packs trits (and +2) as q = value + 1; LENGTH, CAPACITY, CODE first.
+    pub fn tfs_mlx_encode(values: []i32, rows: usize, cols: usize, group: usize, out: []u8, capacity: usize) -> i64 {
+        if (rows == 0 || cols == 0 || !tfs_mlx_group_valid(cols, group)) { return TFS_MLX_ERR_LENGTH as i64; }
+        if (rows > capacity / (cols / 4)) { return TFS_MLX_ERR_CAPACITY as i64; }
+        var i: usize = 0;
+        while (i < rows * cols) {
+            if (values[i] < -1 || values[i] > 2) { return TFS_MLX_ERR_CODE as i64; }
+            i = i + 1;
+        }
+        i = 0;
+        while (i < rows * (cols / 4)) { out[i] = 0; i = i + 1; }
+        var r: usize = 0;
+        while (r < rows) {
+            var w: usize = 0;
+            while (w < cols / 16) {
+                var word: u32 = 0;
+                var k: usize = 0;
+                while (k < 16) {
+                    word = word | (((values[r * cols + 16 * w + k] + 1) as u32) << (2 * k));
+                    k = k + 1;
+                }
+                var at: usize = 4 * (r * (cols / 16) + w);
+                out[at] = (word & 255) as u8;
+                out[at + 1] = ((word >> 8) & 255) as u8;
+                out[at + 2] = ((word >> 16) & 255) as u8;
+                out[at + 3] = ((word >> 24) & 255) as u8;
+                w = w + 1;
+            }
+            r = r + 1;
+        }
+        return (rows * (cols / 4)) as i64;
+    }
+
+    // One 16-bit word of kind F16 or BF16: 0 positive, 1 zero, 2 negative,
+    // ERR_SCALE_NONFINITE.
+    pub fn tfs_mlx_class(word: u32, kind: i32) -> i32 {
+        var top: u32 = 0x7c00;
+        if (kind == TFS_MLX_KIND_BF16) { top = 0x7f80; }
+        if ((word & top) == top) { return TFS_MLX_ERR_SCALE_NONFINITE; }
+        if ((word & 0x7fff) == 0) { return 1; }
+        if ((word & 0x8000) != 0) { return 2; }
+        return 0;
+    }
+
+    // bias == -scale as values: the sign bit flipped, or both zero.
+    pub fn tfs_mlx_group_ternary(scale: u32, bias: u32) -> bool {
+        if ((scale & 0x7fff) == 0 && (bias & 0x7fff) == 0) { return true; }
+        return bias == (scale ^ 0x8000);
+    }
+
+    // SCALE_NONFINITE when any scale or bias is NaN or infinite; else adds
+    // scale_zero, scale_negative and affine_not_ternary counts to flags.
+    pub fn tfs_mlx_affine_check(scales: []u32, biases: []u32, count: usize, kind: i32, flags: []i64) -> i64 {
+        var g: usize = 0;
+        while (g < count) {
+            if (tfs_mlx_class(scales[g], kind) < 0 || tfs_mlx_class(biases[g], kind) < 0) {
+                return TFS_MLX_ERR_SCALE_NONFINITE as i64;
+            }
+            g = g + 1;
+        }
+        g = 0;
+        while (g < count) {
+            var c: i32 = tfs_mlx_class(scales[g], kind);
+            if (c == 1) { flags[TFS_MLX_FLAG_SCALE_ZERO] = flags[TFS_MLX_FLAG_SCALE_ZERO] + 1; }
+            if (c == 2) { flags[TFS_MLX_FLAG_SCALE_NEGATIVE] = flags[TFS_MLX_FLAG_SCALE_NEGATIVE] + 1; }
+            if (!tfs_mlx_group_ternary(scales[g], biases[g])) {
+                flags[TFS_MLX_FLAG_AFFINE_NOT_TERNARY] = flags[TFS_MLX_FLAG_AFFINE_NOT_TERNARY] + 1;
+            }
+            g = g + 1;
+        }
+        return 0;
+    }
+
+    // Bits per weight: 2 for the code plus scale and bias bits per group:
+    // 2 + 32/group = 9/4 (group 128), 5/2 (64), 3 (32).
+    invariant mlx_sixteen_codes_per_word { assert TFS_MLX_CODES_PER_WORD * TFS_MLX_BITS == 32; }
+    invariant mlx_bits_per_weight_group_128 { assert 4 * (TFS_MLX_GROUP_LARGE * TFS_MLX_BITS + TFS_MLX_SCALE_BITS + TFS_MLX_BIAS_BITS) == 9 * TFS_MLX_GROUP_LARGE; }
+    invariant mlx_bits_per_weight_group_64 { assert 2 * (TFS_MLX_GROUP_MEDIUM * TFS_MLX_BITS + TFS_MLX_SCALE_BITS + TFS_MLX_BIAS_BITS) == 5 * TFS_MLX_GROUP_MEDIUM; }
+    invariant mlx_bits_per_weight_group_32 { assert TFS_MLX_GROUP_SMALL * TFS_MLX_BITS + TFS_MLX_SCALE_BITS + TFS_MLX_BIAS_BITS == 3 * TFS_MLX_GROUP_SMALL; }
+
+    test "mlx 2-bit words hold sixteen codes low bits first" {
+        var t: [32]i32;
+        var i: usize = 0;
+        while (i < 32) { t[i] = 0; i = i + 1; }
+        t[0] = 1; t[1] = -1; t[15] = 1; t[16] = 2;
+        var out: [8]u8;
+        assert tfs_mlx_encode(t, 1, 32, 32, out, 8) == 8;
+        assert out[0] == 82 && out[1] == 85 && out[3] == 149 && out[4] == 87;
+        var v: [32]i32;
+        assert tfs_mlx_decode(out, 8, 1, 32, 32, v, 32) == 1;
+        assert v[0] == 1 && v[1] == -1 && v[15] == 1 && v[16] == 2 && v[31] == 0;
+        assert tfs_mlx_code(out, 32, 0, 16) == 3;
+        assert tfs_mlx_decode(out, 8, 1, 32, 48, v, 32) == TFS_MLX_ERR_LENGTH;
+        assert tfs_mlx_decode(out, 7, 1, 32, 32, v, 32) == TFS_MLX_ERR_LENGTH;
+        assert tfs_mlx_decode(out, 8, 1, 32, 32, v, 31) == TFS_MLX_ERR_CAPACITY;
+        t[3] = 3;
+        assert tfs_mlx_encode(t, 1, 32, 32, out, 8) == TFS_MLX_ERR_CODE;
+    }
+    test "mlx affine groups are ternary when bias is minus scale" {
+        var s: [4]u32 = [8264, 0, 47104, 15360];
+        var b: [4]u32 = [41032, 32768, 14336, 48128];
+        var f: [7]i64;
+        var i: usize = 0;
+        while (i < 7) { f[i] = 0; i = i + 1; }
+        assert tfs_mlx_affine_check(s, b, 4, TFS_MLX_KIND_F16, f) == 0;
+        assert f[6] == 0 && f[3] == 1 && f[2] == 1;
+        b[3] = 15360;
+        assert tfs_mlx_affine_check(s, b, 4, TFS_MLX_KIND_F16, f) == 0 && f[6] == 1;
+        b[1] = 31744;
+        assert tfs_mlx_affine_check(s, b, 4, TFS_MLX_KIND_F16, f) == TFS_MLX_ERR_SCALE_NONFINITE;
+        assert tfs_mlx_class(32640, TFS_MLX_KIND_BF16) == TFS_MLX_ERR_SCALE_NONFINITE && tfs_mlx_class(32640, TFS_MLX_KIND_F16) == TFS_MLX_ERR_SCALE_NONFINITE;
+        assert tfs_mlx_class(31744, TFS_MLX_KIND_BF16) == 0;
+    }
+    test "mlx bonsai down_proj sizes" {
+        // Ternary Bonsai 2 27B layer-0 mlp.down_proj: [5120, 17408] weights,
+        // U32 [5120, 1088] words, F16 [5120, 136] scales and biases.
+        assert tfs_mlx_group_valid(17408, 128) && 5120 * (17408 / 4) == 22282240 && 5120 * (17408 / 128) * 2 == 1392640;
+    }
+}

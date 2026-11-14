@@ -1,0 +1,491 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/ci/affected.t27 -- which specs a change affects, so CI and `tri test` run those and not the whole corpus.
+; Epic #6595, item E. The t27b lab already keys its reference cache by spec bytes + the `use` closure + t27c
+; + zig (#6535); this is the same idea for CI: a spec's verdict can only move when its own bytes, the bytes
+; of a spec it imports with `use` (transitively), or the toolchain move.
+; --
+; The rule, stated where it lives:
+; - A change to anything outside specs/ means RUN_ALL. The compiler (bootstrap/, cli/), tools/, CI
+;   configuration, ledgers and conformance vectors can all move any verdict, and this file does not
+;   try to tell which of them is harmless. Two exceptions, both measured (#7527):
+;   - A Markdown file (.md) anywhere is prose and selects nothing: no spec test reads a document. The
+;     documentation gates have their own triggers. .txt stays RUN_ALL outside specs/, because
+;     tools/*.txt are baselines a gate reads.
+;   - A seal (.trinity/seals/*.json) selects nothing: it is the verdict record t27c writes for a spec,
+;     never an input to that spec's tests. A spec that changed is a seed anyway, and the seal gates
+;     check the changed seal files themselves.
+;   Over the last 400 first-parent master commits (f943ba355) the old rule ran everything on 373 of
+;   them, 208 because of docs/*.md alone; with these two exceptions 284 of 400 are selective, with a
+;   median of 1 affected spec out of 1545 (p90 5, max 49).
+; - Under specs/, a changed .t27 or .tri file is a seed. Every spec that imports a seed with `use`,
+;   directly or transitively, is affected too. The answer is the seeds and their importers that still
+;   exist in the head tree.
+; - Under specs/, prose (.md .txt) moves no verdict and selects nothing. Any other file under specs/
+;   (specs/RUST_DIALECT.json, an image) is RUN_ALL: a tool may read it, and failing open costs a missed
+;   regression while failing closed costs minutes.
+; - A deleted spec runs nothing itself, but every spec that imported it is affected: its `use` now
+;   resolves to nothing. bootstrap/src/use_resolve.rs drops an import whose file is missing, so the head
+;   tree has no edge to a deleted spec -- the graph fed here is the UNION of the base tree's edges and
+;   the head tree's edges. A rename (R) seeds both its old and its new path; a copy (C) seeds both too.
+; - A line that cannot be read, a status letter other than A C D M R T, a path git had to quote, and a
+;   working set or output that does not fit are RUN_ALL (fail closed): a selector that drops what it
+;   cannot read is a selector that skips tests.
+; --
+; Input, one buffer -- the same shape as specs/policy/own_language.t27, so one plumbing feeds both:
+;   `git diff --name-status <base>...<head>` lines ("X\tpath" or "R100\told\tnew")
+;   a line "--graph", then one edge per line: "importer\timported", both repo-relative .t27 paths
+;   a line "--corpus", then every spec path of the head tree, one per line
+; A missing or out-of-order marker is RUN_ALL. Output: the affected spec paths of the corpus, one per
+; line, in corpus order.
+; --
+; The `use` edges come from the same resolution t27c uses (bootstrap/src/use_resolve.rs `use_targets`:
+; `use a::b::c;` and `use a.b.c;` -> specs/a/b/c.t27, a trailing // comment stripped, a missing file
+; dropped). `t27c graph --format json` does not give that: its nodes are module names, not paths (124
+; specs share 24 names), and a spec that fails to parse is left out with its edges (1211 of 1287 specs on
+; master 1f9b3706a). A path-keyed edge list is the missing piece of plumbing; see the issue.
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module CiAffected;
+
+use policy::own_language;
+use policy::text_lines;
+
+/// select_affected() returns this instead of a count when the answer is "run every spec".
+pub const RUN_ALL : u32 = 0xFFFFFFFF;
+
+/// What one changed path asks for.
+pub const C_SEED : u8 = 1;
+pub const C_NOTHING : u8 = 2;
+pub const C_ALL_OUTSIDE : u8 = 16;
+pub const C_ALL_UNDER_SPECS : u8 = 17;
+pub const C_ALL_UNREADABLE : u8 = 18;
+/// Every code at or above this one means RUN_ALL.
+pub const ALL_FROM : u8 = 16;
+
+/// Lists are comma separated and end with '$' (no length needed in C or Zig).
+pub const SPEC_EXTS : str = "t27,tri,$";
+pub const PROSE_EXTS : str = "md,txt,$";
+pub const SPECS_ROOT : str = "specs/,$";
+/// Outside specs/ only Markdown is prose; .txt there can be a baseline a gate reads.
+pub const PROSE_ANYWHERE_EXTS : str = "md,$";
+pub const SEALS_ROOT : str = ".trinity/seals/,$";
+pub const SEAL_EXTS : str = "json,$";
+/// The status letters a selection can be made from. U X B and anything else are RUN_ALL.
+pub const KINDS : str = "ACDMRT$";
+pub const MARK_GRAPH : str = "--graph$";
+pub const MARK_CORPUS : str = "--corpus$";
+
+pub const LIST_END : u8 = 36;
+pub const LIST_SEP : u8 = 44;
+
+/// ASCII lowercase of one byte.
+pub fn lower(c: u8) -> u8 {
+    if (c >= 'A' and c <= 'Z') { return c + 32; }
+    return c;
+}
+
+/// Is s[from..to] exactly one entry of `list`, compared case-insensitively?
+pub fn in_list(list: []const u8, s: []const u8, from: usize, to: usize) -> bool {
+    var i : usize = 0;
+    while (list[i] != LIST_END) {
+        var k : usize = from;
+        var ok : bool = true;
+        while (list[i] != LIST_SEP and list[i] != LIST_END) {
+            if (k >= to) {
+                ok = false;
+            } else {
+                if (lower(s[k]) != lower(list[i])) { ok = false; }
+            }
+            k += 1;
+            i += 1;
+        }
+        if (ok and k == to) { return true; }
+        if (list[i] == LIST_SEP) { i += 1; }
+    }
+    return false;
+}
+
+/// Index of the extension's dot in the file name of s[from..to], or `to` when there is none. A leading
+/// dot (.gitignore) names the file; it does not start an extension.
+pub fn ext_dot(s: []const u8, from: usize, to: usize) -> usize {
+    var b : usize = from;
+    var i : usize = from;
+    while (i < to) {
+        if (s[i] == '/') { b = i + 1; }
+        i += 1;
+    }
+    var d : usize = to;
+    i = b + 1;
+    while (i < to) {
+        if (s[i] == '.') { d = i; }
+        i += 1;
+    }
+    return d;
+}
+
+/// What the changed path s[from..to] asks for.
+pub fn path_class(s: []const u8, from: usize, to: usize) -> u8 {
+    if (to <= from) { return C_ALL_UNREADABLE; }
+    if (s[from] == '"') { return C_ALL_UNREADABLE; }
+    const d : usize = ext_dot(s, from, to);
+    if (own_language::has_prefix(SPECS_ROOT, s, from, to) == false) {
+        if (d < to) {
+            if (in_list(PROSE_ANYWHERE_EXTS, s, d + 1, to)) { return C_NOTHING; }
+            if (own_language::has_prefix(SEALS_ROOT, s, from, to) and in_list(SEAL_EXTS, s, d + 1, to)) {
+                return C_NOTHING;
+            }
+        }
+        return C_ALL_OUTSIDE;
+    }
+    if (d < to) {
+        if (in_list(SPEC_EXTS, s, d + 1, to)) { return C_SEED; }
+        if (in_list(PROSE_EXTS, s, d + 1, to)) { return C_NOTHING; }
+    }
+    return C_ALL_UNDER_SPECS;
+}
+
+/// Is buf[s..t] exactly the '$'-terminated literal `lit`?
+pub fn line_is(buf: []const u8, s: usize, t: usize, lit: []const u8) -> bool {
+    var k : usize = 0;
+    while (lit[k] != LIST_END) {
+        if (s + k >= t) { return false; }
+        if (buf[s + k] != lit[k]) { return false; }
+        k += 1;
+    }
+    return s + k == t;
+}
+
+/// Start of the first line at or after `from` that is exactly `lit`, or n.
+pub fn marker_at(buf: []const u8, n: usize, from: usize, lit: []const u8) -> usize {
+    var s : usize = from;
+    while (s < n) {
+        const e : usize = line_end(buf, s, n);
+        if (line_is(buf, s, text_end(buf, s, e), lit)) { return s; }
+        s = e + 1;
+    }
+    return n;
+}
+
+/// First tab in buf[s..t], or t.
+pub fn first_tab(buf: []const u8, s: usize, t: usize) -> usize {
+    var i : usize = s;
+    while (i < t) {
+        if (buf[i] == '\t') { return i; }
+        i += 1;
+    }
+    return t;
+}
+
+/// Last tab in buf[s..t], or t.
+pub fn last_tab(buf: []const u8, s: usize, t: usize) -> usize {
+    var p : usize = t;
+    var i : usize = s;
+    while (i < t) {
+        if (buf[i] == '\t') { p = i; }
+        i += 1;
+    }
+    return p;
+}
+
+/// What one diff line buf[s..t] asks for: the worse of its paths (a rename or copy has two).
+pub fn diff_class(buf: []const u8, s: usize, t: usize) -> u8 {
+    if (t <= s) { return C_NOTHING; }
+    if (own_language::is_letter_of(KINDS, buf[s]) == false) { return C_ALL_UNREADABLE; }
+    const p1 : usize = first_tab(buf, s, t);
+    if (p1 >= t) { return C_ALL_UNREADABLE; }
+    const p2 : usize = last_tab(buf, s, t);
+    var c : u8 = path_class(buf, p2 + 1, t);
+    if (p2 > p1) {
+        const old : u8 = path_class(buf, p1 + 1, p2);
+        if (old > c) { c = old; }
+    }
+    return c;
+}
+
+/// True when the input asks for every spec: a marker is missing or out of order, or a changed path
+/// is outside specs/, a non-spec non-prose file under specs/, or unreadable.
+pub fn run_all(buf: []const u8, n: usize) -> bool {
+    const g : usize = marker_at(buf, n, 0, MARK_GRAPH);
+    if (g >= n) { return true; }
+    const c : usize = marker_at(buf, n, g, MARK_CORPUS);
+    if (c >= n) { return true; }
+    var s : usize = 0;
+    while (s < g) {
+        const e : usize = line_end(buf, s, g);
+        if (diff_class(buf, s, text_end(buf, s, e)) >= ALL_FROM) { return true; }
+        s = e + 1;
+    }
+    return false;
+}
+
+/// Is a[af..at] the same bytes as b[bf..bt]?
+pub fn same(a: []const u8, af: usize, at: usize, b: []const u8, bf: usize, bt: usize) -> bool {
+    if (at - af != bt - bf) { return false; }
+    var k : usize = 0;
+    while (af + k < at) {
+        if (a[af + k] != b[bf + k]) { return false; }
+        k += 1;
+    }
+    return true;
+}
+
+/// Is s[f..t] one of the newline-terminated lines of set[0..sn]?
+pub fn in_set(set: []const u8, sn: usize, s: []const u8, f: usize, t: usize) -> bool {
+    var i : usize = 0;
+    while (i < sn) {
+        const e : usize = line_end(set, i, sn);
+        if (same(set, i, e, s, f, t)) { return true; }
+        i = e + 1;
+    }
+    return false;
+}
+
+/// Append s[f..t] and a newline to set[0..sn] unless it is there; the new length, or scap + 1 when it
+/// does not fit (the caller then answers RUN_ALL).
+pub fn set_add(set: []u8, sn: usize, scap: usize, s: []const u8, f: usize, t: usize) -> usize {
+    if (sn > scap) { return sn; }
+    if (in_set(set, sn, s, f, t)) { return sn; }
+    if (sn + (t - f) + 1 > scap) { return scap + 1; }
+    var w : usize = sn;
+    var i : usize = f;
+    while (i < t) {
+        set[w] = s[i];
+        w += 1;
+        i += 1;
+    }
+    set[w] = '\n';
+    return w + 1;
+}
+
+/// The affected set, built in set[0..scap]: the spec seeds of the diff, then every importer of a member
+/// until nothing changes (a cycle in the graph ends because a member is never added twice). Returns the
+/// set's length, or scap + 1 when it does not fit. Call only when run_all() is false.
+pub fn closure(buf: []const u8, n: usize, set: []u8, scap: usize) -> usize {
+    const g : usize = marker_at(buf, n, 0, MARK_GRAPH);
+    const c : usize = marker_at(buf, n, g, MARK_CORPUS);
+    var sn : usize = 0;
+    var s : usize = 0;
+    while (s < g) {
+        const e : usize = line_end(buf, s, g);
+        const t : usize = text_end(buf, s, e);
+        if (t > s) {
+            const p1 : usize = first_tab(buf, s, t);
+            const p2 : usize = last_tab(buf, s, t);
+            if (path_class(buf, p2 + 1, t) == C_SEED) { sn = set_add(set, sn, scap, buf, p2 + 1, t); }
+            if (p2 > p1) {
+                if (path_class(buf, p1 + 1, p2) == C_SEED) { sn = set_add(set, sn, scap, buf, p1 + 1, p2); }
+            }
+        }
+        s = e + 1;
+    }
+    const gs : usize = line_end(buf, g, n) + 1;
+    var grew : bool = true;
+    while (grew and sn <= scap) {
+        grew = false;
+        s = gs;
+        // Stop once set_add() has overflowed: sn is then scap + 1 and in_set() would read set[sn0..sn],
+        // bytes never written. t27b's interpreter faults on that read (lab run 099ac2224, #6063).
+        while (s < c and sn <= scap) {
+            const e : usize = line_end(buf, s, c);
+            const t : usize = text_end(buf, s, e);
+            const p : usize = first_tab(buf, s, t);
+            if (p < t and p > s) {
+                if (in_set(set, sn, buf, p + 1, t) and in_set(set, sn, buf, s, p) == false) {
+                    sn = set_add(set, sn, scap, buf, s, p);
+                    grew = true;
+                }
+            }
+            s = e + 1;
+        }
+    }
+    return sn;
+}
+
+/// Write one byte at w if it fits; the returned position keeps counting past the end.
+pub fn put(out: []u8, w: usize, cap: usize, c: u8) -> usize {
+    if (w < cap) { out[w] = c; }
+    return w + 1;
+}
+
+/// Read the input buf[0..n] (see the header), write the affected spec paths of the corpus into
+/// out[0..cap], one per line, and return how many -- or RUN_ALL. set[0..scap] is working space.
+pub fn select_affected(buf: []const u8, n: usize, set: []u8, scap: usize, out: []u8, cap: usize) -> u32 {
+    if (run_all(buf, n)) { return RUN_ALL; }
+    const sn : usize = closure(buf, n, set, scap);
+    if (sn > scap) { return RUN_ALL; }
+    const g : usize = marker_at(buf, n, 0, MARK_GRAPH);
+    const c : usize = marker_at(buf, n, g, MARK_CORPUS);
+    var count : u32 = 0;
+    var w : usize = 0;
+    var s : usize = line_end(buf, c, n) + 1;
+    while (s < n) {
+        const e : usize = line_end(buf, s, n);
+        const t : usize = text_end(buf, s, e);
+        if (t > s and in_set(set, sn, buf, s, t)) {
+            var i : usize = s;
+            while (i < t) {
+                w = put(out, w, cap, buf[i]);
+                i += 1;
+            }
+            w = put(out, w, cap, '\n');
+            count += 1;
+        }
+        s = e + 1;
+    }
+    if (w > cap) { return RUN_ALL; }
+    return count;
+}
+
+test negative_control_a_compiler_change_runs_everything {
+    assert path_class("bootstrap/src/compiler.rs", 0, 25) == C_ALL_OUTSIDE;
+    assert run_all("M\tbootstrap/src/compiler.rs\n--graph\n--corpus\nspecs/a.t27\n", 57) == true;
+    var set : [64]u8 = undefined;
+    var out : [64]u8 = undefined;
+    assert select_affected("M\tbootstrap/src/compiler.rs\n--graph\n--corpus\nspecs/a.t27\n", 57, &set, 64, &out, 64) == RUN_ALL;
+}
+
+test anything_outside_specs_runs_everything {
+    assert path_class("cli/t27b/src/lower.rs", 0, 21) == C_ALL_OUTSIDE;
+    assert path_class(".github/workflows/ci.yml", 0, 24) == C_ALL_OUTSIDE;
+    assert path_class("xspecs/a.t27", 0, 12) == C_ALL_OUTSIDE;
+    assert path_class("tools/specs_generate_baseline.txt", 0, 33) == C_ALL_OUTSIDE;
+    assert path_class("docs/reports/suite_expectations.json", 0, 36) == C_ALL_OUTSIDE;
+    assert run_all("M\tspecs/a.t27\nA\ttools/x.json\n--graph\n--corpus\n", 46) == true;
+}
+
+test a_spec_is_a_seed_and_prose_under_specs_is_nothing {
+    assert path_class("specs/a/b.t27", 0, 13) == C_SEED;
+    assert path_class("specs/01-vm-core.tri", 0, 20) == C_SEED;
+    assert path_class("specs/A.T27", 0, 11) == C_SEED;
+    assert path_class("specs/OWNERS.md", 0, 15) == C_NOTHING;
+    assert path_class("specs/RUST_DIALECT.json", 0, 23) == C_ALL_UNDER_SPECS;
+    assert path_class("specs/.gitignore", 0, 16) == C_ALL_UNDER_SPECS;
+}
+
+test negative_control_unreadable_input_runs_everything {
+    assert diff_class("Q\tspecs/a.t27", 0, 13) == C_ALL_UNREADABLE;
+    assert diff_class("U\tspecs/a.t27", 0, 13) == C_ALL_UNREADABLE;
+    assert diff_class("M specs/a.t27", 0, 13) == C_ALL_UNREADABLE;
+    assert path_class("\"specs/a b.t27\"", 0, 15) == C_ALL_UNREADABLE;
+    assert run_all("M\tspecs/a.t27\n--corpus\nspecs/a.t27\n", 35) == true;
+    assert run_all("M\tspecs/a.t27\n--corpus\n--graph\n", 31) == true;
+    assert run_all("M\tspecs/a.t27\n--graph\n--corpus\n", 31) == false;
+}
+
+test a_rename_is_judged_by_both_paths {
+    assert diff_class("R100\tspecs/a.t27\tspecs/b.t27", 0, 28) == C_SEED;
+    assert diff_class("R100\tspecs/a.t27\ttools/b.t27", 0, 28) == C_ALL_OUTSIDE;
+    assert diff_class("R100\ttools/a.py\tspecs/b.t27", 0, 27) == C_ALL_OUTSIDE;
+}
+
+test a_spec_change_selects_its_importers_and_only_them {
+    var set : [256]u8 = undefined;
+    var out : [256]u8 = undefined;
+    const inp : str = "M\tspecs/c.t27\n--graph\nspecs/b.t27\tspecs/c.t27\nspecs/a.t27\tspecs/b.t27\nspecs/x.t27\tspecs/y.t27\n--corpus\nspecs/a.t27\nspecs/b.t27\nspecs/c.t27\nspecs/x.t27\nspecs/y.t27\n";
+    const sn : usize = closure(inp, 163, &set, 256);
+    assert in_set(&set, sn, "specs/c.t27", 0, 11) == true;
+    assert in_set(&set, sn, "specs/b.t27", 0, 11) == true;
+    assert in_set(&set, sn, "specs/a.t27", 0, 11) == true;
+    assert in_set(&set, sn, "specs/x.t27", 0, 11) == false;
+    assert in_set(&set, sn, "specs/y.t27", 0, 11) == false;
+    assert select_affected(inp, 163, &set, 256, &out, 256) == 3;
+    assert out[0] == 's';
+    assert out[6] == 'a';
+    assert out[11] == '\n';
+    assert out[18] == 'b';
+    assert out[30] == 'c';
+}
+
+test negative_control_an_import_does_not_select_what_it_imports {
+    var set : [256]u8 = undefined;
+    var out : [256]u8 = undefined;
+    const inp : str = "M\tspecs/a.t27\n--graph\nspecs/a.t27\tspecs/b.t27\n--corpus\nspecs/a.t27\nspecs/b.t27\n";
+    assert select_affected(inp, 79, &set, 256, &out, 256) == 1;
+    assert out[6] == 'a';
+}
+
+test a_deleted_spec_selects_its_importers_but_not_itself {
+    var set : [256]u8 = undefined;
+    var out : [256]u8 = undefined;
+    const inp : str = "D\tspecs/c.t27\n--graph\nspecs/b.t27\tspecs/c.t27\nspecs/a.t27\tspecs/b.t27\n--corpus\nspecs/a.t27\nspecs/b.t27\n";
+    assert select_affected(inp, 103, &set, 256, &out, 256) == 2;
+    assert out[6] == 'a';
+    assert out[18] == 'b';
+}
+
+test a_renamed_spec_selects_the_importers_of_the_old_path {
+    var set : [256]u8 = undefined;
+    var out : [256]u8 = undefined;
+    const inp : str = "R097\tspecs/c.t27\tspecs/d.t27\n--graph\nspecs/a.t27\tspecs/c.t27\n--corpus\nspecs/a.t27\nspecs/d.t27\n";
+    assert select_affected(inp, 94, &set, 256, &out, 256) == 2;
+    assert out[6] == 'a';
+    assert out[18] == 'd';
+}
+
+test a_cycle_in_the_graph_ends {
+    var set : [256]u8 = undefined;
+    var out : [256]u8 = undefined;
+    const inp : str = "M\tspecs/a.t27\n--graph\nspecs/a.t27\tspecs/b.t27\nspecs/b.t27\tspecs/a.t27\n--corpus\nspecs/a.t27\nspecs/b.t27\n";
+    assert select_affected(inp, 103, &set, 256, &out, 256) == 2;
+}
+
+test prose_only_and_an_empty_diff_select_nothing {
+    var set : [64]u8 = undefined;
+    var out : [64]u8 = undefined;
+    assert select_affected("M\tspecs/OWNERS.md\n--graph\n--corpus\nspecs/a.t27\n", 47, &set, 64, &out, 64) == 0;
+    assert select_affected("--graph\n--corpus\nspecs/a.t27\n", 29, &set, 64, &out, 64) == 0;
+}
+
+// The bytes are set by number: t27c does not read "\r" in a string literal as an escape (gen-zig
+// emits a backslash and an r), so a CRLF literal would test the wrong input.
+test a_crlf_line_end_is_dropped {
+    var b : [4]u8 = undefined;
+    b[0] = 'a';
+    b[1] = 13;
+    b[2] = 10;
+    b[3] = 'z';
+    assert line_end(&b, 0, 4) == 2;
+    assert text_end(&b, 0, 2) == 1;
+    assert text_end(&b, 3, 4) == 4;
+    assert line_end(&b, 3, 4) == 4;
+}
+
+test negative_control_a_set_or_output_that_does_not_fit_runs_everything {
+    var set : [256]u8 = undefined;
+    var out : [256]u8 = undefined;
+    const inp : str = "M\tspecs/c.t27\n--graph\nspecs/b.t27\tspecs/c.t27\nspecs/a.t27\tspecs/b.t27\nspecs/x.t27\tspecs/y.t27\n--corpus\nspecs/a.t27\nspecs/b.t27\nspecs/c.t27\nspecs/x.t27\nspecs/y.t27\n";
+    assert select_affected(inp, 163, &set, 20, &out, 256) == RUN_ALL;
+    assert select_affected(inp, 163, &set, 256, &out, 30) == RUN_ALL;
+    assert select_affected(inp, 163, &set, 36, &out, 36) == 3;
+}
+
+test markdown_anywhere_and_a_seal_select_nothing {
+    assert path_class("README.md", 0, 9) == C_NOTHING;
+    assert path_class("docs/now/2026-10-07.MD", 0, 22) == C_NOTHING;
+    assert path_class(".trinity/seals/ci_CiAffected.json", 0, 33) == C_NOTHING;
+    var set : [256]u8 = undefined;
+    var out : [256]u8 = undefined;
+    const inp : str = "M\tdocs/NOW.md\nA\t.trinity/seals/x.json\nM\tspecs/b.t27\n--graph\nspecs/a.t27\tspecs/b.t27\n--corpus\nspecs/a.t27\nspecs/b.t27\nspecs/c.t27\n";
+    assert select_affected(inp, 129, &set, 256, &out, 256) == 2;
+    assert out[6] == 'a';
+    assert out[18] == 'b';
+    assert select_affected("M\tAGENTS.md\nD\t.trinity/seals/y.json\n--graph\n--corpus\nspecs/a.t27\n", 65, &set, 256, &out, 256) == 0;
+}
+
+test negative_control_the_seal_exception_is_only_seal_json {
+    assert path_class(".trinity/seals/x.txt", 0, 20) == C_ALL_OUTSIDE;
+    assert path_class(".trinity/seals.json", 0, 19) == C_ALL_OUTSIDE;
+    assert path_class(".trinity/state/queue.json", 0, 25) == C_ALL_OUTSIDE;
+    assert path_class("gen/c/ci/affected.c", 0, 19) == C_ALL_OUTSIDE;
+    assert path_class("docs/md", 0, 7) == C_ALL_OUTSIDE;
+    assert diff_class("R100\tdocs/a.md\ttools/a.py", 0, 25) == C_ALL_OUTSIDE;
+    assert diff_class("R100\ttools/a.py\tdocs/a.md", 0, 25) == C_ALL_OUTSIDE;
+}
+
+invariant every_run_all_class_is_at_or_above_all_from {
+    assert C_SEED < ALL_FROM;
+    assert C_NOTHING < ALL_FROM;
+    assert C_ALL_OUTSIDE >= ALL_FROM;
+    assert C_ALL_UNDER_SPECS >= ALL_FROM;
+    assert C_ALL_UNREADABLE >= ALL_FROM;
+}

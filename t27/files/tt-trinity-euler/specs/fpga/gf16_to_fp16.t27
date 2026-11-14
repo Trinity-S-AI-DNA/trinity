@@ -1,0 +1,576 @@
+// SPDX-License-Identifier: Apache-2.0
+
+module gf16-to-fp16;
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+pub const GF16_SIGN_BITS : u8 = 1;
+pub const GF16_EXP_BITS : u8 = 6;
+pub const GF16_MANT_BITS : u8 = 9;
+pub const GF16_BIAS : i8 = 31;
+
+pub const FP16_SIGN_BITS : u8 = 1;
+pub const FP16_EXP_BITS : u8 = 5;
+pub const FP16_MANT_BITS : u8 = 10;
+pub const FP16_BIAS : i8 = 15;
+
+pub const MAX_EXP_DIFF : i8 = 6;   // Maximum exponent difference without loss
+pub const MANTissa_MASK_GF16 : u16 = 0x01FF;
+pub const MANTissa_MASK_FP16 : u16 = 0x03FF;
+
+// ============================================================================
+// Types
+// ============================================================================
+
+pub const Gf16 = packed struct {
+    sign : u1,
+    exp : u6,
+    mant : u9,
+}
+
+pub const Fp16 = packed struct {
+    sign : u1,
+    exp : u5,
+    mant : u10,
+}
+
+pub const ConversionResult = struct {
+    value : u16,
+    overflow : bool,
+    underflow : bool,
+    lost_precision : bool,
+}
+
+pub const ConversionConfig = struct {
+    round_mode : u8,
+    overflow_mode : u8,
+    enable_saturation : bool,
+}
+
+// ============================================================================
+// GF16 Functions
+// ============================================================================
+
+// gf16_from_bits(bits: u16) -> Gf16
+// Extract GF16 from 16-bit representation
+pub fn gf16_from_bits(bits: u16) -> Gf16 {
+    return Gf16 {
+        .sign = @as(u1, @truncate((bits >> 15) & 0x01)),
+        .exp = @as(u6, @truncate((bits >> 9) & 0x3F)),
+        .mant = @as(u9, @truncate(bits & 0x01FF)),
+    };
+}
+
+// gf16_to_bits(gf: Gf16) -> u16
+// Convert GF16 to 16-bit representation
+pub fn gf16_to_bits(gf: Gf16) -> u16 {
+    const sign_field : u16 = @as(u16, gf.sign) << 15;
+    const exp_field : u16 = @as(u16, gf.exp) << 9;
+    const mant_field : u16 = @as(u16, gf.mant);
+    return sign_field | exp_field | mant_field;
+}
+
+// gf16_get_exp_biased(gf: Gf16) -> i8
+// Get exponent with bias applied
+pub fn gf16_get_exp_biased(gf: Gf16) -> i8 {
+    return @as(i8, @bitCast(gf.exp)) - GF16_BIAS;
+}
+
+// gf16_is_zero(gf: Gf16) -> bool
+// Check if GF16 is zero
+pub fn gf16_is_zero(gf: Gf16) -> bool {
+    return gf.exp == 0 and gf.mant == 0;
+}
+
+// gf16_is_infinity(gf: Gf16) -> bool
+// Check if GF16 is infinity
+pub fn gf16_is_infinity(gf: Gf16) -> bool {
+    return gf.exp == 0x3F and gf.mant == 0;
+}
+
+// gf16_is_nan(gf: Gf16) -> bool
+// Check if GF16 is NaN
+pub fn gf16_is_nan(gf: Gf16) -> bool {
+    return gf.exp == 0x3F and gf.mant != 0;
+}
+
+// ============================================================================
+// FP16 Functions
+// ============================================================================
+
+// fp16_from_bits(bits: u16) -> Fp16
+// Extract FP16 from 16-bit representation
+pub fn fp16_from_bits(bits: u16) -> Fp16 {
+    return Fp16 {
+        .sign = @as(u1, @truncate((bits >> 15) & 0x01)),
+        .exp = @as(u5, @truncate((bits >> 10) & 0x1F)),
+        .mant = @as(u10, @truncate(bits & 0x03FF)),
+    };
+}
+
+// fp16_to_bits(fp: Fp16) -> u16
+// Convert FP16 to 16-bit representation
+pub fn fp16_to_bits(fp: Fp16) -> u16 {
+    const sign_field : u16 = @as(u16, fp.sign) << 15;
+    const exp_field : u16 = @as(u16, fp.exp) << 10;
+    const mant_field : u16 = @as(u16, fp.mant);
+    return sign_field | exp_field | mant_field;
+}
+
+// fp16_get_exp_biased(fp: Fp16) -> i8
+// Get exponent with bias applied
+pub fn fp16_get_exp_biased(fp: Fp16) -> i8 {
+    if (fp.exp == 0) {
+        return -14;  // Denormal
+    } else if (fp.exp == 0x1F) {
+        return 16;   // Infinity/NaN
+    }
+    return @as(i8, @bitCast(fp.exp)) - FP16_BIAS;
+}
+
+// fp16_is_zero(fp: Fp16) -> bool
+// Check if FP16 is zero
+pub fn fp16_is_zero(fp: Fp16) -> bool {
+    return fp.exp == 0 and fp.mant == 0;
+}
+
+// fp16_is_infinity(fp: Fp16) -> bool
+// Check if FP16 is infinity
+pub fn fp16_is_infinity(fp: Fp16) -> bool {
+    return fp.exp == 0x1F and fp.mant == 0;
+}
+
+// fp16_is_nan(fp: Fp16) -> bool
+// Check if FP16 is NaN
+pub fn fp16_is_nan(fp: Fp16) -> bool {
+    return fp.exp == 0x1F and fp.mant != 0;
+}
+
+// ============================================================================
+// Config Functions
+// ============================================================================
+
+// conversion_config_init() -> ConversionConfig
+// Initialize conversion config
+pub fn conversion_config_init() -> ConversionConfig {
+    return ConversionConfig {
+        .round_mode = 0,  // Round to nearest
+        .overflow_mode = 0,  // Clamp
+        .enable_saturation = true,
+    };
+}
+
+// conversion_config_no_saturation() -> ConversionConfig
+// Create config without saturation
+pub fn conversion_config_no_saturation() -> ConversionConfig {
+    return ConversionConfig {
+        .round_mode = 0,
+        .overflow_mode = 1,  // Overflow to infinity
+        .enable_saturation = false,
+    };
+}
+
+// ============================================================================
+// Conversion Functions
+// ============================================================================
+
+// gf16_to_fp16_raw(gf: Gf16) -> Fp16
+// Convert GF16 to FP16 (raw, no overflow/underflow handling)
+pub fn gf16_to_fp16_raw(gf: Gf16) -> Fp16 {
+    var exp_i8 = gf16_get_exp_biased(gf);
+
+    if (gf16_is_zero(gf)) {
+        return Fp16{.sign = gf.sign, .exp = 0, .mant = 0};
+    } else if (gf16_is_infinity(gf)) {
+        return Fp16{.sign = gf.sign, .exp = 0x1F, .mant = 0};
+    } else if (gf16_is_nan(gf)) {
+        return Fp16{.sign = gf.sign, .exp = 0x1F, .mant = 1};  // Quiet NaN
+    }
+
+    // Adjust exponent bias: GF16 bias 31 -> FP16 bias 15
+    exp_i8 = exp_i8 + GF16_BIAS - FP16_BIAS;
+
+    var exp : u5 = 0;
+    var mant : u10 = 0;
+    var lost_precision = false;
+
+    if (exp_i8 <= -15) {
+        // Underflow to zero
+        exp = 0;
+        mant = 0;
+        lost_precision = true;
+    } else if (exp_i8 >= 16) {
+        // Overflow to infinity
+        exp = 0x1F;
+        mant = 0;
+    } else {
+        exp = @as(u5, @truncate(@as(u8, @bitCast(exp_i8)) & 0x1F));
+        // Extend mantissa from 9 to 10 bits
+        mant = @as(u10, gf.mant) << 1;
+    }
+
+    return Fp16{.sign = gf.sign, .exp = exp, .mant = mant};
+}
+
+// gf16_to_fp16_with_result(gf: Gf16, config: ConversionConfig) -> ConversionResult
+// Convert GF16 to FP16 with full result
+pub fn gf16_to_fp16_with_result(gf: Gf16, config: ConversionConfig) -> ConversionResult {
+    var result : ConversionResult = undefined;
+
+    if (gf16_is_zero(gf)) {
+        result.value = fp16_to_bits(Fp16{.sign = gf.sign, .exp = 0, .mant = 0});
+        result.overflow = false;
+        result.underflow = false;
+        result.lost_precision = false;
+        return result;
+    } else if (gf16_is_infinity(gf)) {
+        result.value = fp16_to_bits(Fp16{.sign = gf.sign, .exp = 0x1F, .mant = 0});
+        result.overflow = false;
+        result.underflow = false;
+        result.lost_precision = false;
+        return result;
+    } else if (gf16_is_nan(gf)) {
+        result.value = fp16_to_bits(Fp16{.sign = gf.sign, .exp = 0x1F, .mant = 1});
+        result.overflow = false;
+        result.underflow = false;
+        result.lost_precision = false;
+        return result;
+    }
+
+    var exp_i8 = gf16_get_exp_biased(gf);
+    exp_i8 = exp_i8 + GF16_BIAS - FP16_BIAS;
+
+    result.overflow = false;
+    result.underflow = false;
+    result.lost_precision = false;
+
+    var exp : u5 = 0;
+    var mant : u10 = 0;
+
+    if (exp_i8 <= -15) {
+        // Underflow
+        if (config.enable_saturation) {
+            result.value = fp16_to_bits(Fp16{.sign = gf.sign, .exp = 0, .mant = 0});
+        } else {
+            result.value = fp16_to_bits(Fp16{.sign = gf.sign, .exp = 0, .mant = 1});  // Smallest denormal
+        }
+        result.underflow = true;
+        result.lost_precision = true;
+        return result;
+    } else if (exp_i8 >= 16) {
+        // Overflow
+        if (config.overflow_mode == 0 or config.enable_saturation) {
+            result.value = fp16_to_bits(Fp16{.sign = gf.sign, .exp = 0x1E, .mant = 0x3FF});  // Max finite
+        } else {
+            result.value = fp16_to_bits(Fp16{.sign = gf.sign, .exp = 0x1F, .mant = 0});  // Infinity
+        }
+        result.overflow = true;
+        return result;
+    } else {
+        exp = @as(u5, @truncate(@as(u8, @bitCast(exp_i8)) & 0x1F));
+        mant = @as(u10, gf.mant) << 1;
+        result.value = fp16_to_bits(Fp16{.sign = gf.sign, .exp = exp, .mant = mant});
+        return result;
+    }
+}
+
+// gf16_to_fp16(gf: Gf16) -> Fp16
+// Convert GF16 to FP16
+pub fn gf16_to_fp16(gf: Gf16) -> Fp16 {
+    const result = gf16_to_fp16_with_result(gf, conversion_config_init());
+    return fp16_from_bits(result.value);
+}
+
+// gf16_bits_to_fp16_bits(gf_bits: u16) -> u16
+// Convert GF16 bits to FP16 bits
+pub fn gf16_bits_to_fp16_bits(gf_bits: u16) -> u16 {
+    const gf = gf16_from_bits(gf_bits);
+    const fp = gf16_to_fp16(gf);
+    return fp16_to_bits(fp);
+}
+
+// gf16_bits_to_fp16_bits_with_result(gf_bits: u16, config: ConversionConfig) -> ConversionResult
+// Convert GF16 bits to FP16 bits with full result
+pub fn gf16_bits_to_fp16_bits_with_result(gf_bits: u16, config: ConversionConfig) -> ConversionResult {
+    const gf = gf16_from_bits(gf_bits);
+    return gf16_to_fp16_with_result(gf, config);
+}
+
+// ============================================================================
+// TDD Tests
+// ============================================================================
+
+test "gf16_bits_constants" {
+    assert(GF16_SIGN_BITS == 1);
+    assert(GF16_EXP_BITS == 6);
+    assert(GF16_MANT_BITS == 9);
+    assert(GF16_BIAS == 31);
+}
+
+test "fp16_bits_constants" {
+    assert(FP16_SIGN_BITS == 1);
+    assert(FP16_EXP_BITS == 5);
+    assert(FP16_MANT_BITS == 10);
+    assert(FP16_BIAS == 15);
+}
+
+test "mantissa_masks" {
+    assert(MANTissa_MASK_GF16 == 0x01FF);
+    assert(MANTissa_MASK_FP16 == 0x03FF);
+}
+
+test "gf16_from_bits_to_bits_roundtrip" {
+    const bits = 0x1234;
+    const gf = gf16_from_bits(bits);
+    const result = gf16_to_bits(gf);
+    assert(result == bits);
+}
+
+test "gf16_from_bits_structure" {
+    const gf = gf16_from_bits(0x8000);
+    assert(gf.sign == 1);
+    assert(gf.exp == 0);
+    assert(gf.mant == 0);
+}
+
+test "fp16_from_bits_to_bits_roundtrip" {
+    const bits = 0x3C00;
+    const fp = fp16_from_bits(bits);
+    const result = fp16_to_bits(fp);
+    assert(result == bits);
+}
+
+test "gf16_is_zero_true" {
+    const gf = Gf16{.sign = 0, .exp = 0, .mant = 0};
+    assert(gf16_is_zero(gf) == true);
+}
+
+test "gf16_is_zero_false" {
+    const gf = Gf16{.sign = 0, .exp = 0, .mant = 1};
+    assert(gf16_is_zero(gf) == false);
+}
+
+test "gf16_is_infinity_true" {
+    const gf = Gf16{.sign = 0, .exp = 0x3F, .mant = 0};
+    assert(gf16_is_infinity(gf) == true);
+}
+
+test "gf16_is_infinity_false" {
+    const gf = Gf16{.sign = 0, .exp = 0x3E, .mant = 0};
+    assert(gf16_is_infinity(gf) == false);
+}
+
+test "gf16_is_nan_true" {
+    const gf = Gf16{.sign = 0, .exp = 0x3F, .mant = 1};
+    assert(gf16_is_nan(gf) == true);
+}
+
+test "fp16_is_zero_true" {
+    const fp = Fp16{.sign = 0, .exp = 0, .mant = 0};
+    assert(fp16_is_zero(fp) == true);
+}
+
+test "fp16_is_infinity_true" {
+    const fp = Fp16{.sign = 0, .exp = 0x1F, .mant = 0};
+    assert(fp16_is_infinity(fp) == true);
+}
+
+test "conversion_config_init_structure" {
+    const config = conversion_config_init();
+    assert(config.round_mode == 0);
+    assert(config.enable_saturation == true);
+}
+
+test "conversion_config_no_saturation_structure" {
+    const config = conversion_config_no_saturation();
+    assert(config.enable_saturation == false);
+}
+
+test "gf16_to_fp16_zero" {
+    const gf = Gf16{.sign = 0, .exp = 0, .mant = 0};
+    const fp = gf16_to_fp16(gf);
+    assert(fp.exp == 0);
+    assert(fp.mant == 0);
+}
+
+test "gf16_to_fp16_infinity" {
+    const gf = Gf16{.sign = 0, .exp = 0x3F, .mant = 0};
+    const fp = gf16_to_fp16(gf);
+    assert(fp.exp == 0x1F);
+    assert(fp.mant == 0);
+}
+
+test "gf16_to_fp16_nan" {
+    const gf = Gf16{.sign = 0, .exp = 0x3F, .mant = 1};
+    const fp = gf16_to_fp16(gf);
+    assert(fp.exp == 0x1F);
+    assert(fp.mant == 1);
+}
+
+test "gf16_to_fp16_preserves_sign" {
+    const gf_pos = Gf16{.sign = 1, .exp = 1, .mant = 0};
+    const gf_neg = Gf16{.sign = 0, .exp = 1, .mant = 0};
+    const fp_pos = gf16_to_fp16(gf_pos);
+    const fp_neg = gf16_to_fp16(gf_neg);
+    assert(fp_pos.sign == 1 and fp_neg.sign == 0);
+}
+
+test "gf16_to_fp16_with_result_zero" {
+    const gf = Gf16{.sign = 0, .exp = 0, .mant = 0};
+    const config = conversion_config_init();
+    const result = gf16_to_fp16_with_result(gf, config);
+    assert(result.overflow == false);
+    assert(result.underflow == false);
+    assert(result.lost_precision == false);
+}
+
+test "gf16_bits_to_fp16_bits_zero" {
+    const config = conversion_config_init();
+    assert(gf16_bits_to_fp16_bits(0x0000, config) == 0x0000);
+}
+
+test "gf16_bits_to_fp16_bits_roundtrip" {
+    const config = conversion_config_init();
+    // Normal value
+    const gf_bits = 0x2000;  // exp=32, mant=0 -> value ~1.0 in GF16
+    const fp_bits = gf16_bits_to_fp16_bits(gf_bits);
+    assert((fp_bits & 0x8000) == (gf_bits & 0x8000));  // Sign preserved
+}
+
+test "gf16_to_fp16_with_result_underflow" {
+    const gf = Gf16{.sign = 0, .exp = 0, .mant = 1};  // Very small value
+    const config = conversion_config_init();
+    const result = gf16_to_fp16_with_result(gf, config);
+    assert(result.underflow == true or result.lost_precision == true);
+}
+
+test "gf16_to_fp16_with_result_overflow" {
+    const gf = Gf16{.sign = 0, .exp = 62, .mant = 0};  // Very large value
+    const config = conversion_config_init();
+    const result = gf16_to_fp16_with_result(gf, config);
+    assert(result.overflow == true);
+}
+
+test "gf16_to_fp16_with_result_saturation" {
+    const gf = Gf16{.sign = 0, .exp = 62, .mant = 0};  // Very large value
+    const config = conversion_config_init();
+    const result = gf16_to_fp16_with_result(gf, config);
+    assert(result.value != 0x7C00);  // Not infinity, but max finite
+}
+
+test "gf16_to_fp16_with_result_no_saturation_overflow" {
+    const gf = Gf16{.sign = 0, .exp = 62, .mant = 0};  // Very large value
+    const config = conversion_config_no_saturation();
+    const result = gf16_to_fp16_with_result(gf, config);
+    assert(result.value == 0x7C00);  // Infinity
+}
+
+// ============================================================================
+// Invariants
+// ============================================================================
+
+invariant gf16_bit_count
+    assert GF16_SIGN_BITS + GF16_EXP_BITS + GF16_MANT_BITS == 16
+
+invariant fp16_bit_count
+    assert FP16_SIGN_BITS + FP16_EXP_BITS + FP16_MANT_BITS == 16
+
+invariant gf16_exp_width
+    assert GF16_EXP_BITS == 6
+
+invariant fp16_exp_width
+    assert FP16_EXP_BITS == 5
+
+invariant gf16_mant_width
+    assert GF16_MANT_BITS == 9
+
+invariant fp16_mant_width
+    assert FP16_MANT_BITS == 10
+
+invariant mantissa_masks_correct
+    assert MANTissa_MASK_GF16 == (@as(u16, 1) << GF16_MANT_BITS) - 1
+    assert MANTissa_MASK_FP16 == (@as(u16, 1) << FP16_MANT_BITS) - 1
+
+invariant gf16_from_bits_roundtrip
+    given bits = 0x5678
+    assert gf16_to_bits(gf16_from_bits(bits)) == bits
+
+invariant fp16_from_bits_roundtrip
+    given bits = 0x4567
+    assert fp16_to_bits(fp16_from_bits(bits)) == bits
+
+invariant gf16_zero_exp_zero_mant_zero
+    given gf = Gf16{.sign = 0, .exp = 0, .mant = 0}
+    assert gf16_is_zero(gf) and gf.exp == 0 and gf.mant == 0
+
+invariant gf16_infinity_exp_max_mant_zero
+    given gf = Gf16{.sign = 0, .exp = 0x3F, .mant = 0}
+    assert gf16_is_infinity(gf) and !gf16_is_nan(gf)
+
+invariant fp16_infinity_exp_max_mant_zero
+    given fp = Fp16{.sign = 0, .exp = 0x1F, .mant = 0}
+    assert fp16_is_infinity(fp) and !fp16_is_nan(fp)
+
+invariant conversion_config_init_saturation_enabled
+    given config = conversion_config_init()
+    assert config.enable_saturation == true
+
+invariant conversion_config_no_saturation_disabled
+    given config = conversion_config_no_saturation()
+    assert config.enable_saturation == false
+
+invariant gf16_to_fp16_zero_preserves {
+    const gf = Gf16{.sign = 0, .exp = 0, .mant = 0};
+    const fp = gf16_to_fp16(gf);
+    assert(fp.sign == gf.sign);
+}
+
+invariant gf16_to_fp16_infinity_preserves_sign {
+    const gf_pos = Gf16{.sign = 1, .exp = 0x3F, .mant = 0};
+    const fp_pos = gf16_to_fp16(gf_pos);
+    assert(fp_pos.sign == 1);
+}
+
+invariant gf16_to_fp16_nan_preserves_sign {
+    const gf = Gf16{.sign = 1, .exp = 0x3F, .mant = 1};
+    const fp = gf16_to_fp16(gf);
+    assert(fp.sign == gf.sign);
+}
+
+// ============================================================================
+// Benchmarks
+// ============================================================================
+
+bench gf16_from_bits_latency
+    measure: nanoseconds to gf16_from_bits(0x1234)
+    target: < 20ns
+
+bench gf16_to_bits_latency
+    measure: nanoseconds to gf16_to_bits(gf16_from_bits(0x1234))
+    target: < 20ns
+
+bench fp16_from_bits_latency
+    measure: nanoseconds to fp16_from_bits(0x3C00)
+    target: < 20ns
+
+bench fp16_to_bits_latency
+    measure: nanoseconds to fp16_to_bits(fp16_from_bits(0x3C00))
+    target: < 20ns
+
+bench gf16_to_fp16_latency
+    measure: nanoseconds to gf16_to_fp16(gf16_from_bits(0x4000))
+    target: < 30ns
+
+bench gf16_to_fp16_with_result_latency
+    measure: nanoseconds to gf16_to_fp16_with_result(gf16_from_bits(0x4000), conversion_config_init())
+    target: < 40ns
+
+bench gf16_bits_to_fp16_bits_latency
+    measure: nanoseconds to gf16_bits_to_fp16_bits(0x4000)
+    target: < 30ns
+
+bench conversion_config_init_latency
+    measure: nanoseconds to conversion_config_init()
+    target: < 15ns

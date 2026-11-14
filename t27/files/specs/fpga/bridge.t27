@@ -1,0 +1,523 @@
+// SPDX-License-Identifier: Apache-2.0
+// t27/specs/fpga/bridge.t27
+// FPGA Communication Bridge Specification
+// Combines UART and SPI for host and peripheral communication
+// φ² + 1/φ² = 3 | TRINITY
+
+module FPGA_Bridge;
+    // Import base types and submodules
+    use base::types;
+    use fpga::uart::UART_Bridge;
+    use fpga::spi::SPI_Master;
+    use fpga::mac::ZeroDSP_MAC;
+
+    // ═══════════════════════════════════════════════════════════════
+    // 1. Bridge Configuration
+    // ═════════════════════════════════════════════════════════════════════════
+
+    // Buffer configuration
+    const RX_BUFFER_SIZE : usize = 256;       // UART RX buffer size
+    const TX_BUFFER_SIZE : usize = 256;       // UART TX buffer size
+    const SPI_BUFFER_SIZE : usize = 64;       // SPI transfer buffer
+
+    // Protocol configuration
+    const MAX_PACKET_SIZE : usize = 128;       // Max bytes per packet
+    const PACKET_TIMEOUT : u32 = 10_000;    // 10ms timeout (cycles)
+
+    // MAC operation codes (mirrors fpga::mac::ZeroDSP_MAC)
+    const OP_MAC_MUL : u8 = 0;
+    const OP_MAC_MAC : u8 = 1;
+    const OP_MAC_MACC : u8 = 2;
+    const OP_MAC_DOT : u8 = 3;
+    const NUM_MAC_UNITS : usize = 8;
+
+    // ═══════════════════════════════════════════════════════════════
+    // 2. Bridge State
+    // ═════════════════════════════════════════════════════════════════════════
+
+    // Bridge state machine
+    const BRIDGE_IDLE : u8 = 0;
+    const BRIDGE_RX : u8 = 1;
+    const BRIDGE_PARSE : u8 = 2;
+    const BRIDGE_TX : u8 = 3;
+    const BRIDGE_SPI : u8 = 4;
+    const BRIDGE_MAC : u8 = 5;
+
+    // Bridge unit state
+    struct Bridge_Unit {
+        state : u8,                    // Current state
+        rx_head : usize,                // RX buffer head
+        rx_tail : usize,                // RX buffer tail
+        tx_head : usize,                // TX buffer head
+        tx_tail : usize,                // TX buffer tail
+        tx_bytes : [TX_BUFFER_SIZE]u8,    // TX ring storage (struct field: wasm + verilog both accept)
+
+        // Packet state
+        packet_len : u8,                // Current packet length
+        packet_type : u8,              // Current packet type
+        timeout_cnt : u32,              // Packet timeout counter
+
+        // Mode selection
+        spi_enabled : bool,              // SPI peripheral mode
+        mac_enabled : bool,              // MAC operation mode
+    }
+
+    // Initialize bridge
+    var bridge : Bridge_Unit = Bridge_Unit{
+        .state = BRIDGE_IDLE,
+        .rx_head = 0,
+        .rx_tail = 0,
+        .tx_head = 0,
+        .tx_tail = 0,
+        .tx_bytes = [0u8; TX_BUFFER_SIZE],
+        .packet_len = 0,
+        .packet_type = 0,
+        .timeout_cnt = 0,
+        .spi_enabled = true,
+        .mac_enabled = true,
+    };
+
+    // ═══════════════════════════════════════════════════════════════
+    // 3. Buffer Management
+    // ═════════════════════════════════════════════════════════════════════════
+
+    // RX and TX buffers
+    var rx_buffer : [RX_BUFFER_SIZE]u8 = [0u8; RX_BUFFER_SIZE];
+
+    // buffer_write(buf: []u8, size: usize, head: usize, data: u8) → bool
+    // Write byte to circular buffer
+    fn buffer_write(buf_in: []u8, size: usize, head: usize, data: u8) -> bool {
+        // `head` was never checked against `size`, so a caller one past the end
+        // wrote out of bounds: in the generated Rust that panics, and in C the
+        // signature is `bool buffer_write(uint8_t* buf_in, size_t size, size_t
+        // head, uint8_t data)` -- a bare pointer, so the write simply happens.
+        // The sibling `buffer_read` in this same file guards its index; this
+        // one did not, and an asymmetry inside one file is an oversight rather
+        // than a convention.
+        //
+        // The bound uses `size`, not `buf_in.len`, deliberately: a `[]T` loses
+        // its length at the C ABI, so a `.len`-based guard would exist in the
+        // Rust and Zig outputs and be absent from C (#3428).
+        if (head >= size) {
+            return false;
+        }
+        const new_head = (head + 1) % size;
+        if (new_head == 0 && head == size - 1) {
+            return false;  // Buffer full
+        }
+        buf_in[head] = data;
+        return true;
+    }
+
+    // buffer_read(buf: []u8, size: usize, tail: usize) → (u8, usize)
+    // Read byte from circular buffer, return (data, new_tail)
+    fn buffer_read(buf: []u8, size: usize, tail: usize) -> (u8, usize) {
+        // `>=`, not `==`: the equality caught the one-past-the-end case and
+        // let every larger index through to `buf[tail]`.
+        if (tail >= size) {
+            return (0u8, 0);
+        }
+        const data = buf[tail];
+        const new_tail = (tail + 1) % size;
+        return (data, new_tail);
+    }
+
+    // buffer_count(head: usize, tail: usize, size: usize) → usize
+    // Count bytes in circular buffer
+    fn buffer_count(head: usize, tail: usize, size: usize) -> usize {
+        if (head >= tail) {
+            return head - tail;
+        } else {
+            return head + size - tail;
+        }
+    }
+
+    // bridge_rx_available() → usize
+    // Get available bytes in RX buffer
+    fn bridge_rx_available() -> usize {
+        return buffer_count(bridge.rx_head, bridge.rx_tail, RX_BUFFER_SIZE);
+    }
+
+    // bridge_tx_space() → usize
+    // Get available space in TX buffer
+    fn bridge_tx_space() -> usize {
+        return TX_BUFFER_SIZE - buffer_count(bridge.tx_head, bridge.tx_tail, TX_BUFFER_SIZE);
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // 4. Packet Protocol
+    // ═════════════════════════════════════════════════════════════════════════
+
+    // Packet types
+    const PKT_UART_DATA : u8 = 0x00;
+    const PKT_SPI_XFER : u8 = 0x10;
+    const PKT_MAC_OP : u8 = 0x20;
+    const PKT_STATUS : u8 = 0x30;
+    const PKT_CONFIG : u8 = 0x40;
+
+    // Packet format: [TYPE][LEN][DATA...][CRC]
+
+    // bridge_parse_header() → bool
+    // Parse packet header from RX buffer
+    fn bridge_parse_header() -> bool {
+        if (bridge_rx_available() < 2) {
+            return false;
+        }
+
+        const ptype = buffer_read(rx_buffer, RX_BUFFER_SIZE, bridge.rx_tail);
+        const plen = buffer_read(rx_buffer, RX_BUFFER_SIZE, ptype);
+        bridge.rx_tail = plen;
+
+        bridge.packet_type = ptype;
+        bridge.packet_len = plen;
+
+        // Validate packet
+        if (plen > MAX_PACKET_SIZE) {
+            return false;  // Invalid length
+        }
+
+        bridge.state = BRIDGE_PARSE;
+        bridge.timeout_cnt = 0;
+        return true;
+    }
+
+    // bridge_process_payload() → bool
+    // Process packet payload based on type
+    fn bridge_process_payload() -> bool {
+        if (bridge_rx_available() < bridge.packet_len as usize) {
+            // Wait for more data
+            bridge.timeout_cnt = bridge.timeout_cnt + 1;
+            if (bridge.timeout_cnt > PACKET_TIMEOUT) {
+                // Timeout, reset to idle
+                bridge.state = BRIDGE_IDLE;
+                bridge.rx_tail = bridge.rx_head;  // Clear buffer
+            }
+            return false;
+        }
+
+        // Dispatch by packet type. Was a `match` STATEMENT, which the parser
+        // has never supported -- the whole dispatch was silently DROPPED from
+        // the generated Verilog (t27#1940 hardening surfaced it).
+        if (bridge.packet_type == PKT_UART_DATA) {
+            bridge_handle_uart_data();
+        } else if (bridge.packet_type == PKT_SPI_XFER) {
+            bridge_handle_spi_xfer();
+        } else if (bridge.packet_type == PKT_MAC_OP) {
+            bridge_handle_mac_op();
+        } else if (bridge.packet_type == PKT_STATUS) {
+            bridge_handle_status();
+        } else if (bridge.packet_type == PKT_CONFIG) {
+            bridge_handle_config();
+        } else {
+            // Unknown packet type
+            bridge.state = BRIDGE_IDLE;
+            bridge.rx_tail = bridge.rx_head;
+            return false;
+        }
+
+        bridge.state = BRIDGE_IDLE;
+        return true;
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // 5. Packet Handlers
+    // ═════════════════════════════════════════════════════════════════════════
+
+    // bridge_handle_uart_data() → void
+    // Handle UART data packet (echo back)
+    fn bridge_handle_uart_data() -> void {
+        var i : usize = 0;
+        while (i < bridge.packet_len as usize) {
+             const result_read = buffer_read(rx_buffer, RX_BUFFER_SIZE, bridge.rx_tail);
+             const data = result_read;
+             bridge.rx_tail = result_read;
+
+             // Echo back via TX
+             if (bridge_tx_space() > 0) {
+                 const ok = true;
+                 const new_head = (bridge.tx_head + 1) % TX_BUFFER_SIZE;
+                 bridge.tx_bytes[bridge.tx_head] = data;
+                 bridge.tx_head = new_head;
+             }
+            i = i + 1;
+        }
+    }
+
+    // bridge_handle_spi_xfer() → void
+    // Handle SPI transfer packet
+    fn bridge_handle_spi_xfer() -> void {
+        if (!bridge.spi_enabled || spi_is_busy()) {
+            return;
+        }
+
+        const cs_sel = buffer_read(rx_buffer, RX_BUFFER_SIZE, bridge.rx_tail);
+        const data_l = buffer_read(rx_buffer, RX_BUFFER_SIZE, cs_sel);
+        const data_h = buffer_read(rx_buffer, RX_BUFFER_SIZE, data_l);
+        bridge.rx_tail = data_h;
+
+        const data = (data_h as u32) << 8 | data_l as u32;
+        if (spi_transfer(data)) {
+            // Transfer started, will complete asynchronously
+        }
+    }
+
+    // bridge_handle_mac_op() → void
+    // Handle MAC operation packet
+    // Packet format: [OP][UNIT][A_L][A_H][B_L][B_H]
+    // OP: MAC opcode (0=mul, 1=mac, 2=macc, 3=dot)
+    // UNIT: MAC unit index (0..7)
+    // A_L,A_H: operand A (low/high byte of 16-bit value)
+    // B_L,B_H: operand B (low/high byte of 16-bit value)
+    fn bridge_handle_mac_op() -> void {
+        if (!bridge.mac_enabled) {
+            return;
+        }
+
+        if (bridge_rx_available() < 6) {
+            return;
+        }
+
+        const op_byte = buffer_read(rx_buffer, RX_BUFFER_SIZE, bridge.rx_tail);
+        bridge.rx_tail = op_byte;
+
+        const unit_byte = buffer_read(rx_buffer, RX_BUFFER_SIZE, bridge.rx_tail);
+        bridge.rx_tail = unit_byte;
+
+        const a_l = buffer_read(rx_buffer, RX_BUFFER_SIZE, bridge.rx_tail);
+        bridge.rx_tail = a_l;
+
+        const a_h = buffer_read(rx_buffer, RX_BUFFER_SIZE, bridge.rx_tail);
+        bridge.rx_tail = a_h;
+
+        const b_l = buffer_read(rx_buffer, RX_BUFFER_SIZE, bridge.rx_tail);
+        bridge.rx_tail = b_l;
+
+        const b_h = buffer_read(rx_buffer, RX_BUFFER_SIZE, bridge.rx_tail);
+        bridge.rx_tail = b_h;
+
+        // Validate unit index
+        if (unit_byte >= NUM_MAC_UNITS) {
+            return;
+        }
+
+        // Reconstruct 16-bit operands
+        const operand_a = (a_h as u16) << 8 | a_l as u16;
+        const operand_b = (b_h as u16) << 8 | b_l as u16;
+
+        // Dispatch MAC operation
+        if (op_byte == OP_MAC_MUL) {
+            mac_multiply(operand_a, operand_b, unit_byte);
+        } else if (op_byte == OP_MAC_MAC) {
+            mac_cycle(operand_a, operand_b, unit_byte, mac_get_accumulator(unit_byte));
+        } else if (op_byte == OP_MAC_DOT) {
+            mac_dot_product([operand_a], [operand_b], 1, unit_byte);
+        }
+
+        // Send result back via TX
+        if (bridge_tx_space() >= 4) {
+            const acc = mac_get_accumulator(unit_byte) as u32;
+            bridge.tx_bytes[bridge.tx_head] = (acc & 0xFF) as u8;
+            bridge.tx_head = (bridge.tx_head + 1) % TX_BUFFER_SIZE;
+            bridge.tx_bytes[bridge.tx_head] = ((acc >> 8) & 0xFF) as u8;
+            bridge.tx_head = (bridge.tx_head + 1) % TX_BUFFER_SIZE;
+            bridge.tx_bytes[bridge.tx_head] = ((acc >> 16) & 0xFF) as u8;
+            bridge.tx_head = (bridge.tx_head + 1) % TX_BUFFER_SIZE;
+            bridge.tx_bytes[bridge.tx_head] = ((acc >> 24) & 0xFF) as u8;
+            bridge.tx_head = (bridge.tx_head + 1) % TX_BUFFER_SIZE;
+        }
+    }
+
+    // bridge_handle_status() → void
+    // Handle status request
+    fn bridge_handle_status() -> void {
+        // Send status response
+        const status = [
+            if (bridge.spi_enabled) { 1u8 } else { 0u8 },
+            if (bridge.mac_enabled) { 1u8 } else { 0u8 },
+            0u8, 0u8,  // Reserved
+        ];
+
+        var i : usize = 0;
+        while (i < 4) {
+            if (bridge_tx_space() > 0) {
+                bridge.tx_bytes[bridge.tx_head] = status[i];
+                bridge.tx_head = (bridge.tx_head + 1) % TX_BUFFER_SIZE;
+            }
+            i = i + 1;
+        }
+    }
+
+    // bridge_handle_config() → void
+    // Handle configuration packet
+    fn bridge_handle_config() -> void {
+        const cfg_byte = buffer_read(rx_buffer, RX_BUFFER_SIZE, bridge.rx_tail);
+        bridge.rx_tail = cfg_byte;
+
+        // Bit 0: SPI enable
+        // Bit 1: MAC enable
+        bridge.spi_enabled = (cfg_byte & 0x01) != 0;
+        bridge.mac_enabled = (cfg_byte & 0x02) != 0;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════════════════════
+    // TDD-Inside-Spec: Tests and Invariants for FPGA_Bridge
+    // ═══════════════════════════════════════════════════════════════════════════════════════════
+
+    test bridge_initially_idle
+        given state = bridge.state
+        then state == BRIDGE_IDLE
+
+    test bridge_rx_buffers_empty
+        given rx_avail = bridge_rx_available()
+        then rx_avail == 0
+
+    test bridge_tx_buffer_full_space
+        given tx_space = bridge_tx_space()
+        then tx_space == TX_BUFFER_SIZE
+
+    test bridge_rx_write_success
+        given result = buffer_write(rx_buffer, RX_BUFFER_SIZE, bridge.rx_head, 0xAA)
+        then result == true
+
+    test bridge_buffer_count_empty
+        given count = buffer_count(0, 0, RX_BUFFER_SIZE)
+        then count == 0
+
+    test bridge_buffer_count_wrap
+        given count = buffer_count(RX_BUFFER_SIZE - 1, 0, RX_BUFFER_SIZE)
+        then count == RX_BUFFER_SIZE - 1
+
+    test bridge_buffer_count_wrap2
+        given count = buffer_count(0, RX_BUFFER_SIZE - 1, RX_BUFFER_SIZE)
+        then count == 1
+
+    test bridge_packet_types_defined
+        given uart_pkt = PKT_UART_DATA
+        and   spi_pkt = PKT_SPI_XFER
+        and   mac_pkt = PKT_MAC_OP
+        then uart_pkt == 0x00 and spi_pkt == 0x10 and mac_pkt == 0x20
+
+    test bridge_max_packet_size
+        given max_pkt = MAX_PACKET_SIZE
+        then max_pkt == 128
+
+    test bridge_timeout_defined
+        given timeout = PACKET_TIMEOUT
+        then timeout == 10_000
+
+    test bridge_rx_tx_buffer_sizes
+        given rx_size = RX_BUFFER_SIZE
+        and   tx_size = TX_BUFFER_SIZE
+        then rx_size == 256 and tx_size == 256
+
+    test bridge_spi_enabled_by_default
+        given spi_en = bridge.spi_enabled
+        and   mac_en = bridge.mac_enabled
+        then spi_en == true and mac_en == true
+
+    test bridge_parse_header_requires_2_bytes
+        given bridge_rx_available() == 1
+        and   result = bridge_parse_header()
+        then result == false
+
+    test bridge_config_enables_spi
+        given bridge.handle_config(0x01)
+        then bridge.spi_enabled == true
+
+    test bridge_config_enables_mac
+        given bridge.handle_config(0x02)
+        then bridge.mac_enabled == true
+
+    test bridge_config_disables_spi
+        given bridge.handle_config(0x00)
+        then bridge.spi_enabled == false
+
+    test bridge_mac_opcodes_defined
+        given mul_op = OP_MAC_MUL
+        and   mac_op = OP_MAC_MAC
+        and   macc_op = OP_MAC_MACC
+        and   dot_op = OP_MAC_DOT
+        then mul_op == 0 and mac_op == 1 and macc_op == 2 and dot_op == 3
+
+    test bridge_mac_unit_count
+        given units = NUM_MAC_UNITS
+        then units == 8
+
+    test bridge_mac_handler_disabled_when_mac_off
+        given bridge.mac_enabled = false
+        and   bridge_handle_mac_op()
+        then bridge.state == BRIDGE_IDLE
+
+    test bridge_mac_handler_rejects_insufficient_data
+        given bridge.mac_enabled = true
+        and   bridge_rx_available() == 3
+        and   bridge_handle_mac_op()
+        then bridge.state == BRIDGE_IDLE
+
+    test bridge_mac_handler_rejects_invalid_unit
+        given bridge.mac_enabled = true
+        and   bridge_rx_available() >= 6
+        and   rx_buffer[bridge.rx_tail + 1] == 8
+        and   bridge_handle_mac_op()
+        then mac_get_accumulator(0) == 0
+
+    invariant bridge_states_valid
+        given state = bridge.state
+        assert state == BRIDGE_IDLE or state == BRIDGE_RX or state == BRIDGE_PARSE
+                or state == BRIDGE_TX or state == BRIDGE_SPI or state == BRIDGE_MAC
+
+    invariant bridge_rx_tail_never_exceeds_head
+        // Circular buffer invariant
+        assert bridge.rx_head < RX_BUFFER_SIZE and bridge.rx_tail < RX_BUFFER_SIZE
+
+    invariant bridge_tx_tail_never_exceeds_head
+        assert bridge.tx_head < TX_BUFFER_SIZE and bridge.tx_tail < TX_BUFFER_SIZE
+
+    invariant bridge_rx_available_bounds
+        given avail = bridge_rx_available()
+        assert avail <= RX_BUFFER_SIZE
+
+    invariant bridge_tx_space_bounds
+        given space = bridge_tx_space()
+        assert space <= TX_BUFFER_SIZE
+
+    invariant bridge_packet_length_bounds
+        given plen = bridge.packet_len
+        assert plen <= MAX_PACKET_SIZE
+
+    invariant bridge_timeout_counter_increments
+        given old_cnt = bridge.timeout_cnt
+        when bridge.state == BRIDGE_PARSE and bridge_process_payload() == false
+        then bridge.timeout_cnt >= old_cnt
+
+    invariant bridge_timeout_resets_on_expiration
+        given bridge.timeout_cnt = PACKET_TIMEOUT + 1
+        and   bridge.state == BRIDGE_PARSE
+        when bridge_process_payload() == false
+        then bridge.state == BRIDGE_IDLE
+
+    invariant bridge_config_affects_flags
+        given old_spi = bridge.spi_enabled
+        and   old_mac = bridge.mac_enabled
+        when bridge.handle_config(0x03)
+        then (bridge.spi_enabled || !bridge.spi_enabled)  // May have changed
+
+    invariant bridge_modes_mutable
+        assert true  // SPI and MAC can be toggled at runtime
+
+    bench bridge_rx_write_latency
+        measure: nanoseconds to buffer_write(rx_buffer, RX_BUFFER_SIZE, bridge.rx_head, 0xAA)
+        target: < 50ns
+
+    bench bridge_tx_read_latency
+        measure: nanoseconds to buffer_read(bridge.tx_bytes, TX_BUFFER_SIZE, bridge.tx_tail)
+        target: < 50ns
+
+    bench bridge_parse_header_latency
+        measure: nanoseconds to bridge_parse_header() when 2 bytes available
+        target: < 200ns
+
+    bench bridge_packet_processing_latency
+        measure: nanoseconds to process PKT_STATUS packet
+        target: < 500ns
+

@@ -1,0 +1,780 @@
+// Compatibility matrix cells of Ternary Check (issue #32). Canonical
+// executable source: the shared library, the test harness and formats.wasm
+// are generated from it. For one real tensor (a reference: trits in C order
+// [rows, cols] and scale words) and one storage format, these functions
+// decide whether the format can hold the tensor, write and read it back with
+// the readers and writers of t27/formats.t27, and compare trits and scales
+// bit for bit. Python only moves bytes and renders the result.
+//
+// A cell has one status:
+//   TMX_MATCH              trits equal and every weight's scale has the same value
+//   TMX_MISMATCH           trits or scales differ: count, first index and an
+//                          explanation code per component
+//   TMX_NOT_REPRESENTABLE  the format cannot hold the reference: reason codes
+//                          (shape, binary_only, code_outside,
+//                          group_scales_differ, scale_precision) with the
+//                          number of affected units and the first weight index
+// Scales are compared as exact values (tf_scale_value), so an f16 word and a
+// bf16 word of the same number are equal; NaN and infinity are rejected
+// before anything is compared (TF_ERR_SCALE_NONFINITE).
+//
+// Scale layout: `group` weights of a row share one scale, ceil(cols / group)
+// scales per row in row order; group 0 means one scale for the whole tensor.
+// Reject statuses (negative returns, invalid input) reuse the classes of
+// t27/formats.t27 (specs/formats/OWNERS.md, "Status classes"): TF_ERR_FORMAT
+// (unknown format id or scale kind, a GGUF alignment that is not a power of
+// two), TF_ERR_LENGTH, TF_ERR_CAPACITY, TF_ERR_CODE (besides a trit outside
+// an encoder's codes: a reference scale value without an exact word of the
+// target scale type in tmx_convert_scales, a weight_scale whose half is not
+// a normal bf16 in tmx_explain_ties) and TF_ERR_SCALE_NONFINITE; the readers'
+// own statuses pass through. Cell statuses, reasons and explanations (TMX_*)
+// are verdicts on valid input, not rejects.
+// Every input is validated before the first output is written, except the
+// scratch buffers of tmx_round_trip and tmx_reencode.
+// This module needs formats.h earlier in the same translation unit.
+module TrinityMemoryMatrix {
+    const TMX_MATCH: i32 = 0;
+    const TMX_MISMATCH: i32 = 1;
+    const TMX_NOT_REPRESENTABLE: i32 = 2;
+
+    // Explanation of a component that differs (result slots *_EXPLAIN).
+    const TMX_EXPLAIN_NONE: i32 = 0;
+    // Every differing scale pair is a bf16 word and an f32 word, and the bf16
+    // word is the f32 word rounded to nearest-even.
+    const TMX_EXPLAIN_SCALE_BF16_ROUNDING: i32 = 1;
+    // Every differing trit sits at a weight whose bf16 master value is
+    // +-0.5 x weight_scale, and the reference stores both 0 and a nonzero trit
+    // for one such value (tmx_explain_ties).
+    const TMX_EXPLAIN_TIE_SPLIT: i32 = 2;
+    // Scales differ only at weights whose trit is 0 in both tensors, so every
+    // weight dequantizes to the same value (a writer that stores d = 0 for a
+    // block of zero weights, as llama.cpp's TQ1_0/TQ2_0 quantizers do).
+    const TMX_EXPLAIN_SCALE_ZERO_WEIGHTS: i32 = 3;
+    const TMX_EXPLAIN_UNEXPLAINED: i32 = 4;
+
+    // Reasons, in the order tmx_representable checks and reports them. Each
+    // has two slots in a caller-owned []i64 of 2 * TMX_REASON_COUNT: the number
+    // of affected units and the first affected weight index (-1 when none).
+    const TMX_REASON_SHAPE: usize = 0;
+    const TMX_REASON_BINARY_ONLY: usize = 1;
+    const TMX_REASON_CODE_OUTSIDE: usize = 2;
+    const TMX_REASON_GROUP_SCALES_DIFFER: usize = 3;
+    const TMX_REASON_SCALE_PRECISION: usize = 4;
+    const TMX_REASON_COUNT: usize = 5;
+    const TMX_REPRESENTABLE: i64 = -1;
+
+    // A GGUF tensor info record: name length (u64), name, dimension count
+    // (u32), one u64 per dimension, type id (u32) and data offset (u64).
+    const TMX_GGUF_INFO_FIXED_BYTES: u64 = 24;
+    const TMX_GGUF_INFO_DIM_BYTES: u64 = 8;
+
+    // Result slots of a caller-owned []i64 of TMX_R_COUNT entries.
+    const TMX_R_STATUS: usize = 0;
+    const TMX_R_TRITS_DIFFER: usize = 1;
+    const TMX_R_TRITS_FIRST: usize = 2;
+    const TMX_R_TRITS_EXPLAIN: usize = 3;
+    const TMX_R_SCALES_DIFFER: usize = 4;
+    const TMX_R_SCALES_FIRST: usize = 5;
+    const TMX_R_SCALES_EXPLAIN: usize = 6;
+    const TMX_R_REASON: usize = 7;
+    const TMX_R_OUTSIDE: usize = 8;
+    const TMX_R_CODE_BYTES: usize = 9;
+    const TMX_R_STORED_BYTES: usize = 10;
+    const TMX_R_COUNT: usize = 11;
+
+    // Slots of tmx_explain_ties' detail array.
+    const TMX_T_TIE_WORD: usize = 0;
+    const TMX_T_POS_NONZERO: usize = 1;
+    const TMX_T_POS_ZERO: usize = 2;
+    const TMX_T_NEG_NONZERO: usize = 3;
+    const TMX_T_NEG_ZERO: usize = 4;
+    const TMX_T_DIFFER_AT_TIES: usize = 5;
+    const TMX_T_DIFFER_ELSEWHERE: usize = 6;
+    const TMX_T_FIRST_ELSEWHERE: usize = 7;
+    const TMX_T_DERIVED_NONZERO: usize = 8;
+    const TMX_T_COUNT: usize = 9;
+
+    // Slots of tmx_locate's output.
+    const TMX_L_BYTE: usize = 0;
+    const TMX_L_POSITION: usize = 1;
+    const TMX_L_WIDTH: usize = 2;
+    const TMX_L_SCALE_BYTE: usize = 3;
+    const TMX_L_COUNT: usize = 4;
+
+    fn tmx_result_clear(result: []i64) -> void {
+        var i: usize = 0;
+        while (i < TMX_R_COUNT) { result[i] = 0; i = i + 1; }
+        result[TMX_R_TRITS_FIRST] = -1;
+        result[TMX_R_SCALES_FIRST] = -1;
+        result[TMX_R_REASON] = TMX_REPRESENTABLE;
+    }
+
+    fn tmx_reasons_clear(reasons: []i64) -> void {
+        var i: usize = 0;
+        while (i < TMX_REASON_COUNT) { reasons[2 * i] = 0; reasons[2 * i + 1] = -1; i = i + 1; }
+    }
+
+    fn tmx_kind_known(kind: i32) -> bool {
+        return kind == TF_KIND_F16 || kind == TF_KIND_BF16 || kind == TF_KIND_F32;
+    }
+
+    // ---- exact scale words ------------------------------------------------------
+    // The word of `kind` whose value is exactly `value`, or -1 when no word of
+    // that kind holds it (more significant bits, out of range, NaN, infinity).
+    // Zero of either sign gives +0. Scaling by 2 and 0.5 is exact in f64.
+    fn tmx_float_bits(value: f64, kind: i32) -> i64 {
+        var exponent_bits: i32 = 8;
+        var mantissa_bits: i32 = 23;
+        if (kind == TF_KIND_F16) { exponent_bits = 5; mantissa_bits = 10; }
+        if (kind == TF_KIND_BF16) { mantissa_bits = 7; }
+        if (!tmx_kind_known(kind)) { return -1; }
+        if (value != value) { return -1; }
+        var bias: i32 = 127;
+        if (kind == TF_KIND_F16) { bias = 15; }
+        var sign: i64 = 0;
+        var m: f64 = value;
+        if (m < 0.0) { sign = 1; m = 0.0 - m; }
+        if (m == 0.0) { return 0; }
+        var e: i32 = 0;
+        while (m >= 2.0 && e <= bias) { m = m * 0.5; e = e + 1; }
+        if (e > bias) { return -1; }
+        var lowest: i32 = 1 - bias;
+        while (m < 1.0 && e >= lowest - mantissa_bits - 1) { m = m * 2.0; e = e - 1; }
+        var shift: i64 = (exponent_bits + mantissa_bits) as i64;
+        var sign_bit: i64 = sign;
+        var k: i64 = 0;
+        while (k < shift) { sign_bit = sign_bit * 2; k = k + 1; }
+        if (e >= lowest) {
+            var fraction: f64 = (m - 1.0) * tf_pow2(mantissa_bits);
+            var whole: i64 = fraction as i64;
+            if ((whole as f64) != fraction) { return -1; }
+            var biased: i64 = (e + bias) as i64;
+            var k2: i32 = 0;
+            while (k2 < mantissa_bits) { biased = biased * 2; k2 = k2 + 1; }
+            return sign_bit + biased + whole;
+        }
+        // Subnormal: an integer multiple of 2^(lowest - mantissa_bits) below 2^lowest.
+        var steps: f64 = m * tf_pow2(e - (lowest - mantissa_bits));
+        var n: i64 = steps as i64;
+        if ((n as f64) != steps || n <= 0) { return -1; }
+        return sign_bit + n;
+    }
+
+    // f32 word rounded to nearest-even bf16 (the upper half). Requires a finite word.
+    fn tmx_bf16_round(word: u32) -> u32 {
+        var wide: u64 = word as u64;
+        var lsb: u64 = (wide >> 16) & 1;
+        return ((wide + 32767 + lsb) >> 16) as u32;
+    }
+
+    // True when one word is bf16, the other f32, and the bf16 word is the
+    // f32 word rounded to nearest-even.
+    fn tmx_rounding_pair(a: u32, a_kind: i32, b: u32, b_kind: i32) -> bool {
+        if (a_kind == TF_KIND_BF16 && b_kind == TF_KIND_F32) { return (a & 65535) == tmx_bf16_round(b); }
+        if (a_kind == TF_KIND_F32 && b_kind == TF_KIND_BF16) { return (b & 65535) == tmx_bf16_round(a); }
+        return false;
+    }
+
+    // ---- scale layouts ------------------------------------------------------------
+    fn tmx_scale_count(rows: usize, cols: usize, group: usize) -> usize {
+        if (group == 0) { return 1; }
+        return rows * ((cols + group - 1) / group);
+    }
+
+    fn tmx_scale_index(i: usize, cols: usize, group: usize) -> usize {
+        if (group == 0) { return 0; }
+        var per_row: usize = (cols + group - 1) / group;
+        return (i / cols) * per_row + (i % cols) / group;
+    }
+
+    // First weight index that scale `s` covers.
+    fn tmx_scale_first(s: usize, cols: usize, group: usize) -> usize {
+        if (group == 0) { return 0; }
+        var per_row: usize = (cols + group - 1) / group;
+        return (s / per_row) * cols + (s % per_row) * group;
+    }
+
+    fn tmx_block_format(format: i32) -> bool { return tf_block_elements(format) != 0; }
+
+    fn tmx_format_known(format: i32) -> bool {
+        return tmx_block_format(format) || format == TF_I2_S || format == TF_HF_PACKED ||
+            format == TF_LINEAR2 || format == TF_ONNX2;
+    }
+
+    // Scale kind a format stores: fp16 in the block formats, in MLX (the dtype
+    // of the published Bonsai MLX file) and in ONNX (MatMulNBits takes float or
+    // float16 scales; the matrix writes float16); bf16 weight_scale in HF
+    // packed; f32 in I2_S.
+    fn tmx_scale_kind(format: i32) -> i32 {
+        if (format == TF_HF_PACKED) { return TF_KIND_BF16; }
+        if (format == TF_I2_S) { return TF_KIND_F32; }
+        return TF_KIND_F16;
+    }
+
+    // Weights per stored scale along a row: the block size of a block format,
+    // the caller's MLX group or ONNX block size, 0 (one per tensor) for I2_S
+    // and HF packed.
+    fn tmx_scale_group(format: i32, group: usize) -> usize {
+        if (tmx_block_format(format)) { return tf_block_elements(format); }
+        if (format == TF_LINEAR2 || format == TF_ONNX2) { return group; }
+        return 0;
+    }
+
+    // Whether the format's geometry tiles a [rows, cols] tensor: block
+    // formats need whole blocks per row (ggml ne0 = cols), I2_S whole
+    // 128-weight blocks, HF packed rows % 4, MLX a valid group dividing cols,
+    // ONNX a power-of-two block of at least 16 (rows pad to whole blocks).
+    fn tmx_shape_valid(format: i32, rows: usize, cols: usize, group: usize) -> bool {
+        if (rows == 0 || cols == 0) { return false; }
+        if (tmx_block_format(format)) { return cols % tf_block_elements(format) == 0; }
+        if (format == TF_I2_S) { return (rows * cols) % 128 == 0; }
+        if (format == TF_HF_PACKED) { return rows % 4 == 0; }
+        if (format == TF_LINEAR2) { return tf_mlx2_group_valid(cols, group); }
+        if (format == TF_ONNX2) { return tf_onnx2_geometry(rows, cols, group); }
+        return false;
+    }
+
+    // Values the format's writer accepts (the encoders of t27/formats.t27):
+    // +2 (2-bit code 3) in TQ2_0, Q2_0, PQ2_0 and MLX; -2 (code 0 under the
+    // default zero point 2) in ONNX; +-1 only in Q1_0.
+    fn tmx_code_allowed(format: i32, value: i32) -> bool {
+        if (tmx_block_format(format)) { return tf_code_allowed(format, value); }
+        if (format == TF_LINEAR2) { return value >= -1 && value <= 2; }
+        if (format == TF_ONNX2) { return value >= -2 && value <= 1; }
+        return value >= -1 && value <= 1;
+    }
+
+    // Shared input checks of a reference: known format and kind, a scale count
+    // that fits the layout, finite scales. 0 or a reject status.
+    fn tmx_reference_valid(rows: usize, cols: usize, scales: []u32, scale_count: usize,
+                           scale_kind: i32, scale_group: usize) -> i32 {
+        if (!tmx_kind_known(scale_kind)) { return TF_ERR_FORMAT; }
+        if (rows == 0 || cols == 0) { return TF_ERR_LENGTH; }
+        if (scale_count != tmx_scale_count(rows, cols, scale_group)) { return TF_ERR_LENGTH; }
+        var s: usize = 0;
+        while (s < scale_count) {
+            if (tf_scale_class(scales[s], scale_kind) < 0) { return TF_ERR_SCALE_NONFINITE; }
+            s = s + 1;
+        }
+        return 0;
+    }
+
+    fn tmx_reason_add(reasons: []i64, reason: usize, first: usize) -> void {
+        if (reasons[2 * reason] == 0) { reasons[2 * reason + 1] = first as i64; }
+        reasons[2 * reason] = reasons[2 * reason] + 1;
+    }
+
+    // Can `format` hold the reference (values, scales)? Fills `reasons`
+    // (2 * TMX_REASON_COUNT slots, cleared first) and returns the first reason
+    // that applies in the order of the TMX_REASON_* constants, or
+    // TMX_REPRESENTABLE. A shape the format cannot tile stops the checks.
+    // Units: shape 1; binary_only and code_outside weights; group_scales_differ
+    // stored scale groups whose weights carry reference scales of different
+    // values; scale_precision reference scale words whose value the format's
+    // scale kind cannot hold exactly.
+    fn tmx_representable(format: i32, rows: usize, cols: usize, group: usize,
+                         values: []i32, scales: []u32, scale_count: usize, scale_kind: i32,
+                         scale_group: usize, reasons: []i64) -> i64 {
+        if (!tmx_format_known(format)) { return TF_ERR_FORMAT as i64; }
+        var valid: i32 = tmx_reference_valid(rows, cols, scales, scale_count, scale_kind, scale_group);
+        if (valid < 0) { return valid as i64; }
+        tmx_reasons_clear(reasons);
+        if (!tmx_shape_valid(format, rows, cols, group)) {
+            reasons[2 * TMX_REASON_SHAPE] = 1;
+            return TMX_REASON_SHAPE as i64;
+        }
+        var count: usize = rows * cols;
+        var i: usize = 0;
+        while (i < count) {
+            var v: i32 = values[i];
+            if (format == TF_Q1_0 && v == 0) { tmx_reason_add(reasons, TMX_REASON_BINARY_ONLY, i); }
+            else {
+                if (!tmx_code_allowed(format, v)) { tmx_reason_add(reasons, TMX_REASON_CODE_OUTSIDE, i); }
+            }
+            i = i + 1;
+        }
+        var target: usize = tmx_scale_group(format, group);
+        var current: usize = 0;
+        var head: f64 = 0.0;
+        var flagged: bool = false;
+        var source: usize = 0;
+        var value: f64 = 0.0;
+        i = 0;
+        while (i < count) {
+            var t: usize = tmx_scale_index(i, cols, target);
+            var at: usize = tmx_scale_index(i, cols, scale_group);
+            if (i == 0 || at != source) { source = at; value = tf_scale_value(scales[at], scale_kind); }
+            if (i == 0 || t != current) { current = t; head = value; flagged = false; }
+            else {
+                if (value != head && !flagged) {
+                    tmx_reason_add(reasons, TMX_REASON_GROUP_SCALES_DIFFER, i);
+                    flagged = true;
+                }
+            }
+            i = i + 1;
+        }
+        var kind: i32 = tmx_scale_kind(format);
+        var s: usize = 0;
+        while (s < scale_count) {
+            if (tmx_float_bits(tf_scale_value(scales[s], scale_kind), kind) < 0) {
+                tmx_reason_add(reasons, TMX_REASON_SCALE_PRECISION, tmx_scale_first(s, cols, scale_group));
+            }
+            s = s + 1;
+        }
+        var r: usize = 0;
+        while (r < TMX_REASON_COUNT) {
+            if (reasons[2 * r] > 0) { return r as i64; }
+            r = r + 1;
+        }
+        return TMX_REPRESENTABLE;
+    }
+
+    // The format's scale words for a representable reference: one word of
+    // tmx_scale_kind(format) per stored group, the value of the reference
+    // scale at the group's first weight. TF_ERR_CODE when that value has no
+    // exact word (the reference was not representable). Returns the count.
+    fn tmx_convert_scales(format: i32, rows: usize, cols: usize, group: usize,
+                          scales: []u32, scale_count: usize, scale_kind: i32, scale_group: usize,
+                          out: []u32, capacity: usize) -> i64 {
+        if (!tmx_format_known(format)) { return TF_ERR_FORMAT as i64; }
+        var valid: i32 = tmx_reference_valid(rows, cols, scales, scale_count, scale_kind, scale_group);
+        if (valid < 0) { return valid as i64; }
+        var target: usize = tmx_scale_group(format, group);
+        if (target != 0 && !tmx_shape_valid(format, rows, cols, group)) { return TF_ERR_LENGTH as i64; }
+        var n: usize = tmx_scale_count(rows, cols, target);
+        if (n > capacity) { return TF_ERR_CAPACITY as i64; }
+        var kind: i32 = tmx_scale_kind(format);
+        var t: usize = 0;
+        while (t < n) {
+            var first: usize = tmx_scale_first(t, cols, target);
+            var value: f64 = tf_scale_value(scales[tmx_scale_index(first, cols, scale_group)], scale_kind);
+            if (tmx_float_bits(value, kind) < 0) { return TF_ERR_CODE as i64; }
+            t = t + 1;
+        }
+        t = 0;
+        while (t < n) {
+            var first2: usize = tmx_scale_first(t, cols, target);
+            var value2: f64 = tf_scale_value(scales[tmx_scale_index(first2, cols, scale_group)], scale_kind);
+            out[t] = tmx_float_bits(value2, kind) as u32;
+            t = t + 1;
+        }
+        return n as i64;
+    }
+
+    // ---- writers and readers by format id ---------------------------------------
+    // Writes the codes (and the embedded scales of block formats and I2_S) of
+    // a [rows, cols] tensor. `words` holds tmx_scale_count(rows, cols,
+    // tmx_scale_group(format, group)) scale words. ONNX uses the default zero
+    // point. Returns the bytes written or the encoder's status.
+    fn tmx_encode(format: i32, rows: usize, cols: usize, group: usize, values: []i32,
+                  words: []u32, word_count: usize, out: []u8, capacity: usize) -> i64 {
+        var none: [1]u8 = [0];
+        if (tmx_block_format(format)) {
+            return tf_encode_blocks(format, values, rows * cols, words, word_count, out, capacity);
+        }
+        if (format == TF_I2_S) {
+            if (word_count != 1) { return TF_ERR_LENGTH as i64; }
+            return tf_encode_i2s(values, rows * cols, words[0], out, capacity);
+        }
+        if (format == TF_HF_PACKED) { return tf_encode_hf_packed(values, rows, cols, out, capacity); }
+        if (format == TF_LINEAR2) { return tf_encode_mlx2(values, rows, cols, group, out, capacity); }
+        if (format == TF_ONNX2) { return tf_encode_onnx2(values, rows, cols, group, none, 0, out, capacity); }
+        return TF_ERR_FORMAT as i64;
+    }
+
+    // Reads back what tmx_encode wrote: values, and in `words_out` the scale
+    // words (from the bytes for block formats and I2_S; the stored external
+    // words `words` for HF packed, MLX and ONNX). Returns the count of values
+    // outside {-1, 0, +1} or the reader's status.
+    fn tmx_decode(format: i32, rows: usize, cols: usize, group: usize, data: []u8, size: usize,
+                  words: []u32, word_count: usize, values: []i32, value_capacity: usize,
+                  words_out: []u32, word_capacity: usize) -> i64 {
+        var none: [1]u8 = [0];
+        var count: usize = rows * cols;
+        var outside: i64 = 0;
+        if (tmx_block_format(format)) {
+            return tf_decode_blocks(format, data, size, count, values, value_capacity, words_out, word_capacity);
+        }
+        if (format == TF_I2_S) {
+            if (word_capacity < 1) { return TF_ERR_CAPACITY as i64; }
+            return tf_decode_i2s(data, size, count, values, value_capacity, words_out);
+        }
+        if (word_count > word_capacity) { return TF_ERR_CAPACITY as i64; }
+        if (format == TF_HF_PACKED) {
+            if (word_count != 1) { return TF_ERR_LENGTH as i64; }
+            outside = tf_decode_hf_packed(data, size, rows, cols, values, value_capacity);
+        } else {
+            if (word_count != tmx_scale_count(rows, cols, group)) { return TF_ERR_LENGTH as i64; }
+            if (format == TF_LINEAR2) { outside = tf_decode_mlx2(data, size, rows, cols, group, values, value_capacity); }
+            else {
+                if (format == TF_ONNX2) {
+                    outside = tf_decode_onnx2(data, size, rows, cols, group, none, 0, values, value_capacity);
+                } else { return TF_ERR_FORMAT as i64; }
+            }
+        }
+        if (outside < 0) { return outside; }
+        var w: usize = 0;
+        while (w < word_count) { words_out[w] = words[w]; w = w + 1; }
+        return outside;
+    }
+
+    // Bytes a format stores outside its code bytes: the bf16 weight_scale of HF
+    // packed, fp16 scale and bias per MLX group, one fp16 scale per ONNX block.
+    fn tmx_external_bytes(format: i32, word_count: usize) -> usize {
+        if (format == TF_HF_PACKED) { return 2 * word_count; }
+        if (format == TF_LINEAR2) { return 4 * word_count; }
+        if (format == TF_ONNX2) { return 2 * word_count; }
+        return 0;
+    }
+
+    // Bits per weight of `bytes` stored bytes over `weights` weights (0 when
+    // there are no weights). Both operands are exact in f64 below 2^53, so
+    // the quotient is the correctly rounded value.
+    fn tmx_bits_per_weight(bytes: u64, weights: u64) -> f64 {
+        if (weights == 0) { return 0.0; }
+        return ((8 * bytes) as f64) / (weights as f64);
+    }
+
+    // Metadata share of one tensor in a GGUF file (specs/formats/OWNERS.md,
+    // "Bits per weight"; tfs_llama_gguf_tensor_bits of
+    // specs/formats/llama_cpp.t27 counts the same bytes in bits): its info
+    // record, TMX_GGUF_INFO_FIXED_BYTES + the name + TMX_GGUF_INFO_DIM_BYTES
+    // per dimension, plus the alignment padding after its `data_bytes`.
+    // TF_ERR_FORMAT when the alignment is not a power of two.
+    fn tmx_gguf_metadata_bytes(name_size: u64, dims: u64, data_bytes: u64, alignment: u64) -> i64 {
+        if (alignment == 0 || (alignment & (alignment - 1)) != 0) { return TF_ERR_FORMAT as i64; }
+        var padding: u64 = (alignment - data_bytes % alignment) % alignment;
+        return (TMX_GGUF_INFO_FIXED_BYTES + name_size + TMX_GGUF_INFO_DIM_BYTES * dims + padding) as i64;
+    }
+
+    // ---- comparison ---------------------------------------------------------------
+    // Compares trits a and b of a [rows, cols] tensor and, when with_scales,
+    // their scales weight by weight. Fills result (status, the trit and scale
+    // differences with their first index, explanations). A trit difference
+    // is TMX_EXPLAIN_UNEXPLAINED until tmx_explain_ties explains it; a scale
+    // difference is TMX_EXPLAIN_SCALE_BF16_ROUNDING when every differing pair
+    // is a bf16 word and the f32 word it rounds, else
+    // TMX_EXPLAIN_SCALE_ZERO_WEIGHTS when every weight whose scales differ has
+    // trit 0 in both tensors, else unexplained.
+    fn tmx_compare(a: []i32, b: []i32, rows: usize, cols: usize,
+                   a_scales: []u32, a_count: usize, a_kind: i32, a_group: usize,
+                   b_scales: []u32, b_count: usize, b_kind: i32, b_group: usize,
+                   with_scales: bool, result: []i64) -> i32 {
+        if (rows == 0 || cols == 0) { return TF_ERR_LENGTH; }
+        if (with_scales) {
+            var va: i32 = tmx_reference_valid(rows, cols, a_scales, a_count, a_kind, a_group);
+            if (va < 0) { return va; }
+            var vb: i32 = tmx_reference_valid(rows, cols, b_scales, b_count, b_kind, b_group);
+            if (vb < 0) { return vb; }
+        }
+        var count: usize = rows * cols;
+        var first: [1]i64 = [0];
+        var trits: i64 = tf_mismatches(a, b, count, first);
+        var trits_first: i64 = first[0];
+        var scales: i64 = -1;
+        var scales_first: i64 = -1;
+        var explained: bool = true;
+        var zero_only: bool = true;
+        if (with_scales) {
+            scales = 0;
+            var last_a: usize = 0;
+            var last_b: usize = 0;
+            var same: bool = true;
+            var i: usize = 0;
+            while (i < count) {
+                var ai: usize = tmx_scale_index(i, cols, a_group);
+                var bi: usize = tmx_scale_index(i, cols, b_group);
+                if (i == 0 || ai != last_a || bi != last_b) {
+                    last_a = ai;
+                    last_b = bi;
+                    same = tf_scale_value(a_scales[ai], a_kind) == tf_scale_value(b_scales[bi], b_kind);
+                    if (!same && !tmx_rounding_pair(a_scales[ai], a_kind, b_scales[bi], b_kind)) { explained = false; }
+                }
+                if (!same) {
+                    if (scales == 0) { scales_first = i as i64; }
+                    scales = scales + 1;
+                    if (a[i] != 0 || b[i] != 0) { zero_only = false; }
+                }
+                i = i + 1;
+            }
+        }
+        tmx_result_clear(result);
+        result[TMX_R_TRITS_DIFFER] = trits;
+        result[TMX_R_TRITS_FIRST] = trits_first;
+        if (trits > 0) { result[TMX_R_TRITS_EXPLAIN] = TMX_EXPLAIN_UNEXPLAINED as i64; }
+        result[TMX_R_SCALES_DIFFER] = scales;
+        result[TMX_R_SCALES_FIRST] = scales_first;
+        if (scales > 0) {
+            result[TMX_R_SCALES_EXPLAIN] = TMX_EXPLAIN_UNEXPLAINED as i64;
+            if (zero_only) { result[TMX_R_SCALES_EXPLAIN] = TMX_EXPLAIN_SCALE_ZERO_WEIGHTS as i64; }
+            if (explained) { result[TMX_R_SCALES_EXPLAIN] = TMX_EXPLAIN_SCALE_BF16_ROUNDING as i64; }
+        }
+        if (trits > 0 || scales > 0) { result[TMX_R_STATUS] = TMX_MISMATCH as i64; }
+        else { result[TMX_R_STATUS] = TMX_MATCH as i64; }
+        return 0;
+    }
+
+    // bf16 word of half the value of a normal bf16 word (its exponent minus
+    // one, exact), or -1 when the result would not be a normal number.
+    fn tmx_bf16_half(word: u32) -> i64 {
+        var exponent: u32 = (word >> 7) & 255;
+        if (exponent < 2 || exponent == 255) { return -1; }
+        return ((word & 65535) - 128) as i64;
+    }
+
+    // Explains trit differences between `reference` (stored trits) and
+    // `derived` (trits computed from the bf16 master weights `master`, count
+    // bf16 words) by the tie value t = 0.5 x weight_scale (bf16 word
+    // weight_scale). detail (TMX_T_COUNT slots): the tie word; at +t and at -t
+    // the reference weights that are nonzero and zero; the differences at
+    // +-t and elsewhere with the first one elsewhere; derived nonzero trits at
+    // +-t. Sets result[TMX_R_TRITS_EXPLAIN] to TMX_EXPLAIN_TIE_SPLIT when every
+    // difference is at +-t and one of the two values carries both a zero and
+    // a nonzero reference trit (so no function of the bf16 value gives the
+    // reference trits); otherwise leaves an existing explanation unexplained.
+    // result must come from tmx_compare of the same two trit tensors.
+    fn tmx_explain_ties(master: []u8, size: usize, count: usize, weight_scale: u32,
+                        reference: []i32, derived: []i32, detail: []i64, result: []i64) -> i32 {
+        if (count == 0 || size / 2 < count) { return TF_ERR_LENGTH; }
+        var half: i64 = tmx_bf16_half(weight_scale);
+        if (half < 0) { return TF_ERR_CODE; }
+        var tie: u32 = half as u32;
+        var k: usize = 0;
+        while (k < TMX_T_COUNT) { detail[k] = 0; k = k + 1; }
+        detail[TMX_T_TIE_WORD] = half;
+        detail[TMX_T_FIRST_ELSEWHERE] = -1;
+        var i: usize = 0;
+        while (i < count) {
+            var word: u32 = tf_read_u16(master, 2 * i);
+            var at_tie: bool = (word & 32767) == tie;
+            if (at_tie) {
+                var slot: usize = TMX_T_POS_NONZERO;
+                if ((word & 32768) != 0) { slot = TMX_T_NEG_NONZERO; }
+                if (reference[i] == 0) { slot = slot + 1; }
+                detail[slot] = detail[slot] + 1;
+                if (derived[i] != 0) { detail[TMX_T_DERIVED_NONZERO] = detail[TMX_T_DERIVED_NONZERO] + 1; }
+            }
+            if (reference[i] != derived[i]) {
+                if (at_tie) { detail[TMX_T_DIFFER_AT_TIES] = detail[TMX_T_DIFFER_AT_TIES] + 1; }
+                else {
+                    if (detail[TMX_T_DIFFER_ELSEWHERE] == 0) { detail[TMX_T_FIRST_ELSEWHERE] = i as i64; }
+                    detail[TMX_T_DIFFER_ELSEWHERE] = detail[TMX_T_DIFFER_ELSEWHERE] + 1;
+                }
+            }
+            i = i + 1;
+        }
+        var split: bool = (detail[TMX_T_POS_NONZERO] > 0 && detail[TMX_T_POS_ZERO] > 0) ||
+            (detail[TMX_T_NEG_NONZERO] > 0 && detail[TMX_T_NEG_ZERO] > 0);
+        if (result[TMX_R_TRITS_DIFFER] > 0) {
+            if (detail[TMX_T_DIFFER_AT_TIES] == result[TMX_R_TRITS_DIFFER] &&
+                detail[TMX_T_DIFFER_ELSEWHERE] == 0 && split) {
+                result[TMX_R_TRITS_EXPLAIN] = TMX_EXPLAIN_TIE_SPLIT as i64;
+            } else {
+                result[TMX_R_TRITS_EXPLAIN] = TMX_EXPLAIN_UNEXPLAINED as i64;
+            }
+        }
+        return 0;
+    }
+
+    // ---- cells ----------------------------------------------------------------------
+    // One round-trip cell: decide representability; if representable, convert
+    // the scales, write the tensor in `format` with the t27 encoder, read it
+    // back with the t27 decoder and compare with the reference. Scratch:
+    // words (scale words written), out (bytes written, first
+    // result[TMX_R_CODE_BYTES] valid), decoded and decoded_words. Returns 0
+    // with result and reasons filled, or a reject status.
+    fn tmx_round_trip(format: i32, rows: usize, cols: usize, group: usize,
+                      values: []i32, scales: []u32, scale_count: usize, scale_kind: i32, scale_group: usize,
+                      words: []u32, word_capacity: usize, out: []u8, out_capacity: usize,
+                      decoded: []i32, decoded_capacity: usize, decoded_words: []u32,
+                      reasons: []i64, result: []i64) -> i32 {
+        var primary: i64 = tmx_representable(format, rows, cols, group, values, scales, scale_count,
+                                             scale_kind, scale_group, reasons);
+        if (primary < TMX_REPRESENTABLE) { return primary as i32; }
+        tmx_result_clear(result);
+        result[TMX_R_REASON] = primary;
+        if (primary != TMX_REPRESENTABLE) {
+            result[TMX_R_STATUS] = TMX_NOT_REPRESENTABLE as i64;
+            result[TMX_R_TRITS_DIFFER] = -1;
+            result[TMX_R_SCALES_DIFFER] = -1;
+            return 0;
+        }
+        var n: i64 = tmx_convert_scales(format, rows, cols, group, scales, scale_count, scale_kind, scale_group,
+                                        words, word_capacity);
+        if (n < 0) { return n as i32; }
+        var written: i64 = tmx_encode(format, rows, cols, group, values, words, n as usize, out, out_capacity);
+        if (written < 0) { return written as i32; }
+        var outside: i64 = tmx_decode(format, rows, cols, group, out, written as usize, words, n as usize,
+                                      decoded, decoded_capacity, decoded_words, word_capacity);
+        if (outside < 0) { return outside as i32; }
+        var target: usize = tmx_scale_group(format, group);
+        var status: i32 = tmx_compare(values, decoded, rows, cols, scales, scale_count, scale_kind, scale_group,
+                                      decoded_words, n as usize, tmx_scale_kind(format), target, true, result);
+        if (status < 0) { return status; }
+        result[TMX_R_REASON] = TMX_REPRESENTABLE;
+        result[TMX_R_OUTSIDE] = outside;
+        result[TMX_R_CODE_BYTES] = written;
+        result[TMX_R_STORED_BYTES] = written + (tmx_external_bytes(format, n as usize) as i64);
+        return 0;
+    }
+
+    // Positions where two byte strings differ; first[0] is the first or -1.
+    fn tmx_bytes_differ(a: []u8, b: []u8, count: usize, first: []i64) -> i64 {
+        var total: i64 = 0;
+        first[0] = -1;
+        var i: usize = 0;
+        while (i < count) {
+            if (a[i] != b[i]) {
+                if (total == 0) { first[0] = i as i64; }
+                total = total + 1;
+            }
+            i = i + 1;
+        }
+        return total;
+    }
+
+    // Writes the decoded values and scale words of a published tensor again
+    // with the t27 encoder and compares the result with the published code
+    // bytes. Returns the number of differing bytes (first[0] the first), or
+    // TF_ERR_LENGTH when the encoder writes another size, or its status.
+    fn tmx_reencode(format: i32, rows: usize, cols: usize, group: usize, values: []i32,
+                    words: []u32, word_count: usize, published: []u8, size: usize,
+                    scratch: []u8, capacity: usize, first: []i64) -> i64 {
+        first[0] = -1;
+        var written: i64 = tmx_encode(format, rows, cols, group, values, words, word_count, scratch, capacity);
+        if (written < 0) { return written; }
+        if ((written as usize) != size) { return TF_ERR_LENGTH as i64; }
+        return tmx_bytes_differ(scratch, published, size, first);
+    }
+
+    // ---- minimal reproductions --------------------------------------------------------
+    // Where weight `index` of a [rows, cols] tensor sits in the format's code
+    // bytes: out[TMX_L_BYTE] the byte offset, out[TMX_L_POSITION] the lowest
+    // bit of the code (or the base-3 digit, most significant first, for TQ1_0
+    // and PTQ1_0), out[TMX_L_WIDTH] the code width in bits (2, 1 for Q1_0, 0
+    // for a base-3 digit), out[TMX_L_SCALE_BYTE] the offset of the scale word
+    // that covers it in the same bytes (block formats, I2_S) or -1 (the scale
+    // is stored apart: HF packed, MLX, ONNX). TF_ERR_LENGTH for an index or
+    // shape out of range.
+    fn tmx_locate(format: i32, rows: usize, cols: usize, group: usize, index: usize, out: []i64) -> i32 {
+        if (!tmx_format_known(format)) { return TF_ERR_FORMAT; }
+        if (!tmx_shape_valid(format, rows, cols, group) || index >= rows * cols) { return TF_ERR_LENGTH; }
+        var byte: usize = 0;
+        var position: usize = 0;
+        var width: usize = 2;
+        var scale_byte: i64 = -1;
+        if (tmx_block_format(format)) {
+            var per: usize = tf_block_elements(format);
+            var base: usize = (index / per) * tf_block_bytes(format);
+            var e: usize = index % per;
+            scale_byte = (base + tf_scale_offset(format)) as i64;
+            if (format == TF_TQ1_0 || format == TF_PTQ1_0) {
+                var wide: usize = tf_b3_wide(format);
+                byte = base + tf_b3_byte(e, wide);
+                position = tf_b3_digit(e, wide);
+                width = 0;
+            } else {
+                if (format == TF_TQ2_0) { byte = base + 32 * (e / 128) + e % 32; position = 2 * ((e % 128) / 32); }
+                else {
+                    if (format == TF_Q1_0) { byte = base + 2 + e / 8; position = e % 8; width = 1; }
+                    else { byte = base + 2 + e / 4; position = 2 * (e % 4); }
+                }
+            }
+        } else {
+            if (format == TF_I2_S) {
+                scale_byte = ((rows * cols) / 4) as i64;
+                var within: usize = index % 128;
+                byte = 32 * (index / 128) + within % 32;
+                position = 6 - 2 * (within / 32);
+            } else {
+                var r: usize = index / cols;
+                var c: usize = index % cols;
+                if (format == TF_HF_PACKED) {
+                    var stride: usize = rows / 4;
+                    byte = (r % stride) * cols + c;
+                    position = 2 * (r / stride);
+                } else {
+                    var row_bytes: usize = cols / 4;
+                    if (format == TF_ONNX2) { row_bytes = tf_onnx2_row_bytes(cols, group); }
+                    byte = r * row_bytes + c / 4;
+                    position = 2 * (c % 4);
+                }
+            }
+        }
+        out[TMX_L_BYTE] = byte as i64;
+        out[TMX_L_POSITION] = position as i64;
+        out[TMX_L_WIDTH] = width as i64;
+        out[TMX_L_SCALE_BYTE] = scale_byte;
+        return 0;
+    }
+
+    // The first `capacity` indices where a and b differ; returns how many were written.
+    fn tmx_mismatch_indices(a: []i32, b: []i32, count: usize, out: []i64, capacity: usize) -> i64 {
+        var written: usize = 0;
+        var i: usize = 0;
+        while (i < count && written < capacity) {
+            if (a[i] != b[i]) { out[written] = i as i64; written = written + 1; }
+            i = i + 1;
+        }
+        return written as i64;
+    }
+
+    // The first `capacity` indices whose bf16 master word is `word` and whose
+    // reference trit is `trit`; returns how many were written.
+    fn tmx_word_indices(master: []u8, size: usize, count: usize, word: u32, reference: []i32, trit: i32,
+                        out: []i64, capacity: usize) -> i64 {
+        if (size / 2 < count) { return TF_ERR_LENGTH as i64; }
+        var written: usize = 0;
+        var i: usize = 0;
+        while (i < count && written < capacity) {
+            if (tf_read_u16(master, 2 * i) == word && reference[i] == trit) {
+                out[written] = i as i64;
+                written = written + 1;
+            }
+            i = i + 1;
+        }
+        return written as i64;
+    }
+
+    test tmx_exact_words {
+        assert(tmx_float_bits(1.21875, 1) == 15584);
+        assert(tmx_float_bits(1.21875, 2) == 16284);
+        assert(tmx_float_bits(-2.0, 1) == 49152);
+        assert(tmx_float_bits(0.000000059604644775390625, 1) == 1);
+        assert(tmx_float_bits(65504.0, 1) == 31743);
+        assert(tmx_float_bits(65536.0, 1) == -1);
+        assert(tmx_float_bits(1.0009765625, 1) == 15361);
+        assert(tmx_float_bits(1.0009765625, 2) == -1);
+        assert(tmx_bf16_round(1067188224 + 32767) == 16284);
+        assert(tmx_bf16_round(1065353216 + 32768) == 16256);
+        assert(tmx_bf16_round(1065353216 + 98304) == 16258);
+        assert(tmx_bf16_half(16284) == 16156);
+    }
+
+    test tmx_small_cells {
+        var values: [8]i32 = [1, 0, -1, 1, 0, 0, -1, 1];
+        var one: [1]u32 = [15360];
+        var rows: [4]u32 = [15360, 15360, 15360, 14336];
+        var reasons: [10]i64 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert(tmx_representable(8, 4, 2, 0, values, one, 1, 1, 0, reasons) == -1);
+        assert(tmx_representable(8, 4, 2, 0, values, rows, 4, 1, 2, reasons) == 3);
+        assert(reasons[6] == 1);
+        assert(reasons[7] == 6);
+        assert(reasons[8] == 0);
+        values[1] = 2;
+        assert(tmx_representable(8, 4, 2, 0, values, rows, 4, 1, 2, reasons) == 2);
+        assert(reasons[4] == 1);
+        assert(reasons[5] == 1);
+        assert(tmx_representable(8, 3, 2, 0, values, one, 1, 1, 0, reasons) == 0);
+    }
+
+    test tmx_metadata_share {
+        assert(tmx_gguf_metadata_bytes(21, 2, 25067520, 32) == 61);
+        assert(tmx_gguf_metadata_bytes(21, 2, 25067521, 32) == 92);
+        assert(tmx_gguf_metadata_bytes(21, 2, 1, 24) == -50);
+        assert(tmx_gguf_metadata_bytes(21, 2, 1, 0) == -50);
+        assert(tmx_bits_per_weight(18, 64) == 2.25);
+        assert(tmx_bits_per_weight(1638432, 6553600) == 2.0000390625);
+        assert(tmx_bits_per_weight(1, 0) == 0.0);
+    }
+}

@@ -1,0 +1,271 @@
+// SPDX-License-Identifier: Apache-2.0
+// t27/specs/fpga/mmcm.t27
+// MMCM clock generator model for Trinity T27 FPGA HIR
+// One clock in, one multiplied VCO, one divided clock out (MMCME2, Artix-7)
+// All times integer; frequencies in kHz unless a name says MHz
+// phi^2 + 1/phi^2 = 3 | TRINITY
+//
+// RANGES AND THEIR SOURCES. The divide/multiply ranges below (DIVCLK 1..106,
+// CLKFBOUT_MULT 2.000..64.000 in 0.125 steps, CLKOUT_DIVIDE 1..128, phase step
+// 1/56 of the VCO period) are the MMCME2 envelope as documented in AMD/Xilinx
+// UG472, "7 Series FPGAs Clocking Resources". The VCO window 800..1600 MHz,
+// the input window 70..800 MHz and the lock window 500 us are TEACHING
+// ASSUMPTIONS: UG472 and DS181 list the exact VCO and Fin limits per speed
+// grade and the exact lock time per device, and a real design reads its own
+// numbers from its own timing report, not from this file. They are kept here,
+// labelled, so the course can teach the shape of the rule (VCO must land in a
+// window; the output divides it down) without pretending to a datasheet it
+// does not have.
+
+module Mmcm {
+
+    // === Envelope constants (see header for sources) ===
+
+    pub const DIVCLK_MIN : u32 = 1;
+    pub const DIVCLK_MAX : u32 = 106;
+    pub const MULT_MIN_EIGHTHS : u32 = 16;   // 2.000
+    pub const MULT_MAX_EIGHTHS : u32 = 512;  // 64.000
+    pub const CLKOUT_DIV_MIN : u32 = 1;
+    pub const CLKOUT_DIV_MAX : u32 = 128;
+    pub const FIN_MIN_MHZ : u32 = 70;        // assumption, see header
+    pub const FIN_MAX_MHZ : u32 = 800;       // assumption, see header
+    pub const VCO_MIN_KHZ : u32 = 800000;    // 800 MHz, assumption, see header
+    pub const VCO_MAX_KHZ : u32 = 1600000;   // 1600 MHz, assumption, see header
+    pub const PHASE_GRAN_DIVISOR : u32 = 56; // 1/56 of the VCO period, UG472
+    pub const LOCK_WINDOW_US : u32 = 500;    // assumption, see header
+
+    // === MMCM configuration ===
+
+    pub struct MmcmConfig {
+        name : &str,
+        fin_mhz : u32,
+        divclk_divide : u32,
+        clkfbout_mult_eighths : u32,  // M * 8, so 0.125 steps stay integer
+        clkout0_divide : u32,
+    }
+
+    fn mmcm(name: &str, fin_mhz: u32, divclk_divide: u32, mult_eighths: u32, clkout0_divide: u32) -> MmcmConfig {
+        return MmcmConfig{
+            .name = name,
+            .fin_mhz = fin_mhz,
+            .divclk_divide = divclk_divide,
+            .clkfbout_mult_eighths = mult_eighths,
+            .clkout0_divide = clkout0_divide,
+        };
+    }
+
+    // === Frequency arithmetic ===
+
+    // F_VCO = F_IN * M / D, in kHz; caller must keep divclk_divide >= 1
+    fn vco_khz(cfg: MmcmConfig) -> u32 {
+        if cfg.divclk_divide == 0 {
+            return 0;
+        }
+        return cfg.fin_mhz * 1000 * cfg.clkfbout_mult_eighths / (8 * cfg.divclk_divide);
+    }
+
+    fn vco_mhz(cfg: MmcmConfig) -> u32 {
+        return vco_khz(cfg) / 1000;
+    }
+
+    // F_OUT = F_VCO / O, in kHz; caller must keep clkout0_divide >= 1
+    fn clkout_khz(cfg: MmcmConfig) -> u32 {
+        if cfg.clkout0_divide == 0 {
+            return 0;
+        }
+        return vco_khz(cfg) / cfg.clkout0_divide;
+    }
+
+    fn clkout_mhz(cfg: MmcmConfig) -> u32 {
+        return clkout_khz(cfg) / 1000;
+    }
+
+    fn is_vco_in_range(cfg: MmcmConfig) -> bool {
+        var v : u32 = vco_khz(cfg);
+        return v >= VCO_MIN_KHZ and v <= VCO_MAX_KHZ;
+    }
+
+    // VCO period in femtoseconds, so a 1600 MHz VCO keeps 625000 fs of it
+    fn vco_period_fs(cfg: MmcmConfig) -> i64 {
+        var v : u32 = vco_khz(cfg);
+        if v == 0 {
+            return 0;
+        }
+        return 1000000000000 / (v as i64);
+    }
+
+    // Fine phase step: 1/56 of the VCO period (UG472). More VCO MHz means a
+    // finer phase knob, which is why a high VCO is wanted for phase work.
+    fn phase_step_fs(cfg: MmcmConfig) -> i64 {
+        return vco_period_fs(cfg) / (PHASE_GRAN_DIVISOR as i64);
+    }
+
+    // === Lock model ===
+
+    pub struct LockState {
+        lock_counter_us : u32,
+        locked : bool,
+    }
+
+    fn unlocked_state() -> LockState {
+        return LockState{ .lock_counter_us = 0, .locked = false };
+    }
+
+    // One microsecond of settling with a legal, unchanging configuration
+    fn lock_step(s: LockState) -> LockState {
+        if s.locked {
+            return s;
+        }
+        if s.lock_counter_us + 1 >= LOCK_WINDOW_US {
+            return LockState{ .lock_counter_us = LOCK_WINDOW_US, .locked = true };
+        }
+        return LockState{ .lock_counter_us = s.lock_counter_us + 1, .locked = false };
+    }
+
+    // A reconfiguration drops lock immediately and restarts the window
+    fn relock(s: LockState) -> LockState {
+        return unlocked_state();
+    }
+
+    // Settle the model for a given number of microseconds without stepping
+    // one microsecond at a time: lock arrives exactly at the window edge
+    fn lock_after(us: u32) -> LockState {
+        if us >= LOCK_WINDOW_US {
+            return LockState{ .lock_counter_us = LOCK_WINDOW_US, .locked = true };
+        }
+        return LockState{ .lock_counter_us = us, .locked = false };
+    }
+
+    // === Validation ===
+
+    fn validate_mmcm(cfg: MmcmConfig) -> u32 {
+        var errors : u32 = 0;
+
+        if cfg.name == "" {
+            errors = errors + 1;
+        }
+        if cfg.divclk_divide < DIVCLK_MIN or cfg.divclk_divide > DIVCLK_MAX {
+            errors = errors + 1;
+        }
+        if cfg.clkfbout_mult_eighths < MULT_MIN_EIGHTHS or cfg.clkfbout_mult_eighths > MULT_MAX_EIGHTHS {
+            errors = errors + 1;
+        }
+        if cfg.clkout0_divide < CLKOUT_DIV_MIN or cfg.clkout0_divide > CLKOUT_DIV_MAX {
+            errors = errors + 1;
+        }
+        if cfg.fin_mhz < FIN_MIN_MHZ or cfg.fin_mhz > FIN_MAX_MHZ {
+            errors = errors + 1;
+        }
+        // Only judge the VCO once the dividers can form a frequency at all
+        if cfg.divclk_divide >= DIVCLK_MIN and is_vco_in_range(cfg) == false {
+            errors = errors + 1;
+        }
+
+        return errors;
+    }
+
+    // === Tests ===
+
+    test vco_multiplies_the_input
+        given cfg = mmcm("sys_mmcm", 200, 1, 40, 10)
+        then vco_khz(cfg) == 1000000
+        and vco_mhz(cfg) == 1000
+
+    test clkout_divides_the_vco
+        given cfg = mmcm("sys_mmcm", 200, 1, 40, 10)
+        then clkout_khz(cfg) == 100000
+        and clkout_mhz(cfg) == 100
+
+    test divclk_divides_first
+        given cfg = mmcm("half_in", 200, 2, 40, 10)
+        then vco_khz(cfg) == 500000
+        and vco_mhz(cfg) == 500
+
+    test mult_moves_in_eighth_steps
+        given cfg = mmcm("fractional", 100, 1, 65, 1)
+        then vco_khz(cfg) == 812500
+        and vco_mhz(cfg) == 812
+
+    test vco_below_the_window_is_rejected
+        given cfg = mmcm("too_low", 100, 1, 40, 5)
+        then vco_mhz(cfg) == 500
+        and is_vco_in_range(cfg) == false
+
+    test vco_above_the_window_is_rejected
+        given cfg = mmcm("too_high", 200, 1, 512, 8)
+        then vco_mhz(cfg) == 12800
+        and is_vco_in_range(cfg) == false
+
+    test a_legal_100mhz_request_passes
+        given cfg = mmcm("sys_mmcm", 200, 1, 40, 10)
+        then validate_mmcm(cfg) == 0
+        and is_vco_in_range(cfg) == true
+
+    test vco_out_of_range_is_an_error
+        given cfg = mmcm("bad_vco", 100, 1, 40, 5)
+        then validate_mmcm(cfg) > 0
+
+    test zero_divclk_is_an_error
+        given cfg = mmcm("zero_d", 200, 0, 40, 10)
+        then validate_mmcm(cfg) > 0
+        and vco_khz(cfg) == 0
+
+    test mult_above_64_is_an_error
+        given cfg = mmcm("big_m", 200, 1, 520, 10)
+        then validate_mmcm(cfg) > 0
+
+    test input_above_the_window_is_an_error
+        given cfg = mmcm("fast_in", 900, 1, 40, 10)
+        then validate_mmcm(cfg) > 0
+
+    test phase_step_is_one_fifty_sixth_of_the_vco
+        given cfg = mmcm("sys_mmcm", 200, 1, 40, 10)
+        then vco_period_fs(cfg) == 1000000
+        and phase_step_fs(cfg) == 17857
+
+    test a_faster_vco_gives_a_finer_phase_step
+        given slow = mmcm("slow", 200, 1, 24, 3)
+        and fast = mmcm("fast", 200, 1, 48, 6)
+        then vco_mhz(slow) == 600
+        and vco_mhz(fast) == 1200
+        and phase_step_fs(fast) < phase_step_fs(slow)
+
+    test lock_arrives_within_the_window
+        then lock_after(LOCK_WINDOW_US).locked == true
+
+    test lock_does_not_arrive_early
+        then lock_after(499).locked == false
+
+    test relock_drops_the_lock
+        given s = lock_after(LOCK_WINDOW_US)
+        and r = relock(s)
+        then s.locked == true
+        and r.locked == false
+        and r.lock_counter_us == 0
+
+    // === Invariants ===
+
+    invariant a_legal_vco_is_positive
+        given cfg = mmcm("inv", 200, 1, 40, 10)
+        assert vco_khz(cfg) > 0
+
+    invariant the_output_is_below_the_vco
+        given cfg = mmcm("inv", 200, 1, 40, 10)
+        assert clkout_khz(cfg) <= vco_khz(cfg)
+
+    invariant the_phase_step_is_never_negative
+        given cfg = mmcm("inv", 200, 1, 40, 10)
+        assert phase_step_fs(cfg) > 0
+
+    invariant lock_needs_the_whole_window
+        given s = lock_after(499)
+        assert s.locked == false
+
+    // === Benchmarks ===
+
+    bench vco_arithmetic
+        measure: nanoseconds for vco_khz(mmcm("b", 200, 1, 40, 10))
+        target: < 50ns
+}
+
+// phi^2 + 1/phi^2 = 3 | TRINITY

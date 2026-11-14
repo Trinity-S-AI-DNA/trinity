@@ -1,0 +1,132 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      # No `author-guard` step is defined in build.zig on any branch of this
+      # repository, so this gate has never been able to pass — and because it ran
+      # first, it hid every real check behind it (build, tests, fmt, schema drift).
+      # Left in place and loud, but non-blocking, until the step is reimplemented
+      # or the gate is retired deliberately.
+      - name: Author attribution guard
+        continue-on-error: true
+        run: zig build author-guard -Dci=true
+
+      - name: Build
+        run: |
+          # Build with -Dci=true to skip GUI targets requiring raylib
+          zig build -Dci=true
+
+      # P0.4: Memory leak detection via Zig's General Purpose Allocator (GPA) is kept: a
+      # leak fails this step as before.
+      #
+      # The test step is judged, not piped. It used to run `zig build test -Dci=true 2>&1 | tee`
+      # under bash without pipefail, so its exit code was tee's: on main five test roots do not
+      # compile -- src/trinity.zig, the library's own test root, among them -- and the step was
+      # green on every push while its summary said "124/135 steps succeeded; 5 failed" (#616;
+      # #987 is the tee fix alone). tools/reproduce.py reads the exit code from the process and
+      # holds the result to specs/reproduce/headless.t27: exactly the roots that file names as
+      # blocked may fail, a sixth fails this step, and so does a blocked root that compiles again
+      # (take it off the list); a failed test, a leak, fewer tests or fewer run steps fail it too.
+      # The record of the run is test-output.json.
+      - name: Test (judged against specs/reproduce/headless.t27)
+        run: python3 tools/reproduce.py test --reuse-cache --out test-output.json
+
+      - name: Format check
+        run: |
+          # Check core modules that compile (skip WIP/broken files)
+          #
+          # `src/vsa/*.zig` and `src/vsa/agent/` used to be listed here and are
+          # gone -- there is no src/vsa/ directory at all, only src/vsa.zig. The
+          # step failed on them, not on formatting:
+          #     error: unable to format 'src/vsa/*.zig': FileNotFound
+          # A path that no longer exists makes the gate fail identically to real
+          # formatting debt, so it stops reporting either. Every remaining path
+          # here was checked and passes.
+          zig fmt --check src/vsa.zig src/vm.zig src/hybrid.zig src/trinity.zig \
+            src/bsd/ src/hslm/ tools/mcp/
+
+      # P0.4: Explicit leak check for critical modules
+      - name: Leak check critical modules
+        run: |
+          # Test modules with explicit allocator checking
+          zig test src/tri/job_system.zig
+          zig test src/tri/unified_output.zig
+          zig test src/registry/command_table.zig
+
+      # P1.6: Schema drift detection - Registry must be exported from code
+      - name: Registry schema check
+        run: |
+          # Export registry to temporary location
+          zig build export-registry 2>&1
+
+          # Compare with committed registry (if exists)
+          if [ -f .trinity/registry.json ]; then
+            # Move generated registry to temp file for comparison
+            mv .trinity/registry.json .trinity/registry.json.generated
+
+            # Restore original and compare (ignore generated_at timestamp)
+            git restore .trinity/registry.json 2>/dev/null || true
+
+            # Strip volatile generated_at field before comparison
+            sed 's/"generated_at":"[0-9]*"/"generated_at":"0"/g' .trinity/registry.json > /tmp/reg_committed.json
+            sed 's/"generated_at":"[0-9]*"/"generated_at":"0"/g' .trinity/registry.json.generated > /tmp/reg_generated.json
+
+            if ! diff -q /tmp/reg_committed.json /tmp/reg_generated.json; then
+              echo "::error::Registry schema drift detected!"
+              echo "The committed .trinity/registry.json does not match the generated one."
+              echo "Run 'zig build export-registry' and commit the updated registry."
+              echo ""
+              echo "Diff:"
+              diff /tmp/reg_committed.json /tmp/reg_generated.json || true
+              exit 1
+            fi
+
+            # Clean up
+            rm .trinity/registry.json.generated /tmp/reg_committed.json /tmp/reg_generated.json
+          else
+            echo "::warning::No .trinity/registry.json in repo. Run 'zig build export-registry' and commit it."
+          fi
+
+      # P1.6: MCP schema drift detection - MCP schemas must be exported from code
+      # continue-on-error: tri binary segfaults on Linux (tvc_corpus init bug)
+      - name: MCP schema check
+        continue-on-error: true
+        run: |
+          # Export MCP schemas using tri mcp export command
+          ./zig-out/bin/tri mcp export .trinity/mcp_schemas.json.generated 2>&1
+
+          # Compare with committed MCP schemas (if exists)
+          if [ -f .trinity/mcp_schemas.json ]; then
+            if ! diff -q .trinity/mcp_schemas.json .trinity/mcp_schemas.json.generated; then
+              echo "::error::MCP schema drift detected!"
+              echo "The committed .trinity/mcp_schemas.json does not match the generated one."
+              echo "Run './zig-out/bin/tri mcp export .trinity/mcp_schemas.json' and commit the updated schemas."
+              echo ""
+              echo "Diff:"
+              diff .trinity/mcp_schemas.json .trinity/mcp_schemas.json.generated || true
+              rm .trinity/mcp_schemas.json.generated
+              exit 1
+            fi
+
+            # Clean up
+            rm .trinity/mcp_schemas.json.generated
+          else
+            echo "::warning::No .trinity/mcp_schemas.json in repo. Run 'tri mcp export .trinity/mcp_schemas.json' and commit it."
+            rm .trinity/mcp_schemas.json.generated
+          fi

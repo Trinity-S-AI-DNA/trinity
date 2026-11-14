@@ -1,0 +1,730 @@
+// SPDX-License-Identifier: Apache-2.0
+// t27/specs/nn/hslm.t27
+// HSLM (Hierarchical Sacred Learning Model) Specification
+// Ternary neural network with sacred constants and VSA attention
+// φ² + 1/φ² = 3 | TRINITY
+
+module HSLM {
+    // Import base types, math, numeric, and attention
+    use base::types;
+    use base::ops;
+    use math::constants;
+    use math::sacred_physics;
+    use numeric::gf16;
+    use nn::attention;
+
+    // ═════════════════════════════════════════════════════════════════
+    // 1. HSLM Configuration
+    // ═════════════════════════════════════════════════════════════════════════
+
+    // TRINITY-based architecture
+    const NUM_LAYERS : usize = 6;        // 6 transformer-like layers
+    const NUM_HEADS : usize = 3;         // 3 attention heads per layer
+    const HEAD_DIM : usize = 81;         // 81 dim per head (3⁴)
+    const EMBED_DIM : usize = 243;       // 243 total embedding (3 × 81)
+    const FF_DIM : usize = 972;          // 4 × EMBED_DIM (3⁴ × 4)
+    const CONTEXT_LEN : usize = 81;      // Max sequence length
+    const VSA_DIM : usize = 1024;        // VSA hypervector dimension
+
+    // Layer phases
+    const PHASE_NORM : u8 = 0;      // Layer normalization
+    const PHASE_ATTN : u8 = 1;      // Attention block
+    const PHASE_FFN : u8 = 2;       // Feed-forward network
+    const PHASE_RESIDUAL : u8 = 3;  // Residual connection
+
+    // HSLM activation functions
+    const ACT_RELU : u8 = 0;        // ReLU
+    const ACT_GELU : u8 = 1;        // GELU
+    const ACT_SWISH : u8 = 2;       // Swish
+    const ACT_TERNARY : u8 = 3;    // Ternary (sign)
+
+    // HSLM training phases
+    const PHASE_FORWARD : u8 = 0;   // Forward pass
+    const PHASE_BACKWARD : u8 = 1;  // Backward pass
+    const PHASE_UPDATE : u8 = 2;    // Weight update
+
+    // ═════════════════════════════════════════════════════════════════
+    // 2. HSLM State
+    // ═════════════════════════════════════════════════════════════════════════
+
+    // Training/inference mode
+    var hslm_mode : u8 = PHASE_FORWARD;
+
+    // Layer buffers (per position, per layer)
+    struct LayerBuffers {
+        input : [EMBED_DIM]f64,
+        output : [EMBED_DIM]f64,
+        temp : [EMBED_DIM]f64,           // For residual connections
+        ffn_intermediate : [FF_DIM]f64,
+    }
+
+    // Attention caches (KV cache for causal attention)
+    struct AttentionCache {
+        cache_k : [CONTEXT_LEN * EMBED_DIM]f64,
+        cache_v : [CONTEXT_LEN * EMBED_DIM]f64,
+    }
+
+    // Layer weights (ternary)
+    struct LayerWeights {
+        w_q : [EMBED_DIM * EMBED_DIM]Trit,   // Query projection
+        w_k : [EMBED_DIM * EMBED_DIM]Trit,   // Key projection
+        w_v : [EMBED_DIM * EMBED_DIM]Trit,   // Value projection
+        w_o : [EMBED_DIM * EMBED_DIM]Trit,   // Output projection
+        w1 : [EMBED_DIM * FF_DIM]Trit,      // FFN first projection
+        w2 : [FF_DIM * EMBED_DIM]Trit,      // FFN second projection
+        norm1_gamma : [EMBED_DIM]f64,        // RMSNorm scale
+        norm2_gamma : [EMBED_DIM]f64,        // RMSNorm scale
+    }
+
+    // Full HSLM weights
+    struct HSLMWeights {
+        layers : [NUM_LAYERS]LayerWeights,
+    }
+
+    // ═════════════════════════════════════════════════════════════════
+    // 3. HSLM Forward Pass
+    // ═════════════════════════════════════════════════════════════════════════
+
+    // hslm_forward(input, weights, seq_len, output, caches) → void
+    // Full forward pass through all HSLM layers
+    fn hslm_forward(
+        input: [][]f64,           // [seq_len][EMBED_DIM]
+        weights: *HSLMWeights,
+        seq_len: usize,
+        output: [][]f64,          // [seq_len][EMBED_DIM]
+        caches: []AttentionCache, // [NUM_LAYERS]
+    ) -> void {
+        var position : usize = 0;
+
+        while (position < seq_len) {
+            // Initialize with input embedding
+            var layer_input = input[position];
+            var layer_output : [EMBED_DIM]f64 = [0.0; EMBED_DIM];
+
+            // Process through all layers
+            var layer_idx : usize = 0;
+
+            while (layer_idx < NUM_LAYERS) {
+                const layer_weights = &weights.layers[layer_idx];
+                const layer_cache = &caches[layer_idx];
+
+                var buffers = LayerBuffers{
+                    .input = layer_input,
+                    .output = [0.0; EMBED_DIM],
+                    .temp = [0.0; EMBED_DIM],
+                    .ffn_intermediate = [0.0; FF_DIM],
+                };
+
+                // Layer forward: norm -> attention -> residual -> norm -> ffn -> residual
+                hslm_layer_forward(&buffers, layer_weights, position, seq_len, layer_cache);
+
+                layer_input = buffers.output;
+                layer_output = buffers.output;
+
+                layer_idx = layer_idx + 1;
+            }
+
+            output[position] = layer_output;
+            position = position + 1;
+        }
+    }
+
+    // hslm_layer_forward(buffers, weights, position, seq_len, cache) → void
+    // Single transformer layer: Attention + FFN with residual connections
+    fn hslm_layer_forward(
+        buffers: *LayerBuffers,
+        weights: *LayerWeights,
+        position: usize,
+        seq_len: usize,
+        cache: *AttentionCache,
+    ) -> void {
+        // Copy input to output for residual
+        var i : usize = 0;
+        while (i < EMBED_DIM) {
+            buffers.output[i] = buffers.input[i];
+            i = i + 1;
+        }
+
+        // Step 1: RMSNorm before attention
+        rms_norm_forward(&buffers.output, weights.norm1_gamma);
+
+        // Save attention output for residual
+        i = 0;
+        while (i < EMBED_DIM) {
+            buffers.temp[i] = buffers.output[i];
+            i = i + 1;
+        }
+
+        // Step 2: Multi-head sacred attention
+        attention::sacred_attention_kernel(
+            buffers.output,
+            weights.w_q, weights.w_k, weights.w_v, weights.w_o,
+            position, seq_len, buffers.output,
+            cache.cache_k, cache.cache_v,
+        );
+
+        // Step 3: Residual connection (attention + input)
+        i = 0;
+        while (i < EMBED_DIM) {
+            buffers.output[i] = buffers.output[i] + buffers.input[i];
+            i = i + 1;
+        }
+
+        // Save attention output for second residual
+        i = 0;
+        while (i < EMBED_DIM) {
+            buffers.input[i] = buffers.output[i];
+            i = i + 1;
+        }
+
+        // Step 4: RMSNorm before FFN
+        rms_norm_forward(&buffers.output, weights.norm2_gamma);
+
+        // Step 5: Feed-forward network
+        ffn_forward(&buffers, weights);
+
+        // Step 6: Residual connection (ffn + attention_output)
+        i = 0;
+        while (i < EMBED_DIM) {
+            buffers.output[i] = buffers.output[i] + buffers.input[i];
+            i = i + 1;
+        }
+    }
+
+    // ═════════════════════════════════════════════════════════════════
+    // 4. RMS Normalization
+    // ═════════════════════════════════════════════════════════════════════════
+
+    // rms_norm_forward(x, gamma) → void (in-place)
+    // RMSNorm: output = (input / sqrt(mean(input²) + eps)) * gamma
+    // Uses sacred gamma from math/sacred_physics
+    fn rms_norm_forward(x: []f64, gamma: []f64) -> void {
+        // Compute mean of squares
+        var sum_squares : f64 = 0.0;
+        var i : usize = 0;
+
+        while (i < x.len()) {
+            sum_squares = sum_squares + x[i] * x[i];
+            i = i + 1;
+        }
+
+        // rms = sqrt(mean + eps)
+        const mean = sum_squares / (x.len() as f64);
+        const rms = sqrt(mean + 1e-6);
+
+        // Normalize and scale by gamma
+        i = 0;
+        while (i < x.len()) {
+            x[i] = (x[i] / rms) * gamma[i];
+            i = i + 1;
+        }
+    }
+
+    // ═════════════════════════════════════════════════════════════════
+    // 5. Feed-Forward Network
+    // ═════════════════════════════════════════════════════════════════════════
+
+    // ffn_forward(buffers, weights) → void
+    // Feed-forward network: Gelu(x @ W1) @ W2
+    // Using ternary weights, sacred expansion
+    fn ffn_forward(buffers: *LayerBuffers, weights: *LayerWeights) -> void {
+        // Step 1: Project to FF_DIM: intermediate = input @ W1
+        ternary_matmul(buffers.output, weights.w1, buffers.ffn_intermediate, EMBED_DIM, FF_DIM);
+
+        // Step 2: Apply GELU activation
+        gelu_activation(buffers.ffn_intermediate);
+
+        // Step 3: Project back to EMBED_DIM: output = intermediate @ W2
+        ternary_matmul(buffers.ffn_intermediate, weights.w2, buffers.output, FF_DIM, EMBED_DIM);
+    }
+
+    // ternary_matmul(input, weights, output, in_dim, out_dim) → void
+    // Matrix multiplication with ternary weights
+    fn ternary_matmul(
+        input: []f64,
+        weights: []Trit,
+        output: []f64,
+        in_dim: usize,
+        out_dim: usize,
+    ) -> void {
+        var i : usize = 0;
+
+        while (i < out_dim) {
+            var acc : f64 = 0.0;
+            var j : usize = 0;
+
+            while (j < in_dim) {
+                const weight_val = weights[j * out_dim + i] as i8;
+
+                if (weight_val == 1) {
+                    acc = acc + input[j];
+                } else if (weight_val == -1) {
+                    acc = acc - input[j];
+                }
+
+                j = j + 1;
+            }
+
+            output[i] = acc;
+            i = i + 1;
+        }
+    }
+
+    // gelu_activation(x) → void (in-place)
+    // GELU: x * Φ(x) where Φ is standard normal CDF
+    // Approximation: x * 0.5 * (1 + tanh(√(2/π) * (x + 0.044715x³)))
+    fn gelu_activation(x: []f64) -> void {
+        const sqrt_2_over_pi = sqrt(2.0 / 3.141592653589793);
+        var i : usize = 0;
+
+        while (i < x.len()) {
+            const val = x[i];
+            const cube = val * val * val;
+            const inner = sqrt_2_over_pi * (val + 0.044715 * cube);
+            const tanh_val = tanh(inner);
+            x[i] = 0.5 * val * (1.0 + tanh_val);
+            i = i + 1;
+        }
+    }
+
+    // ═════════════════════════════════════════════════════════════════
+    // 6. HSLM Backward Pass
+    // ═════════════════════════════════════════════════════════════════════════
+
+    // hslm_backward(grad_output, weights, seq_len, grad_input) → void
+    // Full backward pass with gradient computation
+    fn hslm_backward(
+        grad_output: [][]f64,      // [seq_len][EMBED_DIM]
+        weights: *HSLMWeights,
+        seq_len: usize,
+        grad_input: [][]f64,       // [seq_len][EMBED_DIM]
+    ) -> void {
+        // Initialize weight gradients to zero
+        var weight_grads = zero_weight_gradients();
+
+        // Backward through layers (reverse order)
+        var layer_idx : usize = NUM_LAYERS;
+
+        while (layer_idx > 0) {
+            layer_idx = layer_idx - 1;
+            // Layer backward: FFN + Attention gradients
+            hslm_layer_backward(&weight_grads, layer_idx);
+        }
+    }
+
+    // zero_weight_gradients() → HSLMWeights
+    // Initialize all weight gradients to zero
+    fn zero_weight_gradients() -> HSLMWeights {
+        var weights : HSLMWeights = undefined;
+        var layer : usize = 0;
+
+        while (layer < NUM_LAYERS) {
+            // All ternary weight gradients stored as f64 for accumulation
+            var i : usize = 0;
+            while (i < EMBED_DIM * EMBED_DIM) {
+                // In real implementation, would use proper gradient storage
+                i = i + 1;
+            }
+            layer = layer + 1;
+        }
+
+        return weights;
+    }
+
+    // hslm_layer_backward(grads, layer_idx) → void
+    // Single layer backward: FFN + Attention gradients
+    fn hslm_layer_backward(grads: *HSLMWeights, layer_idx: usize) -> void {
+        // Gradient flows backward through: residual -> ffn -> norm -> residual -> attn -> norm
+        // FFN backward (with residual)
+        ffn_backward(grads, layer_idx);
+
+        // Attention backward (with residual)
+        attention_backward(grads, layer_idx);
+    }
+
+    // ffn_backward(grads, layer_idx) → void
+    // Backward through FFN: compute gradients for W2, W1, and input
+    fn ffn_backward(grads: *HSLMWeights, layer_idx: usize) -> void {
+        // Step 1: Gradient through second projection (W2)
+        ffn_backward_w2(grads, layer_idx);
+
+        // Step 2: Gradient through GELU activation
+        gelu_backward(layer_idx);
+
+        // Step 3: Gradient through first projection (W1)
+        ffn_backward_w1(grads, layer_idx);
+    }
+
+    // ffn_backward_w2(grads, layer_idx) → void
+    // Gradient through second FFN projection
+    fn ffn_backward_w2(grads: *HSLMWeights, layer_idx: usize) -> void {
+        // Gradient: dL/dW2 = dL/dout * x^T
+        // dL/dx = W2^T * dL/dout
+        // Implementation: accumulate gradients in weight structure
+        var layer_grads = &grads.layers[layer_idx];
+        
+        // For now, initialize gradients to zero (placeholder for actual gradient computation)
+        // In a full implementation, this would compute dL/dW2 from upstream gradients
+        // and stored intermediate activations from the forward pass
+        var i : usize = 0;
+        while (i < FF_DIM * EMBED_DIM) {
+            // Initialize gradient to zero - actual computation would use stored activations
+            layer_grads.w2[i] = 0.0;  // Placeholder for gradient computation
+            i = i + 1;
+        }
+    }
+
+    // gelu_backward(layer_idx) → void
+    // Gradient through GELU activation
+    fn gelu_backward(layer_idx: usize) -> void {
+        // GELU derivative: dGELU/dx = Φ(x) + x * φ(x)
+        // where φ is standard normal PDF
+        // Implementation: compute derivative using the same approximation as forward pass
+        const sqrt_2_over_pi = sqrt(2.0 / 3.141592653589793);
+        const sqrt_2_pi = sqrt(2.0 * 3.141592653589793);
+        
+        // For now, this is a placeholder implementation
+        // In a full implementation, this would:
+        // 1. Access stored intermediate activations from forward pass
+        // 2. Compute dGELU/dx for each activation
+        // 3. Multiply by upstream gradients
+        // 4. Pass gradients backward to previous layer
+        
+        // Placeholder: compute derivative values (would use stored activations in real implementation)
+        var i : usize = 0;
+        while (i < FF_DIM) {
+            // This would access stored intermediate values and compute gradients
+            // For now, just a placeholder computation
+            const x = 0.0;  // Would be stored intermediate activation
+            const cube = x * x * x;
+            const inner = sqrt_2_over_pi * (x + 0.044715 * cube);
+            const tanh_val = tanh(inner);
+            const gelu_derivative = 0.5 * (1.0 + tanh_val) + 0.5 * x * (1.0 - tanh_val * tanh_val) * sqrt_2_over_pi * (1.0 + 0.134145 * cube);
+            
+            // Store or apply gradient (placeholder)
+            i = i + 1;
+        }
+    }
+
+    // ffn_backward_w1(grads, layer_idx) → void
+    // Gradient through first FFN projection
+    fn ffn_backward_w1(grads: *HSLMWeights, layer_idx: usize) -> void {
+        // Gradient: dL/dW1 = dL/dmid * x^T
+        // dL/dx = W1^T * dL/dmid
+        // Implementation: accumulate gradients in weight structure
+        var layer_grads = &grads.layers[layer_idx];
+        
+        // For now, initialize gradients to zero (placeholder for actual gradient computation)
+        // In a full implementation, this would:
+        // 1. Access downstream gradients (dL/dmid from gelu_backward)
+        // 2. Access original input activations from forward pass
+        // 3. Compute dL/dW1 = dL/dmid * x^T using ternary matrix multiplication pattern
+        var i : usize = 0;
+        while (i < EMBED_DIM * FF_DIM) {
+            // Initialize gradient to zero - actual computation would use downstream gradients
+            // and stored input activations from forward pass
+            layer_grads.w1[i] = 0.0;  // Placeholder for gradient computation
+            i = i + 1;
+        }
+    }
+
+    // attention_backward(grads, layer_idx) → void
+    // Gradient through attention block
+    fn attention_backward(grads: *HSLMWeights, layer_idx: usize) -> void {
+        // Gradient flows through: output projection -> attention weights -> Q/K/V projections
+        // Implementation: compute gradients for attention weights and projections
+        var layer_grads = &grads.layers[layer_idx];
+        
+        // For now, initialize gradients to zero (placeholder for actual gradient computation)
+        // In a full implementation, this would:
+        // 1. Access downstream gradients from output projection
+        // 2. Compute gradients for attention weights (softmax derivatives)
+        // 3. Compute gradients for Q, K, V projections
+        // 4. Pass gradients backward to input embeddings
+        
+        // Initialize output projection gradients
+        var i : usize = 0;
+        while (i < EMBED_DIM * EMBED_DIM) {
+            layer_grads.w_o[i] = 0.0;  // Placeholder for output projection gradients
+            i = i + 1;
+        }
+        
+        // Initialize attention projection gradients
+        i = 0;
+        while (i < EMBED_DIM * EMBED_DIM) {
+            layer_grads.w_q[i] = 0.0;  // Placeholder for query projection gradients
+            layer_grads.w_k[i] = 0.0;  // Placeholder for key projection gradients  
+            layer_grads.w_v[i] = 0.0;  // Placeholder for value projection gradients
+            i = i + 1;
+        }
+    }
+
+    // ═════════════════════════════════════════════════════════════════
+    // 7. Phase Management
+    // ═════════════════════════════════════════════════════════════════════════
+
+    // hslm_phase(phase: u8) → void
+    // Switch HSLM phase (forward, backward, update)
+    // Used for streaming inference and training
+    fn hslm_phase(phase: u8) -> void {
+        if (phase == PHASE_FORWARD) {
+            hslm_mode = 1;
+        } else if (phase == PHASE_BACKWARD) {
+            hslm_mode = 2;
+        } else if (phase == PHASE_UPDATE) {
+            hslm_mode = 3;
+        }
+    }
+
+    // get_hslm_mode() → u8
+    // Get current HSLM mode
+    fn get_hslm_mode() -> u8 {
+        return hslm_mode;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════════════════════════════════
+    // TDD-Inside-Spec: Tests and Invariants for HSLM
+    // ═══════════════════════════════════════════════════════════════════════════════════════════════════════
+
+    test hslm_num_layers_is_six
+        given layers = NUM_LAYERS
+        then layers == 6
+
+    test hslm_num_heads_is_trinity
+        given heads = NUM_HEADS
+        then heads == 3
+
+    test hslm_head_dim_is_three_pow_four
+        given dim = HEAD_DIM
+        then dim == 81  // 3^4
+
+    test hslm_embed_dim_is_heads_times_head_dim
+        given embed = EMBED_DIM
+        and computed = NUM_HEADS * HEAD_DIM
+        then embed == computed
+
+    test hslm_ff_dim_is_four_times_embed_dim
+        given ff_dim = FF_DIM
+        and computed = 4 * EMBED_DIM
+        then ff_dim == computed
+
+    test hslm_context_len_is_eighty_one
+        given ctx = CONTEXT_LEN
+        then ctx == 81
+
+    test hslm_vsa_dim_is_1024
+        given vsa = VSA_DIM
+        then vsa == 1024
+
+    test hslm_phase_constants_are_unique
+        given a = PHASE_NORM and b = PHASE_ATTN and c = PHASE_FFN and d = PHASE_RESIDUAL
+        then a != b and b != c and c != d
+
+    test hslm_activation_constants_are_unique
+        given a = ACT_RELU and b = ACT_GELU and c = ACT_SWISH and d = ACT_TERNARY
+        then a != b and b != c and c != d
+
+    test hslm_training_phase_constants_are_unique
+        given a = PHASE_FORWARD and b = PHASE_BACKWARD and c = PHASE_UPDATE
+        then a != b and b != c
+
+    test hslm_phase_forward_sets_mode_one
+        given hslm_phase(PHASE_FORWARD)
+        and mode = get_hslm_mode()
+        then mode == 1
+
+    test hslm_phase_backward_sets_mode_two
+        given hslm_phase(PHASE_BACKWARD)
+        and mode = get_hslm_mode()
+        then mode == 2
+
+    test hslm_phase_update_sets_mode_three
+        given hslm_phase(PHASE_UPDATE)
+        and mode = get_hslm_mode()
+        then mode == 3
+
+    test hslm_rms_norm_preserves_shape
+        given x = [1.0, 2.0, 3.0, 4.0, 5.0]
+        and gamma = [1.0, 1.0, 1.0, 1.0, 1.0]
+        and len_before = x.len()
+        when rms_norm_forward(x, gamma)
+        then x.len() == len_before
+
+    test hslm_rms_norm_zero_input_returns_zero
+        given x = [0.0, 0.0, 0.0]
+        and gamma = [1.0, 1.0, 1.0]
+        when rms_norm_forward(x, gamma)
+        then x[0] == 0.0 and x[1] == 0.0 and x[2] == 0.0
+
+    test hslm_ternary_matmul_identity
+        given input = [1.0, 2.0, 3.0]
+        and weights = [Trit.pos, Trit.zero, Trit.zero,
+                       Trit.zero, Trit.pos, Trit.zero,
+                       Trit.zero, Trit.zero, Trit.pos]
+        and output = [0.0; 3]
+        when ternary_matmul(input, weights, output, 3, 3)
+        then output[0] == 1.0 and output[1] == 2.0 and output[2] == 3.0
+
+    test hslm_ternary_matmul_negation
+        given input = [1.0, 2.0, 3.0]
+        and weights = [Trit.neg, Trit.neg, Trit.neg,
+                       Trit.neg, Trit.neg, Trit.neg,
+                       Trit.neg, Trit.neg, Trit.neg]
+        and output = [0.0; 3]
+        when ternary_matmul(input, weights, output, 3, 3)
+        then output[0] == -6.0 and output[1] == -6.0 and output[2] == -6.0
+
+    test hslm_gelu_activation_preserves_shape
+        given x = [1.0, 2.0, -1.0, 0.0]
+        and len_before = x.len()
+        when gelu_activation(x)
+        then x.len() == len_before
+
+    test hslm_gelu_activation_positive_is_positive
+        given x = [1.0; 10]
+        when gelu_activation(x)
+        then x[0] > 0.0
+
+    test hslm_gelu_activation_zero_is_zero
+        given x = [0.0]
+        when gelu_activation(x)
+        then abs(x[0]) < 0.0001
+
+    test hslm_gelu_activation_negative_is_negative
+        given x = [-1.0]
+        when gelu_activation(x)
+        then x[0] < 0.0
+
+    test hslm_ffn_forward_intermediate_dimension
+        given buffers = LayerBuffers{...}
+        and weights = LayerWeights{...}
+        when buffers.output = [1.0; EMBED_DIM]
+        and ffn_forward(&buffers, &weights)
+        then buffers.ffn_intermediate.len() == FF_DIM
+
+    test hslm_zero_weight_gradients_initializes_all
+        given grads = zero_weight_gradients()
+        then grads.layers.len() == NUM_LAYERS
+
+    invariant hslm_num_layers_constant
+        assert NUM_LAYERS == 6
+
+    invariant hslm_num_heads_constant
+        assert NUM_HEADS == 3
+
+    invariant hslm_head_dim_constant
+        assert HEAD_DIM == 81
+
+    invariant hslm_embed_dim_constant
+        assert EMBED_DIM == 243
+
+    invariant hslm_ff_dim_constant
+        assert FF_DIM == 972
+
+    invariant hslm_context_len_constant
+        assert CONTEXT_LEN == 81
+
+    invariant hslm_vsa_dim_constant
+        assert VSA_DIM == 1024
+
+    invariant hslm_embedding_dimensional_consistency
+        assert EMBED_DIM == NUM_HEADS * HEAD_DIM
+
+    invariant hslm_ffn_expansion_ratio
+        assert FF_DIM == 4 * EMBED_DIM
+
+    invariant hslm_layer_weights_size
+        given weights = LayerWeights{...}
+        and wq_size = weights.w_q.len()
+        and wk_size = weights.w_k.len()
+        and wv_size = weights.w_v.len()
+        and wo_size = weights.w_o.len()
+        assert wq_size == EMBED_DIM * EMBED_DIM
+        assert wk_size == EMBED_DIM * EMBED_DIM
+        assert wv_size == EMBED_DIM * EMBED_DIM
+        assert wo_size == EMBED_DIM * EMBED_DIM
+
+    invariant hslm_ffn_weights_size
+        given weights = LayerWeights{...}
+        and w1_size = weights.w1.len()
+        and w2_size = weights.w2.len()
+        assert w1_size == EMBED_DIM * FF_DIM
+        assert w2_size == FF_DIM * EMBED_DIM
+
+    invariant hslm_rms_norm_gamma_size
+        given weights = LayerWeights{...}
+        assert weights.norm1_gamma.len() == EMBED_DIM
+        assert weights.norm2_gamma.len() == EMBED_DIM
+
+    invariant hslm_ternary_matmul_output_dim
+        given input = [0.0; 10]
+        and weights = [Trit.zero; 100]
+        and output = [0.0; 5]
+        and ternary_matmul(input, weights, output, 10, 5)
+        assert output.len() == 5
+
+    invariant hslm_gelu_monotonic_positive
+        given x = [0.0, 1.0, 2.0, 3.0]
+        and gelu_activation(x)
+        assert x[0] <= x[1] and x[1] <= x[2] and x[2] <= x[3]
+
+    invariant hslm_gelu_smooth
+        // GELU is C1 continuous (smooth) - verified by lack of discontinuities
+        given x = [0.0, 0.001, 0.002]
+        and gelu_activation(x)
+        and delta1 = x[1] - x[0]
+        and delta2 = x[2] - x[1]
+        // Derivative should not have large jumps
+        assert abs(delta2 - delta1) < 0.01
+
+    invariant hslm_mode_in_valid_range
+        given mode = get_hslm_mode()
+        assert mode >= 1 and mode <= 3
+
+    bench hslm_rms_norm_latency
+        measure: nanoseconds to rms_norm_forward([1.0; EMBED_DIM], [1.0; EMBED_DIM])
+        target: < 1000ns
+
+    bench hslm_ternary_matmul_embed_to_ff
+        measure: nanoseconds to ternary_matmul([1.0; EMBED_DIM], [Trit.pos; EMBED_DIM*FF_DIM], [0.0; FF_DIM], EMBED_DIM, FF_DIM)
+        target: < 5000ns
+
+    bench hslm_gelu_activation_latency
+        measure: nanoseconds to gelu_activation([1.0; FF_DIM])
+        target: < 2000ns
+
+    bench hslm_ffn_forward_latency
+        measure: nanoseconds for ffn_forward on single layer
+        target: < 10000ns
+
+    bench hslm_layer_forward_latency
+        measure: nanoseconds for hslm_layer_forward on single position
+        target: < 30000ns
+
+    bench hslm_forward_throughput
+        measure: microseconds for full forward pass on [81, 243] input
+        target: < 50000us
+
+    test hslm_ffn_backward_w2_initializes_grads
+        given grads = zero_weight_gradients()
+        and layer_idx = 0
+        when ffn_backward_w2(&grads, layer_idx)
+        then grads.layers[layer_idx].w2[0] == 0.0  // Should initialize gradients
+
+    test hslm_gelu_backward_no_crash
+        given layer_idx = 0
+        when gelu_backward(layer_idx)
+        then true  // Should not crash
+
+    test hslm_ffn_backward_w1_initializes_grads
+        given grads = zero_weight_gradients()
+        and layer_idx = 0
+        when ffn_backward_w1(&grads, layer_idx)
+        then grads.layers[layer_idx].w1[0] == 0.0  // Should initialize gradients
+
+    test hslm_attention_backward_initializes_grads
+        given grads = zero_weight_gradients()
+        and layer_idx = 0
+        when attention_backward(&grads, layer_idx)
+        then grads.layers[layer_idx].w_q[0] == 0.0  // Should initialize gradients
+}

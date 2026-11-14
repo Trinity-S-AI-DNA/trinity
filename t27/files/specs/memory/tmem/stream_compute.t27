@@ -1,0 +1,438 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/memory/tmem/stream_compute.t27 -- Trinity Stream Compute contract
+// The path from stored codes to a dot product: the synchronous storage
+// sequencer (load, start, busy, one registered read per word), the view that
+// decodes a word into five masked lanes, and the framed ready/valid dot
+// pipeline (five trits x five int8 activations per beat, checked accumulation,
+// sticky frame errors, synchronous reset). The executable implementation is
+// t27/rtl/dot_stream.t27, t27/rtl/stream_storage.t27, t27/rtl/stream_view.t27
+// with the wiring in rtl/t27/, driven by t27/rtl_driver.t27. The reference
+// functions here restate the rules for differential tests and cycle traces.
+// Evidence produced from this path is labelled rtl-simulation, never fpga.
+// phi^2 + 1/phi^2 = 3 | TRINITY
+module TrinityMemoryStreamComputeSpec {
+    // 1. Beat layout: five lanes of decoded trits, five int8 activations, a
+    //    five-bit prefix mask and a last flag.
+    pub const TMS_DOT_LANES: u32 = 5;
+    pub const TMS_DOT_LANE_BITS: u32 = 2;
+    pub const TMS_DOT_LANE_FIELD_BITS: u32 = 10;
+    pub const TMS_DOT_DECODED_VALID_BIT: u32 = 1024;
+    pub const TMS_DOT_CODE_BITS: u32 = 10;
+    pub const TMS_DOT_DENSE_CODE_BITS: u32 = 8;
+    pub const TMS_DOT_DENSE_CODE_LIMIT: u32 = 243;
+    pub const TMS_DOT_BASELINE_CODE_LIMIT: u32 = 1024;
+    pub const TMS_DOT_ACTIVATION_BITS: u32 = 8;
+    pub const TMS_DOT_ACTIVATION_FIELD_BITS: u32 = 40;
+    pub const TMS_DOT_ACTIVATION_MIN: i32 = -128;
+    pub const TMS_DOT_ACTIVATION_MAX: i32 = 127;
+    pub const TMS_DOT_MASK_BITS: u32 = 5;
+    pub const TMS_DOT_FULL_MASK: u32 = 31;
+    pub const TMS_DOT_EMPTY_MASK: u32 = 0;
+    pub const TMS_DOT_GROUP_SUM_MIN: i32 = -640;
+    pub const TMS_DOT_GROUP_SUM_MAX: i32 = 640;
+
+    // 2. Accumulator: checked signed addition per accepted group, never wrapping
+    //    or saturating; an error zeroes the result and drains the frame.
+    pub const TMS_DOT_ACC_WIDTH_MIN: u32 = 2;
+    pub const TMS_DOT_ACC_WIDTH_MAX: u32 = 32;
+    pub const TMS_DOT_RUNNER_ACC_WIDTH_MIN: u32 = 12;
+    pub const TMS_DOT_DEFAULT_ACC_WIDTH: u32 = 32;
+    pub const TMS_DOT_ERROR_RESULT: i32 = 0;
+
+    // 3. Pipeline: one input register stage and one accumulator stage. A beat
+    //    accepted at edge A reaches the accumulator at edge A+1; the final beat's
+    //    result is visible after edge A+1 and can be consumed at edge A+2.
+    pub const TMS_DOT_PIPELINE_STAGES: u32 = 2;
+    pub const TMS_DOT_ACCEPT_TO_VALID_EDGES: u32 = 1;
+    pub const TMS_DOT_ACCEPT_TO_CONSUME_EDGES: u32 = 2;
+
+    // 4. Runner packet words (t27/rtl_driver.t27 and rtl/tb_dot_stream.v).
+    pub const TMS_RTL_PACKET_CODE_SHIFT: u32 = 0;
+    pub const TMS_RTL_PACKET_ACTIVATION_SHIFT: u32 = 10;
+    pub const TMS_RTL_PACKET_MASK_SHIFT: u32 = 50;
+    pub const TMS_RTL_PACKET_LAST_BIT: u32 = 55;
+    pub const TMS_RTL_PACKET_RESET_BIT: u32 = 56;
+    pub const TMS_RTL_PACKET_RESET_PENDING_BIT: u32 = 57;
+    pub const TMS_RTL_EXPECTED_RESULT_BITS: u32 = 32;
+    pub const TMS_RTL_EXPECTED_ERROR_BIT: u32 = 32;
+    pub const TMS_RTL_ERR_ARGUMENT: i32 = -80;
+    pub const TMS_RTL_ERR_CAPACITY: i32 = -81;
+    pub const TMS_RTL_ERR_OVERFLOW: i32 = -82;
+    pub const TMS_RTL_ERR_OUTPUT: i32 = -83;
+    pub const TMS_RTL_ERR_MISMATCH: i32 = -84;
+    pub const TMS_RTL_ERR_PROCESS: i32 = -85;
+    pub const TMS_RTL_ERR_RESOURCE: i32 = -86;
+
+    // 5. Storage sequencer and view. Words are read in order after start; the
+    //    sequencer has no downstream ready port, so joining it to the dot
+    //    pipeline needs a buffer or a ready-capable sequencer (recorded gap).
+    pub const TMS_STORAGE_CAPACITY_GROUPS: u32 = 64;
+    pub const TMS_STORAGE_TRITS_PER_WORD: u32 = 5;
+    pub const TMS_STORAGE_MAX_TRITS: u32 = 320;
+    pub const TMS_STORAGE_DENSE_CODE_WIDTH: u32 = 8;
+    pub const TMS_STORAGE_BASELINE_CODE_WIDTH: u32 = 10;
+    pub const TMS_STORAGE_ELEMENT_BITS: u32 = 16;
+    pub const TMS_STORAGE_START_TO_WORD0_EDGES: u32 = 1;
+    pub const TMS_STORAGE_HAS_BACKPRESSURE: u32 = 0;
+    pub const TMS_STORAGE_JOIN_NEEDS_BUFFER: u32 = 1;
+    pub const TMS_VIEW_VALID_BIT: u32 = 32768;
+    pub const TMS_VIEW_MASK_SHIFT: u32 = 10;
+    pub const TMS_VIEW_LANE_FIELD_MASK: u32 = 1023;
+
+    // Reference functions: decoding.
+    pub fn tms_dot_dense_digit(code: u32, divisor: u32) -> u32 {
+        var digit: u32 = (code / divisor) % 3;
+        if (digit == 0) { return 2; }
+        if (digit == 1) { return 0; }
+        return 1;
+    }
+
+    // Decoded word: bit 10 valid, bits 9:0 five lanes (00=0, 01=+1, 10=-1).
+    pub fn tms_dot_decode(code: u32, dense_mode: bool) -> u32 {
+        if (dense_mode) {
+            if (code < TMS_DOT_DENSE_CODE_LIMIT) {
+                return TMS_DOT_DECODED_VALID_BIT | tms_dot_dense_digit(code, 1) | (tms_dot_dense_digit(code, 3) << 2)
+                    | (tms_dot_dense_digit(code, 9) << 4) | (tms_dot_dense_digit(code, 27) << 6)
+                    | (tms_dot_dense_digit(code, 81) << 8);
+            }
+            return 0;
+        }
+        if (code >= TMS_DOT_BASELINE_CODE_LIMIT) { return 0; }
+        var lane: u32 = 0;
+        while (lane < TMS_DOT_LANES) {
+            if (((code >> (lane * 2)) & 3) == 3) { return 0; }
+            lane = lane + 1;
+        }
+        return TMS_DOT_DECODED_VALID_BIT | code;
+    }
+
+    pub fn tms_dot_lane_trit(lanes: u32, lane: u32) -> i32 {
+        var code: u32 = (lanes >> (lane * 2)) & 3;
+        if (code == 1) { return 1; }
+        if (code == 2) { return -1; }
+        return 0;
+    }
+
+    pub fn tms_dot_activation(acts: u64, lane: u32) -> i32 {
+        var byte: i32 = ((acts >> (lane * 8)) & 255) as i32;
+        if (byte >= 128) { return byte - 256; }
+        return byte;
+    }
+
+    // Five int8 activations packed little-endian into the 40-bit field.
+    pub fn tms_dot_pack_activations(a0: i32, a1: i32, a2: i32, a3: i32, a4: i32) -> u64 {
+        var word: u64 = ((a0 as u32) & 255) as u64;
+        word = word | ((((a1 as u32) & 255) as u64) << 8);
+        word = word | ((((a2 as u32) & 255) as u64) << 16);
+        word = word | ((((a3 as u32) & 255) as u64) << 24);
+        word = word | ((((a4 as u32) & 255) as u64) << 32);
+        return word;
+    }
+
+    pub fn tms_dot_product(lanes: u32, acts: u64, mask: u32, lane: u32) -> i32 {
+        if (((mask >> lane) & 1) == 0) { return 0; }
+        return tms_dot_lane_trit(lanes, lane) * tms_dot_activation(acts, lane);
+    }
+
+    pub fn tms_dot_group_sum(lanes: u32, acts: u64, mask: u32) -> i32 {
+        var sum: i32 = 0;
+        var lane: u32 = 0;
+        while (lane < TMS_DOT_LANES) { sum = sum + tms_dot_product(lanes, acts, mask, lane); lane = lane + 1; }
+        return sum;
+    }
+
+    // Masks are prefixes: every beat before the last is full; the last beat may
+    // be empty only when it is the whole frame.
+    pub fn tms_dot_mask_valid(mask: u32, last: bool) -> bool {
+        if (!last) { return mask == TMS_DOT_FULL_MASK; }
+        return mask == 0 || mask == 1 || mask == 3 || mask == 7 || mask == 15 || mask == 31;
+    }
+
+    pub fn tms_dot_lane_valid(lanes: u32, acts: u64, mask: u32, lane: u32) -> bool {
+        if (((mask >> lane) & 1) == 1) { return true; }
+        return ((lanes >> (lane * 2)) & 3) == 0 && ((acts >> (lane * 8)) & 255) == 0;
+    }
+
+    pub fn tms_dot_group_valid(lanes: u32, acts: u64, mask: u32, last: bool) -> bool {
+        if ((lanes & TMS_DOT_DECODED_VALID_BIT) == 0) { return false; }
+        if (!tms_dot_mask_valid(mask, last)) { return false; }
+        var lane: u32 = 0;
+        while (lane < TMS_DOT_LANES) {
+            if (!tms_dot_lane_valid(lanes, acts, mask, lane)) { return false; }
+            lane = lane + 1;
+        }
+        return true;
+    }
+
+    // Reference functions: accumulation and handshake.
+    pub fn tms_dot_width_supported(width: u32) -> bool {
+        return width >= TMS_DOT_ACC_WIDTH_MIN && width <= TMS_DOT_ACC_WIDTH_MAX;
+    }
+
+    pub fn tms_dot_runner_width_supported(width: u32) -> bool {
+        return width >= TMS_DOT_RUNNER_ACC_WIDTH_MIN && width <= TMS_DOT_ACC_WIDTH_MAX;
+    }
+
+    pub fn tms_dot_acc_max(width: u32) -> i64 {
+        return (((1 as i64) << (width - 1)) - 1);
+    }
+
+    pub fn tms_dot_acc_min(width: u32) -> i64 {
+        return 0 - ((1 as i64) << (width - 1));
+    }
+
+    pub fn tms_dot_next_error(frame_error: bool, stage_error: bool, total: i64, min_value: i64, max_value: i64,
+                              stage_empty: bool, frame_active: bool) -> bool {
+        if (frame_error || stage_error) { return true; }
+        if (total < min_value || total > max_value) { return true; }
+        return stage_empty && frame_active;
+    }
+
+    pub fn tms_dot_accumulate_ready(out_valid: bool, out_ready: bool) -> bool {
+        return !out_valid || out_ready;
+    }
+
+    pub fn tms_dot_in_ready(reset: bool, stage_valid: bool, out_valid: bool, out_ready: bool) -> bool {
+        if (reset) { return false; }
+        return !stage_valid || tms_dot_accumulate_ready(out_valid, out_ready);
+    }
+
+    pub fn tms_dot_encoded_bits(dense_mode: bool) -> u32 {
+        if (dense_mode) { return TMS_DOT_DENSE_CODE_BITS; }
+        return TMS_DOT_CODE_BITS;
+    }
+
+    // Reference functions: runner packet words.
+    pub fn tms_rtl_packet_word(code: u32, activations: []i32, mask: u32, last: bool) -> u64 {
+        var word: u64 = code as u64;
+        var lane: u32 = 0;
+        while (lane < TMS_DOT_LANES) {
+            var byte: u64 = ((activations[lane] as u32) & 255) as u64;
+            word = word | (byte << (TMS_RTL_PACKET_ACTIVATION_SHIFT + lane * TMS_DOT_ACTIVATION_BITS));
+            lane = lane + 1;
+        }
+        word = word | ((mask as u64) << TMS_RTL_PACKET_MASK_SHIFT);
+        if (last) { word = word | ((1 as u64) << TMS_RTL_PACKET_LAST_BIT); }
+        return word;
+    }
+
+    pub fn tms_rtl_expected_word(result: i32, error: bool) -> u64 {
+        var word: u64 = (result as u32) as u64;
+        if (error) { word = word | ((1 as u64) << TMS_RTL_EXPECTED_ERROR_BIT); }
+        return word;
+    }
+
+    pub fn tms_rtl_packet_count(count: u64) -> u64 {
+        var groups: u64 = (count + 4) / 5;
+        if (groups == 0) { return 1; }
+        return groups;
+    }
+
+    // Reference functions: storage sequencer and view.
+    pub fn tms_storage_words(trit_count: u32) -> u32 {
+        return (trit_count + TMS_STORAGE_TRITS_PER_WORD - 1) / TMS_STORAGE_TRITS_PER_WORD;
+    }
+
+    pub fn tms_storage_last_mask(trit_count: u32) -> u32 {
+        var lanes: u32 = trit_count - TMS_STORAGE_TRITS_PER_WORD * (tms_storage_words(trit_count) - 1);
+        return (1 << lanes) - 1;
+    }
+
+    pub fn tms_storage_config_ok(word_count: u32) -> bool {
+        return word_count >= 1 && word_count <= TMS_STORAGE_CAPACITY_GROUPS;
+    }
+
+    pub fn tms_storage_busy(active: bool, output_pending: bool) -> bool {
+        return active || output_pending;
+    }
+
+    pub fn tms_storage_load_ready(reset: bool, busy: bool, start: bool, config_ok: bool) -> bool {
+        return !reset && !busy && !start && config_ok;
+    }
+
+    // Edges after the accepting start edge S: word k is visible after S+1+k,
+    // the last word after S+WORDS, and the sequencer is idle after S+WORDS+1.
+    pub fn tms_storage_word_edge(word: u32) -> u32 {
+        return TMS_STORAGE_START_TO_WORD0_EDGES + word;
+    }
+
+    pub fn tms_storage_idle_edge(words: u32) -> u32 {
+        return words + 1;
+    }
+
+    // Packed view word: [15] code valid, [14:10] lane mask, [9:0] visible lanes.
+    pub fn tms_view_pack(lanes: u32, mask: u32, decoded_valid: bool, input_valid: bool) -> u32 {
+        if (!input_valid) { return 0; }
+        if (!decoded_valid) { return mask << TMS_VIEW_MASK_SHIFT; }
+        var visible: u32 = 0;
+        var lane: u32 = 0;
+        while (lane < TMS_DOT_LANES) {
+            if (((mask >> lane) & 1) == 1) { visible = visible | (lanes & (3 << (lane * 2))); }
+            lane = lane + 1;
+        }
+        return TMS_VIEW_VALID_BIT | (mask << TMS_VIEW_MASK_SHIFT) | visible;
+    }
+
+    // Invariants: constant expressions, compiled as static assertions.
+    invariant beat_fields_have_the_documented_widths {
+        assert TMS_DOT_LANES * TMS_DOT_ACTIVATION_BITS == TMS_DOT_ACTIVATION_FIELD_BITS
+            && TMS_DOT_LANES * TMS_DOT_LANE_BITS == TMS_DOT_LANE_FIELD_BITS
+            && TMS_DOT_DECODED_VALID_BIT == 1024 && TMS_DOT_MASK_BITS == TMS_DOT_LANES;
+    }
+    invariant code_limits_are_three_to_the_fifth_and_two_to_the_tenth {
+        assert TMS_DOT_DENSE_CODE_LIMIT == 3 * 3 * 3 * 3 * 3 && TMS_DOT_DENSE_CODE_LIMIT <= 256
+            && TMS_DOT_BASELINE_CODE_LIMIT == 1024 && TMS_DOT_CODE_BITS == 10 && TMS_DOT_DENSE_CODE_BITS == 8;
+    }
+    invariant group_sum_bound_is_five_times_the_int8_magnitude {
+        assert TMS_DOT_GROUP_SUM_MAX == 5 * 128 && TMS_DOT_GROUP_SUM_MIN == -640
+            && TMS_DOT_ACTIVATION_MIN == -128 && TMS_DOT_ACTIVATION_MAX == 127;
+    }
+    invariant masks_are_five_bit_prefixes {
+        assert TMS_DOT_FULL_MASK == 31 && TMS_DOT_EMPTY_MASK == 0;
+    }
+    invariant accumulator_widths_nest {
+        assert TMS_DOT_ACC_WIDTH_MIN == 2 && TMS_DOT_ACC_WIDTH_MIN < TMS_DOT_RUNNER_ACC_WIDTH_MIN
+            && TMS_DOT_RUNNER_ACC_WIDTH_MIN == 12 && TMS_DOT_RUNNER_ACC_WIDTH_MIN <= TMS_DOT_DEFAULT_ACC_WIDTH
+            && TMS_DOT_DEFAULT_ACC_WIDTH == TMS_DOT_ACC_WIDTH_MAX && TMS_DOT_ACC_WIDTH_MAX == 32;
+    }
+    invariant pipeline_latency_follows_the_two_stages {
+        assert TMS_DOT_PIPELINE_STAGES == 2 && TMS_DOT_ACCEPT_TO_VALID_EDGES == 1 && TMS_DOT_ACCEPT_TO_CONSUME_EDGES == 2;
+    }
+    invariant packet_fields_are_contiguous {
+        assert TMS_RTL_PACKET_ACTIVATION_SHIFT == TMS_RTL_PACKET_CODE_SHIFT + TMS_DOT_CODE_BITS
+            && TMS_RTL_PACKET_MASK_SHIFT == TMS_RTL_PACKET_ACTIVATION_SHIFT + TMS_DOT_ACTIVATION_FIELD_BITS
+            && TMS_RTL_PACKET_LAST_BIT == TMS_RTL_PACKET_MASK_SHIFT + TMS_DOT_MASK_BITS
+            && TMS_RTL_PACKET_RESET_BIT == TMS_RTL_PACKET_LAST_BIT + 1
+            && TMS_RTL_PACKET_RESET_PENDING_BIT == TMS_RTL_PACKET_RESET_BIT + 1
+            && TMS_RTL_EXPECTED_ERROR_BIT == TMS_RTL_EXPECTED_RESULT_BITS;
+    }
+    invariant runner_status_codes_are_distinct_and_negative {
+        assert TMS_RTL_ERR_RESOURCE < TMS_RTL_ERR_PROCESS && TMS_RTL_ERR_PROCESS < TMS_RTL_ERR_MISMATCH
+            && TMS_RTL_ERR_MISMATCH < TMS_RTL_ERR_OUTPUT && TMS_RTL_ERR_OUTPUT < TMS_RTL_ERR_OVERFLOW
+            && TMS_RTL_ERR_OVERFLOW < TMS_RTL_ERR_CAPACITY && TMS_RTL_ERR_CAPACITY < TMS_RTL_ERR_ARGUMENT
+            && TMS_RTL_ERR_ARGUMENT < -27;
+    }
+    invariant storage_capacity_and_element_width {
+        assert TMS_STORAGE_CAPACITY_GROUPS * TMS_STORAGE_TRITS_PER_WORD == TMS_STORAGE_MAX_TRITS
+            && TMS_STORAGE_ELEMENT_BITS >= TMS_STORAGE_BASELINE_CODE_WIDTH
+            && TMS_STORAGE_BASELINE_CODE_WIDTH > TMS_STORAGE_DENSE_CODE_WIDTH
+            && TMS_STORAGE_TRITS_PER_WORD == TMS_DOT_LANES;
+    }
+    invariant the_storage_join_is_a_recorded_gap {
+        assert TMS_STORAGE_HAS_BACKPRESSURE == 0 && TMS_STORAGE_JOIN_NEEDS_BUFFER == 1;
+    }
+    invariant view_packing_uses_the_upper_bits {
+        assert TMS_VIEW_VALID_BIT == 32768 && TMS_VIEW_MASK_SHIFT == TMS_DOT_LANE_FIELD_BITS && TMS_VIEW_LANE_FIELD_MASK == 1023;
+    }
+
+    // Tests execute in the generated C test runner.
+    test "dense and baseline decoding" {
+        assert tms_dot_decode(121, true) == 1024;
+        assert tms_dot_decode(0, true) == 1706;
+        assert tms_dot_decode(242, true) == 1365;
+        assert tms_dot_decode(243, true) == 0;
+        assert tms_dot_decode(377, true) == 0;
+        assert tms_dot_decode(0, false) == 1024;
+        assert tms_dot_decode(682, false) == 1706;
+        assert tms_dot_decode(341, false) == 1365;
+        assert tms_dot_decode(3, false) == 0;
+        assert tms_dot_decode(768, false) == 0;
+        assert tms_dot_decode(1024, false) == 0;
+    }
+    test "prefix masks" {
+        assert tms_dot_mask_valid(31, false) && !tms_dot_mask_valid(3, false) && !tms_dot_mask_valid(0, false);
+        assert tms_dot_mask_valid(0, true) && tms_dot_mask_valid(1, true) && tms_dot_mask_valid(3, true);
+        assert tms_dot_mask_valid(7, true) && tms_dot_mask_valid(15, true) && tms_dot_mask_valid(31, true);
+        assert !tms_dot_mask_valid(11, true) && !tms_dot_mask_valid(2, true) && !tms_dot_mask_valid(16, true);
+    }
+    test "int8 activations are widened before negation" {
+        assert tms_dot_activation(128, 0) == -128;
+        assert tms_dot_activation(127, 0) == 127;
+        assert tms_dot_activation(255 << 8, 1) == -1;
+        assert tms_dot_product(2, 128, 1, 0) == 128;
+        assert tms_dot_product(1, 128, 1, 0) == -128;
+        assert tms_dot_product(1, 127, 0, 0) == 0;
+    }
+    test "group sums stay within five times int8" {
+        var minimums: u64 = tms_dot_pack_activations(-128, -128, -128, -128, -128);
+        assert tms_dot_group_sum(1706, minimums, 31) == 640;
+        assert tms_dot_group_sum(1365, minimums, 31) == -640;
+        var mixed: u64 = tms_dot_pack_activations(-128, 127, 5, 3, 9);
+        assert tms_dot_group_sum(1097, mixed, 31) == -252;
+        assert tms_dot_group_sum(1097, mixed, 3) == -255;
+        assert tms_dot_group_sum(1024, minimums, 31) == 0;
+        assert tms_dot_activation(minimums, 4) == -128;
+    }
+    test "beat validity" {
+        assert tms_dot_group_valid(1024, 0, 0, true);
+        assert !tms_dot_group_valid(1024, 0, 0, false);
+        assert !tms_dot_group_valid(1281, 0, 1, true);
+        assert !tms_dot_group_valid(1024, 256, 1, true);
+        assert tms_dot_group_valid(1025, 5, 1, true);
+        assert !tms_dot_group_valid(1, 0, 31, true);
+        assert !tms_dot_group_valid(1024, 0, 11, true);
+        assert tms_dot_group_valid(1365, 0, 31, false);
+    }
+    test "accumulator bounds and widths" {
+        assert tms_dot_acc_min(12) == -2048 && tms_dot_acc_max(12) == 2047;
+        assert tms_dot_acc_min(32) == -2147483648 && tms_dot_acc_max(32) == 2147483647;
+        assert tms_dot_acc_min(2) == -2 && tms_dot_acc_max(2) == 1;
+        assert tms_dot_width_supported(2) && tms_dot_width_supported(32) && !tms_dot_width_supported(1) && !tms_dot_width_supported(33);
+        assert tms_dot_runner_width_supported(12) && !tms_dot_runner_width_supported(11);
+    }
+    test "frame errors are sticky and never repaired" {
+        assert !tms_dot_next_error(false, false, 2047, -2048, 2047, false, true);
+        assert tms_dot_next_error(false, false, 2048, -2048, 2047, false, true);
+        assert tms_dot_next_error(false, false, -2049, -2048, 2047, false, true);
+        assert tms_dot_next_error(true, false, 0, -2048, 2047, false, true);
+        assert tms_dot_next_error(false, true, 0, -2048, 2047, false, false);
+        assert tms_dot_next_error(false, false, 0, -2048, 2047, true, true);
+        assert !tms_dot_next_error(false, false, 0, -2048, 2047, true, false);
+    }
+    test "handshake readiness" {
+        assert tms_dot_accumulate_ready(false, false) && tms_dot_accumulate_ready(true, true) && !tms_dot_accumulate_ready(true, false);
+        assert tms_dot_in_ready(false, false, true, false);
+        assert !tms_dot_in_ready(false, true, true, false);
+        assert tms_dot_in_ready(false, true, true, true);
+        assert tms_dot_in_ready(false, true, false, false);
+        assert !tms_dot_in_ready(true, false, false, true);
+        assert tms_dot_encoded_bits(true) == 8 && tms_dot_encoded_bits(false) == 10;
+    }
+    test "runner packet words" {
+        var acts: [5]i32;
+        acts[0] = -128; acts[1] = 127; acts[2] = 0; acts[3] = 1; acts[4] = -1;
+        var word: u64 = tms_rtl_packet_word(5, acts, 31, true);
+        var code_field: u64 = word & 1023;
+        var lane0: u64 = (word >> 10) & 255;
+        var lane1: u64 = (word >> 18) & 255;
+        var lane3: u64 = (word >> 34) & 255;
+        var lane4: u64 = (word >> 42) & 255;
+        var mask_field: u64 = (word >> 50) & 31;
+        var last_field: u64 = (word >> 55) & 1;
+        var reset_fields: u64 = (word >> 56) & 3;
+        assert code_field == 5 && lane0 == 128 && lane1 == 127 && lane3 == 1 && lane4 == 255;
+        assert mask_field == 31 && last_field == 1 && reset_fields == 0;
+        assert tms_rtl_expected_word(-255, false) == 4294967041;
+        assert tms_rtl_expected_word(0, true) == 4294967296;
+        assert tms_rtl_packet_count(0) == 1 && tms_rtl_packet_count(5) == 1 && tms_rtl_packet_count(6) == 2;
+    }
+    test "storage words, tail masks, configuration and timing" {
+        assert tms_storage_words(12) == 3 && tms_storage_last_mask(12) == 3;
+        assert tms_storage_words(320) == 64 && tms_storage_last_mask(320) == 31;
+        assert tms_storage_words(1) == 1 && tms_storage_last_mask(1) == 1;
+        assert tms_storage_words(5) == 1 && tms_storage_last_mask(5) == 31;
+        assert tms_storage_config_ok(1) && tms_storage_config_ok(64) && !tms_storage_config_ok(0) && !tms_storage_config_ok(65);
+        assert tms_storage_busy(true, false) && tms_storage_busy(false, true) && !tms_storage_busy(false, false);
+        assert tms_storage_load_ready(false, false, false, true);
+        assert !tms_storage_load_ready(false, true, false, true) && !tms_storage_load_ready(false, false, true, true);
+        assert !tms_storage_load_ready(true, false, false, true) && !tms_storage_load_ready(false, false, false, false);
+        assert tms_storage_word_edge(0) == 1 && tms_storage_word_edge(2) == 3 && tms_storage_idle_edge(3) == 4;
+    }
+    test "view packing" {
+        assert tms_view_pack(1365, 31, true, true) == 64853;
+        assert tms_view_pack(1365, 3, true, true) == 35845;
+        assert tms_view_pack(0, 3, false, true) == 3072;
+        assert tms_view_pack(0, 31, false, true) == 31744;
+        assert tms_view_pack(1365, 31, true, false) == 0;
+    }
+}

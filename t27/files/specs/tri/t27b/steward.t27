@@ -1,0 +1,529 @@
+module T27bSteward;
+// The t27b steward's decisions, in t27 (#6198, owner rule 2026-10-05:
+// t27b and its tooling are written in t27). `tri t27b` reads the lab's JSON;
+// what it CONCLUDES from a run is decided here, and t27b compiles these
+// rules itself.
+//
+// Verdict codes of one spec in one lab run (t27b side and reference side).
+// PASS = 0, PASS_VACUOUS = 1, BLOCKED = 2, FRONTEND = 3, CODEGEN = 4,
+// FAIL = 5, MISMATCH = 6, CRASH = 7, TIMEOUT = 8, NOT_RUN = 9, MISSING = 10,
+// LAB_ERROR = 11 (the lab could not run the reference: no verdict either way).
+//
+// Delta codes between two runs of one spec:
+// NONE = 0, REF_MOVED = 1, REGRESSED = 2, NEW_MISMATCH = 3, GAINED = 4,
+// CHECK_LOST = 5.
+//
+// Ratchet codes of one spec against docs/reports/t27b_expectations.json:
+// NONE = 0, VACUITY_MEASURED = 1, UNEXPECTED_FAILURE = 2, UNEXPECTED_PASS = 3,
+// MOVED = 4, STALE = 5, UNJUDGED = 6, UNLISTED = 7, OVER_CAP = 8,
+// BAD_REASON = 9.
+//
+// Reason codes of a non-pass ledger entry: NONE = 0, UNIMPLEMENTED = 1,
+// REFERENCE_BUG = 2, NA = 3.
+//
+// Doctor codes (#6230). Claim: NONE = 0, CLAIM_DEAD = 1, CLAIM_OLD = 2;
+// liveness of the claim's pid: DEAD = 0, ALIVE = 1, UNKNOWN = 2.
+// Checkout of a lab run: NONE = 0, LAB_CHECKOUT = 1 (failed: the run measured
+// nothing), LAB_RECLONED = 2 (healed by a fresh clone: report it, #6220).
+//
+// Deployed lab image (#6443): NONE = 0, LAB_IMAGE_STALE = 1 (the running
+// lab.py or Dockerfile is not master's contrib/railway/t27b-lab).
+//
+// Merge gate (#6244). Check state on a PR or on master: SUCCESS = 0,
+// PENDING = 1, RED = 2 (failure, error, cancelled, timed out), ABSENT = 3,
+// NEUTRAL = 4 (skipped, neutral). What one check does to a PR: NONE = 0,
+// WAIT = 1, BLOCK = 2. Mergeable: MERGEABLE = 0, CONFLICTING = 1, UNKNOWN = 2.
+// Verdict: READY = 0, WAIT = 1, RED = 2, CONFLICT = 3, RETARGET = 4,
+// BLOCKED = 5 (a non-required check is red here and green on master),
+// CLOSED = 6 (merged or closed: nothing to decide).
+
+// fail, mismatch and crash are defects someone has to read, not blockers.
+pub fn is_bad(v: u8) -> bool {
+    if (v == 5) { return true; }
+    if (v == 6) { return true; }
+    if (v == 7) { return true; }
+    return false;
+}
+
+// A spec counts toward coverage only where the reference itself passes.
+pub fn delta_code(ref_a: u8, ref_b: u8, t_a: u8, t_b: u8, checks_a: u32, checks_b: u32) -> u8 {
+    if (ref_a != ref_b) { return 1; }
+    if (ref_b != 0) { return 0; }
+    if (t_a == 0) {
+        if (t_b != 0) { return 2; }
+    }
+    if (is_bad(t_b)) {
+        if (is_bad(t_a) == false) { return 3; }
+    }
+    if (t_a != 0) {
+        if (t_b == 0) { return 4; }
+    }
+    if (t_a == 0) {
+        if (t_b == 0) {
+            if (checks_a > 0) {
+                if (checks_b == 0) { return 5; }
+            }
+        }
+    }
+    return 0;
+}
+
+// REGRESSED, NEW_MISMATCH and CHECK_LOST stop the lanes.
+pub fn delta_is_red(code: u8) -> bool {
+    if (code == 2) { return true; }
+    if (code == 3) { return true; }
+    if (code == 5) { return true; }
+    return false;
+}
+
+// The honest ratio in tenths of a percent: t27b passes inside the reference
+// set over reference passes. Never t27b_pass (which counts specs the
+// reference fails) over reference passes -- that was the 70/648 slip (#6184).
+pub fn pct_tenths(in_ref: u32, reference: u32) -> u32 {
+    if (reference == 0) { return 0; }
+    return (in_ref * 1000 + reference / 2) / reference;
+}
+
+pub fn is_pass(v: u8) -> bool {
+    if (v == 0) { return true; }
+    if (v == 1) { return true; }
+    return false;
+}
+
+// One ledger entry against one run record whose spec still exists.
+// `counted` is false when the ledger was blessed from a run that did not count
+// runtime asserts; `same_blocker` compares the first blocker text.
+pub fn entry_code(want: u8, reference: u8, got: u8, counted: bool, same_blocker: bool) -> u8 {
+    if (reference != 0) {
+        if (reference == 2) { return 5; }
+        if (reference == 5) { return 5; }
+        return 6;
+    }
+    if (want == 0) {
+        if (got == 1) {
+            if (counted == false) { return 1; }
+        }
+        if (got != 0) { return 2; }
+        return 0;
+    }
+    if (want == 1) {
+        if (is_pass(got) == false) { return 2; }
+        if (got == 0) { return 3; }
+        return 0;
+    }
+    if (is_pass(got)) { return 3; }
+    if (same_blocker == false) { return 4; }
+    return 0;
+}
+
+// A spec the reference passes must be named in the ledger.
+pub fn unlisted(reference: u8, listed: bool) -> bool {
+    if (reference != 0) { return false; }
+    if (listed) { return false; }
+    return true;
+}
+
+// The cap only moves down; a ledger without one is over it.
+pub fn over_cap(not_pass: u32, cap: u32, has_cap: bool) -> bool {
+    if (has_cap == false) { return true; }
+    return not_pass > cap;
+}
+
+// UNEXPECTED FAILURE / PASS, STALE, UNLISTED, OVER CAP and BAD REASON are red;
+// VACUITY MEASURED, MOVED and UNJUDGED are information.
+pub fn ratchet_is_red(code: u8) -> bool {
+    if (code == 2) { return true; }
+    if (code == 3) { return true; }
+    if (code == 5) { return true; }
+    if (code == 7) { return true; }
+    if (code == 8) { return true; }
+    if (code == 9) { return true; }
+    return false;
+}
+
+// Bless records what t27b says it cannot compile yet; it never files a defect.
+pub fn is_unimplemented(v: u8) -> bool {
+    if (v == 2) { return true; }
+    if (v == 3) { return true; }
+    if (v == 4) { return true; }
+    return false;
+}
+
+// The reason bless writes for a non-pass entry: the one a human wrote, else
+// UNIMPLEMENTED for a construct t27b rejects, else NONE (bless refuses).
+pub fn bless_reason(got: u8, kept: u8) -> u8 {
+    if (kept != 0) { return kept; }
+    if (is_unimplemented(got)) { return 1; }
+    return 0;
+}
+
+// Bless may lower the cap, never raise it; a ledger without a cap sets one.
+pub fn cap_rises(not_pass: u32, old_cap: u32, has_old: bool) -> bool {
+    if (has_old == false) { return false; }
+    return not_pass > old_cap;
+}
+
+// The doctor's thresholds are minutes. A lab run that failed has no
+// `finished`; its age is read from `updated`, so a stuck lab ages too.
+pub fn lab_stale(age_min: u32, limit_min: u32) -> bool {
+    return age_min > limit_min;
+}
+
+// A dead pid frees the claim at any age; a live one is only reported past
+// the limit (a long tick is not a stuck tick). An unknown pid says nothing.
+pub fn claim_code(alive: u8, age_min: u32, limit_min: u32) -> u8 {
+    if (alive == 0) { return 1; }
+    if (alive == 1) {
+        if (age_min > limit_min) { return 2; }
+    }
+    return 0;
+}
+
+// railway 4.x cannot reach the lab's project; 5.x can.
+pub fn railway_old(major: u32) -> bool {
+    return major < 5;
+}
+
+pub fn ledger_quiet(age_min: u32, limit_min: u32) -> bool {
+    return age_min > limit_min;
+}
+
+// A failed checkout outranks a heal: the re-clone failed too.
+pub fn checkout_code(ok: bool, recloned: bool) -> u8 {
+    if (ok == false) { return 1; }
+    if (recloned) { return 2; }
+    return 0;
+}
+
+// Is the running lab image master's (#6443)? `master_known`: master's
+// contrib/railway/t27b-lab could be read; without it nothing is said.
+// `reported`: the lab published its own lab.py sha -- an image from before
+// #6443 does not, and is older than master by construction (on 2026-10-05
+// latest.json had no steps.ratchet: the image predated #6115). `same`: every
+// file sha the lab published equals master's.
+pub fn image_code(master_known: bool, reported: bool, same: bool) -> u8 {
+    if (master_known == false) { return 0; }
+    if (reported == false) { return 1; }
+    if (same == false) { return 1; }
+    return 0;
+}
+
+// A cap rise is covered when every new non-pass entry is a spec the old
+// ledger did not name: no entry already in it got worse (#6237).
+pub fn cap_rise_is_new(not_pass: u32, old_cap: u32, new_not_pass: u32) -> bool {
+    if (not_pass < new_not_pass) { return true; }
+    return not_pass - new_not_pass <= old_cap;
+}
+
+// An alarm someone has to read. A crash or a mismatch always is; a fail or a
+// timeout only where the reference passes -- one the reference shares is a
+// reference-path defect, outside the denominator (#6237).
+pub fn is_alarm(t: u8, reference: u8) -> bool {
+    if (t == 6) { return true; }
+    if (t == 7) { return true; }
+    if (reference != 0) { return false; }
+    if (t == 5) { return true; }
+    if (t == 8) { return true; }
+    return false;
+}
+
+// is_alarm, judged test by test where both sides ran the file's tests
+// (#6441). `compared` says the record carries the per-test differential
+// against the reference (t27c + zig), `disagree` how many tests differ. A
+// fail the reference shares is no alarm only when the same tests fail; a
+// file t27b passes is an alarm when a test's verdict differs from the
+// reference's. Without the differential it is is_alarm.
+pub fn is_alarm_tests(t: u8, reference: u8, compared: bool, disagree: u32) -> bool {
+    if (is_alarm(t, reference)) { return true; }
+    if (compared) {
+        if (disagree > 0) { return true; }
+    }
+    return false;
+}
+
+// What stops the lanes (#6441). `jit_interp_mismatch` is t27b's JIT against
+// t27b's own interpreter: both run lower.rs's IR, so a lowering defect both
+// share agrees with itself. `reference_disagree` is t27b against the
+// reference, test by test: the files where some test's verdict differs or
+// only one side has it. Either one is a stop and a report, never a skip.
+pub fn lanes_stop(jit_interp_mismatch: u32, reference_disagree: u32) -> bool {
+    if (jit_interp_mismatch > 0) { return true; }
+    if (reference_disagree > 0) { return true; }
+    return false;
+}
+
+// A required check must be SUCCESS; anything else waits or blocks. A
+// non-required check blocks only when it is red here and its latest
+// completed result on master is success (Q16): red on master too means
+// master broke it, not this PR.
+pub fn check_effect(state: u8, master: u8, required: bool) -> u8 {
+    if (required) {
+        if (state == 0) { return 0; }
+        if (state == 2) { return 2; }
+        return 1;
+    }
+    if (state == 2) {
+        if (master == 0) { return 2; }
+        if (master == 1) { return 1; }
+    }
+    return 0;
+}
+
+// Which master state a PR check is judged against (#6334). `last` is the
+// newest completed verdict of the check over the last few master commits (a
+// state code; ABSENT = 3 when none in the window); `running` says a newer
+// master run of it has no conclusion yet. A red verdict stays red: master was
+// already broken at that commit, the queued run cannot clear this PR (live
+// 2026-10-05 02:02Z, #6333: coverage FAILURE on the three commits under a
+// queued tip). A green verdict under a running tip is not trusted: PENDING,
+// so a red check waits (Q29). No verdict at all under a running tip is
+// PENDING too: nothing was proved, so the gate waits, never merges.
+pub fn master_state(running: bool, last: u8) -> u8 {
+    if (running == false) { return last; }
+    if (last == 2) { return 2; }
+    return 1;
+}
+
+// The worse of two effects, so a list of checks folds to one.
+pub fn effect_fold(acc: u8, e: u8) -> u8 {
+    if (e > acc) { return e; }
+    return acc;
+}
+
+pub fn pr_ready(open: bool, mergeable: u8, base_master: bool, required: u8, other: u8) -> u8 {
+    if (open == false) { return 6; }
+    if (mergeable == 1) { return 3; }
+    if (base_master == false) { return 4; }
+    if (required == 2) { return 2; }
+    if (other == 2) { return 5; }
+    if (required == 1) { return 1; }
+    if (other == 1) { return 1; }
+    if (mergeable != 0) { return 1; }
+    return 0;
+}
+
+// What `tri t27b watch` does with one PR now (#6285). `verdict` is
+// pr_ready's. `parent` is the PR the base branch belongs to: 0 none (the
+// base is master), 1 merged, 2 still open, 3 closed unmerged or not found.
+// 0 wait, 1 merge, 2 retarget to master and bring master in, 3 stop and
+// report, 4 done. A stacked PR is retargeted only once its parent merged
+// (Q33: from the parent's state, never from a read that failed).
+pub fn watch_action(verdict: u8, parent: u8) -> u8 {
+    if (verdict == 6) { return 4; }
+    if (verdict == 0) { return 1; }
+    if (verdict == 1) { return 0; }
+    if (verdict == 4) {
+        if (parent == 1) { return 2; }
+        if (parent == 2) { return 0; }
+        return 3;
+    }
+    return 3;
+}
+
+// `tri t27b next` (#6317): which side of the lane picker one file's blockers
+// count on. `reference` and `t` are verdict codes. 0 not counted, 1 lane (the
+// reference passes and t27b is blocked: a construct to implement), 2 reference
+// bug (t27b is blocked but the reference itself does not pass: file it, it is
+// not a lane -- slip Q38: a lane picked without the reference moved the
+// counted number by 0). No reference verdict (not run, missing, lab error)
+// counts nowhere.
+pub fn lane_kind(reference: u8, t: u8) -> u8 {
+    if (t != 2) { return 0; }
+    if (reference == 0) { return 1; }
+    if (reference == 1) { return 0; }
+    if (reference > 8) { return 0; }
+    return 2;
+}
+
+// The rank of a blocker family for the next lane: a file where it is the
+// sole blocker passes once the family lands, so sole outranks first; first
+// (files where it is the first blocker) breaks ties.
+pub fn lane_score(sole: u32, first: u32) -> u32 {
+    return sole * 1000 + first;
+}
+
+// The denominator for "t27b pass among reference passes with tests": a
+// pass_vacuous spec runs no test or invariant, so it proves nothing.
+pub fn with_tests(reference: u32, vacuous: u32) -> u32 {
+    if (vacuous > reference) { return 0; }
+    return reference - vacuous;
+}
+
+test delta_ref_moved { assert_eq(delta_code(2, 0, 2, 0, 0, 0), 1); }
+test delta_outside_reference_is_silent { assert_eq(delta_code(2, 2, 2, 0, 0, 0), 0); }
+test delta_regressed { assert_eq(delta_code(0, 0, 0, 3, 1, 0), 2); }
+test delta_regressed_to_fail_is_regressed { assert_eq(delta_code(0, 0, 0, 5, 1, 0), 2); }
+test delta_new_mismatch { assert_eq(delta_code(0, 0, 2, 6, 0, 0), 3); }
+test delta_old_mismatch_is_silent { assert_eq(delta_code(0, 0, 6, 5, 0, 0), 0); }
+test delta_gained { assert_eq(delta_code(0, 0, 2, 0, 0, 1), 4); }
+test delta_check_lost { assert_eq(delta_code(0, 0, 0, 0, 2, 0), 5); }
+test delta_unchanged { assert_eq(delta_code(0, 0, 0, 0, 1, 1), 0); }
+test red_codes {
+    assert(delta_is_red(2));
+    assert(delta_is_red(3));
+    assert(delta_is_red(5));
+    assert(delta_is_red(4) == false);
+    assert(delta_is_red(1) == false);
+}
+test pct_56_of_648 { assert_eq(pct_tenths(56, 648), 86); }
+test pct_75_of_657 { assert_eq(pct_tenths(75, 657), 114); }
+// 2/3 is 66.66..%: rounding gives 66.7, truncation 66.6. 56/648 and 75/657
+// cannot tell the two apart (a mutation control found that).
+test pct_rounds_to_nearest { assert_eq(pct_tenths(2, 3), 667); }
+test pct_empty_reference { assert_eq(pct_tenths(0, 0), 0); }
+test ratchet_green { assert_eq(entry_code(0, 0, 0, true, true), 0); }
+test ratchet_unexpected_failure { assert_eq(entry_code(0, 0, 2, true, true), 2); }
+test ratchet_vacuous_counted_is_failure { assert_eq(entry_code(0, 0, 1, true, true), 2); }
+test ratchet_vacuity_measured { assert_eq(entry_code(0, 0, 1, false, true), 1); }
+test ratchet_vacuous_to_pass { assert_eq(entry_code(1, 0, 0, true, true), 3); }
+test ratchet_vacuous_lost { assert_eq(entry_code(1, 0, 3, true, true), 2); }
+test ratchet_vacuous_stays { assert_eq(entry_code(1, 0, 1, true, true), 0); }
+test ratchet_unexpected_pass { assert_eq(entry_code(2, 0, 0, true, false), 3); }
+test ratchet_moved { assert_eq(entry_code(2, 0, 3, true, false), 4); }
+test ratchet_same_blocker { assert_eq(entry_code(2, 0, 2, true, true), 0); }
+test ratchet_stale_blocked { assert_eq(entry_code(0, 2, 0, true, true), 5); }
+test ratchet_stale_fail { assert_eq(entry_code(0, 5, 0, true, true), 5); }
+test ratchet_unjudged { assert_eq(entry_code(0, 8, 0, true, true), 6); }
+test ratchet_lab_error_is_unjudged { assert_eq(entry_code(2, 11, 2, true, true), 6); }
+test ratchet_unlisted {
+    assert(unlisted(0, false));
+    assert(unlisted(0, true) == false);
+    assert(unlisted(2, false) == false);
+}
+test ratchet_cap {
+    assert(over_cap(583, 582, true));
+    assert(over_cap(582, 582, true) == false);
+    assert(over_cap(0, 0, false));
+}
+test ratchet_red_codes {
+    assert(ratchet_is_red(2));
+    assert(ratchet_is_red(9));
+    assert(ratchet_is_red(1) == false);
+    assert(ratchet_is_red(4) == false);
+    assert(ratchet_is_red(6) == false);
+}
+test bless_keeps_a_written_reason { assert_eq(bless_reason(5, 2), 2); }
+test bless_unimplemented { assert_eq(bless_reason(3, 0), 1); }
+test bless_refuses_a_defect { assert_eq(bless_reason(6, 0), 0); }
+test bless_refuses_a_timeout { assert_eq(bless_reason(8, 0), 0); }
+test bless_cap_rises { assert_eq(cap_rises(6, 5, true), true); }
+test bless_cap_holds { assert_eq(cap_rises(5, 5, true), false); }
+test bless_first_cap { assert_eq(cap_rises(9, 0, false), false); }
+
+test doctor_stale { assert(lab_stale(361, 360)); }
+test doctor_fresh_at_limit { assert(lab_stale(360, 360) == false); }
+test doctor_claim_dead_young { assert_eq(claim_code(0, 1, 100), 1); }
+test doctor_claim_old { assert_eq(claim_code(1, 101, 100), 2); }
+test doctor_claim_live_at_limit { assert_eq(claim_code(1, 100, 100), 0); }
+test doctor_claim_unknown_old { assert_eq(claim_code(2, 999, 100), 0); }
+test doctor_railway {
+    assert(railway_old(4));
+    assert(railway_old(5) == false);
+    assert(railway_old(0));
+}
+test doctor_ledger_quiet {
+    assert(ledger_quiet(181, 180));
+    assert(ledger_quiet(180, 180) == false);
+}
+test doctor_checkout_failed { assert_eq(checkout_code(false, false), 1); }
+test doctor_checkout_reclone_failed { assert_eq(checkout_code(false, true), 1); }
+test doctor_checkout_healed { assert_eq(checkout_code(true, true), 2); }
+test doctor_checkout_kept { assert_eq(checkout_code(true, false), 0); }
+
+test doctor_image_master_unknown { assert_eq(image_code(false, false, false), 0); }
+test doctor_image_unreported_is_stale { assert_eq(image_code(true, false, false), 1); }
+test doctor_image_differs { assert_eq(image_code(true, true, false), 1); }
+test doctor_image_current { assert_eq(image_code(true, true, true), 0); }
+
+test bless_rise_all_new { assert(cap_rise_is_new(594, 582, 41)); }
+test bless_rise_old_entries_over_cap { assert(cap_rise_is_new(624, 582, 41) == false); }
+test bless_rise_at_old_cap { assert(cap_rise_is_new(623, 582, 41)); }
+test bless_rise_none_new { assert(cap_rise_is_new(583, 582, 0) == false); }
+test bless_rise_more_new_than_total { assert(cap_rise_is_new(3, 0, 5)); }
+test alarm_fail_where_reference_passes { assert(is_alarm(5, 0)); }
+test alarm_fail_reference_shares { assert(is_alarm(5, 5) == false); }
+test alarm_timeout_reference_shares { assert(is_alarm(8, 8) == false); }
+test alarm_timeout { assert(is_alarm(8, 0)); }
+test alarm_crash_always { assert(is_alarm(7, 5)); }
+test alarm_mismatch_always { assert(is_alarm(6, 2)); }
+test alarm_blocked_never { assert(is_alarm(2, 0) == false); }
+test alarm_shared_fail_same_tests { assert(is_alarm_tests(5, 5, true, 0) == false); }
+test alarm_shared_fail_other_tests { assert(is_alarm_tests(5, 5, true, 1)); }
+test alarm_shared_fail_not_compared { assert(is_alarm_tests(5, 5, false, 0) == false); }
+test alarm_pass_disagrees { assert(is_alarm_tests(0, 0, true, 2)); }
+test alarm_pass_agrees { assert(is_alarm_tests(0, 0, true, 0) == false); }
+test alarm_tests_keeps_is_alarm {
+    assert(is_alarm_tests(5, 0, true, 0));
+    assert(is_alarm_tests(6, 2, false, 0));
+    assert(is_alarm_tests(2, 0, false, 0) == false);
+}
+test stop_on_mismatch { assert(lanes_stop(1, 0)); }
+test stop_on_reference_disagree { assert(lanes_stop(0, 3)); }
+test stop_neither { assert(lanes_stop(0, 0) == false); }
+
+test gate_required_green { assert_eq(check_effect(0, 3, true), 0); }
+test gate_required_pending_waits { assert_eq(check_effect(1, 0, true), 1); }
+test gate_required_absent_waits { assert_eq(check_effect(3, 0, true), 1); }
+test gate_required_skipped_waits { assert_eq(check_effect(4, 0, true), 1); }
+test gate_required_red_blocks_even_if_master_red { assert_eq(check_effect(2, 2, true), 2); }
+test gate_other_red_green_on_master_blocks { assert_eq(check_effect(2, 0, false), 2); }
+test gate_other_red_red_on_master_passes { assert_eq(check_effect(2, 2, false), 0); }
+test gate_other_red_absent_on_master_passes { assert_eq(check_effect(2, 3, false), 0); }
+test gate_other_pending_never_waits { assert_eq(check_effect(1, 0, false), 0); }
+test gate_other_red_master_running_waits { assert_eq(check_effect(2, 1, false), 1); }
+test gate_master_settled_is_its_verdict {
+    assert_eq(master_state(false, 0), 0);
+    assert_eq(master_state(false, 2), 2);
+    assert_eq(master_state(false, 3), 3);
+}
+test gate_master_running_red_below_stays_red { assert_eq(master_state(true, 2), 2); }
+test gate_master_running_green_below_is_pending { assert_eq(master_state(true, 0), 1); }
+test gate_master_running_no_verdict_is_pending { assert_eq(master_state(true, 3), 1); }
+test gate_other_red_master_running_no_verdict_waits { assert_eq(check_effect(2, master_state(true, 3), false), 1); }
+test gate_other_red_master_red_below_running_passes { assert_eq(check_effect(2, master_state(true, 2), false), 0); }
+test gate_fold {
+    assert_eq(effect_fold(effect_fold(effect_fold(0, 1), 0), 2), 2);
+    assert_eq(effect_fold(effect_fold(0, 0), 1), 1);
+}
+test gate_ready { assert_eq(pr_ready(true, 0, true, 0, 0), 0); }
+test gate_conflict_first { assert_eq(pr_ready(true, 1, false, 2, 2), 3); }
+test gate_retarget { assert_eq(pr_ready(true, 0, false, 0, 0), 4); }
+test gate_required_red { assert_eq(pr_ready(true, 0, true, 2, 2), 2); }
+test gate_blocked_by_other { assert_eq(pr_ready(true, 0, true, 1, 2), 5); }
+test gate_waits_on_required { assert_eq(pr_ready(true, 0, true, 1, 0), 1); }
+test gate_closed_first { assert_eq(pr_ready(false, 1, false, 2, 2), 6); }
+test gate_waits_on_other_wait { assert_eq(pr_ready(true, 0, true, 0, 1), 1); }
+test gate_waits_on_mergeable_unknown { assert_eq(pr_ready(true, 2, true, 0, 0), 1); }
+test watch_merges_ready { assert_eq(watch_action(0, 0), 1); }
+test watch_waits { assert_eq(watch_action(1, 0), 0); }
+test watch_stops_on_red { assert_eq(watch_action(2, 0), 3); }
+test watch_stops_on_conflict { assert_eq(watch_action(3, 0), 3); }
+test watch_stops_on_blocked { assert_eq(watch_action(5, 0), 3); }
+test watch_done_when_closed { assert_eq(watch_action(6, 2), 4); }
+test watch_retargets_after_parent_merged { assert_eq(watch_action(4, 1), 2); }
+test watch_stacked_waits_for_parent { assert_eq(watch_action(4, 2), 0); }
+test watch_orphan_stack_stops { assert_eq(watch_action(4, 3), 3); }
+test watch_unknown_base_stops { assert_eq(watch_action(4, 0), 3); }
+test next_lane_when_reference_passes { assert_eq(lane_kind(0, 2), 1); }
+test next_reference_bug_when_reference_blocked { assert_eq(lane_kind(2, 2), 2); }
+test next_reference_bug_when_reference_fails { assert_eq(lane_kind(5, 2), 2); }
+test next_reference_bug_on_reference_timeout { assert_eq(lane_kind(8, 2), 2); }
+test next_no_verdict_counts_nowhere { assert_eq(lane_kind(11, 2), 0); }
+test next_not_run_counts_nowhere { assert_eq(lane_kind(9, 2), 0); }
+test next_only_blocked_files_count { assert_eq(lane_kind(0, 0), 0); }
+test next_frontend_is_not_a_lane { assert_eq(lane_kind(0, 3), 0); }
+test next_sole_outranks_first { assert(lane_score(1, 0) > lane_score(0, 999)); }
+test next_first_breaks_ties { assert(lane_score(3, 10) > lane_score(3, 9)); }
+test next_score_value { assert_eq(lane_score(12, 40), 12040); }
+test next_with_tests { assert_eq(with_tests(720, 271), 449); }
+test next_with_tests_never_wraps { assert_eq(with_tests(3, 5), 0); }
+
+invariant reference_disagree_always_stops {
+    assert(lanes_stop(0, 1));
+}
+
+invariant gained_never_red {
+    assert(delta_is_red(delta_code(0, 0, 2, 0, 0, 1)) == false);
+}
+
+endmodule

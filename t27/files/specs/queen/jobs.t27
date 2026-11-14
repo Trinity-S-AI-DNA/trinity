@@ -1,0 +1,232 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/queen/jobs.t27 -- a multi-step job the Queen drives to its end, with no session open anywhere
+; A release is the measured example (2026-10-07, t27c 0.5.0): a Claude session ran it from a laptop,
+; on a 15-minute cron, for about three hours. It polled the Actions queue, rebased a pull request that
+; went conflicting, checked every manifest by hand before an irreversible crates.io publish, tagged,
+; published, watched the pipeline, then deleted its own cron. Every step was a decision this file can
+; make, and every wait was for an event the Queen already sees. Owner, 2026-10-08 (translated): "then
+; any release or multi-step job is done by the swarm, and nobody needs an open laptop".
+; A job is an ordered list of steps read from a job card (specs/jobs/<name>.t27). Each step is one of:
+;   CHECK  -- a read-only gate (every manifest says the version; the tag does not exist yet)
+;   WAIT   -- a condition GitHub or a registry reports later (a workflow succeeded; the crate is out)
+;   EFFECT -- one external effect, through the effects journal of control.t27 section 7, so a Queen
+;             that restarts mid-step never repeats it (a second release, a second comment)
+; The Queen advances every running job on each round and on each control event (control.t27 section
+; 1); a job holds no lane and no bee. No person is waited for: a wait is bounded, a failure is retried
+; a bounded number of times, and then the job fails with its reason written down. A person may cancel.
+; An irreversible effect runs only at a pinned subject (one commit) that every check before it passed
+; at, and never in a rehearsal: a rehearsal walks the whole job and records what each effect would do.
+; Not here: the step executors (GitHub and registry I/O in the supervisor, gHashTag/BrowserOS), and the
+; credential an effect needs -- a job whose effect has none answers BLOCKED and waits, visibly.
+; ASCII only (L3).
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module QueenJobs;
+
+/// Step kinds, by number in the job cards.
+pub const SK_CHECK : u8 = 0;
+pub const SK_WAIT : u8 = 1;
+pub const SK_EFFECT : u8 = 2;
+pub const STEP_KINDS : u8 = 3;
+
+/// Job states. DONE, FAILED and CANCELLED are terminal.
+pub const J_RUNNING : u8 = 0;
+pub const J_DONE : u8 = 1;
+pub const J_FAILED : u8 = 2;
+pub const J_CANCELLED : u8 = 3;
+
+/// What a step's executor answered this time.
+///   PASS     the condition holds, or the effect is done (or was found done by a look-up)
+///   NOT_YET  a WAIT whose condition has not come yet
+///   FAIL     the condition is false, or the effect was refused
+///   BLOCKED  the step cannot run in this deployment (no credential): it waits, and says why
+pub const O_PASS : u8 = 0;
+pub const O_NOT_YET : u8 = 1;
+pub const O_FAIL : u8 = 2;
+pub const O_BLOCKED : u8 = 3;
+
+/// What the job does with that answer.
+pub const A_ADVANCE : u8 = 0;
+pub const A_STAY : u8 = 1;
+pub const A_RETRY : u8 = 2;
+pub const A_FAIL : u8 = 3;
+
+/// A CHECK or EFFECT that failed runs again this many times in all before the job fails: a GitHub 5xx
+/// or a rate limit is transient, a wrong manifest is not. Three, the effects journal's EFFECT_RUN_LIMIT
+/// (control.t27 section 7, written as a literal here), so one step never runs more than one effect key.
+pub const STEP_RUN_LIMIT : u32 = 3;
+
+/// A WAIT, or a BLOCKED step, fails the job after one day. The release pipeline that motivated this
+/// file took 2 h behind a jammed Actions queue; a day is that with room to spare, and a job that waited
+/// a day is not waiting, it is stuck -- so it fails with its reason rather than waiting for a person.
+pub const WAIT_LIMIT_MINUTES : u32 = 1440;
+
+/// The answer to one step. `runs` counts this step's runs so far (this one included); `waited` counts
+/// minutes since the step started.
+pub fn step_action(kind: u8, outcome: u8, runs: u32, waited: u32) -> u8 {
+    if (outcome == O_PASS) { return A_ADVANCE; }
+    if (outcome == O_NOT_YET) {
+        if (kind != SK_WAIT) { return A_FAIL; }
+        if (waited >= WAIT_LIMIT_MINUTES) { return A_FAIL; }
+        return A_STAY;
+    }
+    if (outcome == O_BLOCKED) {
+        if (waited >= WAIT_LIMIT_MINUTES) { return A_FAIL; }
+        return A_STAY;
+    }
+    if (outcome == O_FAIL) {
+        if (kind == SK_WAIT) { return A_FAIL; }
+        if (runs >= STEP_RUN_LIMIT) { return A_FAIL; }
+        return A_RETRY;
+    }
+    return A_FAIL;
+}
+
+/// The job's state once a step's action is applied. Advancing past the last step finishes the job.
+pub fn job_state_after(action: u8, step: u32, step_count: u32) -> u8 {
+    if (action == A_FAIL) { return J_FAILED; }
+    if (action == A_ADVANCE) {
+        if (step + 1 >= step_count) { return J_DONE; }
+    }
+    return J_RUNNING;
+}
+
+/// The step the job is on afterwards.
+pub fn step_after(action: u8, step: u32) -> u32 {
+    if (action == A_ADVANCE) { return step + 1; }
+    return step;
+}
+
+/// Whether a job may still be cancelled: a terminal job may not. A cancel stops the steps that have
+/// not run; it undoes nothing (an effect that landed stays landed, and its journal entry says so).
+pub fn cancel_allowed(state: u8) -> bool {
+    return state == J_RUNNING;
+}
+
+pub fn is_terminal(state: u8) -> bool {
+    return state != J_RUNNING;
+}
+
+/// What an EFFECT step may do.
+///   E_RUN       run it, through the effects journal
+///   E_REHEARSE  record what it would do, and answer PASS: the job walks on, nothing is published
+///   E_REFUSE    the job's subject is not pinned, or a check before it did not pass at that subject
+pub const E_RUN : u8 = 0;
+pub const E_REHEARSE : u8 = 1;
+pub const E_REFUSE : u8 = 2;
+
+/// The subject is the one commit a job publishes from, pinned by its first CHECK. An effect runs only
+/// when the subject is pinned and every check before it passed at that same subject: a release must
+/// never ship a commit nobody checked, which is what a manifest edited between the check and the tag
+/// would be.
+pub fn effect_may_run(rehearsal: bool, subject_pinned: bool, checks_at_subject: bool) -> u8 {
+    if (subject_pinned == false) { return E_REFUSE; }
+    if (checks_at_subject == false) { return E_REFUSE; }
+    if (rehearsal) { return E_REHEARSE; }
+    return E_RUN;
+}
+
+/// One running job per card. Two release jobs racing for one version would each pass the
+/// "tag absent" check and one would publish what the other checked.
+pub fn job_may_start(running_of_card: u32) -> bool {
+    return running_of_card == 0;
+}
+
+/// The Queen never runs a job's steps on a bee's lane, and a job never holds a lane: it costs a
+/// round's worth of reads, not a worker.
+pub fn job_holds_a_lane() -> bool {
+    return false;
+}
+
+test a_release_walks_its_steps_to_done {
+    // CHECK, CHECK, EFFECT, EFFECT, WAIT, WAIT, EFFECT -- the t27c release card's shape
+    var step : u32 = 0;
+    var a : u8 = step_action(SK_CHECK, O_PASS, 1, 0);
+    assert a == A_ADVANCE;
+    assert job_state_after(a, step, 7) == J_RUNNING;
+    step = step_after(a, step);
+    assert step == 1;
+    // a WAIT that has not come yet keeps the job on its step
+    var w : u8 = step_action(SK_WAIT, O_NOT_YET, 1, 30);
+    assert w == A_STAY;
+    assert step_after(w, 4) == 4;
+    assert job_state_after(w, 4, 7) == J_RUNNING;
+    // the last step passing finishes the job
+    assert job_state_after(A_ADVANCE, 6, 7) == J_DONE;
+    assert job_state_after(A_ADVANCE, 5, 7) == J_RUNNING;
+}
+
+test no_person_is_waited_for {
+    // a wait that never comes, and a step blocked for want of a credential, both end after a day
+    assert step_action(SK_WAIT, O_NOT_YET, 1, WAIT_LIMIT_MINUTES - 1) == A_STAY;
+    assert step_action(SK_WAIT, O_NOT_YET, 1, WAIT_LIMIT_MINUTES) == A_FAIL;
+    assert step_action(SK_EFFECT, O_BLOCKED, 1, WAIT_LIMIT_MINUTES - 1) == A_STAY;
+    assert step_action(SK_EFFECT, O_BLOCKED, 1, WAIT_LIMIT_MINUTES) == A_FAIL;
+    assert job_state_after(A_FAIL, 3, 7) == J_FAILED;
+}
+
+test a_failure_is_retried_then_fails_the_job {
+    assert step_action(SK_CHECK, O_FAIL, 1, 0) == A_RETRY;
+    assert step_action(SK_EFFECT, O_FAIL, 2, 0) == A_RETRY;
+    assert step_action(SK_EFFECT, O_FAIL, STEP_RUN_LIMIT, 0) == A_FAIL;
+    assert step_action(SK_CHECK, O_FAIL, STEP_RUN_LIMIT, 0) == A_FAIL;
+    // a WAIT that answers FAIL saw its condition go false (the pipeline failed): no retry
+    assert step_action(SK_WAIT, O_FAIL, 1, 0) == A_FAIL;
+    // only a WAIT may answer NOT_YET; anything else that does is a broken executor
+    assert step_action(SK_CHECK, O_NOT_YET, 1, 0) == A_FAIL;
+    assert step_action(SK_EFFECT, O_NOT_YET, 1, 0) == A_FAIL;
+    // an answer this file does not know fails the job
+    assert step_action(SK_CHECK, 9, 1, 0) == A_FAIL;
+    // a retry stays on its step
+    assert step_after(A_RETRY, 2) == 2;
+    assert job_state_after(A_RETRY, 2, 7) == J_RUNNING;
+}
+
+test an_irreversible_effect_needs_a_checked_pinned_subject {
+    assert effect_may_run(false, true, true) == E_RUN;
+    assert effect_may_run(false, false, true) == E_REFUSE;
+    assert effect_may_run(false, true, false) == E_REFUSE;
+    // a rehearsal never publishes, and still refuses what a real run would refuse
+    assert effect_may_run(true, true, true) == E_REHEARSE;
+    assert effect_may_run(true, false, true) == E_REFUSE;
+    assert effect_may_run(true, true, false) == E_REFUSE;
+}
+
+test a_cancel_stops_a_running_job_only {
+    assert cancel_allowed(J_RUNNING) == true;
+    assert cancel_allowed(J_DONE) == false;
+    assert cancel_allowed(J_FAILED) == false;
+    assert cancel_allowed(J_CANCELLED) == false;
+    assert is_terminal(J_CANCELLED) == true;
+    assert is_terminal(J_RUNNING) == false;
+}
+
+test one_job_per_card_and_no_lane {
+    assert job_may_start(0) == true;
+    assert job_may_start(1) == false;
+    assert job_holds_a_lane() == false;
+}
+
+// The supervisor mirrors these codes by number, and the job cards write step kinds by number.
+invariant the_job_codes_never_move {
+    assert SK_CHECK == 0;
+    assert SK_WAIT == 1;
+    assert SK_EFFECT == 2;
+    assert STEP_KINDS == 3;
+    assert J_RUNNING == 0;
+    assert J_DONE == 1;
+    assert J_FAILED == 2;
+    assert J_CANCELLED == 3;
+    assert O_PASS == 0;
+    assert O_NOT_YET == 1;
+    assert O_FAIL == 2;
+    assert O_BLOCKED == 3;
+    assert E_RUN == 0;
+    assert E_REHEARSE == 1;
+    assert E_REFUSE == 2;
+}
+
+invariant the_limits_are_bounded {
+    assert STEP_RUN_LIMIT == 3;
+    assert WAIT_LIMIT_MINUTES >= 120 and WAIT_LIMIT_MINUTES <= 2880;
+}

@@ -1,0 +1,184 @@
+// TRI-NET DePIN settlement commitment: a Merkle tree over a payout round's receipts.
+// The settlement publishes ONE root hash; each node proves its (receipt, reward) leaf
+// is under that root with a logarithmic inclusion proof -- exactly Helium's model
+// (store the root on-chain, claim a reward by a Merkle proof). This makes the whole
+// round verifiable by anyone from a single 32-bit root, and lets a node prove it was
+// paid correctly without trusting the settler.
+//
+// Fixed depth 3 (8 leaves) because t27 has no loops -- the tree is unrolled. Hash is
+// the multiply-free mix32 (non-cryptographic; a production commitment would use a
+// real hash, but the STRUCTURE -- order-sensitive, tamper-evident, provable -- holds).
+
+module TriMerkle {
+    use base::types;
+
+    const M_C: u32 = 0x9E3779B9; // golden-ratio mixing constant
+
+    fn rotl(x: u32, k: u32) -> u32 {
+        return ((x << k) | (x >> (32 - k)));
+    }
+
+    fn mix32(x: u32) -> u32 {
+        let a: u32 = x ^ (x >> 16);
+        let b: u32 = a +% (a << 3);
+        let c: u32 = b ^ (b >> 11);
+        let d: u32 = c +% (c << 15);
+        return d ^ (d >> 16);
+    }
+
+    // Parent hash of two children. Order-sensitive: hpair(l,r) != hpair(r,l), so the
+    // left/right position of a leaf is bound into the root (a swapped tree fails).
+    fn hpair(l: u32, r: u32) -> u32 {
+        let a: u32 = mix32(l ^ M_C);
+        let b: u32 = mix32(r ^ rotl(l, 13));
+        return mix32(a ^ rotl(b, 7));
+    }
+
+    // Hash a node's receipt leaf: (node id, total bytes, quality, reward).
+    fn leaf_hash(node_id: u32, total_bytes: u32, quality: u32, reward: u32) -> u32 {
+        let a: u32 = mix32(node_id ^ rotl(total_bytes, 5));
+        let b: u32 = mix32(quality ^ rotl(reward, 11));
+        return hpair(a, b);
+    }
+
+    // Account leaf: (node id, accumulated $TRI balance). The ledger state root is a
+    // Merkle tree over these, so a node proves its OWN balance with a logarithmic
+    // inclusion proof -- no need to ship the whole ledger (Helium's account model).
+    fn account_leaf(node_id: u32, balance: u32) -> u32 {
+        return hpair(mix32(node_id ^ M_C), mix32(balance ^ rotl(node_id, 7)));
+    }
+
+    // Build the round root from 8 receipt leaves.
+    fn merkle_root8(l0: u32, l1: u32, l2: u32, l3: u32, l4: u32, l5: u32, l6: u32, l7: u32) -> u32 {
+        let p0: u32 = hpair(l0, l1);
+        let p1: u32 = hpair(l2, l3);
+        let p2: u32 = hpair(l4, l5);
+        let p3: u32 = hpair(l6, l7);
+        let q0: u32 = hpair(p0, p1);
+        let q1: u32 = hpair(p2, p3);
+        return hpair(q0, q1);
+    }
+
+    // One step up the tree: combine `node` with its `sibling`. is_right=1 when `node`
+    // is the RIGHT child (so the sibling is on the left).
+    fn merkle_step(node: u32, sibling: u32, is_right: u32) -> u32 {
+        if (is_right == 1) {
+            return hpair(sibling, node);
+        } else {
+            return hpair(node, sibling);
+        }
+    }
+
+    // Verify a depth-3 inclusion proof: fold `leaf` up with its 3 siblings, choosing
+    // left/right at each level from the bits of `idx`, and compare to `root`.
+    fn merkle_verify8(leaf: u32, s0: u32, s1: u32, s2: u32, idx: u32, root: u32) -> bool {
+        let n0: u32 = merkle_step(leaf, s0, idx & 1);
+        let n1: u32 = merkle_step(n0, s1, (idx >> 1) & 1);
+        let n2: u32 = merkle_step(n1, s2, (idx >> 2) & 1);
+        return n2 == root;
+    }
+
+    // ---- Tests / invariants ----
+
+    // Order-sensitivity: a leaf's left/right position is bound into every parent.
+    test hpair_order_sensitive {
+        assert(hpair(0x11111111, 0x22222222) != hpair(0x22222222, 0x11111111), "order matters");
+    }
+
+    // A correct inclusion proof for leaf index 3 verifies against the true root.
+    test verify_valid_proof_idx3 {
+        l0 = leaf_hash(0, 1000, 31, 700);
+        l1 = leaf_hash(1, 2000, 15, 250);
+        l2 = leaf_hash(2, 3000, 3, 30);
+        l3 = leaf_hash(3, 4000, 20, 400);
+        l4 = leaf_hash(4, 500, 10, 100);
+        l5 = leaf_hash(5, 600, 5, 60);
+        l6 = leaf_hash(6, 700, 8, 80);
+        l7 = leaf_hash(7, 800, 12, 120);
+        root = merkle_root8(l0, l1, l2, l3, l4, l5, l6, l7);
+        // proof for l3 (idx=3): s0=l2, s1=hpair(l0,l1), s2=hpair(hpair(l4,l5),hpair(l6,l7))
+        s1 = hpair(l0, l1);
+        s2 = hpair(hpair(l4, l5), hpair(l6, l7));
+        assert(merkle_verify8(l3, l2, s1, s2, 3, root) == true, "valid proof for l3");
+    }
+
+    // A correct inclusion proof for index 5 verifies (different left/right pattern).
+    test verify_valid_proof_idx5 {
+        l0 = leaf_hash(0, 1000, 31, 700);
+        l1 = leaf_hash(1, 2000, 15, 250);
+        l2 = leaf_hash(2, 3000, 3, 30);
+        l3 = leaf_hash(3, 4000, 20, 400);
+        l4 = leaf_hash(4, 500, 10, 100);
+        l5 = leaf_hash(5, 600, 5, 60);
+        l6 = leaf_hash(6, 700, 8, 80);
+        l7 = leaf_hash(7, 800, 12, 120);
+        root = merkle_root8(l0, l1, l2, l3, l4, l5, l6, l7);
+        // proof for l5 (idx=5): s0=l4, s1=hpair(l6,l7), s2=hpair(hpair(l0,l1),hpair(l2,l3))
+        s1 = hpair(l6, l7);
+        s2 = hpair(hpair(l0, l1), hpair(l2, l3));
+        assert(merkle_verify8(l5, l4, s1, s2, 5, root) == true, "valid proof for l5");
+    }
+
+    // A forged leaf (node claims a bigger reward) does NOT verify against the root.
+    test verify_rejects_forged_reward {
+        l0 = leaf_hash(0, 1000, 31, 700);
+        l1 = leaf_hash(1, 2000, 15, 250);
+        l2 = leaf_hash(2, 3000, 3, 30);
+        l3 = leaf_hash(3, 4000, 20, 400);
+        l4 = leaf_hash(4, 500, 10, 100);
+        l5 = leaf_hash(5, 600, 5, 60);
+        l6 = leaf_hash(6, 700, 8, 80);
+        l7 = leaf_hash(7, 800, 12, 120);
+        root = merkle_root8(l0, l1, l2, l3, l4, l5, l6, l7);
+        s1 = hpair(l0, l1);
+        s2 = hpair(hpair(l4, l5), hpair(l6, l7));
+        forged = leaf_hash(3, 4000, 20, 9999); // claim 9999 instead of 400
+        assert(merkle_verify8(forged, l2, s1, s2, 3, root) == false, "forged reward rejected");
+    }
+
+    // Tamper-evidence: changing ANY leaf changes the whole round root.
+    test root_tamper_evident {
+        base = merkle_root8(1, 2, 3, 4, 5, 6, 7, 8);
+        one  = merkle_root8(1, 2, 3, 4, 5, 6, 7, 9); // last leaf changed
+        mid  = merkle_root8(1, 2, 99, 4, 5, 6, 7, 8); // middle leaf changed
+        assert(base != one, "changing a leaf changes the root");
+        assert(base != mid, "changing a middle leaf changes the root");
+    }
+
+    // A proof with a wrong sibling does not verify (can't fabricate inclusion).
+    test verify_rejects_wrong_sibling {
+        l0 = leaf_hash(0, 1000, 31, 700);
+        l1 = leaf_hash(1, 2000, 15, 250);
+        l2 = leaf_hash(2, 3000, 3, 30);
+        l3 = leaf_hash(3, 4000, 20, 400);
+        l4 = leaf_hash(4, 500, 10, 100);
+        l5 = leaf_hash(5, 600, 5, 60);
+        l6 = leaf_hash(6, 700, 8, 80);
+        l7 = leaf_hash(7, 800, 12, 120);
+        root = merkle_root8(l0, l1, l2, l3, l4, l5, l6, l7);
+        s1 = hpair(l0, l1);
+        s2 = hpair(hpair(l4, l5), hpair(l6, l7));
+        assert(merkle_verify8(l3, l7, s1, s2, 3, root) == false, "wrong sibling s0 rejected");
+    }
+
+    // A node proves its OWN $TRI balance with an inclusion proof against the ledger
+    // state root -- and cannot claim a balance it does not have.
+    test account_balance_proof {
+        a0 = account_leaf(0, 2108);
+        a1 = account_leaf(1, 971);
+        a2 = account_leaf(2, 350);
+        a3 = account_leaf(3, 1500);
+        a4 = account_leaf(4, 88);
+        a5 = account_leaf(5, 640);
+        a6 = account_leaf(6, 12);
+        a7 = account_leaf(7, 4096);
+        state_root = merkle_root8(a0, a1, a2, a3, a4, a5, a6, a7);
+        // node0 proves balance 2108 (idx 0): s0=a1, s1=hpair(a2,a3), s2=hpair(hpair(a4,a5),hpair(a6,a7))
+        s1 = hpair(a2, a3);
+        s2 = hpair(hpair(a4, a5), hpair(a6, a7));
+        assert(merkle_verify8(a0, a1, s1, s2, 0, state_root) == true, "node0 proves 2108 $TRI");
+        // node0 cannot claim a fatter balance
+        forged = account_leaf(0, 999999);
+        assert(merkle_verify8(forged, a1, s1, s2, 0, state_root) == false, "forged balance rejected");
+    }
+}

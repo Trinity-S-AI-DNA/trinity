@@ -1,0 +1,256 @@
+# Trinity TRI-NET SSOT — what the network pays for, and what it refuses to pay
+# Artefact of record: src/trinet/ledger.zig, src/trinet/mesh.zig
+# Verified 2026-08-01 in software (38 Zig tests). No claim here is a hardware claim.
+
+spec SettlementLaw version 1.0.0
+
+description """
+The law a TRI-NET coordinator applies between receiving a claim and moving
+credit. It is recorded separately from the wire protocol because the two answer
+different questions: the protocol says whether a response is well formed and
+arithmetically right, the settlement law says whether anyone gets paid for it.
+
+Two attacks live on opposite sides of that line, and conflating them was the
+design error worth avoiding. A node that skips the work and tags its guess
+correctly is caught by the protocol, because the tag does not make a wrong
+number right. A node that computes honestly but signs with someone else's
+identity passes the protocol — its tag is valid for the identity it claims —
+and must be refused by the ledger. A tag can never adjudicate whose account a
+credit belongs in.
+
+TRI is the network's unit of payment for verified work, and it is real,
+transferable money. The settlement law below -- what earns a credit and what is
+refused -- is exactly what backs its value: a TRI is worth something only
+because it is paid for work a verifier accepted, never for a promise. TRI is
+issued on-chain, on both TON and Solana (owner decision 2026-09-24). One hundred
+percent of the supply is mined this way and only this way: the mint at genesis is
+zero, there is no pre-mine, no founder allocation and no sale, and every TRI up to
+the 3^21 cap enters circulation when a verifier accepts a spec or a job. The
+earlier scoping of TRI as a non-transferable internal credit, and the reasons it
+held at a handful of nodes, are kept under finding ISSUANCE_AT_SMALL_N, now
+superseded.
+"""
+
+constants {
+  REWARD_PER_JOB_MTRI 1
+  SLASH_PER_BAD_RECEIPT_MTRI 200
+  MIN_STAKE_MTRI 1000
+  AUDIT_RATE_PERCENT 100
+  REJECTION_TOLERANCE 3
+}
+
+// ---------------------------------------------------------------------------
+// The condition that makes a compute market possible at all
+// ---------------------------------------------------------------------------
+
+rule CHEATING_MUST_BE_UNPROFITABLE {
+  name       "expected value of skipping the work must be negative"
+  formula    "p * s > r"
+  where      "p = audit rate, s = slash per detected bad receipt, r = reward per accepted job"
+  trust_tier VERIFIED_ARITHMETIC
+  enforced_at "src/trinet/ledger.zig :: Policy.isSound, checked by Ledger.init"
+}
+
+lemma UNSOUND_POLICY_IS_REFUSED {
+  exact true
+  statement  "Ledger.init returns UnsoundPolicy rather than starting on parameters where cheating pays"
+  rationale  "a configuration in which skipping the work has positive expected value is a defect, not a tuning choice"
+  witnessed_by "ledger.zig test 'a policy where cheating pays is refused'"
+}
+
+// Full audit is affordable only because the work unit is one 32-wide dot
+// product — recomputing it costs less than dispatching it. That is a property
+// of THIS unit, not a general result. When the unit grows past that point p
+// must fall and s must rise to hold the rule.
+scope_note AUDIT_RATE_IS_UNIT_DEPENDENT {
+  current_unit "32-wide ternary dot product"
+  current_p 100
+  quorum_path "src/trinet/mesh.zig :: dispatchQuorum, present for the regime where recomputation stops being cheap; not how correctness is established today"
+}
+
+// ---------------------------------------------------------------------------
+// Attacks, and which layer answers each
+// ---------------------------------------------------------------------------
+
+attacks {
+  free_rider {
+    behaviour   "returns a plausible wrong answer without doing the work, tagged correctly"
+    caught_by   protocol_verify
+    mechanism   "independent recomputation of the dot product"
+    measured    "caught 450+ of 500 in software"
+    residue     "the answer space is 65 wide, so a guess is occasionally right by chance"
+    mitigation  "nodes are scored over many jobs; a single accepted receipt is never evidence of honesty"
+    status      VERIFIED_SW
+  }
+  replay {
+    behaviour   "returns a previous job's nonce"
+    caught_by   protocol_verify
+    mechanism   "nonce binding in the tag preimage"
+    status      VERIFIED_SW
+  }
+  identity_theft {
+    behaviour   "computes honestly, signs as another node"
+    caught_by   ledger_settle
+    mechanism   "credit only when receipt.node_id equals the node the job was dispatched to"
+    note        "the protocol verifier PASSES this — the tag is valid for the identity claimed"
+    outcome     "credited to no account, and slashed against the sender"
+    status      VERIFIED_SW
+  }
+  double_billing {
+    behaviour   "resubmits an already-settled receipt"
+    caught_by   ledger_settle
+    mechanism   "spent-nonce set keyed by (node_id, nonce)"
+    status      VERIFIED_SW
+  }
+  output_corruption {
+    behaviour   "a lying node participates in a model's forward pass"
+    caught_by   mesh_matvec
+    mechanism   "the coordinator recomputes any rejected row, so the layer value stays correct while the node earns nothing"
+    status      VERIFIED_SW
+  }
+  emulation {
+    behaviour   "software claims to be an FPGA"
+    caught_by   nothing
+    status      "[open]"
+    see         open_question DEVICE_BOUND_IDENTITY in specs/trinet/ternary_hw_verification.t27
+  }
+  sybil {
+    behaviour   "one operator registers many node identities"
+    caught_by   stake_only
+    status      "[partially open]"
+    note        "node ids are chosen at synthesis; stake is the only current cost of a new identity"
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Damage is not dishonesty — found by running real boards
+// ---------------------------------------------------------------------------
+
+finding LEDGER_CHARGED_AN_HONEST_BOARD {
+  severity HIGH
+  resolved true
+  found_on "hardware, 2026-08-02, two AX7203 boards"
+  statement """
+    One board returned a few percent of its responses damaged on a marginal
+    link, and the ledger slashed its stake as though it had lied. An honest
+    operator losing stake to a cable drives people off a network faster than
+    any cheat does.
+  """
+  why_software_testing_missed_it "every emulated adversary lies deliberately and none of them corrupts a frame; the failure needs a physical link to appear"
+}
+
+rule DAMAGE_VS_LIE {
+  name    "separating a damaged frame from a dishonest one"
+  formula "wrong answer AND tag valid for THAT answer => lie; anything else => damage"
+  why """
+    A node that skips the work still holds the key, so it signs its guess:
+    the tag fits the wrong answer it returned. Corruption cannot produce that
+    pair, because the tag then fits neither the correct answer nor the returned
+    one. The keyed tag therefore does a second job it was not introduced for.
+  """
+  companion """
+    The same logic separates a replay from a damaged request. A replay is
+    tagged over an old job and reconstructs from nothing we hold; a request
+    whose nonce was corrupted makes the node tag over the nonce it received
+    with our operands, which reconstructs exactly. The coordinator also treats
+    a nonce it previously issued as a lost-response desync rather than a replay.
+  """
+  trust_tier VERIFIED_SW
+  enforced_at "src/trinet/protocol.zig :: verifyWithKey, src/trinet/ledger.zig :: settle"
+}
+
+lemma DAMAGED_FRAMES_ARE_NEITHER_PAID_NOR_CHARGED {
+  exact true
+  outcome "corrupt_not_charged: no credit, no slash, no mark against reputation, counted separately as a link-quality signal"
+  rationale "a damaged receipt is not evidence of work and not evidence of fraud; treating it as either is a mistake in a different direction"
+}
+
+finding MITIGATIONS_TRIED_AND_REMOVED {
+  severity LOW
+  resolved true
+  statement "two software mitigations were measured and removed rather than kept on faith"
+  detail """
+    Draining the receive buffer before each request measured worse on every
+    count, because it can discard a response still arriving. And the drain
+    itself stalled two seconds per call, since a read on an empty buffer waits
+    out VTIME — flushing a serial port is an ioctl, not a read loop.
+  """
+  lesson "a mitigation that is not measured after it is applied is a guess wearing a fix's clothes"
+}
+
+// ---------------------------------------------------------------------------
+// Separation of concerns, stated as law
+// ---------------------------------------------------------------------------
+
+lemma THREE_STEPS_STAY_SEPARATE {
+  exact true
+  steps {
+    "node.execute produces an UNTRUSTED claim",
+    "protocol.verify judges it against an independent recomputation",
+    "ledger.settle moves credit, and only on a judged claim"
+  }
+  rationale "collapsing these is the specific mistake that lets a compute network pay for work that never happened"
+}
+
+// ---------------------------------------------------------------------------
+// Why TRI was scoped as a credit until 2026-09-24, and what the override needs
+// ---------------------------------------------------------------------------
+
+finding ISSUANCE_AT_SMALL_N {
+  severity HIGH
+  resolved true
+  superseded_by "owner decision 2026-09-24 -- TRI is a real, transferable token issued on TON and Solana; work is paid in money, not in a non-transferable credit"
+  original_resolution "TRI was recorded as a non-transferable internal work credit until 2026-09-24"
+  why_it_was_scoped_small """
+    At n = 1..3 nodes the developers hold every node, every key and every vote.
+    Any issuance in that configuration is, after the fact, indistinguishable
+    from a founder allocation. The exemptions that look applicable do not reach
+    software contributions: the SEC's airdrop position requires recipients
+    provide no money, goods, services or other consideration, and MiCA Art
+    4(3)(b) exempts rewards for ledger maintenance and transaction validation.
+    Separately, emission-funded development is currently punished by markets.
+  """
+  what_the_override_requires """
+    Issuing a transferable token answers the question the credit scoping avoided
+    rather than settling it, so the answer now has to be built. Two things must
+    be true for the override to be safe: a compliant issuance path (a foundation
+    entity in a VASP jurisdiction, reviewed by crypto counsel), and a
+    distribution that is PAYMENT for verifiable work, not a sale of a promise --
+    the failure mode is SEC v. Telegram, where a single company selling its own
+    token to fund itself was the whole defect. The settlement law is the utility
+    argument: TRI is only ever paid for work a verifier accepted, backed by a
+    receipt anyone can recompute. No counsel has reviewed this yet; that review
+    is the first task the override creates.
+  """
+  status "[owner-decided; compliance path OPEN]"
+}
+
+finding EFFICIENCY_IS_NOT_DEMAND {
+  severity HIGH
+  resolved false
+  statement """
+    Compute-network economics reward verified served demand, not efficiency. A
+    validated efficiency advantage earns nothing while no buyer has a workload
+    expressed in ternary. Nothing in this repository is a customer.
+  """
+  consequence "node economics should be assumed to need revenue at n=3, not a follow-on raise"
+}
+
+open_question WHO_BUYS_TERNARY_COMPUTE {
+  do_not_guess true
+  owner        author
+  question     "name one workload, with a party who wants it run, that is expressed in ternary dot products"
+  why_blocking "every other open item is engineering; this one decides whether the engineering matters"
+}
+
+scope_limits {
+  not_covered {
+    "any measured multi-operator behaviour — all attack results are software simulations on one machine",
+    "pricing, revenue, or any monetary value for a TRI credit",
+    "legal review of the credit's status in any jurisdiction",
+    "collusion between a majority of nodes",
+    "denial of service against the coordinator"
+  }
+  superiority_claimed false
+  evidence_tier "VERIFIED_SW throughout; no line of this spec is a hardware measurement"
+}

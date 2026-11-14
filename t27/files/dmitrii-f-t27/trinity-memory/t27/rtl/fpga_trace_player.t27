@@ -1,0 +1,585 @@
+module TrinityFpgaTracePlayerT27;
+
+// Sequencer of the AX7203 trace player (fpga/ax7203/tms_trace_player.v wires it
+// to the ROM core, the cores under test, the line emitter and the UART).
+// One run: header, every trace vector stepped (one enabled clock per trace
+// cycle, outputs sampled with the stimulus still applied, compared and
+// reported), every vector free-run (two enabled clocks per trace cycle), the
+// throughput workload (64 stored words, WORKLOAD_FRAMES frames of 64 beats,
+// activations from a closed formula, results reported), the Edge Demo fixtures
+// (three template rows in lockstep, label, accumulators and latency reported),
+// then the totals. A run starts after reset and again on a UART start bit that
+// arrives while the player is idle.
+// Every statement reads a variable before the same tick writes it, so the C
+// and the Verilog backends agree.
+const S_IDLE: u32 = 0;
+const S_LINE_START: u32 = 1;
+const S_LINE_WAIT: u32 = 2;
+const S_VEC_BEGIN: u32 = 3;
+const S_VEC_RESET: u32 = 4;
+const S_STEP_APPLY: u32 = 5;
+const S_STEP_ENABLE: u32 = 6;
+const S_STEP_WAIT: u32 = 7;
+const S_STEP_CAPTURE: u32 = 8;
+const S_STEP_COMPARE: u32 = 9;
+const S_STEP_NEXT: u32 = 10;
+const S_VEC_END: u32 = 11;
+const S_VEC_K: u32 = 12;
+const S_VEC_K_NEXT: u32 = 13;
+const S_FREE_BEGIN: u32 = 14;
+const S_FREE_VEC: u32 = 15;
+const S_FREE_RESET: u32 = 16;
+const S_FREE_LOAD: u32 = 17;
+const S_FREE_CONSUME: u32 = 18;
+const S_FREE_DRAIN: u32 = 19;
+const S_FREE_REPORT: u32 = 20;
+const S_FREE_NEXT: u32 = 21;
+const S_WL_RESET: u32 = 22;
+const S_WL_LOAD: u32 = 23;
+const S_WL_START: u32 = 24;
+const S_WL_STREAM: u32 = 25;
+const S_WL_NEXT: u32 = 26;
+const S_WL_FINISH: u32 = 27;
+const S_WL_REPORT_W: u32 = 28;
+const S_WL_REPORT_R: u32 = 29;
+const S_WL_REPORT_T: u32 = 30;
+const S_EDGE_RESET: u32 = 31;
+const S_EDGE_LOAD: u32 = 32;
+const S_EDGE_START: u32 = 33;
+const S_EDGE_STREAM: u32 = 34;
+const S_EDGE_WAIT: u32 = 35;
+const S_EDGE_CONSUME: u32 = 36;
+const S_EDGE_LINE_A: u32 = 37;
+const S_EDGE_LINE_NEXT: u32 = 38;
+const S_TOTALS: u32 = 39;
+const S_DONE: u32 = 40;
+
+const TAG_H: u32 = 72;
+const TAG_V: u32 = 86;
+const TAG_C: u32 = 67;
+const TAG_E: u32 = 69;
+const TAG_K: u32 = 75;
+const TAG_F: u32 = 70;
+const TAG_W: u32 = 87;
+const TAG_R: u32 = 82;
+const TAG_T: u32 = 84;
+const TAG_X: u32 = 88;
+const TAG_A: u32 = 65;
+const TAG_D: u32 = 68;
+const WORKLOAD_WORDS: u32 = 64;
+const REPORT_FORMAT: u64 = 2;
+
+// registered state and outputs
+var state: u32 = 0;
+var after_line: u32 = 0;
+var vector: u32 = 0;
+var addr: u32 = 0;
+var cyc: u32 = 0;
+var stim_q: u64 = 0;
+var exp_q: u64 = 0;
+var obs_q: u64 = 0;
+var pre_q: u64 = 0;
+var dut_en: bool = false;
+var dut_reset: bool = true;
+var line_go: bool = false;
+var line_tag: u32 = 0;
+var line_a: u32 = 0;
+var line_b: u64 = 0;
+var mism: u32 = 0;
+var mism_total: u32 = 0;
+var free_total: u32 = 0;
+var counter: [6]u32;
+var kidx: u32 = 0;
+var wait_cnt: u32 = 0;
+var auto_started: bool = false;
+var run_done: bool = false;
+var mism_seen: bool = false;
+var free_first: bool = false;
+var rx1: bool = true;
+var rx2: bool = true;
+var rx3: bool = true;
+var wl_reset: bool = true;
+var wl_start: bool = false;
+var wl_load_en: bool = false;
+var wl_load_addr: u32 = 0;
+var wl_act_valid: bool = false;
+var wl_beat_index: u32 = 0;
+var wl_frame: u32 = 0;
+var wl_ticks: u32 = 0;
+var wl_beats: u32 = 0;
+var wl_stalls: u32 = 0;
+var wl_done: u32 = 0;
+var wl_load_ticks: u32 = 0;
+var wl_results: [16]i32;
+var edge_reset: bool = true;
+var edge_load_en: bool = false;
+var edge_load_row: u32 = 0;
+var edge_load_addr: u32 = 0;
+var edge_start: bool = false;
+var edge_act_valid: bool = false;
+var edge_beat_index: u32 = 0;
+var edge_fixture: u32 = 0;
+var edge_out_ready: bool = false;
+var edge_ticks: u32 = 0;
+var edge_acc0_q: i32 = 0;
+var edge_acc1_q: i32 = 0;
+var edge_acc2_q: i32 = 0;
+var edge_label_q: u32 = 0;
+
+// combinational outputs
+var run_active: bool;
+var wl_act_data: u64;
+var wl_out_ready: bool;
+var edge_ra: u32;
+var edge_fb: u32;
+var vbase: u32;
+var vcycles: u32;
+var vkind: u32;
+
+fn bit(word: u64, index: u32) -> bool {
+    return ((word >> index) & 1) == 1;
+}
+
+fn popcount5(mask: u64) -> u32 {
+    return ((mask & 1) + ((mask >> 1) & 1) + ((mask >> 2) & 1) + ((mask >> 3) & 1) + ((mask >> 4) & 1)) as u32;
+}
+
+fn workload_lane(beat: u32, lane: u32, frame: u32) -> u64 {
+    return ((beat * 13 + lane * 29 + frame * 5 + 7) & 255) as u64;
+}
+
+fn workload_beat(beat: u32, frame: u32) -> u64 {
+    return workload_lane(beat, 0, frame) | (workload_lane(beat, 1, frame) << 8)
+        | (workload_lane(beat, 2, frame) << 16) | (workload_lane(beat, 3, frame) << 24)
+        | (workload_lane(beat, 4, frame) << 32);
+}
+
+fn signed_word(value: i32) -> u64 {
+    return (value as u32) as u64;
+}
+
+run_active = state != S_IDLE;
+wl_act_data = workload_beat(wl_beat_index, wl_frame);
+wl_out_ready = true;
+edge_ra = edge_load_row * 4 + edge_load_addr;
+edge_fb = edge_fixture * 4 + edge_beat_index;
+vbase = (entry >> 10) & 1023;
+vcycles = entry & 1023;
+vkind = (entry >> 20) & 3;
+
+// The H line's b field. A typed local, not the constant: gen-c emits constants as
+// untyped macros, and REPORT_FORMAT << 32 would be a 32-bit int shift in C.
+fn header_b(cycle_count: u32, vector_count: u32) -> u64 {
+    var fmt: u64 = REPORT_FORMAT;
+    return (fmt << 32) | ((cycle_count as u64) << 16) | (vector_count as u64);
+}
+
+fn on_clock(uart_rx: bool, line_idle: bool, stimulus: u64, expected: u64, entry: u32,
+            vector_count: u32, cycle_count: u32, observed: u64, workload_frames: u32,
+            wl_busy: bool, wl_act_ready: bool, wl_beat: bool, wl_out_valid: bool, wl_result: i32,
+            edge_fixtures: u32, edge_act_ready: bool, edge_beat: bool, edge_done: bool,
+            edge_acc0: i32, edge_acc1: i32, edge_acc2: i32, edge_label: u32) {
+    line_go = false;
+    if (state == S_IDLE) {
+        dut_en = false;
+        // A falling edge of RX starts a run only while the player is idle; edges
+        // during a run are ignored. A trigger byte has up to five falling edges, and
+        // queueing one of them behind the run made one byte start two runs (fixed
+        // 2026-09-22). The edge is read from the old rx3/rx2, shifted at the end.
+        if ((rx3 && !rx2) || !auto_started) {
+            auto_started = true;
+            run_done = false;
+            mism_seen = false;
+            vector = 0;
+            mism_total = 0;
+            free_total = 0;
+            line_tag = TAG_H;
+            line_a = 0;
+            line_b = header_b(cycle_count, vector_count);
+            line_go = true;
+            after_line = S_VEC_BEGIN;
+            state = S_LINE_START;
+        }
+    } else if (state == S_LINE_START) {
+        state = S_LINE_WAIT;
+    } else if (state == S_LINE_WAIT) {
+        if (line_idle) { state = after_line; }
+    } else if (state == S_VEC_BEGIN) {
+        if (vector == vector_count) {
+            state = S_FREE_BEGIN;
+        } else {
+            dut_reset = true;
+            dut_en = false;
+            wait_cnt = 0;
+            cyc = 0;
+            addr = vbase;
+            mism = 0;
+            counter[0] = 0;
+            counter[1] = 0;
+            counter[2] = 0;
+            counter[3] = 0;
+            counter[4] = 0;
+            counter[5] = 0;
+            state = S_VEC_RESET;
+        }
+    } else if (state == S_VEC_RESET) {
+        if (wait_cnt == 3) {
+            dut_reset = false;
+            line_tag = TAG_V;
+            line_a = vector;
+            line_b = vcycles as u64;
+            line_go = true;
+            after_line = S_STEP_APPLY;
+            state = S_LINE_START;
+        }
+        wait_cnt = wait_cnt + 1;
+    } else if (state == S_STEP_APPLY) {
+        stim_q = stimulus;
+        exp_q = expected;
+        state = S_STEP_ENABLE;
+    } else if (state == S_STEP_ENABLE) {
+        dut_en = true;
+        state = S_STEP_WAIT;
+    } else if (state == S_STEP_WAIT) {
+        // the consuming edge: observed still shows the values the core evaluates its handshakes on
+        pre_q = observed;
+        dut_en = false;
+        state = S_STEP_CAPTURE;
+    } else if (state == S_STEP_CAPTURE) {
+        obs_q = observed;
+        state = S_STEP_COMPARE;
+    } else if (state == S_STEP_COMPARE) {
+        if (obs_q != exp_q) {
+            mism = mism + 1;
+            mism_seen = true;
+        }
+        if (vkind == 0) {
+            if (bit(stim_q, 57) && bit(pre_q, 34)) { counter[0] = counter[0] + 1; }
+            if (bit(stim_q, 58) && bit(pre_q, 33)) { counter[1] = counter[1] + 1; }
+            if (bit(stim_q, 57) && !bit(pre_q, 34)) { counter[2] = counter[2] + 1; }
+            if (bit(pre_q, 33) && !bit(stim_q, 58)) { counter[3] = counter[3] + 1; }
+            if (bit(stim_q, 58) && bit(pre_q, 33) && bit(pre_q, 32)) { counter[4] = counter[4] + 1; }
+            if (bit(stim_q, 56)) { counter[5] = counter[5] + 1; }
+        } else if (vkind == 1) {
+            if (bit(stim_q, 2) && bit(pre_q, 19)) { counter[0] = counter[0] + 1; }
+            if (bit(obs_q, 17)) { counter[1] = counter[1] + 1; }
+            if (bit(obs_q, 17)) { counter[2] = counter[2] + popcount5((obs_q >> 10) & 31); }
+            if (bit(obs_q, 17) && !bit(obs_q, 15)) { counter[3] = counter[3] + 1; }
+            if (bit(stim_q, 1) && !bit(pre_q, 18) && !bit(stim_q, 0)) { counter[4] = counter[4] + 1; }
+            if (bit(stim_q, 0)) { counter[5] = counter[5] + 1; }
+        } else {
+            if (bit(pre_q, 37)) { counter[0] = counter[0] + 1; }
+            if (bit(stim_q, 60) && bit(pre_q, 33)) { counter[1] = counter[1] + 1; }
+            if (bit(stim_q, 19) && !bit(pre_q, 34)) { counter[2] = counter[2] + 1; }
+            if (bit(pre_q, 33) && !bit(stim_q, 60)) { counter[3] = counter[3] + 1; }
+            if (bit(stim_q, 2) && bit(pre_q, 35)) { counter[4] = counter[4] + 1; }
+            if (bit(stim_q, 0)) { counter[5] = counter[5] + 1; }
+        }
+        line_tag = TAG_C;
+        line_a = cyc;
+        line_b = obs_q;
+        line_go = true;
+        after_line = S_STEP_NEXT;
+        state = S_LINE_START;
+    } else if (state == S_STEP_NEXT) {
+        if (cyc + 1 == vcycles) { state = S_VEC_END; } else { state = S_STEP_APPLY; }
+        cyc = cyc + 1;
+        addr = addr + 1;
+    } else if (state == S_VEC_END) {
+        mism_total = mism_total + mism;
+        kidx = 0;
+        line_tag = TAG_E;
+        line_a = vector;
+        line_b = mism as u64;
+        line_go = true;
+        after_line = S_VEC_K;
+        state = S_LINE_START;
+    } else if (state == S_VEC_K) {
+        line_tag = TAG_K;
+        line_a = kidx;
+        line_b = counter[kidx] as u64;
+        line_go = true;
+        after_line = S_VEC_K_NEXT;
+        state = S_LINE_START;
+    } else if (state == S_VEC_K_NEXT) {
+        if (kidx == 5) {
+            vector = vector + 1;
+            state = S_VEC_BEGIN;
+        } else {
+            kidx = kidx + 1;
+            state = S_VEC_K;
+        }
+    } else if (state == S_FREE_BEGIN) {
+        vector = 0;
+        state = S_FREE_VEC;
+    } else if (state == S_FREE_VEC) {
+        if (vector == vector_count) {
+            wl_reset = true;
+            wait_cnt = 0;
+            wl_load_addr = 0;
+            wl_frame = 0;
+            wl_done = 0;
+            wl_ticks = 0;
+            wl_beats = 0;
+            wl_stalls = 0;
+            wl_load_ticks = 0;
+            wl_act_valid = false;
+            wl_start = false;
+            wl_load_en = false;
+            state = S_WL_RESET;
+        } else {
+            dut_reset = true;
+            dut_en = false;
+            wait_cnt = 0;
+            cyc = 0;
+            addr = vbase;
+            mism = 0;
+            free_first = true;
+            state = S_FREE_RESET;
+        }
+    } else if (state == S_FREE_RESET) {
+        if (wait_cnt == 3) {
+            dut_reset = false;
+            state = S_FREE_LOAD;
+        }
+        wait_cnt = wait_cnt + 1;
+    } else if (state == S_FREE_LOAD) {
+        // observed still shows the previous trace cycle with its stimulus applied
+        if (!free_first && observed != exp_q) {
+            mism = mism + 1;
+            mism_seen = true;
+        }
+        free_first = false;
+        stim_q = stimulus;
+        exp_q = expected;
+        dut_en = true;
+        addr = addr + 1;
+        state = S_FREE_CONSUME;
+    } else if (state == S_FREE_CONSUME) {
+        dut_en = false;
+        if (cyc + 1 == vcycles) { state = S_FREE_DRAIN; } else { state = S_FREE_LOAD; }
+        cyc = cyc + 1;
+    } else if (state == S_FREE_DRAIN) {
+        if (observed != exp_q) {
+            mism = mism + 1;
+            mism_seen = true;
+        }
+        state = S_FREE_REPORT;
+    } else if (state == S_FREE_REPORT) {
+        free_total = free_total + mism;
+        line_tag = TAG_F;
+        line_a = vector;
+        line_b = mism as u64;
+        line_go = true;
+        after_line = S_FREE_NEXT;
+        state = S_LINE_START;
+    } else if (state == S_FREE_NEXT) {
+        vector = vector + 1;
+        state = S_FREE_VEC;
+    } else if (state == S_WL_RESET) {
+        if (wait_cnt == 3) {
+            wl_reset = false;
+            wl_load_en = true;
+            wl_load_addr = 0;
+            state = S_WL_LOAD;
+        }
+        wait_cnt = wait_cnt + 1;
+    } else if (state == S_WL_LOAD) {
+        wl_load_ticks = wl_load_ticks + 1;
+        if (wl_load_addr == WORKLOAD_WORDS - 1) {
+            wl_load_en = false;
+            state = S_WL_START;
+        }
+        wl_load_addr = wl_load_addr + 1;
+    } else if (state == S_WL_START) {
+        // the previous frame's result arrives here (two ticks after its last beat)
+        if (wl_out_valid) {
+            wl_results[wl_done] = wl_result;
+            wl_done = wl_done + 1;
+        }
+        wl_start = true;
+        wl_act_valid = true;
+        wl_beat_index = 0;
+        wl_ticks = wl_ticks + 1;
+        state = S_WL_STREAM;
+    } else if (state == S_WL_STREAM) {
+        wl_start = false;
+        wl_ticks = wl_ticks + 1;
+        if (wl_act_valid && !wl_act_ready) { wl_stalls = wl_stalls + 1; }
+        if (wl_out_valid) {
+            wl_results[wl_done] = wl_result;
+            wl_done = wl_done + 1;
+        }
+        if (wl_beat) {
+            wl_beats = wl_beats + 1;
+            if (wl_beat_index == WORKLOAD_WORDS - 1) {
+                wl_act_valid = false;
+                state = S_WL_NEXT;
+            }
+            wl_beat_index = wl_beat_index + 1;
+        }
+    } else if (state == S_WL_NEXT) {
+        wl_ticks = wl_ticks + 1;
+        if (wl_out_valid) {
+            wl_results[wl_done] = wl_result;
+            wl_done = wl_done + 1;
+        }
+        if (wl_frame + 1 == workload_frames) {
+            state = S_WL_FINISH;
+        } else if (!wl_busy) {
+            wl_frame = wl_frame + 1;
+            state = S_WL_START;
+        }
+    } else if (state == S_WL_FINISH) {
+        if (wl_done == workload_frames) {
+            line_tag = TAG_W;
+            line_a = 0;
+            line_b = workload_frames as u64;
+            line_go = true;
+            after_line = S_WL_REPORT_R;
+            kidx = 0;
+            state = S_LINE_START;
+        } else {
+            wl_ticks = wl_ticks + 1;
+            if (wl_out_valid) {
+                wl_results[wl_done] = wl_result;
+                wl_done = wl_done + 1;
+            }
+        }
+    } else if (state == S_WL_REPORT_R) {
+        line_tag = TAG_R;
+        line_a = kidx;
+        line_b = signed_word(wl_results[kidx]);
+        line_go = true;
+        if (kidx + 1 == workload_frames) { after_line = S_WL_REPORT_T; kidx = 0; }
+        else { after_line = S_WL_REPORT_R; kidx = kidx + 1; }
+        state = S_LINE_START;
+    } else if (state == S_WL_REPORT_T) {
+        line_tag = TAG_T;
+        line_a = kidx;
+        if (kidx == 0) { line_b = wl_ticks as u64; }
+        if (kidx == 1) { line_b = wl_beats as u64; }
+        if (kidx == 2) { line_b = wl_done as u64; }
+        if (kidx == 3) { line_b = wl_stalls as u64; }
+        if (kidx == 4) { line_b = wl_load_ticks as u64; }
+        line_go = true;
+        if (kidx == 4) {
+            after_line = S_EDGE_RESET;
+            edge_reset = true;
+            wait_cnt = 0;
+            edge_fixture = 0;
+            edge_load_en = false;
+            edge_act_valid = false;
+            edge_start = false;
+            edge_out_ready = false;
+        } else {
+            after_line = S_WL_REPORT_T;
+            kidx = kidx + 1;
+        }
+        state = S_LINE_START;
+    } else if (state == S_EDGE_RESET) {
+        if (wait_cnt == 3) {
+            edge_reset = false;
+            edge_load_en = true;
+            edge_load_row = 0;
+            edge_load_addr = 0;
+            state = S_EDGE_LOAD;
+        }
+        wait_cnt = wait_cnt + 1;
+    } else if (state == S_EDGE_LOAD) {
+        if (edge_load_addr == 2) {
+            if (edge_load_row == 2) {
+                edge_load_en = false;
+                state = S_EDGE_START;
+            }
+            edge_load_row = edge_load_row + 1;
+            edge_load_addr = 0;
+        } else {
+            edge_load_addr = edge_load_addr + 1;
+        }
+    } else if (state == S_EDGE_START) {
+        edge_start = true;
+        edge_act_valid = true;
+        edge_beat_index = 0;
+        edge_ticks = 1;
+        state = S_EDGE_STREAM;
+    } else if (state == S_EDGE_STREAM) {
+        edge_start = false;
+        edge_ticks = edge_ticks + 1;
+        if (edge_beat) {
+            if (edge_beat_index == 2) {
+                edge_act_valid = false;
+                state = S_EDGE_WAIT;
+            }
+            edge_beat_index = edge_beat_index + 1;
+        }
+    } else if (state == S_EDGE_WAIT) {
+        if (edge_done) {
+            edge_acc0_q = edge_acc0;
+            edge_acc1_q = edge_acc1;
+            edge_acc2_q = edge_acc2;
+            edge_label_q = edge_label;
+            edge_out_ready = true;
+            state = S_EDGE_CONSUME;
+        } else {
+            edge_ticks = edge_ticks + 1;
+        }
+    } else if (state == S_EDGE_CONSUME) {
+        edge_out_ready = false;
+        line_tag = TAG_X;
+        line_a = edge_fixture;
+        if (edge_label_q == 7) {
+            line_b = ((edge_ticks as u64) << 3) | 7;
+        } else {
+            line_b = ((edge_ticks as u64) << 3) | (edge_label_q as u64);
+        }
+        line_go = true;
+        after_line = S_EDGE_LINE_A;
+        kidx = 0;
+        state = S_LINE_START;
+    } else if (state == S_EDGE_LINE_A) {
+        line_tag = TAG_A;
+        line_a = edge_fixture * 4 + kidx;
+        if (kidx == 0) { line_b = signed_word(edge_acc0_q); }
+        if (kidx == 1) { line_b = signed_word(edge_acc1_q); }
+        if (kidx == 2) { line_b = signed_word(edge_acc2_q); }
+        line_go = true;
+        after_line = S_EDGE_LINE_NEXT;
+        state = S_LINE_START;
+    } else if (state == S_EDGE_LINE_NEXT) {
+        if (kidx == 2) {
+            if (edge_fixture + 1 == edge_fixtures) {
+                state = S_TOTALS;
+            } else {
+                edge_fixture = edge_fixture + 1;
+                state = S_EDGE_START;
+            }
+        } else {
+            kidx = kidx + 1;
+            state = S_EDGE_LINE_A;
+        }
+    } else if (state == S_TOTALS) {
+        line_tag = TAG_D;
+        line_a = mism_total;
+        line_b = free_total as u64;
+        line_go = true;
+        after_line = S_DONE;
+        state = S_LINE_START;
+    } else if (state == S_DONE) {
+        run_done = true;
+        state = S_IDLE;
+    } else {
+        state = S_IDLE;
+    }
+    rx3 = rx2;
+    rx2 = rx1;
+    rx1 = uart_rx;
+}
+
+test header_fields { assert_eq(header_b(406, 34), 8616542242); }
+test bit_extraction { assert_eq(bit(8, 3), true); assert_eq(bit(8, 2), false); }
+test popcount_of_the_lane_mask { assert_eq(popcount5(31), 5); assert_eq(popcount5(3), 2); assert_eq(popcount5(0), 0); }
+test workload_activation_formula { assert_eq(workload_lane(0, 0, 0), 7); assert_eq(workload_lane(63, 4, 15), (63 * 13 + 4 * 29 + 15 * 5 + 7) & 255); }
+test workload_beat_packs_five_lanes { assert_eq(workload_beat(0, 0) & 255, 7); assert_eq((workload_beat(0, 0) >> 8) & 255, 36); }
+test signed_words_are_two_complement { assert_eq(signed_word(-1), 4294967295); assert_eq(signed_word(5), 5); }
+endmodule

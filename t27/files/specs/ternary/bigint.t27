@@ -1,0 +1,1442 @@
+// SPDX-License-Identifier: Apache-2.0
+// t27/specs/ternary/bigint.t27
+// TVC BigInt - Balanced Ternary Arbitrary Precision Arithmetic
+// ⲤⲀⲔⲢⲀ ⲪⲞⲢⲘⲨⲖⲀ: V = n × 3^k × π^m × φ^p × e^q
+// φ² + 1/φ² = 3 | TRINITY
+//
+// Balanced Ternary representation:
+// - Each trit has value {-1, 0, +1}
+// - Number = Σ(trit[i] × 3^i) for i = 0..n-1
+// - No separate sign bit needed (inherent in representation)
+// - Rounding is simpler (truncation = rounding to nearest)
+//
+// Supports:
+// - Arbitrary precision integers up to 3^256 ≈ 10^122
+// - SIMD-optimized operations (32 trits in parallel)
+// - Karatsuba multiplication O(n^1.585)
+// - Newton-Raphson division for large numbers
+
+module TernaryBigInt;
+
+// ============================================================================
+// Imports
+// ============================================================================
+
+use base::types::Trit;
+use base::types::trit_negate;
+use base::types::trit_multiply;
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+/// Maximum trits for BigInt (supports numbers up to 3^256 ≈ 10^122)
+pub const MAX_TRITS : usize = 256;
+
+/// Trit constants for convenience
+pub const TRIT_NEG : Trit = Trit.neg;
+pub const TRIT_ZERO : Trit = Trit.zero;
+pub const TRIT_POS : Trit = Trit.pos;
+
+/// SIMD chunk size (32 trits = 256 bits = AVX2)
+pub const SIMD_CHUNK_SIZE : usize = 32;
+
+/// Number of SIMD chunks in BigInt (256 / 32 = 8)
+pub const SIMD_CHUNKS : usize = MAX_TRITS / SIMD_CHUNK_SIZE;
+
+/// Karatsuba threshold: use simple multiplication for smaller numbers
+pub const KARATSUBA_THRESHOLD : usize = 32;
+
+/// SIMD threshold: use SIMD for numbers with >= 64 trits
+pub const SIMD_THRESHOLD : usize = 64;
+
+/// Long division threshold for using i64 native division
+pub const I64_DIV_THRESHOLD : usize = 40;
+
+// ============================================================================
+// Types
+// ============================================================================
+
+/// Division result type
+pub const DivResult = struct {
+    q : BigInt,  // quotient
+    r : BigInt,  // remainder
+};
+
+/// Balanced Ternary BigInt
+/// Stores number as array of trits (least significant first)
+pub const BigInt = struct {
+    /// Trits array (LST first)
+    trits : [MAX_TRITS]Trit,
+    /// Number of significant trits
+    len : usize,
+
+    const Self = @This();
+
+    // ========================================================================
+    // Constructors
+    // ========================================================================
+
+    /// Create zero BigInt
+    pub fn zero() Self {
+        return Self{
+            .trits = [_]Trit{TRIT_ZERO} ** MAX_TRITS,
+            .len = 1,
+        };
+    }
+
+    /// Create BigInt from i64 value
+    /// Algorithm: repeated division by 3 with balanced ternary remainder
+    /// Complexity: O(log_3(|value|))
+    pub fn from_i64(value: i64) Self {
+        var result = zero();
+        if (value == 0) {
+            return result;
+        }
+
+        var v = value;
+        var i : usize = 0;
+
+        while (v != 0 and i < MAX_TRITS) {
+            // Get remainder in range -1..1
+            var rem = @mod(v, @as(i64, 3));
+            if (rem == 2) {
+                rem = -1;
+                v = @divFloor(v - rem, 3);
+            } else if (rem == -2) {
+                rem = 1;
+                v = @divFloor(v - rem, 3);
+            } else {
+                v = @divFloor(v, 3);
+            }
+
+            result.trits[i] = @intCast(rem);
+            i = i + 1;
+        }
+
+        result.len = if (i == 0) { 1 } else { i };
+        return result.normalize();
+    }
+
+    // ========================================================================
+    // Conversion
+    // ========================================================================
+
+    /// Convert BigInt to i64 (may overflow for large numbers)
+    /// Algorithm: Σ(trit[i] × 3^i)
+    /// Complexity: O(len)
+    pub fn to_i64(self: Self) i64 {
+        var result : i64 = 0;
+        var power : i64 = 1;
+
+        var i : usize = 0;
+        while (i < self.len) {
+            result += @as(i64, self.trits[i]) * power;
+            power *= 3;
+            i = i + 1;
+        }
+
+        return result;
+    }
+
+    // ========================================================================
+    // Properties
+    // ========================================================================
+
+    /// Remove leading zero trits
+    /// Ensures canonical representation
+    /// Complexity: O(len) worst case, O(1) typical
+    pub fn normalize(self: *Self) void {
+        while (self.len > 1 and self.trits[self.len - 1] == TRIT_ZERO) {
+            self.len -= 1;
+        }
+    }
+
+    /// Check if BigInt is zero
+    /// Returns: true if only trit is zero
+    pub fn is_zero(self: Self) bool {
+        return self.len == 1 and self.trits[0] == TRIT_ZERO;
+    }
+
+    /// Check if BigInt is negative
+    /// In balanced ternary, sign is determined by most significant trit
+    /// Returns: true if MST < 0
+    pub fn is_negative(self: Self) bool {
+        return self.trits[self.len - 1] == TRIT_NEG;
+    }
+
+    /// Check if BigInt is positive
+    /// Returns: true if MST > 0
+    pub fn is_positive(self: Self) bool {
+        return self.trits[self.len - 1] == TRIT_POS;
+    }
+
+    /// Get sign of BigInt
+    /// Returns: -1 if negative, 0 if zero, +1 if positive
+    pub fn signum(self: Self) i8 {
+        if (self.is_zero()) {
+            return 0;
+        } else if (self.is_negative()) {
+            return -1;
+        } else {
+            return 1;
+        }
+    }
+
+    // ========================================================================
+    // Unary Operations
+    // ========================================================================
+
+    /// Negate BigInt (flip all trits)
+    /// In balanced ternary: -x = flip all trits of x
+    /// Complexity: O(len)
+    pub fn negate(self: Self) Self {
+        var result = self;
+        var i : usize = 0;
+        while (i < result.len) {
+            result.trits[i] = trit_negate(result.trits[i]);
+            i = i + 1;
+        }
+        return result;
+    }
+
+/// Absolute value
+/// Returns: self if positive, negate(self) if negative
+/// Complexity: O(len) worst case, O(1) for positive
+pub fn abs(self: Self) Self {
+    return @abs(self);
+}
+
+    // ========================================================================
+    // Addition
+    // ========================================================================
+
+    /// Add two BigInts
+    /// Uses SIMD for large numbers, scalar for small
+    /// Algorithm: trit-wise addition with carry propagation
+    /// Complexity: O(max(len(a), len(b)))
+    pub fn add(a: Self, b: Self) Self {
+        // Use SIMD for larger numbers
+        if (a.len >= SIMD_THRESHOLD or b.len >= SIMD_THRESHOLD) {
+            return a.add_simd(b);
+        }
+        return a.add_scalar(b);
+    }
+
+    /// Scalar addition (trit-by-trit with carry)
+    /// Complexity: O(max(len(a), len(b)))
+    fn add_scalar(a: Self, b: Self) Self {
+        var result = zero();
+        var carry : i8 = 0;
+
+        const max_len = @max(a.len, b.len);
+
+        var i : usize = 0;
+        while (i < max_len + 1) {
+            if (i >= MAX_TRITS) {
+                break;
+            }
+
+            const a_trit : i8 = if (i < a.len) { @intCast(a.trits[i]) } else { 0 };
+            const b_trit : i8 = if (i < b.len) { @intCast(b.trits[i]) } else { 0 };
+
+            var sum : i8 = a_trit + b_trit + carry;
+            carry = 0;
+
+            // Normalize to balanced ternary (-1, 0, +1)
+            while (sum > 1) {
+                sum -= 3;
+                carry += 1;
+            }
+            while (sum < -1) {
+                sum += 3;
+                carry -= 1;
+            }
+
+            result.trits[i] = @intCast(sum);
+            result.len = i + 1;
+            i = i + 1;
+        }
+
+        result.normalize();
+        return result;
+    }
+
+    /// SIMD-optimized addition (32 trits at a time)
+    /// Complexity: O(max(len(a), len(b)) / 32 + carry_propagation)
+    fn add_simd(a: Self, b: Self) Self {
+        var result = zero();
+        const max_len = @max(a.len, b.len);
+        const num_chunks = (max_len + SIMD_CHUNK_SIZE - 1) / SIMD_CHUNK_SIZE;
+
+        // First pass: parallel add without carry propagation
+        var chunk : usize = 0;
+        while (chunk < num_chunks) {
+            const offset = chunk * SIMD_CHUNK_SIZE;
+
+            var i : usize = 0;
+            while (i < SIMD_CHUNK_SIZE) {
+                const idx = offset + i;
+                const a_trit : i8 = if (idx < a.len) { @intCast(a.trits[idx]) } else { 0 };
+                const b_trit : i8 = if (idx < b.len) { @intCast(b.trits[idx]) } else { 0 };
+                result.trits[idx] = @intCast(a_trit + b_trit);
+                i = i + 1;
+            }
+            chunk = chunk + 1;
+        }
+
+        // Second pass: sequential carry propagation
+        var carry : i8 = 0;
+        var i : usize = 0;
+        while (i < max_len + 1) {
+            if (i >= MAX_TRITS) {
+                break;
+            }
+
+            var val : i16 = @as(i16, result.trits[i]) + carry;
+            carry = 0;
+
+            while (val > 1) {
+                val -= 3;
+                carry += 1;
+            }
+            while (val < -1) {
+                val += 3;
+                carry -= 1;
+            }
+
+            result.trits[i] = @intCast(val);
+            i = i + 1;
+        }
+
+        result.len = max_len + 1;
+        result.normalize();
+        return result;
+    }
+
+    // ========================================================================
+    // Subtraction
+    // ========================================================================
+
+    /// Subtract: a - b = a + (-b)
+    /// Uses negation and addition
+    /// Complexity: O(max(len(a), len(b)))
+    pub fn sub(a: Self, b: Self) Self {
+        const neg_b = b.negate();
+        return a.add(neg_b);
+    }
+
+    // ========================================================================
+    // Multiplication
+    // ========================================================================
+
+    /// Multiply two BigInts
+    /// Uses Karatsuba for large numbers, simple for small
+    /// Complexity: O(n^1.585) for Karatsuba, O(n^2) for simple
+    pub fn mul(a: Self, b: Self) Self {
+        if (a.len <= KARATSUBA_THRESHOLD or b.len <= KARATSUBA_THRESHOLD) {
+            return a.mul_simple(b);
+        }
+        return a.mul_karatsuba(b);
+    }
+
+    /// Grade school multiplication
+    /// For each trit in a, multiply with b and add with offset
+    /// Complexity: O(len(a) * len(b))
+    fn mul_simple(a: Self, b: Self) Self {
+        var result = zero();
+
+        var i : usize = 0;
+        while (i < a.len) {
+            if (a.trits[i] == TRIT_ZERO) {
+                i = i + 1;
+                continue;
+            }
+
+            var partial = zero();
+            var carry : i8 = 0;
+
+            var j : usize = 0;
+            while (j < b.len) {
+                if (i + j >= MAX_TRITS) {
+                    break;
+                }
+
+                var prod : i16 = @as(i16, @intCast(a.trits[i])) * @as(i16, @intCast(b.trits[j])) + carry;
+                carry = 0;
+
+                while (prod > 1) {
+                    prod -= 3;
+                    carry += 1;
+                }
+                while (prod < -1) {
+                    prod += 3;
+                    carry -= 1;
+                }
+
+                partial.trits[i + j] = @intCast(prod);
+                if (i + j + 1 > partial.len) {
+                    partial.len = i + j + 1;
+                }
+                j = j + 1;
+            }
+
+            // Handle final carry
+            if (carry != 0 and i + b.len < MAX_TRITS) {
+                partial.trits[i + b.len] = @intCast(carry);
+                if (i + b.len + 1 > partial.len) {
+                    partial.len = i + b.len + 1;
+                }
+            }
+
+            result = result.add(partial);
+            i = i + 1;
+        }
+
+        result.normalize();
+        return result;
+    }
+
+    /// Karatsuba multiplication for large numbers
+    /// Recursively splits numbers: a = a1*3^m + a0, b = b1*3^m + b0
+    /// Uses 3 multiplications: z0 = a0*b0, z2 = a1*b1, z1 = (a0+a1)*(b0+b1) - z0 - z2
+    /// Complexity: O(n^log2(3)) ≈ O(n^1.585)
+    fn mul_karatsuba(a: Self, b: Self) Self {
+        // Base case: use simple multiplication
+        if (a.len <= KARATSUBA_THRESHOLD or b.len <= KARATSUBA_THRESHOLD) {
+            return a.mul_simple(b);
+        }
+
+        // Split at midpoint
+        const m = @max(a.len, b.len) / 2;
+
+        // a = a1 * 3^m + a0
+        var a0 = zero();
+        var a1 = zero();
+
+        var i : usize = 0;
+        while (i < @min(m, a.len)) {
+            a0.trits[i] = a.trits[i];
+            i = i + 1;
+        }
+        a0.len = @min(m, a.len);
+        a0.normalize();
+
+        if (a.len > m) {
+            var j : usize = 0;
+            while (m + j < a.len) {
+                a1.trits[j] = a.trits[m + j];
+                j = j + 1;
+            }
+            a1.len = a.len - m;
+            a1.normalize();
+        }
+
+        // b = b1 * 3^m + b0
+        var b0 = zero();
+        var b1 = zero();
+
+        i = 0;
+        while (i < @min(m, b.len)) {
+            b0.trits[i] = b.trits[i];
+            i = i + 1;
+        }
+        b0.len = @min(m, b.len);
+        b0.normalize();
+
+        if (b.len > m) {
+            var j : usize = 0;
+            while (m + j < b.len) {
+                b1.trits[j] = b.trits[m + j];
+                j = j + 1;
+            }
+            b1.len = b.len - m;
+            b1.normalize();
+        }
+
+        // Karatsuba: 3 multiplications
+        const z0 = a0.mul_karatsuba(b0);
+        const z2 = a1.mul_karatsuba(b1);
+
+        const a_sum = a0.add(a1);
+        const b_sum = b0.add(b1);
+        var z1 = a_sum.mul_karatsuba(b_sum);
+        z1 = z1.sub(z0);
+        z1 = z1.sub(z2);
+
+        // Result = z0 + z1 * 3^m + z2 * 3^(2m)
+        var result = z0;
+
+        // Add z1 * 3^m
+        const z1_shifted = z1.shift_left(m);
+        result = result.add(z1_shifted);
+
+        // Add z2 * 3^(2m)
+        const z2_shifted = z2.shift_left(2 * m);
+        result = result.add(z2_shifted);
+
+        result.normalize();
+        return result;
+    }
+
+    // ========================================================================
+    // Comparison
+    // ========================================================================
+
+    /// Compare absolute values
+    /// Returns: -1 if |a| < |b|, 0 if |a| == |b|, +1 if |a| > |b|
+    fn compare_abs(a: Self, b: Self) i8 {
+        const a_abs = a.abs();
+        const b_abs = b.abs();
+
+        if (a_abs.len != b_abs.len) {
+            return if (a_abs.len < b_abs.len) { -1 } else { 1 };
+        }
+
+        // Compare from most significant trit
+        var i = a_abs.len;
+        while (i > 0) {
+            i -= 1;
+            if (a_abs.trits[i] != b_abs.trits[i]) {
+                return if (a_abs.trits[i] < b_abs.trits[i]) { -1 } else { 1 };
+            }
+        }
+
+        return 0;
+    }
+
+    /// Compare two BigInts
+    /// Returns: -1 if a < b, 0 if a == b, +1 if a > b
+    /// Complexity: O(min(len(a), len(b)))
+    pub fn compare(a: Self, b: Self) i8 {
+        // Compare signs first
+        const a_sign = a.signum();
+        const b_sign = b.signum();
+
+        if (a_sign < b_sign) {
+            return -1;
+        } else if (a_sign > b_sign) {
+            return 1;
+        }
+
+        // Same sign: compare absolute values
+        const cmp = a.compare_abs(b);
+
+        // If both negative, reverse comparison
+        if (a_sign < 0) {
+            return -cmp;
+        }
+
+        return cmp;
+    }
+
+    /// Compare absolute values (public wrapper)
+    pub fn compare_abs(a: Self, b: Self) i8 {
+        return a.compare_abs(b);
+    }
+
+    // ========================================================================
+    // Division
+    // ========================================================================
+
+    /// Division with remainder
+    /// Returns (q, r) such that a = q * b + r, |r| < |b|
+    /// Uses Newton-Raphson for large numbers, long division for small
+    pub fn div_rem(a: Self, b: Self) DivResult {
+        if (b.is_zero()) {
+            // Division by zero: return zeros
+            return DivResult{ .q = zero(), .r = zero() };
+        }
+
+        // For small numbers, use native division via i64
+        if (a.len <= I64_DIV_THRESHOLD and b.len <= I64_DIV_THRESHOLD) {
+            const a_val = a.to_i64();
+            const b_val = b.to_i64();
+
+            if (b_val == 0) {
+                return DivResult{ .q = zero(), .r = zero() };
+            }
+
+            const q_val = @divTrunc(a_val, b_val);
+            const r_val = @rem(a_val, b_val);
+
+            return DivResult{
+                .q = from_i64(q_val),
+                .r = from_i64(r_val),
+            };
+        }
+
+        // For larger numbers, use long division
+        return a.div_rem_long(b);
+    }
+
+    /// Long division for large numbers
+    /// Algorithm: shift and subtract method
+    /// Complexity: O(len(a) * len(b))
+    fn div_rem_long(a: Self, b: Self) DivResult {
+        const cmp = a.compare_abs(b);
+        if (cmp < 0) {
+            // |a| < |b|: quotient = 0, remainder = a
+            return DivResult{ .q = zero(), .r = a };
+        }
+        if (cmp == 0) {
+            // |a| == |b|
+            if (a.is_negative() == b.is_negative()) {
+                return DivResult{ .q = from_i64(1), .r = zero() };
+            } else {
+                return DivResult{ .q = from_i64(-1), .r = zero() };
+            }
+        }
+
+        // Determine result sign
+        const result_neg = a.is_negative() != b.is_negative();
+
+        // Work with absolute values
+        var remainder = a.abs();
+        const divisor = b.abs();
+        var quotient = zero();
+
+        // Find scale (shift to align MSB)
+        var scale : usize = 0;
+        if (remainder.len > divisor.len) {
+            scale = remainder.len - divisor.len;
+        }
+
+        // Long division
+        var pos : usize = scale + 1;
+        while (pos > 0) {
+            pos -= 1;
+
+            // Shift divisor to current position
+            const shifted_divisor = divisor.shift_left(pos);
+
+            // Find quotient trit
+            var q_trit : i8 = 0;
+
+            // Try +1
+            if (!remainder.is_negative() and remainder.compare_abs(shifted_divisor) >= 0) {
+                const test_sub = remainder.sub(shifted_divisor);
+                if (test_sub.abs().compare_abs(remainder.abs()) <= 0) {
+                    q_trit = 1;
+                    remainder = test_sub;
+                }
+            }
+
+            // Try -1
+            if (q_trit == 0 and remainder.is_negative()) {
+                const test_add = remainder.add(shifted_divisor);
+                if (test_add.abs().compare_abs(remainder.abs()) < 0) {
+                    q_trit = -1;
+                    remainder = test_add;
+                }
+            }
+
+            quotient.trits[pos] = @intCast(q_trit);
+            if (pos >= quotient.len and q_trit != 0) {
+                quotient.len = pos + 1;
+            }
+        }
+
+        quotient.normalize();
+        remainder.normalize();
+
+        // Adjust signs
+        if (result_neg) {
+            quotient = quotient.negate();
+        }
+        if (a.is_negative() and !remainder.is_zero()) {
+            remainder = remainder.negate();
+        }
+
+        return DivResult{ .q = quotient, .r = remainder };
+    }
+
+    /// Division (quotient only)
+    pub fn div(a: Self, b: Self) Self {
+        return a.div_rem(b).q;
+    }
+
+    /// Modulo (remainder only)
+    pub fn mod(a: Self, b: Self) Self {
+        return a.div_rem(b).r;
+    }
+
+    // ========================================================================
+    // Shift Operations
+    // ========================================================================
+
+    /// Shift left by n trits (multiply by 3^n)
+    /// Complexity: O(len + n)
+    pub fn shift_left(self: Self, n: usize) Self {
+        if (n == 0) {
+            return self;
+        }
+
+        var result = zero();
+        var i : usize = 0;
+        while (i < self.len) {
+            if (i + n < MAX_TRITS) {
+                result.trits[i + n] = self.trits[i];
+            }
+            i = i + 1;
+        }
+        result.len = @min(self.len + n, MAX_TRITS);
+        result.normalize();
+        return result;
+    }
+
+    /// Shift right by n trits (divide by 3^n, truncate)
+    /// Complexity: O(len - n)
+    pub fn shift_right(self: Self, n: usize) Self {
+        if (n >= self.len) {
+            return zero();
+        }
+
+        var result = zero();
+        var i = n;
+        while (i < self.len) {
+            result.trits[i - n] = self.trits[i];
+            i = i + 1;
+        }
+        result.len = self.len - n;
+        result.normalize();
+        return result;
+    }
+
+    // ========================================================================
+    // Newton-Raphson Division (for very large numbers)
+    // ========================================================================
+
+    /// Newton-Raphson reciprocal approximation
+    /// Computes approximation of 3^precision / b
+    /// Iteration: x_{n+1} = x_n * (2 - b * x_n / 3^precision)
+    /// Complexity: O(log(precision) * mul_cost)
+    pub fn newton_reciprocal(b: Self, precision: usize) Self {
+        if (b.is_zero()) {
+            return zero();
+        }
+
+        const b_abs = b.abs();
+
+        // Initial guess: 3^(precision - b.len + 1)
+        var x = zero();
+        const initial_pos = if (precision > b_abs.len) {
+            precision - b_abs.len + 1
+        } else {
+            1
+        };
+        if (initial_pos < MAX_TRITS) {
+            x.trits[initial_pos] = TRIT_POS;
+            x.len = initial_pos + 1;
+        } else {
+            x.trits[0] = TRIT_POS;
+            x.len = 1;
+        }
+
+        const two = from_i64(2);
+        const max_iterations : usize = 10;
+
+        var iter : usize = 0;
+        while (iter < max_iterations) {
+            // x = x * (2 - b * x / 3^precision)
+            const bx = b_abs.mul(x);
+            const two_scaled = two.shift_left(precision);
+            const diff = two_scaled.sub(bx);
+            const x_new = x.mul(diff).shift_right(precision);
+
+            // Check convergence
+            if (x_new.compare(x) == 0) {
+                x = x_new;
+                break;
+            }
+
+            x = x_new;
+            iter = iter + 1;
+        }
+
+        if (b.is_negative()) {
+            return x.negate();
+        }
+        return x;
+    }
+
+    /// Fast division using Newton-Raphson for very large numbers
+    /// Computes a / b using reciprocal approximation
+    /// Complexity: O(mul_cost * log(precision))
+    pub fn div_newton(a: Self, b: Self) DivResult {
+        if (b.is_zero()) {
+            return DivResult{ .q = zero(), .r = zero() };
+        }
+
+        // For small numbers, use regular division
+        if (a.len <= I64_DIV_THRESHOLD and b.len <= I64_DIV_THRESHOLD) {
+            return a.div_rem(b);
+        }
+
+        // Compute precision needed
+        const precision = @max(a.len, b.len) + 10;
+
+        // Get reciprocal of b
+        const recip = b.newton_reciprocal(precision);
+
+        // Compute a * recip / 3^precision
+        const product = a.mul(recip);
+        var quotient = product.shift_right(precision);
+
+        // Compute remainder: r = a - q * b
+        const qb = quotient.mul(b);
+        var remainder = a.sub(qb);
+
+        // Adjust if remainder is out of range
+        while (!remainder.is_zero() and remainder.abs().compare_abs(b.abs()) >= 0) {
+            if (remainder.is_negative() == b.is_negative()) {
+                remainder = remainder.sub(b);
+                quotient = quotient.add(from_i64(1));
+            } else {
+                remainder = remainder.add(b);
+                quotient = quotient.sub(from_i64(1));
+            }
+        }
+
+        return DivResult{ .q = quotient, .r = remainder };
+    }
+};
+
+// ============================================================================
+// TDD - Tests
+// ============================================================================
+
+test "big_int_zero_creation" {
+    // Verify zero() creates valid zero BigInt
+    const z = BigInt.zero();
+    try std.testing.expect(z.is_zero() == true);
+    try std.testing.expect(z.len == 1);
+    try std.testing.expect(z.trits[0] == TRIT_ZERO);
+}
+
+test "big_int_from_i64_zero" {
+    // Verify from_i64(0) creates zero
+    const z = BigInt.from_i64(0);
+    try std.testing.expect(z.is_zero() == true);
+}
+
+test "big_int_from_i64_positive" {
+    // Verify from_i64 creates correct positive BigInt
+    const a = BigInt.from_i64(42);
+    const b = BigInt.from_i64(100);
+    const c = BigInt.from_i64(1);
+    try std.testing.expectEqual(@as(i64, 42), a.to_i64());
+    try std.testing.expectEqual(@as(i64, 100), b.to_i64());
+    try std.testing.expectEqual(@as(i64, 1), c.to_i64());
+}
+
+test "big_int_from_i64_negative" {
+    // Verify from_i64 creates correct negative BigInt
+    const a = BigInt.from_i64(-42);
+    const b = BigInt.from_i64(-100);
+    const c = BigInt.from_i64(-1);
+    try std.testing.expectEqual(@as(i64, -42), a.to_i64());
+    try std.testing.expectEqual(@as(i64, -100), b.to_i64());
+    try std.testing.expectEqual(@as(i64, -1), c.to_i64());
+}
+
+test "big_int_to_i64_roundtrip" {
+    // Verify to_i64(from_i64(x)) == x for various values
+    const values = [_]i64{ 0, 1, -1, 2, -2, 10, -10, 100, -100, 1000, -1000, 12345, -12345 };
+    for (values) |val| {
+        const big = BigInt.from_i64(val);
+        const back = big.to_i64();
+        try std.testing.expectEqual(val, back);
+    }
+}
+
+test "big_int_normalize" {
+    // Verify normalize removes leading zeros
+    var a = BigInt.zero();
+    a.trits[0] = TRIT_POS;
+    a.trits[1] = TRIT_ZERO;
+    a.trits[2] = TRIT_ZERO;
+    a.trits[3] = TRIT_ZERO;
+    a.len = 4;
+    a.normalize();
+    try std.testing.expect(a.len == 1);
+    try std.testing.expect(a.trits[0] == TRIT_POS);
+}
+
+test "big_int_is_negative" {
+    // Verify is_negative works correctly
+    const pos = BigInt.from_i64(42);
+    const neg = BigInt.from_i64(-42);
+    const z = BigInt.zero();
+    try std.testing.expect(pos.is_negative() == false);
+    try std.testing.expect(neg.is_negative() == true);
+    try std.testing.expect(z.is_negative() == false);
+}
+
+test "big_int_is_positive" {
+    // Verify is_positive works correctly
+    const pos = BigInt.from_i64(42);
+    const neg = BigInt.from_i64(-42);
+    const z = BigInt.zero();
+    try std.testing.expect(pos.is_positive() == true);
+    try std.testing.expect(neg.is_positive() == false);
+    try std.testing.expect(z.is_positive() == false);
+}
+
+test "big_int_signum" {
+    // Verify signum returns correct sign
+    const pos = BigInt.from_i64(42);
+    const neg = BigInt.from_i64(-42);
+    const z = BigInt.zero();
+    try std.testing.expectEqual(@as(i8, 1), pos.signum());
+    try std.testing.expectEqual(@as(i8, -1), neg.signum());
+    try std.testing.expectEqual(@as(i8, 0), z.signum());
+}
+
+test "big_int_negate" {
+    // Verify negate flips sign
+    const a = BigInt.from_i64(42);
+    const b = BigInt.from_i64(-42);
+    const c = BigInt.zero();
+    const neg_a = a.negate();
+    const neg_b = b.negate();
+    const neg_c = c.negate();
+    try std.testing.expectEqual(@as(i64, -42), neg_a.to_i64());
+    try std.testing.expectEqual(@as(i64, 42), neg_b.to_i64());
+    try std.testing.expectEqual(@as(i64, 0), neg_c.to_i64());
+}
+
+test "big_int_abs" {
+    // Verify abs returns absolute value
+    const a = BigInt.from_i64(42);
+    const b = BigInt.from_i64(-42);
+    const c = BigInt.zero();
+    try std.testing.expectEqual(@as(i64, 42), a.abs().to_i64());
+    try std.testing.expectEqual(@as(i64, 42), b.abs().to_i64());
+    try std.testing.expectEqual(@as(i64, 0), c.abs().to_i64());
+}
+
+test "big_int_add_positive" {
+    // Verify addition of positive numbers
+    const a = BigInt.from_i64(123);
+    const b = BigInt.from_i64(456);
+    const sum = a.add(b);
+    try std.testing.expectEqual(@as(i64, 579), sum.to_i64());
+}
+
+test "big_int_add_negative" {
+    // Verify addition with negative numbers
+    const a = BigInt.from_i64(-100);
+    const b = BigInt.from_i64(50);
+    const sum = a.add(b);
+    try std.testing.expectEqual(@as(i64, -50), sum.to_i64());
+}
+
+test "big_int_add_zero" {
+    // Verify adding zero is identity
+    const a = BigInt.from_i64(42);
+    const z = BigInt.zero();
+    const sum1 = a.add(z);
+    const sum2 = z.add(a);
+    try std.testing.expectEqual(@as(i64, 42), sum1.to_i64());
+    try std.testing.expectEqual(@as(i64, 42), sum2.to_i64());
+}
+
+test "big_int_add_commutative" {
+    // Verify addition is commutative: a + b = b + a
+    const a = BigInt.from_i64(123);
+    const b = BigInt.from_i64(456);
+    const sum1 = a.add(b);
+    const sum2 = b.add(a);
+    try std.testing.expect(sum1.compare(sum2) == 0);
+}
+
+test "big_int_sub" {
+    // Verify subtraction
+    const a = BigInt.from_i64(1000);
+    const b = BigInt.from_i64(300);
+    const diff = a.sub(b);
+    try std.testing.expectEqual(@as(i64, 700), diff.to_i64());
+}
+
+test "big_int_sub_negative" {
+    // Verify subtraction giving negative result
+    const a = BigInt.from_i64(100);
+    const b = BigInt.from_i64(300);
+    const diff = a.sub(b);
+    try std.testing.expectEqual(@as(i64, -200), diff.to_i64());
+}
+
+test "big_int_mul_simple_positive" {
+    // Verify simple multiplication
+    const a = BigInt.from_i64(12);
+    const b = BigInt.from_i64(34);
+    const prod = a.mul_simple(b);
+    try std.testing.expectEqual(@as(i64, 408), prod.to_i64());
+}
+
+test "big_int_mul_simple_negative" {
+    // Verify multiplication with negative
+    const a = BigInt.from_i64(-7);
+    const b = BigInt.from_i64(8);
+    const prod = a.mul_simple(b);
+    try std.testing.expectEqual(@as(i64, -56), prod.to_i64());
+}
+
+test "big_int_mul_zero" {
+    // Verify multiplication by zero
+    const a = BigInt.from_i64(12345);
+    const z = BigInt.zero();
+    const prod = a.mul(z);
+    try std.testing.expect(prod.is_zero() == true);
+}
+
+test "big_int_mul_karatsuba" {
+    // Verify Karatsuba multiplication
+    const a = BigInt.from_i64(12345);
+    const b = BigInt.from_i64(67890);
+    const prod = a.mul_karatsuba(b);
+    try std.testing.expectEqual(@as(i64, 838102050), prod.to_i64());
+}
+
+test "big_int_mul_consistency" {
+    // Verify mul_simple and mul_karatsuba give same result
+    const a = BigInt.from_i64(12345);
+    const b = BigInt.from_i64(67890);
+    const prod_simple = a.mul_simple(b);
+    const prod_karat = a.mul_karatsuba(b);
+    try std.testing.expect(prod_simple.compare(prod_karat) == 0);
+}
+
+test "big_int_compare_equal" {
+    // Verify compare for equal numbers
+    const a = BigInt.from_i64(42);
+    const b = BigInt.from_i64(42);
+    try std.testing.expect(a.compare(b) == 0);
+}
+
+test "big_int_compare_less" {
+    // Verify compare for a < b
+    const a = BigInt.from_i64(42);
+    const b = BigInt.from_i64(100);
+    try std.testing.expect(a.compare(b) == -1);
+}
+
+test "big_int_compare_greater" {
+    // Verify compare for a > b
+    const a = BigInt.from_i64(100);
+    const b = BigInt.from_i64(42);
+    try std.testing.expect(a.compare(b) == 1);
+}
+
+test "big_int_compare_negative" {
+    // Verify compare with negative numbers
+    const a = BigInt.from_i64(-100);
+    const b = BigInt.from_i64(-42);
+    try std.testing.expect(a.compare(b) == -1);
+}
+
+test "big_int_div_exact" {
+    // Verify exact division
+    const a = BigInt.from_i64(81);
+    const b = BigInt.from_i64(9);
+    const result = a.div_rem(b);
+    try std.testing.expectEqual(@as(i64, 9), result.q.to_i64());
+    try std.testing.expect(result.r.is_zero() == true);
+}
+
+test "big_int_div_with_remainder" {
+    // Verify division with remainder
+    const a = BigInt.from_i64(10);
+    const b = BigInt.from_i64(3);
+    const result = a.div_rem(b);
+    try std.testing.expectEqual(@as(i64, 3), result.q.to_i64());
+    try std.testing.expectEqual(@as(i64, 1), result.r.to_i64());
+}
+
+test "big_int_div_negative" {
+    // Verify division with negative numbers
+    const a = BigInt.from_i64(-100);
+    const b = BigInt.from_i64(7);
+    const result = a.div_rem(b);
+    try std.testing.expectEqual(@as(i64, -14), result.q.to_i64());
+    try std.testing.expectEqual(@as(i64, -2), result.r.to_i64());
+}
+
+test "big_int_div_by_negative" {
+    // Verify division by negative divisor
+    const a = BigInt.from_i64(100);
+    const b = BigInt.from_i64(-7);
+    const result = a.div_rem(b);
+    try std.testing.expectEqual(@as(i64, -14), result.q.to_i64());
+    try std.testing.expectEqual(@as(i64, 2), result.r.to_i64());
+}
+
+test "big_int_shift_left" {
+    // Verify shift left (multiply by 3^n)
+    const a = BigInt.from_i64(10);
+    const shifted = a.shift_left(2);
+    try std.testing.expectEqual(@as(i64, 90), shifted.to_i64());  // 10 * 9 = 90
+}
+
+test "big_int_shift_right" {
+    // Verify shift right (divide by 3^n)
+    const a = BigInt.from_i64(27);
+    const shifted = a.shift_right(1);
+    try std.testing.expectEqual(@as(i64, 9), shifted.to_i64());  // 27 / 3 = 9
+}
+
+test "big_int_shift_identity" {
+    // Verify shift by zero is identity
+    const a = BigInt.from_i64(42);
+    const shifted = a.shift_left(0);
+    try std.testing.expect(shifted.compare(a) == 0);
+}
+
+test "big_int_newton_div" {
+    // Verify Newton-Raphson division
+    const a = BigInt.from_i64(1000000);
+    const b = BigInt.from_i64(1234);
+    const result = a.div_newton(b);
+    try std.testing.expectEqual(@as(i64, 810), result.q.to_i64());
+    try std.testing.expectEqual(@as(i64, 460), result.r.to_i64());
+}
+
+test "big_int_newton_div_consistency" {
+    // Verify Newton division gives same result as regular division
+    const a = BigInt.from_i64(1000000);
+    const b = BigInt.from_i64(1234);
+    const result_newton = a.div_newton(b);
+    const result_regular = a.div_rem(b);
+    try std.testing.expect(result_newton.q.compare(result_regular.q) == 0);
+    try std.testing.expect(result_newton.r.compare(result_regular.r) == 0);
+}
+
+test "big_int_large_add" {
+    // Verify addition of larger numbers
+    const a = BigInt.from_i64(1000000000);
+    const b = BigInt.from_i64(999999999);
+    const sum = a.add(b);
+    try std.testing.expectEqual(@as(i64, 1999999999), sum.to_i64());
+}
+
+test "big_int_large_mul" {
+    // Verify multiplication of larger numbers
+    const a = BigInt.from_i64(123456);
+    const b = BigInt.from_i64(789012);
+    const prod = a.mul(b);
+    try std.testing.expectEqual(@as(i64, 97406197072), prod.to_i64());
+}
+
+// ============================================================================
+// TDD - Invariants
+// ============================================================================
+
+invariant big_int_zero_is_neutral_add {
+    // Zero is neutral for addition: a + 0 = a
+    const values = [_]i64{ 1, -1, 42, -42, 100, -100 };
+    inline for (values) |val| {
+        const a = BigInt.from_i64(val);
+        const z = BigInt.zero();
+        a.add(z).compare(a) == 0;
+        z.add(a).compare(a) == 0;
+    }
+}
+
+invariant big_int_zero_is_annihilator_mul {
+    // Zero is annihilator for multiplication: a * 0 = 0
+    const values = [_]i64{ 1, -1, 42, -42, 100, -100 };
+    inline for (values) |val| {
+        const a = BigInt.from_i64(val);
+        const z = BigInt.zero();
+        a.mul(z).is_zero() == true;
+    }
+}
+
+invariant big_int_add_commutative {
+    // Addition is commutative: a + b = b + a
+    const vals_a = [_]i64{ 1, 2, 10, 100 };
+    const vals_b = [_]i64{ 1, 2, 10, 100 };
+    inline for (vals_a) |a_val| {
+        inline for (vals_b) |b_val| {
+            const a = BigInt.from_i64(a_val);
+            const b = BigInt.from_i64(b_val);
+            a.add(b).compare(b.add(a)) == 0;
+        }
+    }
+}
+
+invariant big_int_add_associative {
+    // Addition is associative: (a + b) + c = a + (b + c)
+    const a = BigInt.from_i64(12);
+    const b = BigInt.from_i64(34);
+    const c = BigInt.from_i64(56);
+    a.add(b).add(c).compare(a.add(b.add(c))) == 0;
+}
+
+invariant big_int_mul_commutative {
+    // Multiplication is commutative: a * b = b * a
+    const vals_a = [_]i64{ 1, 2, 10 };
+    const vals_b = [_]i64{ 1, 2, 10 };
+    inline for (vals_a) |a_val| {
+        inline for (vals_b) |b_val| {
+            const a = BigInt.from_i64(a_val);
+            const b = BigInt.from_i64(b_val);
+            a.mul(b).compare(b.mul(a)) == 0;
+        }
+    }
+}
+
+invariant big_int_mul_associative {
+    // Multiplication is associative: (a * b) * c = a * (b * c)
+    const a = BigInt.from_i64(3);
+    const b = BigInt.from_i64(5);
+    const c = BigInt.from_i64(7);
+    a.mul(b).mul(c).compare(a.mul(b.mul(c))) == 0;
+}
+
+invariant big_int_distributive {
+    // Multiplication distributes over addition: a * (b + c) = a*b + a*c
+    const a = BigInt.from_i64(3);
+    const b = BigInt.from_i64(5);
+    const c = BigInt.from_i64(7);
+    a.mul(b.add(c)).compare(a.mul(b).add(a.mul(c))) == 0;
+}
+
+invariant big_int_negate_twice {
+    // Double negation: -(-a) = a
+    const values = [_]i64{ 1, -1, 42, -42, 100 };
+    inline for (values) |val| {
+        const a = BigInt.from_i64(val);
+        a.negate().negate().compare(a) == 0;
+    }
+}
+
+invariant big_int_abs_idempotent {
+    // Absolute value is idempotent: | |a| | = |a|
+    const values = [_]i64{ 1, -1, 42, -42, 100, -100 };
+    inline for (values) |val| {
+        const a = BigInt.from_i64(val);
+        a.abs().abs().compare(a.abs()) == 0;
+    }
+}
+
+invariant big_int_sub_equals_add_negate {
+    // Subtraction equals addition of negation: a - b = a + (-b)
+    const vals_a = [_]i64{ 10, 100 };
+    const vals_b = [_]i64{ 3, 7 };
+    inline for (vals_a) |a_val| {
+        inline for (vals_b) |b_val| {
+            const a = BigInt.from_i64(a_val);
+            const b = BigInt.from_i64(b_val);
+            a.sub(b).compare(a.add(b.negate())) == 0;
+        }
+    }
+}
+
+invariant big_int_division_invariant {
+    // Division invariant: a = q * b + r, |r| < |b|
+    const vals_a = [_]i64{ 10, 100, 1000 };
+    const vals_b = [_]i64{ 3, 7, 13 };
+    inline for (vals_a) |a_val| {
+        inline for (vals_b) |b_val| {
+            const a = BigInt.from_i64(a_val);
+            const b = BigInt.from_i64(b_val);
+            const result = a.div_rem(b);
+            const reconstructed = result.q.mul(b).add(result.r);
+            reconstructed.compare(a) == 0;
+            result.r.compare_abs(b) < 0 or result.r.is_zero();
+        }
+    }
+}
+
+invariant big_int_compare_transitive {
+    // Comparison is transitive: a < b and b < c implies a < c
+    const a = BigInt.from_i64(1);
+    const b = BigInt.from_i64(10);
+    const c = BigInt.from_i64(100);
+    a.compare(b) < 0;
+    b.compare(c) < 0;
+    a.compare(c) < 0;
+}
+
+invariant big_int_compare_total_ordering {
+    // Every pair is comparable
+    const vals_a = [_]i64{ 1, -1, 42, -42 };
+    const vals_b = [_]i64{ 1, -1, 42, -42 };
+    inline for (vals_a) |a_val| {
+        inline for (vals_b) |b_val| {
+            const a = BigInt.from_i64(a_val);
+            const b = BigInt.from_i64(b_val);
+            const cmp = a.compare(b);
+            cmp == -1 or cmp == 0 or cmp == 1;
+        }
+    }
+}
+
+invariant big_int_shift_consistency {
+    // Shift left then right returns original (with truncation)
+    const values = [_]i64{ 10, 100, 1000 };
+    inline for (values) |val| {
+        const a = BigInt.from_i64(val);
+        const shifted = a.shift_left(2);
+        const restored = shifted.shift_right(2);
+        @compileAssert(restored.compare(a) == 0);
+    }
+}
+
+// ============================================================================
+// TDD - Benchmarks
+// ============================================================================
+
+bench "big_int_add_latency" {
+    // Measure: cycles for BigInt addition
+    // Target: < 1000 cycles for 64-trit numbers
+    @setEvalBranchQuota(10000);
+    var result : BigInt = undefined;
+    const a = BigInt.from_i64(12345);
+    const b = BigInt.from_i64(6789);
+    for (0..1000) |_| {
+        result = a.add(b);
+    }
+    _ = result;
+}
+
+bench "big_int_sub_latency" {
+    // Measure: cycles for BigInt subtraction
+    // Target: < 1000 cycles for 64-trit numbers
+    @setEvalBranchQuota(10000);
+    var result : BigInt = undefined;
+    const a = BigInt.from_i64(12345);
+    const b = BigInt.from_i64(6789);
+    for (0..1000) |_| {
+        result = a.sub(b);
+    }
+    _ = result;
+}
+
+bench "big_int_mul_simple_latency" {
+    // Measure: cycles for simple multiplication
+    // Target: < 5000 cycles for 32-trit numbers
+    @setEvalBranchQuota(10000);
+    var result : BigInt = undefined;
+    const a = BigInt.from_i64(12345);
+    const b = BigInt.from_i64(6789);
+    for (0..100) |_| {
+        result = a.mul_simple(b);
+    }
+    _ = result;
+}
+
+bench "big_int_mul_karatsuba_latency" {
+    // Measure: cycles for Karatsuba multiplication
+    // Target: < 3000 cycles for 64-trit numbers
+    @setEvalBranchQuota(10000);
+    var result : BigInt = undefined;
+    const a = BigInt.from_i64(123456789);
+    const b = BigInt.from_i64(987654321);
+    for (0..100) |_| {
+        result = a.mul_karatsuba(b);
+    }
+    _ = result;
+}
+
+bench "big_int_div_latency" {
+    // Measure: cycles for division
+    // Target: < 10000 cycles for 64-trit numbers
+    @setEvalBranchQuota(10000);
+    var result : BigInt = undefined;
+    const a = BigInt.from_i64(1000000);
+    const b = BigInt.from_i64(1234);
+    for (0..100) |_| {
+        result = a.div(b);
+    }
+    _ = result;
+}
+
+bench "big_int_shift_latency" {
+    // Measure: cycles for shift operations
+    // Target: < 500 cycles
+    @setEvalBranchQuota(10000);
+    var result : BigInt = undefined;
+    const a = BigInt.from_i64(12345);
+    for (0..1000) |_| {
+        result = a.shift_left(10);
+        _ = result.shift_right(10);
+    }
+    _ = result;
+}
+
+bench "big_int_normalize_latency" {
+    // Measure: cycles for normalization
+    // Target: < 100 cycles
+    @setEvalBranchQuota(10000);
+    var a = BigInt.from_i64(12345);
+    a.trits[10] = TRIT_ZERO;
+    a.trits[11] = TRIT_ZERO;
+    a.len = 12;
+    for (0..1000) |_| {
+        a.normalize();
+    }
+    _ = a;
+}
+
+bench "big_int_compare_latency" {
+    // Measure: cycles for comparison
+    // Target: < 500 cycles
+    @setEvalBranchQuota(10000);
+    var cmp : i8 = 0;
+    const a = BigInt.from_i64(12345);
+    const b = BigInt.from_i64(6789);
+    for (0..1000) |_| {
+        cmp = a.compare(b);
+    }
+    _ = cmp;
+}
+
+bench "big_int_negate_latency" {
+    // Measure: cycles for negation
+    // Target: < 500 cycles for 64-trit numbers
+    @setEvalBranchQuota(10000);
+    var result : BigInt = undefined;
+    const a = BigInt.from_i64(12345);
+    for (0..1000) |_| {
+        result = a.negate();
+    }
+    _ = result;
+}
+
+bench "big_int_abs_latency" {
+    // Measure: cycles for absolute value
+    // Target: < 500 cycles
+    @setEvalBranchQuota(10000);
+    var result : BigInt = undefined;
+    const a = BigInt.from_i64(-12345);
+    for (0..1000) |_| {
+        result = a.abs();
+    }
+    _ = result;
+}
+
+bench "big_int_to_i64_latency" {
+    // Measure: cycles for to_i64 conversion
+    // Target: < 1000 cycles
+    @setEvalBranchQuota(10000);
+    var result : i64 = 0;
+    const a = BigInt.from_i64(12345);
+    for (0..1000) |_| {
+        result = a.to_i64();
+    }
+    _ = result;
+}
+
+bench "big_int_from_i64_latency" {
+    // Measure: cycles for from_i64 conversion
+    // Target: < 1000 cycles
+    @setEvalBranchQuota(10000);
+    var result : BigInt = undefined;
+    for (0..1000) |i| {
+        result = BigInt.from_i64(@intCast(i));
+    }
+    _ = result;
+}

@@ -1,0 +1,211 @@
+// ETX (Expected Transmission Count) link metric
+// Port from trios-mesh/src/routing.rs
+// Delivery samples use Q0.8; ETX costs use Q8.8. Unit weight is 256.
+
+module MeshEtx {
+    use base::types;
+
+    // --- Delivery ratios (Q0.8) and ETX costs (Q8.8) ---
+    const OPTIMISTIC: u8 = 230;  // ~0.9 in Q0.8
+    const DEAD_EPS: u8 = 38;     // ~0.15 in Q0.8
+    const ONE_FP: u16 = 256;     // 1.0 in Q8.8
+    const ALPHA_HALF: u8 = 128;  // 0.5 in Q0.8
+
+    // Simplified alpha lookup
+    fn alpha_from_window(window: u8) -> u8 {
+        if (window == 10) {
+            return 128;  // 0.5
+        } else {
+            return 160;  // ~0.625 (window=5)
+        }
+    }
+
+    // Convert bool to Q0.8 sample
+    fn bool_to_sample(b: bool) -> u8 {
+        if (b) {
+            return 255;  // ~1.0
+        } else {
+            return 0;
+        }
+    }
+
+    // Fixed-point multiply (Q0.8 * Q0.8 = Q0.8)
+    fn fp_mul(a: u8, b: u8) -> u8 {
+        if (a == 0 || b == 0) {
+            return 0;
+        }
+        return (((a as u16) * (b as u16)) >> 8) as u8;
+    }
+
+    // EWMA: est = alpha*sample + (1-alpha)*est
+    fn ewma_update(est: u8, sample: u8, alpha: u8) -> u8 {
+        // The complement can be 256. Combine before rounding so stationary
+        // values and alpha=0 are exact. The sum is at most 256*255=65280.
+        let weight: u16 = alpha as u16;
+        return ((weight * (sample as u16) + (ONE_FP - weight) * (est as u16)) >> 8) as u8;
+    }
+
+    // Check if delivery ratio is dead
+    fn is_dead(ratio: u8) -> bool {
+        return ratio < DEAD_EPS;
+    }
+
+    // ETX via bucket approximation (no division)
+    fn calc_etx(forward: u8, reverse: u8) -> u16 {
+        if (is_dead(forward) || is_dead(reverse)) {
+            return 0xFFFF;  // infinity marker
+        }
+        
+        if (forward >= 200 && reverse >= 200) {
+            return ONE_FP;  // ~1.0
+        } else if (forward >= 100 && reverse >= 200) {
+            return 512;  // ~2.0
+        } else if (forward >= 200 && reverse >= 100) {
+            return 512;  // ~2.0
+        } else if (forward >= 50 && reverse >= 50) {
+            return 1024; // ~4.0
+        } else {
+            return 2048; // high ETX
+        }
+    }
+
+    // ---- Simplified tests (direct calls, no intermediate variables) ----
+
+    test test_perfect_link {
+        // After 20 good HELLOs, EWMA converges to high values -> ETX ~1.0
+        fwd = ewma_update(ewma_update(ewma_update(OPTIMISTIC, 255, ALPHA_HALF), 255, ALPHA_HALF), 255, ALPHA_HALF);
+        rev = ewma_update(ewma_update(ewma_update(OPTIMISTIC, 255, ALPHA_HALF), 255, ALPHA_HALF), 255, ALPHA_HALF);
+        etx = calc_etx(fwd, rev);
+        assert(etx >= 200 && etx <= 312, "ETX ~1.0 expected");
+    }
+
+    test test_half_forward {
+        // Alternating forward success -> lower forward estimate -> ETX ~2.0
+        fwd = ewma_update(ewma_update(OPTIMISTIC, 255, ALPHA_HALF), 0, ALPHA_HALF);
+        rev = ewma_update(ewma_update(OPTIMISTIC, 255, ALPHA_HALF), 255, ALPHA_HALF);
+        etx = calc_etx(fwd, rev);
+        assert(etx >= 384 && etx <= 512, "ETX ~2.0 expected");
+    }
+
+    test test_dead_direction {
+        // Reverse decays to 0 -> dead link -> ETX = infinity
+        // Three zero samples needed: 230 -> 115 -> 57 -> 28 (< DEAD_EPS=38).
+        // Two are not enough even in the float original (0.9 -> 0.45 -> 0.225 vs eps 0.15).
+        fwd = ewma_update(ewma_update(OPTIMISTIC, 255, ALPHA_HALF), 255, ALPHA_HALF);
+        rev = ewma_update(ewma_update(ewma_update(OPTIMISTIC, 0, ALPHA_HALF), 0, ALPHA_HALF), 0, ALPHA_HALF);
+        etx = calc_etx(fwd, rev);
+        assert(etx == 0xFFFF, "dead link should be infinite");
+    }
+
+    test test_force_dead {
+        // Healthy then forced to 0 then resurrects
+        fwd = ewma_update(OPTIMISTIC, 255, 160);
+        rev = ewma_update(OPTIMISTIC, 255, 160);
+        etx_healthy = calc_etx(fwd, rev);
+        assert(etx_healthy != 0xFFFF, "healthy link should be finite");
+        
+        etx_dead = calc_etx(0, 0);
+        assert(etx_dead == 0xFFFF, "zeroed link should be infinite");
+        
+        fwd2 = ewma_update(0, 255, 160);
+        rev2 = ewma_update(0, 255, 160);
+        etx_resurrect = calc_etx(fwd2, rev2);
+        assert(etx_resurrect != 0xFFFF, "resurrected link should be finite");
+    }
+
+    test test_etx_buckets {
+        etx_perfect = calc_etx(230, 230);
+        assert(etx_perfect >= 200 && etx_perfect <= 312, "perfect ETX ~1.0");
+        
+        etx_half = calc_etx(115, 230);
+        assert(etx_half >= 384 && etx_half <= 512, "half ETX ~2.0");
+        
+        etx_dead = calc_etx(230, 0);
+        assert(etx_dead == 0xFFFF, "dead direction infinite");
+    }
+
+    test test_ewma_convergence {
+        est1 = ewma_update(ewma_update(OPTIMISTIC, 255, ALPHA_HALF), 255, ALPHA_HALF);
+        assert(est1 > OPTIMISTIC, "EWMA should increase");
+        
+        est2 = ewma_update(ewma_update(OPTIMISTIC, 0, ALPHA_HALF), 0, ALPHA_HALF);
+        assert(est2 < OPTIMISTIC, "EWMA should decrease");
+    }
+
+    test test_ewma_stationary_midrange {
+        assert(ewma_update(230, 230, 128) == 230, "stationary half weight");
+        assert(ewma_update(230, 230, 160) == 230, "stationary lookup weight");
+    }
+
+    test test_ewma_stationary_small {
+        assert(ewma_update(1, 1, 128) == 1, "stationary odd value");
+        assert(ewma_update(3, 3, 160) == 3, "small stationary estimate");
+        assert(ewma_update(254, 254, 1) == 254, "stationary near maximum");
+    }
+
+    test test_ewma_zero_alpha {
+        assert(ewma_update(230, 255, 0) == 230, "zero alpha ignores success");
+        assert(ewma_update(230, 0, 0) == 230, "zero alpha ignores loss");
+        assert(ewma_update(255, 0, 0) == 255, "zero alpha retains maximum");
+    }
+
+    test test_ewma_extreme_stationary {
+        assert(ewma_update(0, 0, 0) == 0, "zero stationary minimum alpha");
+        assert(ewma_update(0, 0, 255) == 0, "zero stationary maximum alpha");
+        assert(ewma_update(255, 255, 0) == 255, "full stationary minimum alpha");
+        assert(ewma_update(255, 255, 255) == 255, "full stationary maximum alpha");
+    }
+
+    test test_ewma_single_rounding {
+        assert(ewma_update(1, 3, 128) == 2, "combine fractional products");
+        assert(ewma_update(230, 255, 128) == 242, "half success rounds once");
+        assert(ewma_update(230, 0, 128) == 115, "half loss uses exact complement");
+    }
+
+    test test_ewma_zero_estimate {
+        assert(ewma_update(0, 255, 128) == 127, "half success from zero");
+        assert(ewma_update(0, 255, 255) == 254, "maximum alpha is 255 over 256");
+    }
+
+    test test_ewma_maximum_alpha {
+        assert(ewma_update(230, 17, 255) == 17, "retain residual estimate weight");
+        assert(ewma_update(255, 0, 255) == 0, "maximum alpha loss rounds down");
+    }
+
+    test test_ewma_dead_threshold_stationary {
+        assert(ewma_update(DEAD_EPS, DEAD_EPS, 128) == DEAD_EPS, "keep threshold");
+        assert(!is_dead(ewma_update(DEAD_EPS, DEAD_EPS, 128)), "stationary stays alive");
+        assert(calc_etx(ewma_update(DEAD_EPS, DEAD_EPS, 128), 230) != 0xFFFF, "finite ETX");
+    }
+
+    test test_ewma_boundary_matrix {
+        // All weights and estimates, with endpoint, threshold and rounding
+        // samples. The Cargo oracle separately checks every u8 triple.
+        // Keep declarations and the final assertion outside nested loops so
+        // the pinned Verilog testbench emitter can lower them faithfully.
+        let all_match: bool = true;
+        let weight: u64 = 0;
+        let expected: u64 = 0;
+        let sample_value: u64 = 0;
+        for alpha in 0..256 {
+            for est in 0..256 {
+                all_match = all_match && ((ewma_update(est as u8, est as u8, alpha as u8) as u64) == (est as u64));
+                all_match = all_match && ((ewma_update(est as u8, alpha as u8, 0) as u64) == (est as u64));
+                for sample_index in 0..8 {
+                    if (sample_index == 0) { sample_value = 0; }
+                    else if (sample_index == 1) { sample_value = 1; }
+                    else if (sample_index == 2) { sample_value = 38; }
+                    else if (sample_index == 3) { sample_value = 127; }
+                    else if (sample_index == 4) { sample_value = 128; }
+                    else if (sample_index == 5) { sample_value = 230; }
+                    else if (sample_index == 6) { sample_value = 254; }
+                    else { sample_value = 255; }
+                    weight = alpha as u64;
+                    expected = (weight * sample_value + (256 - weight) * (est as u64)) / 256;
+                    all_match = all_match && ((ewma_update(est as u8, sample_value as u8, alpha as u8) as u64) == expected);
+                }
+            }
+        }
+        assert(all_match, "EWMA boundary matrix, stationary and zero-alpha identities");
+    }
+}

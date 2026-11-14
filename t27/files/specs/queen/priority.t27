@@ -1,0 +1,163 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/queen/priority.t27 -- the order the Queen should take open issues in (gHashTag/t27#6366)
+; Today the Queen takes the first eligible issue in GitHub's listing order, newest first, and reads no
+; label (specs/queen/dispatch.t27, PRIORITY_RULE). This file is the one home of the rule that replaces it.
+; Runtimes read it, nobody restates it: the supervisor imports the label vocabulary from `t27c gen-js`
+; of this file, `tri priority` calls the functions below through `t27c gen-c` and ctypes.
+; Design notes from the survey of agent schedulers (Copilot agent, Devin, OpenHands, Cursor, Jira rank,
+; Kubernetes priority queue, Sidekiq weights, stokowski's Linear sort):
+;   - "no priority" must never sort ahead of "urgent" (stokowski sorted Linear's 0 = none first);
+;   - an issue with an open blocker is skipped, not waited on (head-of-line blocking);
+;   - a cap on critical stops priority inflation; aging stops starvation of labelled low work;
+;   - an issue nobody labelled keeps today's place, so a repository with no labels sees no change.
+; Not here: the fair share of bees per level, cooldown after failed attempts, GitHub's typed Priority
+; field (read it first once the org enables it; its four values map onto the same levels).
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module QueenPriority;
+
+/// Levels, lower runs first. An unlabelled issue is NORMAL and never ages.
+pub const LEVEL_CRITICAL : u8 = 0;
+pub const LEVEL_HIGH : u8 = 1;
+pub const LEVEL_NORMAL : u8 = 2;
+pub const LEVEL_LOW : u8 = 3;
+
+/// The label vocabulary, comma separated, one string per level. A label in none of them means nothing.
+/// When an issue carries labels of two levels, the more urgent one counts.
+pub const CRITICAL_LABELS : str = "P0,priority/critical,critical";
+pub const HIGH_LABELS : str = "P1,priority/high,high-priority";
+pub const NORMAL_LABELS : str = "P2,priority/medium";
+pub const LOW_LABELS : str = "P3,P4,priority/low";
+
+/// A labelled issue gains one level after this many days open, and at most MAX_AGING_STEPS levels,
+/// never CRITICAL. One step, not more: a LOW label that aged past unlabelled work would make "low"
+/// the fastest way to the front of a long queue.
+pub const AGING_DAYS : u32 = 14;
+pub const MAX_AGING_STEPS : u32 = 1;
+
+/// At most this many issues of one listing run as CRITICAL, taken in listing order; the rest run as HIGH.
+pub const CRITICAL_CAP : u32 = 3;
+
+/// Why an issue sits where it does: the code `tri priority` prints and a supervisor logs.
+pub const WHY_LISTING : u8 = 0;
+pub const WHY_LABEL : u8 = 1;
+pub const WHY_AGED : u8 = 2;
+pub const WHY_CAPPED : u8 = 3;
+pub const WHY_BLOCKED : u8 = 4;
+
+/// The level after the critical cap: criticals_before counts CRITICAL issues listed before this one.
+pub fn capped_level(base: u8, criticals_before: u32) -> u8 {
+    if (base == LEVEL_CRITICAL) {
+        if (criticals_before >= CRITICAL_CAP) {
+            return LEVEL_HIGH;
+        }
+    }
+    return base;
+}
+
+/// The level an issue runs at: its capped level, raised one step per AGING_DAYS (at most MAX_AGING_STEPS)
+/// when it is labelled.
+pub fn effective_level(level: u8, labelled: bool, age_days: u32) -> u8 {
+    if (labelled == false) {
+        return level;
+    }
+    if (level <= LEVEL_HIGH) {
+        return level;
+    }
+    var steps : u32 = age_days / AGING_DAYS;
+    if (steps > MAX_AGING_STEPS) {
+        steps = MAX_AGING_STEPS;
+    }
+    var gap : u32 = (level as u32) - (LEVEL_HIGH as u32);
+    if (steps >= gap) {
+        return LEVEL_HIGH;
+    }
+    return ((level as u32) - steps) as u8;
+}
+
+/// An issue with an open blocker is not a candidate; the Queen moves past it.
+pub fn eligible(open_blockers: u32) -> bool {
+    return open_blockers == 0;
+}
+
+/// Whether issue a is taken before issue b: lower effective level, then lower capped level (an aged
+/// issue never beats a real one of the same level), then earlier in GitHub's listing.
+pub fn outranks(eff_a: u8, level_a: u8, index_a: u32, eff_b: u8, level_b: u8, index_b: u32) -> bool {
+    if (eff_a < eff_b) { return true; }
+    if (eff_a > eff_b) { return false; }
+    if (level_a < level_b) { return true; }
+    if (level_a > level_b) { return false; }
+    return index_a < index_b;
+}
+
+/// The reason printed for one issue.
+pub fn why(base: u8, level: u8, eff: u8, labelled: bool, open_blockers: u32) -> u8 {
+    if (open_blockers > 0) { return WHY_BLOCKED; }
+    if (level != base) { return WHY_CAPPED; }
+    if (eff != level) { return WHY_AGED; }
+    if (labelled) { return WHY_LABEL; }
+    return WHY_LISTING;
+}
+
+test no_label_keeps_the_listing_order {
+    assert effective_level(LEVEL_NORMAL, false, 400) == LEVEL_NORMAL;
+    assert outranks(LEVEL_NORMAL, LEVEL_NORMAL, 0, LEVEL_NORMAL, LEVEL_NORMAL, 1);
+    assert outranks(LEVEL_NORMAL, LEVEL_NORMAL, 1, LEVEL_NORMAL, LEVEL_NORMAL, 0) == false;
+    // #7077: a strict order, so a sort can use it: no issue outranks itself
+    assert outranks(LEVEL_NORMAL, LEVEL_NORMAL, 4, LEVEL_NORMAL, LEVEL_NORMAL, 4) == false;
+}
+
+test critical_runs_before_a_newer_unlabelled_issue {
+    assert outranks(LEVEL_CRITICAL, LEVEL_CRITICAL, 9, LEVEL_NORMAL, LEVEL_NORMAL, 0);
+}
+
+test unlabelled_never_beats_urgent {
+    assert outranks(LEVEL_NORMAL, LEVEL_NORMAL, 0, LEVEL_CRITICAL, LEVEL_CRITICAL, 5) == false;
+    assert outranks(LEVEL_NORMAL, LEVEL_NORMAL, 0, LEVEL_HIGH, LEVEL_HIGH, 5) == false;
+}
+
+test labelled_work_ages_one_level_and_never_to_critical {
+    assert effective_level(LEVEL_LOW, true, 13) == LEVEL_LOW;
+    assert effective_level(LEVEL_LOW, true, 14) == LEVEL_NORMAL;
+    assert effective_level(LEVEL_LOW, true, 9000) == LEVEL_NORMAL;
+    assert effective_level(LEVEL_NORMAL, true, 14) == LEVEL_HIGH;
+    assert effective_level(LEVEL_HIGH, true, 9000) == LEVEL_HIGH;
+}
+
+test an_aged_issue_loses_the_tie_to_a_real_one {
+    var aged : u8 = effective_level(LEVEL_LOW, true, 28);
+    assert outranks(aged, LEVEL_LOW, 0, LEVEL_NORMAL, LEVEL_NORMAL, 7) == false;
+    assert outranks(LEVEL_NORMAL, LEVEL_NORMAL, 7, aged, LEVEL_LOW, 0);
+    // #7077: of two LOW labels the aged one goes first, whatever the listing says
+    assert outranks(aged, LEVEL_LOW, 5, LEVEL_LOW, LEVEL_LOW, 0);
+    assert outranks(LEVEL_LOW, LEVEL_LOW, 0, aged, LEVEL_LOW, 5) == false;
+}
+
+test the_fourth_critical_runs_as_high {
+    assert capped_level(LEVEL_CRITICAL, 0) == LEVEL_CRITICAL;
+    assert capped_level(LEVEL_CRITICAL, 2) == LEVEL_CRITICAL;
+    assert capped_level(LEVEL_CRITICAL, 3) == LEVEL_HIGH;
+    assert capped_level(LEVEL_LOW, 9) == LEVEL_LOW;
+}
+
+test a_blocked_issue_is_skipped {
+    assert eligible(0);
+    assert eligible(1) == false;
+    assert why(LEVEL_CRITICAL, LEVEL_CRITICAL, LEVEL_CRITICAL, true, 2) == WHY_BLOCKED;
+}
+
+test every_reason_is_reachable {
+    assert why(LEVEL_NORMAL, LEVEL_NORMAL, LEVEL_NORMAL, false, 0) == WHY_LISTING;
+    assert why(LEVEL_HIGH, LEVEL_HIGH, LEVEL_HIGH, true, 0) == WHY_LABEL;
+    assert why(LEVEL_LOW, LEVEL_LOW, LEVEL_NORMAL, true, 0) == WHY_AGED;
+    assert why(LEVEL_CRITICAL, LEVEL_HIGH, LEVEL_HIGH, true, 0) == WHY_CAPPED;
+}
+
+invariant levels_are_ordered {
+    assert LEVEL_CRITICAL < LEVEL_HIGH;
+    assert LEVEL_HIGH < LEVEL_NORMAL;
+    assert LEVEL_NORMAL < LEVEL_LOW;
+    assert CRITICAL_CAP > 0;
+    assert AGING_DAYS > 0;
+    assert MAX_AGING_STEPS == 1;
+}

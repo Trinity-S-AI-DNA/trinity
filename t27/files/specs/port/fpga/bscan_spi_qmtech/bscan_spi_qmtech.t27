@@ -1,0 +1,383 @@
+// SPDX-License-Identifier: Apache-2.0
+// t27/specs/port/fpga/bscan_spi_qmtech/bscan_spi_qmtech.t27
+// BSCAN SPI Bridge for QMTECH Boards Specification
+// Ports the original Verilog module to T27 for generation via t27c gen-verilog
+// Tests the JTAG-to-SPI state machine with known-answer checks on its decision logic
+// Based on gHashTag/t27 fpga/bscan_spi_qmtech.v
+
+module bscan_spi_qmtech {
+
+    // === State encoding (localparams from the original) ===
+
+    pub const S_IDLE : u32 = 0;      // 2'b00
+    pub const S_LENGTH : u32 = 1;    // 2'b01
+    pub const S_DATA : u32 = 2;      // 2'b10
+
+    // === Phase constants ===
+
+    pub const LEN_BITS : u32 = 32;       // big-endian length field, shifted MSB-first
+    pub const LEN_CNT_LAST : u32 = 31;   // len_cnt wraps after the 32nd length bit
+    pub const LEN_CNT_BITS : u32 = 6;    // len_cnt is 6 bits wide (0..31)
+
+    // === Host JTAG face (sampled from BSCANE2 USER1) ===
+
+    pub struct JtagFace {
+        sel : bool,      // jtag_sel  -- USER1 selected
+        shift : bool,    // jtag_shift -- DRCK shift pulse
+        update : bool,   // jtag_update -- DRCK update pulse
+        reset : bool,    // jtag_reset -- internal reset
+        tdi : bool,      // jtag_tdi -- bit entering the shift register
+    }
+
+    // === Core state-machine registers ===
+
+    pub struct CoreRegs {
+        state : u32,     // S_IDLE / S_LENGTH / S_DATA
+        len_cnt : u32,   // length-bit counter, 0..31
+        remaining : u32, // length left to shift, then bits left to clock out
+        mosi_d : bool,   // MOSI data stage
+        mosi_oe : bool,  // MOSI output enable (tristate gate)
+        cs_n_d : bool,   // CS_N data stage
+        cs_n_oe : bool,  // CS_N output enable (tristate gate)
+    }
+
+    // Parked (initial) state: IDLE, counters clear, outputs released, CS_N stage high.
+    pub fn initial_regs() -> CoreRegs {
+        return CoreRegs{
+            .state = S_IDLE,
+            .len_cnt = 0,
+            .remaining = 0,
+            .mosi_d = false,
+            .mosi_oe = false,
+            .cs_n_d = true,
+            .cs_n_oe = false,
+        };
+    }
+
+    // === Pure decision logic (one DRCK rising edge) ===
+
+    // Big-endian shift: {remaining[30:0], tdi}. The MSB leaves on the floor.
+    pub fn shift_in(remaining: u32, tdi: bool) -> u32 {
+        var bit : u32 = 0;
+        if (tdi) { bit = 1; }
+        return (remaining << 1) | bit;
+    }
+
+    // S_IDLE: park the outputs; start a length capture when TDI is high.
+    pub fn step_idle(regs: CoreRegs, tdi: bool) -> CoreRegs {
+        var next = CoreRegs{
+            .state = regs.state,
+            .len_cnt = regs.len_cnt,
+            .remaining = regs.remaining,
+            .mosi_d = regs.mosi_d,
+            .mosi_oe = false,
+            .cs_n_d = true,
+            .cs_n_oe = false,
+        };
+        if (tdi) {
+            next.state = S_LENGTH;
+            next.len_cnt = 0;
+        }
+        return next;
+    }
+
+    // S_LENGTH: shift one bit; at bit 31 latch the length (or bail on zero).
+    pub fn step_length(regs: CoreRegs, tdi: bool) -> CoreRegs {
+        var shifted : u32 = shift_in(regs.remaining, tdi);
+        var next = CoreRegs{
+            .state = regs.state,
+            .len_cnt = regs.len_cnt,
+            .remaining = shifted,
+            .mosi_d = regs.mosi_d,
+            .mosi_oe = false,
+            .cs_n_d = true,
+            .cs_n_oe = false,
+        };
+        if (regs.len_cnt == LEN_CNT_LAST) {
+            next.len_cnt = 0;
+            if (shifted != 0) {
+                next.state = S_DATA;
+                next.cs_n_d = false;
+                next.cs_n_oe = true;
+                next.mosi_oe = true;
+            } else {
+                next.state = S_IDLE;
+            }
+        } else {
+            next.len_cnt = regs.len_cnt + 1;
+        }
+        return next;
+    }
+
+    // S_DATA: drive MOSI, count down; the last bit returns to IDLE.
+    pub fn step_data(regs: CoreRegs, tdi: bool) -> CoreRegs {
+        var next = CoreRegs{
+            .state = regs.state,
+            .len_cnt = regs.len_cnt,
+            .remaining = regs.remaining,
+            .mosi_d = tdi,
+            .mosi_oe = true,
+            .cs_n_d = false,
+            .cs_n_oe = true,
+        };
+        if (regs.remaining == 1) {
+            next.state = S_IDLE;
+            next.remaining = 0;
+        } else {
+            next.remaining = regs.remaining - 1;
+        }
+        return next;
+    }
+
+    // The exit path: jtag_update or a dropped sel parks the outputs, IDLE.
+    pub fn park_regs(regs: CoreRegs) -> CoreRegs {
+        return CoreRegs{
+            .state = S_IDLE,
+            .len_cnt = regs.len_cnt,
+            .remaining = regs.remaining,
+            .mosi_d = regs.mosi_d,
+            .mosi_oe = false,
+            .cs_n_d = true,
+            .cs_n_oe = false,
+        };
+    }
+
+    // One DRCK rising edge: reset, shift, or park -- exactly as the always block.
+    pub fn step_rising(regs: CoreRegs, face: JtagFace) -> CoreRegs {
+        if (face.reset) {
+            return initial_regs();
+        }
+        if (face.sel && face.shift) {
+            if (regs.state == S_IDLE) {
+                return step_idle(regs, face.tdi);
+            }
+            if (regs.state == S_LENGTH) {
+                return step_length(regs, face.tdi);
+            }
+            if (regs.state == S_DATA) {
+                return step_data(regs, face.tdi);
+            }
+            return step_idle(regs, face.tdi); // unreachable in the original (2-bit state)
+        }
+        if (face.update || !face.sel) {
+            return park_regs(regs);
+        }
+        return regs; // nothing to change this cycle
+    }
+
+    // === Falling-edge logic: MISO capture and TDO drive ===
+
+    pub struct FallRegs {
+        miso_capture : bool, // MISO sampled on the previous falling edge
+        tdo : bool,          // jtag_tdo output (2-stage MISO delay)
+    }
+
+    pub fn initial_fall_regs() -> FallRegs {
+        return FallRegs{ .miso_capture = false, .tdo = false };
+    }
+
+    // One DRCK falling edge: MISO -> capture stage -> TDO.
+    pub fn step_falling(fall: FallRegs, miso: bool) -> FallRegs {
+        return FallRegs{ .miso_capture = miso, .tdo = fall.miso_capture };
+    }
+
+    // === Output pins (tristate gates from the original) ===
+
+    pub struct PinDrive {
+        driven : bool, // false = high-Z
+        value : bool,  // the driven bit
+    }
+
+    pub fn cs_n_out(regs: CoreRegs) -> PinDrive {
+        return PinDrive{ .driven = regs.cs_n_oe, .value = regs.cs_n_d };
+    }
+
+    pub fn mosi_out(regs: CoreRegs) -> PinDrive {
+        return PinDrive{ .driven = regs.mosi_oe, .value = regs.mosi_d };
+    }
+
+    pub fn tdo_out(fall: FallRegs) -> bool {
+        return fall.tdo;
+    }
+
+    // === Known-answer tests ===
+    // Every check below recomputes an output the original design produces.
+
+    test park_state
+        given regs = initial_regs()
+        then regs.state == 0
+        and regs.len_cnt == 0
+        and regs.remaining == 0
+        and regs.cs_n_d == true
+        and regs.cs_n_oe == false
+        and regs.mosi_oe == false
+
+    test idle_parks_then_starts_length
+        given regs = initial_regs()
+        given parked = step_idle(regs, false)
+        given started = step_idle(regs, true)
+        then parked.cs_n_oe == false
+        and parked.cs_n_d == true
+        and parked.state == 0
+        and started.state == 1
+        and started.len_cnt == 0
+        and started.cs_n_oe == false
+
+    test length_counts_up
+        given regs = CoreRegs { state: 1, len_cnt: 0, remaining: 0, mosi_d: false, mosi_oe: false, cs_n_d: true, cs_n_oe: false }
+        then step_length(regs, true).len_cnt == 1
+        and step_length(regs, true).remaining == 1
+        and step_length(regs, false).len_cnt == 1
+        and step_length(regs, false).remaining == 0
+
+    test length_latches_nonzero
+        given regs = CoreRegs { state: 1, len_cnt: 31, remaining: 0, mosi_d: false, mosi_oe: false, cs_n_d: true, cs_n_oe: false }
+        given stepped = step_length(regs, true)
+        then stepped.state == 2
+        and stepped.cs_n_oe == true
+        and stepped.cs_n_d == false
+        and stepped.mosi_oe == true
+        and stepped.len_cnt == 0
+        and stepped.remaining == 1
+
+    test length_zero_bails_to_idle
+        given regs = CoreRegs { state: 1, len_cnt: 31, remaining: 0, mosi_d: false, mosi_oe: false, cs_n_d: true, cs_n_oe: false }
+        given stepped = step_length(regs, false)
+        then stepped.state == 0
+        and stepped.len_cnt == 0
+        and stepped.cs_n_oe == false
+        and stepped.mosi_oe == false
+
+    test data_drives_and_counts_down
+        given regs = CoreRegs { state: 2, len_cnt: 0, remaining: 3, mosi_d: false, mosi_oe: true, cs_n_d: false, cs_n_oe: true }
+        then step_data(regs, true).remaining == 2
+        and step_data(regs, true).mosi_d == true
+        and step_data(regs, true).cs_n_oe == true
+        and step_data(regs, false).remaining == 2
+        and step_data(regs, false).mosi_d == false
+
+    test data_last_bit_returns_to_idle
+        given regs = CoreRegs { state: 2, len_cnt: 0, remaining: 1, mosi_d: false, mosi_oe: true, cs_n_d: false, cs_n_oe: true }
+        given stepped = step_data(regs, true)
+        then stepped.state == 0
+        and stepped.remaining == 0
+        and stepped.mosi_d == true
+        and stepped.cs_n_oe == true
+
+    test reset_clears_everything
+        given regs = CoreRegs { state: 2, len_cnt: 5, remaining: 12345, mosi_d: true, mosi_oe: true, cs_n_d: false, cs_n_oe: true }
+        given face = JtagFace { sel: true, shift: true, update: false, reset: true, tdi: true }
+        given cleared = step_rising(regs, face)
+        then cleared.state == 0
+        and cleared.len_cnt == 0
+        and cleared.remaining == 0
+        and cleared.cs_n_oe == false
+        and cleared.mosi_oe == false
+        and cleared.cs_n_d == true
+
+    test update_parks_outputs
+        given regs = CoreRegs { state: 2, len_cnt: 0, remaining: 7, mosi_d: true, mosi_oe: true, cs_n_d: false, cs_n_oe: true }
+        given face = JtagFace { sel: true, shift: false, update: true, reset: false, tdi: false }
+        given parked = step_rising(regs, face)
+        then parked.state == 0
+        and parked.cs_n_oe == false
+        and parked.mosi_oe == false
+        and parked.cs_n_d == true
+        and parked.remaining == 7
+
+    test dropped_sel_parks_outputs
+        given regs = CoreRegs { state: 1, len_cnt: 3, remaining: 0, mosi_d: false, mosi_oe: false, cs_n_d: true, cs_n_oe: false }
+        given face = JtagFace { sel: false, shift: true, update: false, reset: false, tdi: true }
+        given parked = step_rising(regs, face)
+        then parked.state == 0
+        and parked.len_cnt == 3
+        and parked.cs_n_oe == false
+
+    test selected_but_not_shifting_holds_state
+        given regs = CoreRegs { state: 1, len_cnt: 3, remaining: 0, mosi_d: false, mosi_oe: false, cs_n_d: true, cs_n_oe: false }
+        given face = JtagFace { sel: true, shift: false, update: false, reset: false, tdi: true }
+        given held = step_rising(regs, face)
+        then held.state == 1
+        and held.len_cnt == 3
+        and held.cs_n_d == true
+
+    test shift_in_is_big_endian
+        given x = 0x80000001
+        then shift_in(x, false) == 2
+        and shift_in(x, true) == 3
+        and shift_in(0, true) == 1
+        and shift_in(2147483648, true) == 1
+
+    test length_shift_walk
+        given r0 = CoreRegs { state: 1, len_cnt: 0, remaining: 0, mosi_d: false, mosi_oe: false, cs_n_d: true, cs_n_oe: false }
+        then step_length(step_length(r0, true), true).remaining == 3
+        and step_length(step_length(r0, true), true).len_cnt == 2
+        and step_length(step_length(r0, true), false).remaining == 2
+
+    test data_walk_to_idle
+        given r = CoreRegs { state: 2, len_cnt: 0, remaining: 2, mosi_d: false, mosi_oe: true, cs_n_d: false, cs_n_oe: true }
+        given face = JtagFace { sel: true, shift: true, update: false, reset: false, tdi: true }
+        given s1 = step_rising(r, face)
+        given s2 = step_rising(s1, face)
+        then s1.remaining == 1
+        and s1.mosi_d == true
+        and s2.state == 0
+        and s2.remaining == 0
+        and s2.cs_n_oe == true
+
+    test park_regs_on_exit
+        given regs = CoreRegs { state: 2, len_cnt: 4, remaining: 9, mosi_d: true, mosi_oe: true, cs_n_d: false, cs_n_oe: true }
+        given parked = park_regs(regs)
+        then parked.state == 0
+        and parked.cs_n_oe == false
+        and parked.mosi_oe == false
+        and parked.cs_n_d == true
+        and parked.len_cnt == 4
+        and parked.remaining == 9
+
+    test falling_edge_delays_miso_two_stages
+        given fall = initial_fall_regs()
+        then tdo_out(step_falling(fall, true)) == false
+        and tdo_out(step_falling(step_falling(fall, true), true)) == true
+        and tdo_out(step_falling(step_falling(fall, false), false)) == false
+
+    test miso_capture_follows_input
+        given fall = FallRegs { miso_capture: true, tdo: false }
+        then step_falling(fall, false).miso_capture == false
+        and step_falling(fall, false).tdo == true
+
+    test cs_n_pin_is_gated
+        given regs = initial_regs()
+        given busy = CoreRegs { state: 2, len_cnt: 0, remaining: 1, mosi_d: true, mosi_oe: true, cs_n_d: false, cs_n_oe: true }
+        then cs_n_out(regs).driven == false
+        and cs_n_out(step_idle(regs, true)).driven == false
+        and cs_n_out(busy).driven == true
+        and cs_n_out(busy).value == false
+
+    test mosi_pin_is_gated
+        given busy = CoreRegs { state: 2, len_cnt: 0, remaining: 5, mosi_d: true, mosi_oe: true, cs_n_d: false, cs_n_oe: true }
+        then mosi_out(busy).driven == true
+        and mosi_out(busy).value == true
+        and mosi_out(initial_regs()).driven == false
+        and mosi_out(initial_regs()).value == false
+
+    // === Invariants (comptime) ===
+
+    invariant state_codes_distinct
+        given a = S_IDLE
+        given b = S_LENGTH
+        given c = S_DATA
+        assert a != b
+        assert b != c
+        assert a != c
+
+    invariant len_cnt_width
+        given q = 0
+        assert LEN_CNT_BITS == 6
+        assert LEN_CNT_LAST == 31
+        assert LEN_BITS == 32
+        assert (1 << 5) == 32
+
+}
+
+// phi^2 + 1/phi^2 = 3 | TRINITY

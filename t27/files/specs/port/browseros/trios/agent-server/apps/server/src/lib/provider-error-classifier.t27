@@ -1,0 +1,376 @@
+// SPDX-License-Identifier: Apache-2.0
+// t27/specs/port/browseros/trios/agent-server/apps/server/src/lib/provider-error-classifier.t27
+// Port of browseros/trios/agent-server/apps/server/src/lib/provider-error-classifier.ts to t27
+//
+// Classifies provider HTTP errors that must never be retried. The Vercel AI
+// SDK derives isRetryable from the HTTP status alone, so 429 is always treated
+// as a transient rate limit. Several providers reuse 429 (or 400) for
+// permanent conditions: Z.AI answers an exhausted account balance with HTTP
+// 429 and business code 1113, and the BrowserOS gateway answers a spent credit
+// balance with HTTP 429 and code CREDITS_EXHAUSTED. Retrying those turns one
+// dead request into three, tripling latency and log noise while the outcome
+// cannot change.
+//
+// WHAT THIS SPEC DELIBERATELY DOES NOT CONTAIN
+//
+// The plumbing. The original reads the body out of an HTTP response and
+// parses it with JSON.parse; .t27 has neither HTTP nor a JSON parser, so
+// those stay in the TypeScript. What is ported is every decision:
+// - toLowerCase and includes become byte-wise helpers (to_lower_byte,
+//   contains_ignore_case) -- the same decision, with no string building.
+// - The decision inside the JSON.parse block (which envelope codes are
+//   terminal) is ported as has_terminal_error_code, a hand-rolled scan of the
+//   raw body that requires the "error" key, reads the string (or bare
+//   numeric) value bound to "code" after it, and compares it against the two
+//   terminal codes. That is narrower than full JSON navigation -- it cannot
+//   follow arbitrary nesting and does not verify that the whole body parses
+//   -- and it is the one piece of the original ported as an approximation
+//   rather than literally.
+// - The original marks responseBody optional; here an empty body stands for
+//   "could not be read", which the original's !responseBody check treats the
+//   same way as undefined.
+
+module port::browseros::trios::agent_server::apps::server::src::lib::provider_error_classifier;
+
+// Z.AI business code for an exhausted balance or missing resource package.
+pub const ZAI_INSUFFICIENT_BALANCE_CODE: str = "1113";
+
+// BrowserOS gateway code for a fully spent account credit balance.
+pub const BROWSEROS_CREDITS_EXHAUSTED_CODE: str = "CREDITS_EXHAUSTED";
+
+// Wording that indicates a spent account, matched case-insensitively as a
+// fallback for providers that renumber their codes.
+const TERMINAL_BALANCE_PHRASES: [7]str = [
+    "insufficient balance",
+    "no resource package",
+    "please recharge",
+    "insufficient credits",
+    "insufficient_quota",
+    "billing_hard_limit_reached",
+    "exceeded your current quota",
+];
+
+// The provider error facts the decision reads (the original's
+// ProviderErrorContext): statusCode is the HTTP status, responseBody is the
+// raw response body, empty when it could not be read.
+pub struct ProviderErrorContext {
+    statusCode: i32,
+    responseBody: str,
+}
+
+// ASCII lowercase for one byte: the decision inside the original's
+// responseBody.toLowerCase().
+fn to_lower_byte(c: u8) -> u8 {
+    if (c >= 'A' and c <= 'Z') {
+        return c + 32;
+    }
+    return c;
+}
+
+// True when haystack contains needle, comparing bytes ASCII-insensitively:
+// the decision inside the original's phrase scan over the lowercased body.
+fn contains_ignore_case(haystack: []const u8, needle: []const u8) -> bool {
+    if (needle.len == 0) {
+        return true;
+    }
+    if (haystack.len < needle.len) {
+        return false;
+    }
+    var start: usize = 0;
+    while (start + needle.len <= haystack.len) {
+        var j: usize = 0;
+        var matched: bool = true;
+        while (j < needle.len) {
+            if (to_lower_byte(haystack[start + j]) != to_lower_byte(needle[j])) {
+                matched = false;
+            }
+            j += 1;
+        }
+        if (matched) {
+            return true;
+        }
+        start += 1;
+    }
+    return false;
+}
+
+// True when the body contains any wording that indicates a spent account.
+fn matches_terminal_phrase(body: []const u8) -> bool {
+    for phrase in TERMINAL_BALANCE_PHRASES {
+        if (contains_ignore_case(body, phrase)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Index of the first occurrence of needle in haystack, or haystack.len when
+// it does not occur, so the result is always a valid bound.
+fn find_substring(haystack: []const u8, needle: []const u8) -> usize {
+    if (needle.len == 0) {
+        return 0;
+    }
+    if (haystack.len < needle.len) {
+        return haystack.len;
+    }
+    var start: usize = 0;
+    while (start + needle.len <= haystack.len) {
+        var j: usize = 0;
+        var matched: bool = true;
+        while (j < needle.len) {
+            if (haystack[start + j] != needle[j]) {
+                matched = false;
+            }
+            j += 1;
+        }
+        if (matched) {
+            return start;
+        }
+        start += 1;
+    }
+    return haystack.len;
+}
+
+// Skips JSON whitespace (space, tab, carriage return, newline) from from.
+fn skip_whitespace(s: []const u8, from: usize) -> usize {
+    var i: usize = from;
+    while (i < s.len and (s[i] == ' ' or s[i] == '\t' or s[i] == '\r' or s[i] == '\n')) {
+        i += 1;
+    }
+    return i;
+}
+
+// True when the JSON string value starting at value_start (just after the
+// opening quote) equals expected and is closed by a quote right after.
+fn value_at_equals(body: []const u8, value_start: usize, expected: []const u8) -> bool {
+    var j: usize = 0;
+    while (j < expected.len) {
+        if (value_start + j >= body.len) {
+            return false;
+        }
+        if (body[value_start + j] != expected[j]) {
+            return false;
+        }
+        j += 1;
+    }
+    if (value_start + expected.len >= body.len) {
+        return false;
+    }
+    return body[value_start + expected.len] == '"';
+}
+
+// True when the bare JSON number starting at num_start equals expected. The
+// original stringifies the parsed code with String(code), so a JSON number
+// compares the same way as a string; the number must end where expected ends.
+fn number_at_equals(body: []const u8, num_start: usize, expected: []const u8) -> bool {
+    var j: usize = 0;
+    while (j < expected.len) {
+        if (num_start + j >= body.len) {
+            return false;
+        }
+        if (body[num_start + j] != expected[j]) {
+            return false;
+        }
+        j += 1;
+    }
+    if (num_start + expected.len >= body.len) {
+        return true;
+    }
+    if (body[num_start + expected.len] >= '0' and body[num_start + expected.len] <= '9') {
+        return false;
+    }
+    return true;
+}
+
+// The decision inside the original's JSON.parse block: read
+// parsed?.error?.code, stringify it, and treat the error as terminal when it
+// is one of the known permanent codes. .t27 has no JSON parser, so the
+// envelope is scanned by hand: the body must carry the "error" key, the
+// "code" key must follow it, and the code's value must equal one of the two
+// codes, as in {"error":{"code":"1113","message":"Insufficient balance"}}.
+fn has_terminal_error_code(body: []const u8) -> bool {
+    const error_at: usize = find_substring(body, "\"error\"");
+    if (error_at == body.len) {
+        return false;
+    }
+    const code_at: usize = find_substring(body, "\"code\"");
+    if (code_at == body.len) {
+        return false;
+    }
+    if (code_at < error_at) {
+        return false;
+    }
+    const colon_at: usize = skip_whitespace(body, code_at + 6);
+    if (colon_at >= body.len or body[colon_at] != ':') {
+        return false;
+    }
+    const quote_at: usize = skip_whitespace(body, colon_at + 1);
+    if (quote_at >= body.len) {
+        return false;
+    }
+    // A quoted string value.
+    if (body[quote_at] == '"') {
+        const value_start: usize = quote_at + 1;
+        if (value_at_equals(body, value_start, ZAI_INSUFFICIENT_BALANCE_CODE)) {
+            return true;
+        }
+        return value_at_equals(body, value_start, BROWSEROS_CREDITS_EXHAUSTED_CODE);
+    }
+    // A bare JSON number: the original stringifies it, so 1113 and "1113"
+    // are both terminal.
+    if (body[quote_at] >= '0' and body[quote_at] <= '9') {
+        return number_at_equals(body, quote_at, ZAI_INSUFFICIENT_BALANCE_CODE);
+    }
+    return false;
+}
+
+// Returns true when retrying the identical request cannot succeed.
+//
+// Conservative by design: an unrecognised error stays retryable, so a
+// transient provider blip is never misclassified as permanent.
+pub fn isTerminalProviderError(ctx: ProviderErrorContext) -> bool {
+    // 402 Payment Required is unambiguous across providers.
+    if (ctx.statusCode == 402) {
+        return true;
+    }
+
+    // No body means no evidence: stay retryable.
+    if (ctx.responseBody.len == 0) {
+        return false;
+    }
+
+    if (matches_terminal_phrase(ctx.responseBody)) {
+        return true;
+    }
+
+    // Structured checks for known terminal envelopes, e.g.
+    // {"error":{"code":"1113",...}}.
+    if (has_terminal_error_code(ctx.responseBody)) {
+        return true;
+    }
+
+    return false;
+}
+
+// ==================================================================
+// Tests
+// ==================================================================
+
+test status_402_is_terminal {
+    const ctx = ProviderErrorContext { statusCode: 402, responseBody: "" };
+    assert(isTerminalProviderError(ctx));
+}
+
+test status_402_is_terminal_even_with_an_unrecognised_body {
+    const ctx = ProviderErrorContext { statusCode: 402, responseBody: "gateway timeout" };
+    assert(isTerminalProviderError(ctx));
+}
+
+test empty_body_is_retryable {
+    const ctx = ProviderErrorContext { statusCode: 429, responseBody: "" };
+    assert(!isTerminalProviderError(ctx));
+}
+
+test unrecognised_error_is_retryable {
+    const ctx = ProviderErrorContext { statusCode: 500, responseBody: "upstream connect error" };
+    assert(!isTerminalProviderError(ctx));
+}
+
+test zai_insufficient_balance_code_is_terminal {
+    const ctx = ProviderErrorContext { statusCode: 429, responseBody: "{\"error\":{\"code\":\"1113\",\"message\":\"Insufficient balance\"}}" };
+    assert(isTerminalProviderError(ctx));
+}
+
+test zai_numeric_code_is_terminal {
+    const ctx = ProviderErrorContext { statusCode: 429, responseBody: "{\"error\":{\"code\":1113}}" };
+    assert(isTerminalProviderError(ctx));
+}
+
+test browseros_credits_exhausted_code_is_terminal {
+    const ctx = ProviderErrorContext { statusCode: 429, responseBody: "{\"error\":{\"code\":\"CREDITS_EXHAUSTED\"}}" };
+    assert(isTerminalProviderError(ctx));
+}
+
+test other_error_code_is_retryable {
+    const ctx = ProviderErrorContext { statusCode: 429, responseBody: "{\"error\":{\"code\":\"1002\",\"message\":\"server error\"}}" };
+    assert(!isTerminalProviderError(ctx));
+}
+
+test code_outside_the_error_envelope_is_retryable {
+    const ctx = ProviderErrorContext { statusCode: 429, responseBody: "{\"code\":\"1113\"}" };
+    assert(!isTerminalProviderError(ctx));
+}
+
+test phrase_scan_catches_spent_account_wording_case_insensitively {
+    const ctx_a = ProviderErrorContext { statusCode: 429, responseBody: "Error: Insufficient Balance" };
+    assert(isTerminalProviderError(ctx_a));
+    const ctx_b = ProviderErrorContext { statusCode: 400, responseBody: "No resource package found" };
+    assert(isTerminalProviderError(ctx_b));
+    const ctx_c = ProviderErrorContext { statusCode: 400, responseBody: "Please recharge your account" };
+    assert(isTerminalProviderError(ctx_c));
+    const ctx_d = ProviderErrorContext { statusCode: 429, responseBody: "you have insufficient credits" };
+    assert(isTerminalProviderError(ctx_d));
+    const ctx_e = ProviderErrorContext { statusCode: 429, responseBody: "{\"error\":{\"message\":\"insufficient_quota\"}}" };
+    assert(isTerminalProviderError(ctx_e));
+    const ctx_f = ProviderErrorContext { statusCode: 429, responseBody: "billing_hard_limit_reached" };
+    assert(isTerminalProviderError(ctx_f));
+    const ctx_g = ProviderErrorContext { statusCode: 429, responseBody: "You have exceeded your current quota" };
+    assert(isTerminalProviderError(ctx_g));
+}
+
+test to_lower_byte_lowercases_ascii_and_keeps_the_rest {
+    assert(to_lower_byte('A') == 'a');
+    assert(to_lower_byte('Z') == 'z');
+    assert(to_lower_byte('a') == 'a');
+    assert(to_lower_byte('0') == '0');
+    assert(to_lower_byte('_') == '_');
+}
+
+test contains_ignore_case_matches_and_rejects {
+    assert(contains_ignore_case("Please Recharge", "please recharge"));
+    assert(contains_ignore_case("x", ""));
+    assert(!contains_ignore_case("upstream connect error", "insufficient balance"));
+    assert(!contains_ignore_case("short", "a much longer needle"));
+}
+
+test find_substring_returns_first_index_or_the_length_bound {
+    assert(find_substring("hello \"error\" world", "\"error\"") == 6);
+    assert(find_substring("no envelope here", "\"error\"") == 16);
+    assert(find_substring("abc", "") == 0);
+    assert(find_substring("ab", "abcd") == 2);
+}
+
+test skip_whitespace_skips_space_tab_and_newline {
+    assert(skip_whitespace("  :x", 0) == 2);
+    assert(skip_whitespace(":x", 0) == 0);
+    assert(skip_whitespace(" \t\n:", 0) == 3);
+    // \r is part of JSON whitespace, but .t27 string literals only escape
+    // \n \t \\ \", so no source string here can carry a carriage return; the
+    // s[i] == '\r' arm in skip_whitespace is reached only by runtime strings.
+}
+
+test value_at_equals_requires_an_exact_quoted_value {
+    assert(value_at_equals("\"1113\" rest", 1, "1113"));
+    assert(!value_at_equals("\"1113x\" rest", 1, "1113"));
+    assert(!value_at_equals("\"111\"", 1, "1113"));
+    assert(!value_at_equals("\"111", 1, "1113"));
+}
+
+test number_at_equals_requires_the_number_to_end_where_expected_ends {
+    assert(number_at_equals("1113}", 0, "1113"));
+    assert(!number_at_equals("11130}", 0, "1113"));
+    assert(!number_at_equals("111", 0, "1113"));
+}
+
+test matches_terminal_phrase_checks_every_phrase {
+    assert(matches_terminal_phrase("insufficient_quota"));
+    assert(!matches_terminal_phrase("all good here"));
+}
+
+test has_terminal_error_code_checks_both_code_shapes {
+    assert(has_terminal_error_code("{\"error\":{\"code\":\"CREDITS_EXHAUSTED\"}}"));
+    assert(has_terminal_error_code("{\"error\":{\"code\": 1113 }}"));
+    assert(!has_terminal_error_code("{\"error\":{\"code\":\"1113x\"}}"));
+    assert(!has_terminal_error_code("not json at all"));
+    assert(!has_terminal_error_code("{\"error\":\"rate limited\"}"));
+}

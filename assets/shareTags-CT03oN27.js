@@ -1,0 +1,1 @@
+function m(t,n,c,a){const s=t.indexOf("#"),e=s>=0?t.slice(0,s):t,i=s>=0?t.slice(s):"",o=new URLSearchParams({utm_source:n,utm_medium:"social",utm_campaign:c,utm_content:a});return`${e}${e.includes("?")?"&":"?"}${o.toString()}${i}`}export{m as s};

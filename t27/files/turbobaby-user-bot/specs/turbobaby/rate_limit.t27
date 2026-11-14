@@ -1,0 +1,724 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/turbobaby/rate_limit.t27 -- the sliding-window limiter, and the honest worst case
+; This contract owns the general-purpose limiter in src/api/rate_limit.rs: the window algorithm
+; and the half-open edge that prunes it, per-key isolation, the cap on tracked keys and what it
+; actually does when it is reached, the two variants and the one decision they share, the
+; derivation of the caller key from request headers, and the single shared bucket that every
+; failed derivation lands in. It owns the SHAPE of the guarded surface and its counts, never a
+; per-route table. Every number below is read from this repository and carries its line.
+; ASCII only (L3), English only (LANG-EN).
+; --
+; WHY (measured 2026-09-21). One 299-line module decides whether a request proceeds at eight
+; production call sites, over seven separate stores, guarding six HTTP routes -- and the twenty
+; contracts the gate manifested when this file was written describe none of it. Run on 2026-09-21
+; over those twenty files, grep -rn -i "rate limit|ratelimit" returns 0 and
+; grep -rn -i "sliding|window log" returns 0: that corpus had no sentence about the mechanism at
+; all. The words rate-limit and rate_limit did appear, 7 times, and all 7 in ONE file --
+; request_identity.t27, describing the admin-auth bound that file owns. THE ZEROES ARE HISTORY
+; NOW, and saying so is part of the measurement: the manifest has since grown to 43 files, and
+; re-measured over it on 2026-09-21, excluding this file, the same greps return 3 hits in 3 files
+; and 6 hits in 3 files, while rate-limit and rate_limit appear 95 times across 10 files. What
+; closed the silence is this contract and the edges the siblings drew back to it, not a second
+; description of the mechanism: no sibling declares a window, a ceiling or a key derivation, which
+; is checked below. So the silence was not total, it was worse than total: the corpus documented
+; the single narrowest application of the limiter and said nothing about the primitive underneath
+; it or about the other seven places it decides. Behind that silence sits one derivation shared by
+; every call site that keys on a caller, whose failure path is a single string literal at
+; src/api/rate_limit.rs:43. Every request that cannot produce a usable header is counted in that
+; one bucket, together, and nothing in this repository has ever written that down.
+; --
+; WHERE THE BRIEF IS REFUTED. The survey cites :26-42 for the client-IP extraction. The function
+; is :28-44. Line 26 is the middle of a sentence in its doc comment (:23-27), and -- the part that
+; matters -- line 43 is the `"unknown".to_string()` fallback, which is OUTSIDE the cited range.
+; The one line that creates the shared bucket is the one line the citation omits. A reader who
+; opened exactly :26-42 would see two header branches, each returning a distinct key, and would
+; conclude the limiter is per-caller. It is per-caller only for callers that pass the check.
+; --
+; WHERE THE BRIEF IS REFUTED A SECOND TIME, and the tripwire gets wider. The brief calls the
+; shared bucket "the fallback ... when no header is present". Absence is only one of four ways in.
+; Per header the value is rejected when it is missing, when it is not readable as a string
+; (`to_str().ok()` at :29 and :37), when the trimmed first field is empty, and when that field
+; exceeds 64 bytes (:32, :39). Both headers must fail before :43 is reached, and the repository's
+; own test proves the oversize path gets there: :176-182 sends a 200-character header value and
+; asserts the key is the fallback literal. So the shared bucket is not where header-less callers
+; end up by accident. It is where anyone who sends a 65-byte header value chooses to be, which
+; makes exhausting it an action rather than a coincidence.
+; --
+; WHAT THIS FILE NEVER DOES. It restates no part of the ADMIN auth-attempt bound: that limiter's
+; window, attempt cap and tracked-IP cap belong to turbobaby/request-identity, which measured them
+; from src/api/auth.rs, and this file names that ID instead of copying a number. It ships no route
+; table -- six routes with three constants each is six maintenance liabilities and the seventh
+; route added tomorrow would make this file quietly wrong, so what is declared is the shape common
+; to all of them, the counts, and one labelled exemplar. It contains no IP address in any form:
+; the shipped tests use documentation-range addresses and not one of them is copied here, keys
+; appear only as abstract placeholders, and no renter, handle, phone, key code, plate, debt, cost
+; or personal note appears in any constant, fixture or comment (D14). It invents no limit for a
+; route the code does not guard, and it never says the limiter prevents abuse. It bounds a rate.
+; Those are different sentences and the second one is the only one this repository has earned.
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module turbobaby-rate-limit;
+
+pub const KIND : str = "guard";
+pub const ID : str = "turbobaby/rate-limit";
+pub const NAME : str = "Sliding-window request limiter and its worst case";
+pub const WORLD : str = "gHashTag/turbobaby-user-bot";
+pub const SOURCE : str = "src/api/rate_limit.rs";
+pub const SOURCE_LINES : u32 = 299;
+pub const MEASURED_AT : str = "2026-09-21";
+
+; --- The one ownership edge, spelled as an ID because this language has no import ---------------
+; src/api/auth.rs:431-435 declares a store and three constants for failed admin authentication,
+; and src/api/auth.rs:505 feeds them to the sync function this file owns. The bound itself was
+; already measured and published by turbobaby/request-identity, which declares
+; ADMIN_RL_WINDOW_SECONDS, ADMIN_RL_MAX_ATTEMPTS and ADMIN_RL_MAX_TRACKED_IPS and pins the
+; boundary its shipped test proves in admin_attempt_admitted. The edge is named by DECLARATION
+; and not by line, because a line in a sibling goes stale on that sibling's next edit. This file
+; consumes that as a fact about a caller of the primitive and copies none of
+; its three numbers: a second copy would be the hand-written table that goes stale in silence.
+; The direction is worth stating plainly -- that contract owns ONE application, this one owns the
+; mechanism, and the eight call sites below include theirs.
+pub const REUSES_REQUEST_IDENTITY_ID : str = "turbobaby/request-identity";
+pub const ADMIN_AUTH_BOUND_IS_RESTATED_HERE : bool = false;
+pub const REUSE_EDGE_COUNT : u8 = 1;
+
+; --- The measured zero this file closes ---------------------------------------------------------
+; All four greps ran on 2026-09-21 over the twenty files the manifest in
+; scripts/verify_t27_specs.py then held, and the scope was part of the claim. THAT SCOPE HAS SINCE
+; MOVED: the manifest holds 43 files today -- 42 under specs/turbobaby plus
+; specs/agents/turbobaby.t27 -- so the sentence that once read the measured silence is the corpus
+; the gate enforces is no longer true, and it is corrected here rather than left standing. The
+; four constants below are historical by their own names, re-verified 2026-09-21 by re-running the
+; greps against the tree as it stood at the twenty-file manifest: 0, 0, 7 and 1 exactly. The
+; constants beside them are the same greps over the 43 the gate enforces today: the algorithm
+; words appear at all now, and six files draw an edge back here. A zero with
+; no date is a claim; a zero with a date and a scope is a measurement.
+; THE SCOPE IS NOT ONE SCOPE, AND SAYING SO IS THE CORRECTION. This paragraph used to end
+; "excluding this file" as though the exclusion governed all four of today's figures. It governs
+; two. The phrase census and the algorithm census are taken over the other 42 and exclude this
+; file; the word census and its file tally are taken over all 43 and COUNT THIS FILE, which is
+; why the tally reads ten and not the nine it would read under the other scope. A single word
+; standing in for two scopes is how a reader is handed a figure whose meaning nobody checked, so
+; each census below now carries its own scope as a declared boolean rather than a shared adverb.
+; THE WORD CENSUS ALSO MOVED, from 91 to 95, re-run by the corpus audit of 2026-09-21 after the
+; last wave of sibling edits landed. The file tally did not move. Four more occurrences arrived
+; in files that already held some, which is the quietest way a census goes stale: nothing appears
+; to change, because the shape of the answer is unchanged and only its size is wrong.
+pub const CORPUS_FILES_BEFORE_THIS_ONE : u8 = 20;
+pub const CORPUS_ALGORITHM_MENTIONS : u32 = 0;
+pub const CORPUS_WORD_HITS_BEFORE_THIS_FILE : u8 = 7;
+pub const CORPUS_FILES_HOLDING_THOSE_HITS : u8 = 1;
+pub const CORPUS_FILES_TODAY : u8 = 43;
+pub const CORPUS_PHRASE_HITS_TODAY : u32 = 3;
+pub const CORPUS_ALGORITHM_HITS_TODAY : u32 = 6;
+pub const CORPUS_WORD_HITS_TODAY : u8 = 95;
+pub const CORPUS_WORD_HITS_TODAY_SUPERSEDED_FIGURE : u8 = 91;
+pub const CORPUS_FILES_HOLDING_THOSE_HITS_TODAY : u8 = 10;
+; Which of today's four figures exclude this file, declared one by one instead of by an adverb.
+pub const PHRASE_CENSUS_EXCLUDES_THIS_FILE : bool = true;
+pub const ALGORITHM_CENSUS_EXCLUDES_THIS_FILE : bool = true;
+pub const WORD_CENSUS_EXCLUDES_THIS_FILE : bool = false;
+pub const WORD_CENSUS_FILE_TALLY_EXCLUDES_THIS_FILE : bool = false;
+pub const WORD_CENSUS_AUDITED_AT : str = "2026-09-21";
+pub const NO_SIBLING_DECLARES_THE_MECHANISM : bool = true;
+
+; --- The window: a log of instants, pruned from the front ----------------------------------------
+; src/api/rate_limit.rs:16 -- one VecDeque<Instant> per key. src/api/rate_limit.rs:47-55 drops
+; entries from the FRONT while the front is old enough, then breaks. The comparison at :49 is
+; `>=`, so an entry whose age exactly equals the window is already gone: the window is half-open.
+; The break is correct only because the log is sorted oldest-first, and it is sorted because the
+; single writer appends at the back (:84 and :139) and Instant is monotonic. Nothing else in the
+; module inserts into a log; the only other mutation of one is the front-pop at :50.
+pub const LOG_IS_APPEND_ONLY_AT_THE_BACK : bool = true;
+pub const PRUNE_STOPS_AT_THE_FIRST_LIVE_ENTRY : bool = true;
+pub const WINDOW_IS_HALF_OPEN : bool = true;
+
+pub fn entry_is_expired(age_seconds: u32, window_seconds: u32) bool {
+  return age_seconds >= window_seconds;
+}
+
+pub fn entry_survives_prune(age_seconds: u32, window_seconds: u32) bool {
+  return !entry_is_expired(age_seconds, window_seconds);
+}
+
+; --- Admission: the cap counts what is still live ------------------------------------------------
+; src/api/rate_limit.rs:81-85 (async) and :136-140 (sync), after the prune at :79 and :134. The
+; comparison is `>=` against the cap, so max_attempts is the number of attempts that may be
+; RECORDED inside one window and the next one is refused.
+pub fn attempt_admitted(live_entries_in_window: u32, max_attempts: u32) bool {
+  return live_entries_in_window < max_attempts;
+}
+
+; The push at :84 / :139 sits on the admitted branch only; the refusal at :82 / :137 returns first.
+; A refused attempt therefore leaves the log alone: it costs the caller nothing and does not push
+; the window forward. There is no penalty box in this code, and none should be inferred from a 429.
+pub fn entries_after_attempt(live_entries_in_window: u32, max_attempts: u32) u32 {
+  if (attempt_admitted(live_entries_in_window, max_attempts)) {
+    return live_entries_in_window + 1;
+  }
+  return live_entries_in_window;
+}
+
+; --- Per-key isolation ----------------------------------------------------------------------------
+; src/api/rate_limit.rs:78 / :133 -- `map.entry(key.to_string())`. A bucket IS a key string. Two
+; distinct strings never share a log, and two callers that produce the same string always do. That
+; second half is the whole content of the worst case further down, and of the tripwire after it.
+pub fn keys_share_a_bucket(key_a: str, key_b: str) bool {
+  return key_a == key_b;
+}
+
+; --- The cap on tracked keys is a sweep trigger, not a ceiling -------------------------------------
+; THE FIRST TRIPWIRE. src/api/rate_limit.rs:71-76 / :126-131 run a retain when the map has reached
+; max_keys, and the retain keeps every key whose log still holds one live entry. The insert at
+; :78 / :133 then runs unconditionally. So a key is dropped only when pruning empties its log, and
+; when every tracked key is live the sweep frees nothing while the insert still happens -- the map
+; passes max_keys. The doc comment at :59-60 says the cap bounds memory "under spray attacks";
+; measured, it bounds memory under a spray of keys that have gone QUIET, which is a weaker claim.
+; The shipped tests do not separate the two: :243-257 and :287-298 sleep past the window so every
+; prior key is expired before the sweep, and assert the post-sweep size. No test in this repository
+; exercises a sweep with nothing to free.
+pub const EVICTION_SWEEP_TRIGGERS_AT_THE_CAP : bool = true;
+pub const EVICTION_DROPS_ONLY_FULLY_EXPIRED_KEYS : bool = true;
+pub const EVICTION_IS_A_HARD_CEILING : bool = false;
+pub const A_SWEEP_WITH_NOTHING_TO_FREE_IS_UNTESTED : bool = true;
+
+pub fn sweep_runs(tracked_keys: u32, max_keys: u32) bool {
+  return tracked_keys >= max_keys;
+}
+
+pub fn key_survives_sweep(live_entries_in_window: u32) bool {
+  return live_entries_in_window >= 1;
+}
+
+pub fn tracked_keys_after_new_key(tracked_keys: u32, max_keys: u32, expired_keys: u32) u32 {
+  if (sweep_runs(tracked_keys, max_keys)) {
+    return tracked_keys - expired_keys + 1;
+  }
+  return tracked_keys + 1;
+}
+
+pub fn cap_holds_after_new_key(tracked_keys: u32, max_keys: u32, expired_keys: u32) bool {
+  return tracked_keys_after_new_key(tracked_keys, max_keys, expired_keys) <= max_keys;
+}
+
+; --- Two variants, one decision --------------------------------------------------------------------
+; src/api/rate_limit.rs:61-86 is async over a tokio mutex; :109-141 is sync over a std mutex. The
+; header at :88-101 gives the reason -- the admin gate is sync and awaiting it would edit every one
+; of its call sites -- and the bodies are the same five steps in the same order. Nothing downstream
+; may branch on which one ran.
+pub const VARIANT_ASYNC : u8 = 1;
+pub const VARIANT_SYNC : u8 = 2;
+pub const VARIANT_COUNT : u8 = 2;
+pub const VARIANTS_SHARE_ONE_DECISION : bool = true;
+
+pub fn variant_is_known(variant: u8) bool {
+  return variant == VARIANT_ASYNC or variant == VARIANT_SYNC;
+}
+
+; The sync variant alone has a poison branch, :121-124, because a tokio mutex does not poison. The
+; comment above it says a poisoned mutex is treated as "let the request through". The code does not
+; let anything through: `p.into_inner()` recovers the map and the ordinary prune-and-compare then
+; runs on it. What the branch buys is that a poisoned lock does not wedge the gate, not that it
+; opens it, and a reader who takes the comment literally would believe in a bypass that is not
+; there. Stated both ways because one of them is in the shipped source.
+pub const SYNC_POISON_RECOVERS_THE_MAP : bool = true;
+pub const SYNC_POISON_BYPASSES_THE_CAP : bool = false;
+pub const ASYNC_VARIANT_HAS_NO_POISON_BRANCH : bool = true;
+
+pub fn admitted_under_poison(live_entries_in_window: u32, max_attempts: u32) bool {
+  return attempt_admitted(live_entries_in_window, max_attempts);
+}
+
+; --- Where the key comes from ------------------------------------------------------------------------
+; src/api/rate_limit.rs:28-44. First `x-forwarded-for` (:29), and of it only the first
+; comma-separated field (:30), trimmed (:31). Then `x-real-ip` (:37-42). Then the literal at :43.
+; A value is usable only if the header is present, readable as a string, non-empty after trimming
+; and at most 64 bytes (:32, :39). The 64 is the whole of the oversize refusal: nothing checks that
+; the value parses as an address, so any short string is accepted as a key.
+pub const KEY_SOURCE_FORWARDED_FOR : u8 = 1;
+pub const KEY_SOURCE_REAL_IP : u8 = 2;
+pub const KEY_SOURCE_SHARED_FALLBACK : u8 = 3;
+pub const KEY_SOURCE_COUNT : u8 = 3;
+pub const KEY_SOURCE_ORDER : [3]str = [
+  "x-forwarded-for",
+  "x-real-ip",
+  "unknown",
+];
+pub const FORWARDED_FOR_FIELD_TAKEN : u8 = 1;
+pub const HEADER_VALUE_MAX_BYTES : u16 = 64;
+pub const SHARED_FALLBACK_KEY : str = "unknown";
+pub const KEY_IS_VALIDATED_AS_AN_ADDRESS : bool = false;
+
+pub fn header_value_is_usable(present: bool, readable_as_string: bool, trimmed_length: u16) bool {
+  return present and readable_as_string and trimmed_length >= 1 and trimmed_length <= HEADER_VALUE_MAX_BYTES;
+}
+
+pub fn key_source(forwarded_for_usable: bool, real_ip_usable: bool) u8 {
+  if (forwarded_for_usable) {
+    return KEY_SOURCE_FORWARDED_FOR;
+  }
+  if (real_ip_usable) {
+    return KEY_SOURCE_REAL_IP;
+  }
+  return KEY_SOURCE_SHARED_FALLBACK;
+}
+
+pub fn caller_is_in_the_shared_bucket(forwarded_for_usable: bool, real_ip_usable: bool) bool {
+  return key_source(forwarded_for_usable, real_ip_usable) == KEY_SOURCE_SHARED_FALLBACK;
+}
+
+; --- THE WORST CASE, pinned with its line ------------------------------------------------------------
+; src/api/rate_limit.rs:43. Every request whose headers fail the check above is keyed by the same
+; literal, so they hold ONE log between them. One caller that fills it refuses every other caller
+; in it for the rest of the window, and that caller does not have to be header-less to get in: a
+; 65-byte value reaches :43 by the route the test at :176-182 already walks. Four entry paths per
+; header, eight in total, and the deliberate one is the cheapest.
+pub const SHARED_BUCKET_LINE : str = "src/api/rate_limit.rs:43";
+pub const SHARED_BUCKET_ENTRY_PATHS_PER_HEADER : u8 = 4;
+pub const SHARED_BUCKET_IS_REACHABLE_ON_PURPOSE : bool = true;
+pub const SHARED_BUCKET_IS_PER_STORE_NOT_GLOBAL : bool = true;
+
+pub fn shared_bucket_refuses_a_second_caller(live_entries_from_the_first: u32, max_attempts: u32) bool {
+  return !attempt_admitted(live_entries_from_the_first, max_attempts);
+}
+
+; THE DIRECTION OF THE RESIDUAL ERROR, both ways, because there are two and they oppose.
+; Inside the shared bucket the error is REFUSAL: aggregating distinct callers onto one log can only
+; make the log longer than a per-caller log would be, so the limiter refuses requests it would
+; otherwise admit and never the reverse. That is the direction the doc comment at :26-27 claims,
+; and it is correct as far as it goes -- the cost is availability for legitimate header-less
+; traffic, not an open hole.
+; The other direction lives one step earlier and the comment does not mention it. The key is text
+; the caller writes. A caller that varies a usable value gets a different key each time, and a new
+; key starts with an empty log, so rotation is ADMISSION error rather than refusal error. Which
+; direction dominates is a deployment fact -- whether an edge proxy overwrites x-forwarded-for --
+; and this repository does not establish it: ConnectInfo and peer_addr occur 0 times under src/
+; (measured 2026-09-21), so nothing here ever compares the header against the TCP peer, and the
+; trust is asserted only in prose at :24. Declared as a refusal rather than guessed at.
+pub const SHARED_BUCKET_ERROR_DIRECTION_IS_REFUSAL : bool = true;
+pub const ROTATED_HEADER_ERROR_DIRECTION_IS_ADMISSION : bool = true;
+pub const REPOSITORY_VERIFIES_THE_PROXY : bool = false;
+pub const PEER_ADDRESS_OCCURRENCES_IN_SRC : u32 = 0;
+pub const PROXY_TRUST_NOTE : str = "Which residual error dominates cannot be settled from this repository. src/api/rate_limit.rs:24 names Railway, Cloudflare and nginx as the headers' authors, but that is a comment: no code reads the TCP peer address, ConnectInfo and peer_addr return 0 matches under src/ on 2026-09-21, and src/main.rs:1207-1210 forms an all-interfaces address and binds a listener to it without recording what sits in front of it. If an edge proxy overwrites x-forwarded-for on every inbound request the per-key isolation is real and only the refusal error remains; if any request can reach the listener directly the key is caller-chosen and the admission error is unbounded. What is missing is the deployment fact and a check that enforces it, not a number.";
+
+pub fn distinct_usable_values_yield_distinct_buckets(value_a: str, value_b: str) bool {
+  return !keys_share_a_bucket(value_a, value_b);
+}
+
+; --- The guarded surface, as a shape and a count ------------------------------------------------------
+; Measured 2026-09-21 by grepping the two check functions across src/ and excluding test modules
+; (src/api/orders.rs:2626 opens its own). The SHAPE is the claim: every call site passes the same
+; five arguments -- a store, a key, a window, an attempt cap and a key cap -- and declares its three
+; limits next to its own store, in the module that uses them. No route inherits a default, and there
+; is no central limits table in this repository to inherit one from. Counts, not a route table:
+; a table here would be six liabilities and would be wrong the day a seventh route is guarded.
+pub const CHECK_ARGUMENT_COUNT : u8 = 5;
+pub const LIMITS_ARE_DECLARED_AT_THE_CALL_SITE : bool = true;
+pub const CENTRAL_LIMIT_TABLE_EXISTS : bool = false;
+pub const LIMITER_CALL_SITES_IN_PRODUCTION : u8 = 8;
+pub const LIMITER_CALL_SITES_ASYNC : u8 = 5;
+pub const LIMITER_CALL_SITES_SYNC : u8 = 3;
+pub const DISTINCT_STORES : u8 = 7;
+pub const GUARDED_HTTP_ROUTES : u8 = 6;
+pub const CALL_SITES_THAT_ARE_NOT_ROUTES : u8 = 2;
+
+; The two that are not routes, named so the eight add up: src/api/auth.rs:505 is a failure hook
+; reached from src/api/auth.rs:492 and src/api/admin.rs:583 rather than mounted anywhere, and
+; src/bot/mod.rs:30 guards a Telegram bot entrypoint that never touches the HTTP router.
+pub const NON_ROUTE_SITES : [2]str = [
+  "src/api/auth.rs:505",
+  "src/bot/mod.rs:30",
+];
+
+; ONE exemplar, labelled as one. Chosen because it is the widest window in the tree and because its
+; own comment (src/api/upload.rs:26-27) calls itself defense-in-depth behind an admin gate rather
+; than the gate. Route at src/api/upload.rs:19, guard at :116, window at :30, attempt cap at :31.
+pub const EXAMPLE_GUARDED_ROUTE : str = "POST /upload";
+pub const EXAMPLE_ROUTE_DECLARATION : str = "src/api/upload.rs:19";
+pub const EXAMPLE_GUARD_SITE : str = "src/api/upload.rs:116";
+pub const EXAMPLE_WINDOW_SECONDS : u32 = 3600;
+pub const EXAMPLE_MAX_ATTEMPTS : u32 = 30;
+pub const EXAMPLE_IS_AN_EXEMPLAR_NOT_A_TABLE : bool = true;
+
+; Three aggregates over the eight, each with its citation and none of them a row to maintain. The
+; narrowest window is src/bot/mod.rs:24, the widest is src/api/upload.rs:30, and the smallest cap of
+; one appears twice -- as a named constant at src/api/admin.rs:37 and as a bare literal argument at
+; src/bot/mod.rs:34. The spread is nearly three orders of magnitude, which is why no shared default
+; would have fitted and why every call site carries its own three numbers.
+pub const NARROWEST_WINDOW_SECONDS : u32 = 5;
+pub const WIDEST_WINDOW_SECONDS : u32 = 3600;
+pub const SMALLEST_MAX_ATTEMPTS : u32 = 1;
+
+; src/api/orders.rs:884 puts its guard inside `if req.telegram_id.is_none()`. A ROUTE is therefore
+; not the unit that is guarded -- a request is. An identified caller passes that call site without
+; being measured by it at all, and is serialised later by the per-id machinery the comment at
+; src/api/orders.rs:27-30 names. Counting POST /orders as guarded without this sentence would
+; overstate the coverage by exactly the traffic that carries an identity.
+pub const AT_LEAST_ONE_GUARD_IS_CONDITIONAL : bool = true;
+
+pub fn anonymous_order_guard_applies(caller_is_identified: bool) bool {
+  return !caller_is_identified;
+}
+
+; --- THE SECOND TRIPWIRE: two handlers, one bucket -------------------------------------------------
+; src/api/client_errors.rs:547-548 states that the event sink is "rate-limited separately so normal
+; analytics traffic never competes with panic/error reports". Measured 2026-09-21 it is not
+; separate by any of the four things that would make it so: :387 and :555 pass the same store
+; (:37-38), the same window and attempt constants (:39-40, key cap at :41), and the same key -- the
+; bare caller key
+; with no per-handler prefix. The one call site in the tree that does prefix is
+; src/api/events.rs:527 (was :525), which builds its key with an endpoint tag in front of the id, so the idiom
+; exists and was not applied here. The consequence is one bucket for two endpoints: analytics
+; volume from a caller silently suppresses that caller's error reports, and because the two
+; refusals are counted under different metric labels (:396 and :564) the shared cause does not show
+; up in the counter either. What is missing is a prefix on one of the two keys, or a second store.
+pub const TWO_HANDLERS_SHARE_ONE_BUCKET : bool = true;
+pub const SHARED_BUCKET_HANDLERS_PREFIX_THEIR_KEY : bool = false;
+pub const ONE_CALL_SITE_PREFIXES_ITS_KEY : bool = true;
+pub const SHIPPED_COMMENT_CLAIMS_SEPARATION : bool = true;
+
+pub fn handlers_compete(store_is_shared: bool, key_is_prefixed_per_handler: bool) bool {
+  return store_is_shared and !key_is_prefixed_per_handler;
+}
+
+; --- What a refusal leaves behind --------------------------------------------------------------------
+; src/metrics.rs:190-191 defines the counter. Six of the eight call sites increment it before
+; returning: src/api/auth.rs:513, src/api/client_errors.rs:396 and :564, src/api/events.rs:537,
+; src/api/orders.rs:895, src/api/upload.rs:125. Two do not -- the broadcast refusal at
+; src/api/admin.rs:773-776 and the bot cooldown at src/bot/mod.rs:29-37 -- so two of the eight
+; refusal paths are invisible to the only instrument that counts refusals. The repository already
+; guards against the mirror-image mistake: src/metrics.rs:413-433 fails a test for a metric helper
+; with no caller. Nothing fails for a refusal with no metric.
+pub const BLOCKED_METRIC_NAME : str = "rate_limit_blocked_total";
+pub const CALL_SITES_EMITTING_THE_BLOCKED_METRIC : u8 = 6;
+pub const REFUSALS_INVISIBLE_TO_THE_METRIC : u8 = 2;
+pub const A_REFUSAL_WITHOUT_A_METRIC_FAILS_NO_TEST : bool = true;
+
+; --- The inbound edges, counted by a grep rather than by memory ------------------------------------
+; Re-measured 2026-09-21 against the siblings as they stand on disk, after the corpus grew from
+; twenty files to 43. `grep -rl "pub const REUSES_RATE_LIMIT_ID" specs/` returns SIX files, not
+; the FOUR this block first recorded, and each one defers rather than copies. Every neighbour is
+; named by its DECLARATION here; the earlier draft of this block cited them by line, and every one
+; of those line numbers had already drifted by the time it was re-read.
+; promo-broadcast keeps only the two figures its own admin route is configured with and leaves the
+; mechanism, the caller key and the silent refusal here; client-errors is the other file the
+; SECOND TRIPWIRE above lives in and pins the division explicitly, its
+; SHARED_BUCKET_TRIPWIRE_IS_RESTATED_HERE and KEY_SOURCE_RULE_IS_RESTATED_HERE both false;
+; ai-assist takes the verdict for the bot cooldown at src/bot/mod.rs:30 as a plain boolean
+; argument and declares RATE_LIMIT_MECHANISM_IS_RESTATED_HERE false; observability declares
+; LIMITER_CALL_SITE_CENSUS_IS_OWNED_THERE, so the census of emitting sites is this file's and its
+; own block on the same counter, RATE_LIMIT_EMITTED_LABEL_KEY against
+; RATE_LIMIT_REFERENCED_LABEL_KEY, carries the label KEY and the dashboards that select the wrong
+; one, not a count of kinds. The two edges this block did not have are events-booking, which
+; states that book_event carries a limiter and join_waitlist carries none and declares neither
+; budget nor window, and upload-media, which consumes attempt_admitted for the route this file
+; already uses as its exemplar and declares LIMITER_WINDOW_IS_RESTATED_HERE and
+; LIMITER_ATTEMPT_CAP_IS_RESTATED_HERE both false.
+; TWO MORE files name this contract and the grep above sees neither, which is why the edge count
+; and the naming count are two numbers here and not one. http_cache declares the edge as
+; NEIGHBOUR_RATE_LIMIT_ID beside THE_ONLY_BOUND_ON_KEY_GROWTH_IS_OWNED_THERE, a different constant
+; name for the same relation; and turbobaby/request-identity lists this ID inside its CONSUMERS
+; array rather than as an edge constant of its own. A grep for one constant name is a grep for a
+; spelling, not a census of edges. The same grep has one more blind spot worth naming: run
+; literally it also matches THIS file, because the sentence above quotes the constant it looks
+; for, so the six excludes this file by hand and not by the pattern.
+; A DRAFT OF THIS FILE CLAIMED OTHERWISE, and the correction is kept because it is the kind of
+; claim a reader would trust: the draft said observability declares a coincident six in a
+; RATE_LIMIT_EMITTED_KIND_COUNT. RE-VERIFIED 2026-09-21 over all 43 files: no such constant is
+; declared anywhere in specs/, and the only hit of that name in the corpus is this sentence about
+; the mistake. There is no coincident magnitude next door -- what observability does declare is
+; IGNORED_METRIC_KIND_CALL_SITES, a count of call sites it takes from turbobaby/request-identity
+; and marks as a neighbour's figure. The six below is unopposed rather than disambiguated, and
+; nothing was absorbed from it.
+pub const CONSUMER_PROMO_BROADCAST_ID : str = "turbobaby/promo-broadcast";
+pub const CONSUMER_CLIENT_ERRORS_ID : str = "turbobaby/client-errors";
+pub const CONSUMER_AI_ASSIST_ID : str = "turbobaby/ai-assist";
+pub const CONSUMER_EVENTS_BOOKING_ID : str = "turbobaby/events-booking";
+pub const CONSUMER_UPLOAD_MEDIA_ID : str = "turbobaby/upload-media";
+pub const NEIGHBOUR_OBSERVABILITY_ID : str = "turbobaby/observability";
+pub const NEIGHBOUR_HTTP_CACHE_ID : str = "turbobaby/http-cache";
+pub const OBSERVABILITY_DEFERS_THE_CALL_SITE_CENSUS : bool = true;
+pub const OBSERVABILITY_DECLARES_A_KIND_COUNT : bool = false;
+pub const INBOUND_EDGE_COUNT : u8 = 6;
+pub const INBOUND_EDGE_COUNT_AT_FIRST_WRITING : u8 = 4;
+pub const EDGES_NAMED_BY_ANOTHER_CONSTANT : u8 = 1;
+pub const EDGES_NAMED_INSIDE_A_CONSUMER_ARRAY : u8 = 1;
+pub const FILES_NAMING_THIS_CONTRACT_BY_ID : u8 = 8;
+
+; --- What a limiter is, stated so it cannot be overread ------------------------------------------------
+pub const LIMITER_BOUNDS_A_RATE : bool = true;
+pub const LIMITER_PREVENTS_ABUSE : bool = false;
+pub const ABUSE_PREVENTION_NOTE : str = "Nothing in this file or in src/api/rate_limit.rs prevents abuse. The module answers one question -- has this key been recorded max_attempts times inside this window -- and a caller under the cap is admitted whatever the request is for. Abuse spread across keys is not seen at all, because the only relation between two keys in this code is string equality; abuse under the rate is not seen either, because nothing inspects the payload. What the limiter buys is a ceiling on the cost one key can impose per window. Reading a 429 as a judgement about a caller, or an admitted request as a judgement that the caller is legitimate, is reading a sentence this code does not write.";
+
+; --- Tests -----------------------------------------------------------------------------------------
+
+test the_window_is_half_open_at_its_own_edge {
+  assert entry_is_expired(60, 60) == true;
+  assert entry_is_expired(59, 60) == false;
+  assert entry_is_expired(61, 60) == true;
+  assert entry_survives_prune(59, 60) == true;
+  assert entry_survives_prune(60, 60) == false;
+  assert WINDOW_IS_HALF_OPEN == true;
+}
+
+test the_cap_admits_exactly_max_attempts_and_refuses_the_next {
+  assert attempt_admitted(0, 30) == true;
+  assert attempt_admitted(29, 30) == true;
+  assert attempt_admitted(30, 30) == false;
+  assert attempt_admitted(31, 30) == false;
+  assert attempt_admitted(0, 1) == true;
+  assert attempt_admitted(1, 1) == false;
+}
+
+test a_refused_attempt_is_not_recorded {
+  assert entries_after_attempt(0, 1) == 1;
+  assert entries_after_attempt(29, 30) == 30;
+  assert entries_after_attempt(30, 30) == 30;
+  assert entries_after_attempt(31, 30) == 31;
+}
+
+test a_bucket_is_the_key_string_and_nothing_else {
+  assert keys_share_a_bucket("caller-key-a", "caller-key-a") == true;
+  assert keys_share_a_bucket("caller-key-a", "caller-key-b") == false;
+  assert keys_share_a_bucket(SHARED_FALLBACK_KEY, SHARED_FALLBACK_KEY) == true;
+  assert distinct_usable_values_yield_distinct_buckets("caller-key-a", "caller-key-b") == true;
+  assert distinct_usable_values_yield_distinct_buckets("caller-key-a", "caller-key-a") == false;
+}
+
+test the_key_cap_is_a_sweep_trigger_not_a_ceiling {
+  assert sweep_runs(9, 10) == false;
+  assert sweep_runs(10, 10) == true;
+  assert sweep_runs(11, 10) == true;
+  assert key_survives_sweep(0) == false;
+  assert key_survives_sweep(1) == true;
+  assert tracked_keys_after_new_key(9, 10, 0) == 10;
+  assert tracked_keys_after_new_key(10, 10, 10) == 1;
+  assert tracked_keys_after_new_key(10, 10, 0) == 11;
+  assert cap_holds_after_new_key(9, 10, 0) == true;
+  assert cap_holds_after_new_key(10, 10, 10) == true;
+  assert cap_holds_after_new_key(10, 10, 0) == false;
+  assert EVICTION_IS_A_HARD_CEILING == false;
+}
+
+test both_variants_reach_the_same_decision {
+  assert variant_is_known(VARIANT_ASYNC) == true;
+  assert variant_is_known(VARIANT_SYNC) == true;
+  assert variant_is_known(0) == false;
+  assert variant_is_known(3) == false;
+  assert VARIANT_COUNT == 2;
+  assert VARIANTS_SHARE_ONE_DECISION == true;
+}
+
+test a_poisoned_sync_mutex_recovers_rather_than_opens {
+  assert admitted_under_poison(0, 30) == true;
+  assert admitted_under_poison(30, 30) == false;
+  assert SYNC_POISON_RECOVERS_THE_MAP == true;
+  assert SYNC_POISON_BYPASSES_THE_CAP == false;
+  assert ASYNC_VARIANT_HAS_NO_POISON_BRANCH == true;
+}
+
+test header_precedence_and_the_size_refusal {
+  assert header_value_is_usable(true, true, 15) == true;
+  assert header_value_is_usable(true, true, 64) == true;
+  assert header_value_is_usable(true, true, 65) == false;
+  assert header_value_is_usable(true, true, 200) == false;
+  assert header_value_is_usable(true, true, 0) == false;
+  assert header_value_is_usable(true, false, 15) == false;
+  assert header_value_is_usable(false, true, 15) == false;
+  assert key_source(true, true) == KEY_SOURCE_FORWARDED_FOR;
+  assert key_source(true, false) == KEY_SOURCE_FORWARDED_FOR;
+  assert key_source(false, true) == KEY_SOURCE_REAL_IP;
+  assert key_source(false, false) == KEY_SOURCE_SHARED_FALLBACK;
+  assert KEY_SOURCE_ORDER.len == KEY_SOURCE_COUNT;
+}
+
+test an_oversize_value_is_a_way_into_the_shared_bucket {
+  assert caller_is_in_the_shared_bucket(true, false) == false;
+  assert caller_is_in_the_shared_bucket(false, true) == false;
+  assert caller_is_in_the_shared_bucket(false, false) == true;
+  assert SHARED_BUCKET_IS_REACHABLE_ON_PURPOSE == true;
+  assert SHARED_BUCKET_ENTRY_PATHS_PER_HEADER == 4;
+  assert SHARED_FALLBACK_KEY == "unknown";
+}
+
+test one_caller_exhausts_the_shared_bucket_for_every_other {
+  assert shared_bucket_refuses_a_second_caller(9, 10) == false;
+  assert shared_bucket_refuses_a_second_caller(10, 10) == true;
+  assert shared_bucket_refuses_a_second_caller(11, 10) == true;
+  assert shared_bucket_refuses_a_second_caller(1, 1) == true;
+  assert SHARED_BUCKET_ERROR_DIRECTION_IS_REFUSAL == true;
+}
+
+test the_other_residual_error_runs_the_other_way {
+  assert ROTATED_HEADER_ERROR_DIRECTION_IS_ADMISSION == true;
+  assert REPOSITORY_VERIFIES_THE_PROXY == false;
+  assert PEER_ADDRESS_OCCURRENCES_IN_SRC == 0;
+  assert KEY_IS_VALIDATED_AS_AN_ADDRESS == false;
+}
+
+test the_guarded_surface_counts_agree {
+  assert LIMITER_CALL_SITES_ASYNC + LIMITER_CALL_SITES_SYNC == LIMITER_CALL_SITES_IN_PRODUCTION;
+  assert GUARDED_HTTP_ROUTES + CALL_SITES_THAT_ARE_NOT_ROUTES == LIMITER_CALL_SITES_IN_PRODUCTION;
+  assert CALL_SITES_EMITTING_THE_BLOCKED_METRIC + REFUSALS_INVISIBLE_TO_THE_METRIC == LIMITER_CALL_SITES_IN_PRODUCTION;
+  assert DISTINCT_STORES < LIMITER_CALL_SITES_IN_PRODUCTION;
+  assert NON_ROUTE_SITES.len == CALL_SITES_THAT_ARE_NOT_ROUTES;
+  assert CHECK_ARGUMENT_COUNT == 5;
+  assert CENTRAL_LIMIT_TABLE_EXISTS == false;
+}
+
+test the_exemplar_is_one_route_one_window_one_cap {
+  assert EXAMPLE_GUARDED_ROUTE == "POST /upload";
+  assert EXAMPLE_WINDOW_SECONDS == 3600;
+  assert EXAMPLE_MAX_ATTEMPTS == 30;
+  assert EXAMPLE_WINDOW_SECONDS == WIDEST_WINDOW_SECONDS;
+  assert NARROWEST_WINDOW_SECONDS < WIDEST_WINDOW_SECONDS;
+  assert SMALLEST_MAX_ATTEMPTS == 1;
+  assert EXAMPLE_IS_AN_EXEMPLAR_NOT_A_TABLE == true;
+}
+
+test one_guard_is_conditional_on_the_request_not_the_route {
+  assert anonymous_order_guard_applies(false) == true;
+  assert anonymous_order_guard_applies(true) == false;
+  assert AT_LEAST_ONE_GUARD_IS_CONDITIONAL == true;
+}
+
+test two_unprefixed_handlers_on_one_store_compete {
+  assert handlers_compete(true, false) == true;
+  assert handlers_compete(true, true) == false;
+  assert handlers_compete(false, false) == false;
+  assert handlers_compete(false, true) == false;
+  assert TWO_HANDLERS_SHARE_ONE_BUCKET == true;
+  assert SHARED_BUCKET_HANDLERS_PREFIX_THEIR_KEY == false;
+  assert ONE_CALL_SITE_PREFIXES_ITS_KEY == true;
+}
+
+test the_admin_bound_is_named_and_not_restated {
+  assert REUSES_REQUEST_IDENTITY_ID == "turbobaby/request-identity";
+  assert REUSES_REQUEST_IDENTITY_ID != ID;
+  assert ADMIN_AUTH_BOUND_IS_RESTATED_HERE == false;
+  assert REUSE_EDGE_COUNT == 1;
+}
+
+test the_corpus_described_none_of_this_before_today {
+  assert CORPUS_ALGORITHM_MENTIONS == 0;
+  assert CORPUS_FILES_BEFORE_THIS_ONE == 20;
+  assert CORPUS_WORD_HITS_BEFORE_THIS_FILE == 7;
+  assert CORPUS_FILES_HOLDING_THOSE_HITS == 1;
+  assert CORPUS_FILES_HOLDING_THOSE_HITS < CORPUS_FILES_BEFORE_THIS_ONE;
+}
+
+test the_zero_has_a_date_and_the_date_has_since_moved {
+  assert CORPUS_FILES_TODAY == 43;
+  assert CORPUS_FILES_TODAY > CORPUS_FILES_BEFORE_THIS_ONE;
+  assert CORPUS_PHRASE_HITS_TODAY == 3;
+  assert CORPUS_ALGORITHM_HITS_TODAY == 6;
+  assert CORPUS_WORD_HITS_TODAY == 95;
+  assert CORPUS_WORD_HITS_TODAY_SUPERSEDED_FIGURE == 91;
+  assert CORPUS_WORD_HITS_TODAY > CORPUS_WORD_HITS_TODAY_SUPERSEDED_FIGURE;
+  assert CORPUS_FILES_HOLDING_THOSE_HITS_TODAY == 10;
+  assert PHRASE_CENSUS_EXCLUDES_THIS_FILE == true;
+  assert ALGORITHM_CENSUS_EXCLUDES_THIS_FILE == true;
+  assert WORD_CENSUS_EXCLUDES_THIS_FILE == false;
+  assert WORD_CENSUS_FILE_TALLY_EXCLUDES_THIS_FILE == false;
+  assert WORD_CENSUS_AUDITED_AT == "2026-09-21";
+  assert WORD_CENSUS_AUDITED_AT == MEASURED_AT;
+  assert CORPUS_ALGORITHM_HITS_TODAY > CORPUS_ALGORITHM_MENTIONS;
+  assert CORPUS_WORD_HITS_TODAY > CORPUS_WORD_HITS_BEFORE_THIS_FILE;
+  assert CORPUS_FILES_HOLDING_THOSE_HITS_TODAY > CORPUS_FILES_HOLDING_THOSE_HITS;
+  assert NO_SIBLING_DECLARES_THE_MECHANISM == true;
+}
+
+test the_four_inbound_edges_defer_rather_than_copy {
+  assert NEIGHBOUR_OBSERVABILITY_ID != ID;
+  assert CONSUMER_PROMO_BROADCAST_ID != ID;
+  assert CONSUMER_CLIENT_ERRORS_ID != ID;
+  assert CONSUMER_AI_ASSIST_ID != ID;
+  assert NEIGHBOUR_OBSERVABILITY_ID != CONSUMER_PROMO_BROADCAST_ID;
+  assert CONSUMER_CLIENT_ERRORS_ID != CONSUMER_PROMO_BROADCAST_ID;
+  assert CONSUMER_CLIENT_ERRORS_ID != NEIGHBOUR_OBSERVABILITY_ID;
+  assert CONSUMER_AI_ASSIST_ID != CONSUMER_CLIENT_ERRORS_ID;
+  assert CONSUMER_AI_ASSIST_ID != CONSUMER_PROMO_BROADCAST_ID;
+  assert CONSUMER_AI_ASSIST_ID != NEIGHBOUR_OBSERVABILITY_ID;
+  assert OBSERVABILITY_DEFERS_THE_CALL_SITE_CENSUS == true;
+  assert OBSERVABILITY_DECLARES_A_KIND_COUNT == false;
+  assert INBOUND_EDGE_COUNT_AT_FIRST_WRITING == 4;
+  assert CALL_SITES_EMITTING_THE_BLOCKED_METRIC == 6;
+}
+
+; The test above keeps the name it was born with. The count it was named for is
+; INBOUND_EDGE_COUNT_AT_FIRST_WRITING now; the live figure is six, and it is pinned here.
+test the_inbound_edges_were_six_when_the_corpus_stopped_growing {
+  assert INBOUND_EDGE_COUNT == 6;
+  assert INBOUND_EDGE_COUNT > INBOUND_EDGE_COUNT_AT_FIRST_WRITING;
+  assert CONSUMER_EVENTS_BOOKING_ID == "turbobaby/events-booking";
+  assert CONSUMER_UPLOAD_MEDIA_ID == "turbobaby/upload-media";
+  assert NEIGHBOUR_HTTP_CACHE_ID == "turbobaby/http-cache";
+  assert CONSUMER_EVENTS_BOOKING_ID != ID;
+  assert CONSUMER_UPLOAD_MEDIA_ID != ID;
+  assert NEIGHBOUR_HTTP_CACHE_ID != ID;
+  assert CONSUMER_EVENTS_BOOKING_ID != CONSUMER_UPLOAD_MEDIA_ID;
+  assert NEIGHBOUR_HTTP_CACHE_ID != NEIGHBOUR_OBSERVABILITY_ID;
+  assert EDGES_NAMED_BY_ANOTHER_CONSTANT == 1;
+  assert FILES_NAMING_THIS_CONTRACT_BY_ID == 8;
+  assert EDGES_NAMED_INSIDE_A_CONSUMER_ARRAY == 1;
+  assert INBOUND_EDGE_COUNT + EDGES_NAMED_BY_ANOTHER_CONSTANT + EDGES_NAMED_INSIDE_A_CONSUMER_ARRAY == FILES_NAMING_THIS_CONTRACT_BY_ID;
+}
+
+test bounding_a_rate_is_not_preventing_abuse {
+  assert LIMITER_BOUNDS_A_RATE == true;
+  assert LIMITER_PREVENTS_ABUSE == false;
+  assert A_REFUSAL_WITHOUT_A_METRIC_FAILS_NO_TEST == true;
+}
+
+; --- Invariants ---------------------------------------------------------------------------------------
+
+invariant an_entry_as_old_as_the_window_is_already_pruned
+  assert entry_is_expired(60, 60) == true and entry_survives_prune(60, 60) == false
+
+invariant the_attempt_that_equals_the_cap_is_refused
+  assert attempt_admitted(30, 30) == false and attempt_admitted(29, 30) == true
+
+invariant a_refused_attempt_never_lengthens_the_log
+  assert entries_after_attempt(30, 30) == 30 and entries_after_attempt(29, 30) == 30
+
+invariant a_sweep_with_nothing_expired_lets_the_map_pass_its_cap
+  assert cap_holds_after_new_key(10, 10, 0) == false and cap_holds_after_new_key(10, 10, 10) == true
+
+invariant the_tracked_key_cap_is_never_a_ceiling
+  assert EVICTION_IS_A_HARD_CEILING == false and EVICTION_DROPS_ONLY_FULLY_EXPIRED_KEYS == true
+
+invariant a_request_with_no_usable_header_is_keyed_by_the_shared_literal
+  assert key_source(false, false) == KEY_SOURCE_SHARED_FALLBACK and SHARED_FALLBACK_KEY == "unknown"
+
+invariant an_oversize_header_value_is_refused_into_that_same_bucket
+  assert header_value_is_usable(true, true, 65) == false and caller_is_in_the_shared_bucket(false, false) == true
+
+invariant one_caller_can_exhaust_the_shared_bucket_for_every_other
+  assert shared_bucket_refuses_a_second_caller(10, 10) == true and shared_bucket_refuses_a_second_caller(9, 10) == false
+
+invariant the_two_residual_errors_point_in_opposite_directions
+  assert SHARED_BUCKET_ERROR_DIRECTION_IS_REFUSAL == true and ROTATED_HEADER_ERROR_DIRECTION_IS_ADMISSION == true and REPOSITORY_VERIFIES_THE_PROXY == false
+
+invariant a_poisoned_sync_mutex_still_applies_the_cap
+  assert admitted_under_poison(30, 30) == false and SYNC_POISON_BYPASSES_THE_CAP == false
+
+invariant one_store_behind_two_unprefixed_handlers_is_one_bucket
+  assert handlers_compete(true, false) == true and SHARED_BUCKET_HANDLERS_PREFIX_THEIR_KEY == false
+
+invariant an_identified_order_is_not_measured_by_the_anonymous_guard
+  assert anonymous_order_guard_applies(true) == false and anonymous_order_guard_applies(false) == true
+
+invariant every_call_site_is_a_route_or_is_named_as_not_one
+  assert GUARDED_HTTP_ROUTES + CALL_SITES_THAT_ARE_NOT_ROUTES == LIMITER_CALL_SITES_IN_PRODUCTION and NON_ROUTE_SITES.len == CALL_SITES_THAT_ARE_NOT_ROUTES
+
+invariant two_of_the_eight_refusals_never_reach_the_counter
+  assert CALL_SITES_EMITTING_THE_BLOCKED_METRIC + REFUSALS_INVISIBLE_TO_THE_METRIC == LIMITER_CALL_SITES_IN_PRODUCTION and REFUSALS_INVISIBLE_TO_THE_METRIC == 2
+
+invariant the_admin_auth_bound_belongs_to_another_contract
+  assert REUSES_REQUEST_IDENTITY_ID == "turbobaby/request-identity" and ADMIN_AUTH_BOUND_IS_RESTATED_HERE == false
+
+invariant this_file_bounds_a_rate_and_claims_nothing_further
+  assert LIMITER_BOUNDS_A_RATE == true and LIMITER_PREVENTS_ABUSE == false
+
+invariant the_emitting_site_census_is_owned_here_and_deferred_by_every_neighbour
+  assert OBSERVABILITY_DEFERS_THE_CALL_SITE_CENSUS == true and OBSERVABILITY_DECLARES_A_KIND_COUNT == false and NEIGHBOUR_OBSERVABILITY_ID != ID

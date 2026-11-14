@@ -1,0 +1,226 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/verified/reuse.t27 -- when a sealed artifact may be reused instead of rebuilt, and what one
+; failure is called so it files one issue, not one per run. Epic gHashTag/t27#6655, Phase A.
+; --
+; What already exists and is NOT restated here:
+; - specs/ci/affected.t27 decides WHICH specs a change touches (seeds + their `use` importers). This
+;   file decides, for one artifact the selector reached or skipped, whether its old seal still holds.
+; - `t27c seal --save/--verify` (bootstrap/src/main.rs) records spec_hash and gen_hash_* per backend.
+;   It records no toolchain identity and no verdict.
+; - conformance/trinity/bootstrap_receipt.json records the toolchain identity (t27c_sha256,
+;   cargo_lock_sha256, host); the t27b reference cache (cli/t27b/src/blockers.rs, #6535) keys on spec
+;   bytes + `use` closure + t27c + zig. Same idea; this file is the one written rule of it.
+; The hashes themselves are computed by that existing tooling (sha256). This file compares them; it
+; computes none and introduces no hash primitive.
+; --
+; The reuse rule:
+; - An artifact is identified by five parts: its own spec bytes, the seals of its `use` closure, the
+;   toolchain (t27c + backend tools), the configuration it was built under, and the verdict it sealed.
+; - Reuse only when every part is recorded on both sides and equal, and the old verdict was PASS.
+; - A part that was never recorded is MISSING, and MISSING never means "same" (fail closed): an
+;   artifact sealed before toolchain identity existed is rebuilt once, not trusted forever.
+; - The reason is the first part that differs, in the order above, so the same pair of records always
+;   gives the same reason.
+; --
+; The failure rule:
+; - A failure is normalized to (stage, error class, scope). Scope is a 32-bit identity of the affected
+;   spec path or job, supplied by the caller from existing hashes. Run ids, timestamps, log text and
+;   line numbers are NOT part of it: they differ between two runs of the same defect.
+; - The fingerprint packs the three into one u64. Packing, not hashing: two different normalized
+;   failures never share a fingerprint, and the parts can be read back out.
+; - A new fingerprint opens one issue. A fingerprint with an open issue updates that issue. A failure
+;   issue closes only when a run of the fix passed, its seal verified, and the fingerprint did not recur.
+; --
+; Hardware: a device step is VERIFIED only with device evidence (a transcript from the adapter in
+; specs/fpga/adapter.t27). Without it the step is UNPROVEN, never PASS; with a failing adapter, BLOCKED.
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module VerifiedReuse;
+
+/// One identity part, compared between the sealed record and the current state.
+pub const PART_MISSING : u8 = 0;
+pub const PART_SAME : u8 = 1;
+pub const PART_DIFF : u8 = 2;
+
+/// reuse_decision() answers.
+pub const REUSE : u8 = 0;
+pub const REBUILD_SPEC : u8 = 1;
+pub const REBUILD_CLOSURE : u8 = 2;
+pub const REBUILD_TOOLCHAIN : u8 = 3;
+pub const REBUILD_CONFIG : u8 = 4;
+pub const REBUILD_VERDICT : u8 = 5;
+pub const REBUILD_MISSING : u8 = 6;
+
+/// Pipeline stages a failure is normalized to.
+pub const STAGE_PARSE : u8 = 1;
+pub const STAGE_GEN : u8 = 2;
+pub const STAGE_BUILD : u8 = 3;
+pub const STAGE_TEST : u8 = 4;
+pub const STAGE_SEAL : u8 = 5;
+pub const STAGE_VERIFY : u8 = 6;
+pub const STAGE_DEVICE : u8 = 7;
+
+/// What to do with the issue tracker when a fingerprint is seen.
+pub const ISSUE_OPEN_NEW : u8 = 1;
+pub const ISSUE_UPDATE : u8 = 2;
+pub const ISSUE_CLOSE : u8 = 3;
+pub const ISSUE_KEEP : u8 = 4;
+
+/// Hardware step state.
+pub const HW_UNPROVEN : u8 = 0;
+pub const HW_VERIFIED : u8 = 1;
+pub const HW_BLOCKED : u8 = 2;
+
+/// Whether one part may count toward reuse. MISSING and DIFF never do.
+pub fn part_holds(p: u8) -> bool {
+    return p == PART_SAME;
+}
+
+/// The reason one part forces a rebuild, or REUSE when it holds.
+pub fn part_reason(p: u8, diff_reason: u8) -> u8 {
+    if (p == PART_SAME) { return REUSE; }
+    if (p == PART_DIFF) { return diff_reason; }
+    return REBUILD_MISSING;
+}
+
+/// Reuse the sealed artifact, or the first reason it must be rebuilt (spec, closure, toolchain,
+/// config, then verdict). verdict_pass is the verdict the old seal recorded.
+pub fn reuse_decision(spec: u8, closure: u8, toolchain: u8, config: u8, verdict_pass: bool) -> u8 {
+    var r : u8 = part_reason(spec, REBUILD_SPEC);
+    if (r != REUSE) { return r; }
+    r = part_reason(closure, REBUILD_CLOSURE);
+    if (r != REUSE) { return r; }
+    r = part_reason(toolchain, REBUILD_TOOLCHAIN);
+    if (r != REUSE) { return r; }
+    r = part_reason(config, REBUILD_CONFIG);
+    if (r != REUSE) { return r; }
+    if (verdict_pass == false) { return REBUILD_VERDICT; }
+    return REUSE;
+}
+
+/// A dependent's closure part after its imports were judged: SAME only when every import was
+/// reused. any_import_rebuilt and any_import_missing come from walking the `use` closure.
+pub fn closure_part(any_import_rebuilt: bool, any_import_missing: bool) -> u8 {
+    if (any_import_missing) { return PART_MISSING; }
+    if (any_import_rebuilt) { return PART_DIFF; }
+    return PART_SAME;
+}
+
+/// The fingerprint of one normalized failure: stage in bits 40..47, class in 32..39, scope in 0..31.
+pub fn fingerprint(stage: u8, error_class: u8, scope: u32) -> u64 {
+    return ((stage as u64) << 40) | ((error_class as u64) << 32) | (scope as u64);
+}
+
+pub fn fp_stage(fp: u64) -> u8 {
+    return ((fp >> 40) & 255) as u8;
+}
+
+pub fn fp_class(fp: u64) -> u8 {
+    return ((fp >> 32) & 255) as u8;
+}
+
+pub fn fp_scope(fp: u64) -> u32 {
+    return (fp & 4294967295) as u32;
+}
+
+/// A failure was seen: open an issue for a new fingerprint, update the one already open.
+pub fn on_failure(issue_open: bool) -> u8 {
+    if (issue_open) { return ISSUE_UPDATE; }
+    return ISSUE_OPEN_NEW;
+}
+
+/// A run of the fix finished: close the failure issue only when the run passed, its seal verified
+/// and the original fingerprint did not recur. An agent saying "done" is none of these.
+pub fn on_fix_run(passed: bool, seal_verified: bool, fingerprint_recurred: bool) -> u8 {
+    if (fingerprint_recurred) { return ISSUE_UPDATE; }
+    if (passed and seal_verified) { return ISSUE_CLOSE; }
+    return ISSUE_KEEP;
+}
+
+/// The hardware step. Simulation, synthesis or a built bitstream is not device evidence.
+pub fn hw_state(adapter_ok: bool, device_evidence: bool) -> u8 {
+    if (adapter_ok == false) { return HW_BLOCKED; }
+    if (device_evidence) { return HW_VERIFIED; }
+    return HW_UNPROVEN;
+}
+
+test unchanged_state_is_reused {
+    assert reuse_decision(PART_SAME, PART_SAME, PART_SAME, PART_SAME, true) == REUSE;
+}
+
+test a_leaf_change_rebuilds_the_leaf {
+    assert reuse_decision(PART_DIFF, PART_SAME, PART_SAME, PART_SAME, true) == REBUILD_SPEC;
+}
+
+test a_shared_dependency_change_rebuilds_every_dependent {
+    var dep : u8 = closure_part(true, false);
+    assert dep == PART_DIFF;
+    assert reuse_decision(PART_SAME, dep, PART_SAME, PART_SAME, true) == REBUILD_CLOSURE;
+    var unrelated : u8 = closure_part(false, false);
+    assert reuse_decision(PART_SAME, unrelated, PART_SAME, PART_SAME, true) == REUSE;
+}
+
+test a_toolchain_or_config_change_is_not_reusable {
+    assert reuse_decision(PART_SAME, PART_SAME, PART_DIFF, PART_SAME, true) == REBUILD_TOOLCHAIN;
+    assert reuse_decision(PART_SAME, PART_SAME, PART_SAME, PART_DIFF, true) == REBUILD_CONFIG;
+}
+
+test missing_identity_fails_closed {
+    assert reuse_decision(PART_SAME, PART_SAME, PART_MISSING, PART_SAME, true) == REBUILD_MISSING;
+    assert reuse_decision(PART_MISSING, PART_SAME, PART_SAME, PART_SAME, true) == REBUILD_MISSING;
+    assert closure_part(false, true) == PART_MISSING;
+    assert part_holds(PART_MISSING) == false;
+    assert part_holds(PART_DIFF) == false;
+}
+
+test a_failed_seal_is_never_reused {
+    assert reuse_decision(PART_SAME, PART_SAME, PART_SAME, PART_SAME, false) == REBUILD_VERDICT;
+}
+
+test the_first_differing_part_is_the_reason {
+    assert reuse_decision(PART_DIFF, PART_DIFF, PART_DIFF, PART_DIFF, false) == REBUILD_SPEC;
+    assert reuse_decision(PART_SAME, PART_DIFF, PART_MISSING, PART_DIFF, true) == REBUILD_CLOSURE;
+}
+
+test the_same_failure_gets_the_same_fingerprint {
+    assert fingerprint(STAGE_TEST, 3, 77) == fingerprint(STAGE_TEST, 3, 77);
+    assert fingerprint(STAGE_TEST, 3, 77) != fingerprint(STAGE_TEST, 3, 78);
+    assert fingerprint(STAGE_TEST, 3, 77) != fingerprint(STAGE_TEST, 4, 77);
+    assert fingerprint(STAGE_TEST, 3, 77) != fingerprint(STAGE_SEAL, 3, 77);
+}
+
+test a_fingerprint_reads_back_its_parts {
+    var fp : u64 = fingerprint(STAGE_DEVICE, 255, 4294967295);
+    assert fp_stage(fp) == STAGE_DEVICE;
+    assert fp_class(fp) == 255;
+    assert fp_scope(fp) == 4294967295;
+    var low : u64 = fingerprint(STAGE_PARSE, 0, 0);
+    assert fp_stage(low) == STAGE_PARSE;
+    assert fp_class(low) == 0;
+    assert fp_scope(low) == 0;
+}
+
+test a_repeated_failure_updates_not_duplicates {
+    assert on_failure(false) == ISSUE_OPEN_NEW;
+    assert on_failure(true) == ISSUE_UPDATE;
+}
+
+test a_failure_closes_only_on_verified_evidence {
+    assert on_fix_run(true, true, false) == ISSUE_CLOSE;
+    assert on_fix_run(true, false, false) == ISSUE_KEEP;
+    assert on_fix_run(false, true, false) == ISSUE_KEEP;
+    assert on_fix_run(true, true, true) == ISSUE_UPDATE;
+}
+
+test hardware_without_device_evidence_is_unproven {
+    assert hw_state(true, false) == HW_UNPROVEN;
+    assert hw_state(true, true) == HW_VERIFIED;
+    assert hw_state(false, true) == HW_BLOCKED;
+}
+
+invariant only_same_holds {
+    assert part_holds(PART_SAME);
+    assert REUSE == 0;
+    assert STAGE_PARSE < STAGE_DEVICE;
+    assert HW_UNPROVEN != HW_VERIFIED;
+}

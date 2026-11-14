@@ -1,0 +1,853 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/queen/control.t27 -- the Queen's scheduler control layer: events wake her, leases fence every
+; claim, a person can assign or cancel, and a small set of domain agents is reused across tasks
+; (gHashTag/t27#6657, parent #6655). One home of these rules; nobody restates them. The runtime that
+; moves work is the trios supervisor (gHashTag/BrowserOS, trios/agent-server), whose lifecycle is the
+; canonical task machine of specs/queen/dispatch.t27; the Inngest app of
+; specs/automation/inngest-queen-scheduler.t27 delivers the events. This file adds no second queue,
+; lease registry, bee registry or review: it closes the gaps dispatch.t27 measured, in its own words:
+;   EVENT_RULE        "no event IDs and no event log: GitHub is polled each round"
+;   TASK_LEASE_RULE   "a bee the container runs has no per-task lease and no heartbeat"
+;   WRITER_RULE       "the writer that starts a dispatch does not check the table"
+;   CANCEL_RULE       "none: no route aborts a running turn or drops a dispatch"
+;   CHOICE_RULE       "take the FIRST that survives" -- one task per round, whatever the free slots
+; Measured pulse at the time of writing (#6628, 2026-10-06 03:09:44Z): 17 active of 70 workers, 53 idle,
+; about 145 dispatchable issues, 150 issues held by attempts that were not running, 103 finished but
+; unreviewed, 26 open bee pull requests (9 conflicted), 0 bee merges in 6 h, 7.37 finished dispatches an
+; hour. 53 idle slots beside 145 dispatchable issues is the first-only choice plus holds with no lease.
+; The lifecycle this file makes canonical (the issue's words):
+;   event -> Queen wakes -> select/create/reuse domain bee -> assign -> execute -> evidence ->
+;   verify/review -> compact active context -> next task
+; Not here, and why: the supervisor's wiring is TypeScript in gHashTag/BrowserOS (hand-written foreign
+; code, not written from this repository); it imports these constants from `t27c gen-js` of this file
+; and mirrors the functions, as it does for priority.t27 and review_valve.t27. Until it does, every rule
+; below is a contract with tests, not a measured runtime behaviour. ASCII only (L3).
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module QueenControl;
+
+; --- 1. Events wake the Queen; the tick only reconciles ---------------------------------------------
+
+/// Event kinds. Each one is published once, with a per-stream sequence number, by the component that
+/// caused it: the supervisor (created, ended, lease expired, heartbeat), a bee (evidence), the reviewer
+/// (review), a person through the authenticated board (assign, cancel), the Inngest cron (tick).
+pub const EV_TASK_CREATED : u8 = 0;
+pub const EV_TASK_ENDED : u8 = 1;
+pub const EV_WORKER_IDLE : u8 = 2;
+pub const EV_LEASE_EXPIRED : u8 = 3;
+pub const EV_EVIDENCE : u8 = 4;
+pub const EV_REVIEW : u8 = 5;
+pub const EV_ASSIGN : u8 = 6;
+pub const EV_CANCEL : u8 = 7;
+pub const EV_HEARTBEAT : u8 = 8;
+pub const EV_TICK : u8 = 9;
+pub const EVENT_KINDS : u8 = 10;
+
+/// Inngest event names, index = kind. The host registers one function per name on the existing app
+/// (APP_ID "t27-queen"); a name is the only thing a publisher needs to know.
+pub const EVENT_NAMES : [10]str = [
+    "queen/task.created", "queen/task.ended", "queen/worker.idle", "queen/lease.expired",
+    "queen/task.evidence", "queen/task.reviewed", "queen/task.assign", "queen/task.cancel",
+    "queen/lease.heartbeat", "queen/tick"
+];
+
+/// What a woken Queen does. Every reaction is bounded: one decision, its writes, done.
+pub const R_NONE : u8 = 0;
+pub const R_DISPATCH : u8 = 1;
+pub const R_REVIEW : u8 = 2;
+pub const R_RECLAIM : u8 = 3;
+pub const R_ASSIGN : u8 = 4;
+pub const R_CANCEL : u8 = 5;
+pub const R_RECONCILE : u8 = 6;
+
+/// The reconciliation tick. Five minutes: it repairs a lost event, it is not how work moves. The
+/// supervisor's round today runs on its own timer and on POST; with events it runs on both.
+pub const RECONCILE_SECONDS : u32 = 300;
+
+pub fn reaction_of(kind: u8) -> u8 {
+    if (kind == EV_TASK_CREATED) { return R_DISPATCH; }
+    if (kind == EV_TASK_ENDED) { return R_REVIEW; }
+    if (kind == EV_WORKER_IDLE) { return R_DISPATCH; }
+    if (kind == EV_LEASE_EXPIRED) { return R_RECLAIM; }
+    if (kind == EV_EVIDENCE) { return R_REVIEW; }
+    if (kind == EV_REVIEW) { return R_DISPATCH; }
+    if (kind == EV_ASSIGN) { return R_ASSIGN; }
+    if (kind == EV_CANCEL) { return R_CANCEL; }
+    if (kind == EV_TICK) { return R_RECONCILE; }
+    return R_NONE;
+}
+
+/// A heartbeat renews a lease in the store and needs no decision; every other kind wakes the Queen.
+pub fn wakes_queen(kind: u8) -> bool {
+    return reaction_of(kind) != R_NONE;
+}
+
+/// How long a transition waits before the Queen reacts. A waking event is handled at once; only an
+/// event that wakes nobody is left to the next reconciliation.
+pub fn wake_delay_seconds(kind: u8, seconds_to_tick: u32) -> u32 {
+    if (wakes_queen(kind)) { return 0; }
+    return seconds_to_tick;
+}
+
+/// Idempotency: an event is applied only when its sequence number is past the last one applied on its
+/// stream. A redelivery or an older event changes nothing.
+pub fn event_applies(last_applied: u64, seq: u64) -> bool {
+    return seq > last_applied;
+}
+
+/// Wakes that arrive during a reaction coalesce into one more reaction, as dispatch.t27's
+/// followup_rounds does for round requests.
+pub fn followup_reactions(wakes_during: u32) -> u32 {
+    if (wakes_during > 0) { return 1; }
+    return 0;
+}
+
+/// The tick reconciles when nothing has woken the Queen for a whole period, or a period has passed
+/// since the last reconciliation whatever the events did.
+pub fn reconcile_due(since_last_event: u32, since_last_reconcile: u32) -> bool {
+    if (since_last_reconcile >= RECONCILE_SECONDS) { return true; }
+    return since_last_event >= RECONCILE_SECONDS;
+}
+
+; --- 2. Task leases: one fenced claim per task, renewed by heartbeat --------------------------------
+
+/// The task lease has the shape of the Queen's own queen_lease (dispatch.t27 LEASE_RULE): one
+/// INSERT ... ON CONFLICT DO UPDATE ... WHERE free OR expired OR same holder, which bumps a fence that
+/// never restarts. Holder 0 means no holder. The heartbeat comes from the agent runtime, not from the
+/// model turn, so a long turn keeps its lease and a dead runtime loses it within one TTL.
+pub const NO_HOLDER : u32 = 0;
+pub const TASK_LEASE_TTL_SECONDS : u32 = 180;
+pub const TASK_HEARTBEAT_SECONDS : u32 = 60;
+
+/// The atomic claim. A claimant passes the fence it read; the write lands only if the fence is still
+/// that value and the task is free, expired, or already its own. Two claimants that read the same
+/// fence cannot both land: the first bumps it.
+pub fn claim_lands(holder: u32, me: u32, expired: bool, fence: u64, fence_read: u64) -> bool {
+    if (me == NO_HOLDER) { return false; }
+    if (fence != fence_read) { return false; }
+    if (holder == NO_HOLDER) { return true; }
+    if (expired) { return true; }
+    return holder == me;
+}
+
+pub fn fence_after_claim(fence: u64) -> u64 {
+    return fence + 1;
+}
+
+/// A renewal lands only for the live holder at the fence it claimed with. A runtime that slept past
+/// its TTL renews nothing: the lease may already be someone else's.
+pub fn renew_lands(holder: u32, me: u32, expired: bool, fence: u64, my_fence: u64) -> bool {
+    if (expired) { return false; }
+    if (holder != me) { return false; }
+    return fence == my_fence;
+}
+
+pub fn lease_expired(seconds_since_renewal: u32) -> bool {
+    return seconds_since_renewal >= TASK_LEASE_TTL_SECONDS;
+}
+
+/// Every write a bee makes about its task -- evidence, an ending, a branch head -- carries its fence
+/// and lands only at the current one. A reclaimed bee that wakes up late writes nothing.
+pub fn write_lands(fence: u64, my_fence: u64) -> bool {
+    return fence == my_fence;
+}
+
+/// Reclamation: an expired lease on an unfinished task frees the task at once (EV_LEASE_EXPIRED ->
+/// R_RECLAIM), instead of waiting for dispatch.t27's 120-minute age reaper.
+pub fn reclaimable(finished: bool, seconds_since_renewal: u32) -> bool {
+    if (finished) { return false; }
+    return lease_expired(seconds_since_renewal);
+}
+
+; --- 3. A person assigns and cancels through the same machine ----------------------------------------
+
+/// Where the next task comes from. A person's assignment is taken before the automatic choice; the
+/// automatic choice orders by specs/queen/priority.t27.
+pub const SRC_NONE : u8 = 0;
+pub const SRC_MANUAL : u8 = 1;
+pub const SRC_AUTO : u8 = 2;
+
+pub fn next_source(manual_pending: bool, auto_eligible: bool) -> u8 {
+    if (manual_pending) { return SRC_MANUAL; }
+    if (auto_eligible) { return SRC_AUTO; }
+    return SRC_NONE;
+}
+
+/// Answers to a manual assignment. A person does not take a task out from under a live lease: they
+/// cancel it first, so there is exactly one road by which a lease ends early.
+pub const A_OK : u8 = 0;
+pub const A_HELD : u8 = 1;
+pub const A_AGENT_BUSY : u8 = 2;
+pub const A_WRONG_DOMAIN : u8 = 3;
+
+pub fn assign_answer(task_leased_live: bool, agent_idle: bool, domain_match: bool) -> u8 {
+    if (task_leased_live) { return A_HELD; }
+    if (domain_match == false) { return A_WRONG_DOMAIN; }
+    if (agent_idle == false) { return A_AGENT_BUSY; }
+    return A_OK;
+}
+
+/// Cancellation. Any dispatch that is not accepted can be cancelled: a running one is interrupted
+/// (its agent is told to stop and compact), a finished one leaves review. An accept is done; it is
+/// taken back only by the CI take-back of dispatch.t27. A cancel bumps the fence, so the interrupted
+/// bee's late writes do not land, and frees the issue's files at once.
+pub fn cancel_allowed(accepted: bool) -> bool {
+    return accepted == false;
+}
+
+pub fn fence_after_cancel(fence: u64) -> u64 {
+    return fence + 1;
+}
+
+/// A cancelled attempt is an interruption: it is not counted against the issue's retries
+/// (dispatch.t27 counts_against_issue).
+pub fn cancel_counts_against_issue() -> bool {
+    return false;
+}
+
+; --- 4. Capacity is computed at every wake; every free slot is offered --------------------------------
+
+/// Free slots: the least of what keys and lanes allow, the configured ceiling, and what memory holds.
+/// Recomputed on every wake, so a key added or a bee ended raises it without a restart.
+pub fn capacity(keys: u32, lanes: u32, max_workers: u32, free_mb: u32, mb_per_bee: u32) -> u32 {
+    var cap : u32 = keys * lanes;
+    if (max_workers < cap) { cap = max_workers; }
+    if (mb_per_bee > 0) {
+        var by_memory : u32 = free_mb / mb_per_bee;
+        if (by_memory < cap) { cap = by_memory; }
+    }
+    return cap;
+}
+
+pub fn free_slots(cap: u32, running: u32) -> u32 {
+    if (running >= cap) { return 0; }
+    return cap - running;
+}
+
+/// How many tasks one wake offers. Every free slot, up to the eligible candidates, instead of the
+/// first one: the claims of section 2 make the parallel offers safe.
+pub fn offers_per_wake(slots: u32, eligible: u32) -> u32 {
+    if (eligible < slots) { return eligible; }
+    return slots;
+}
+
+/// Placement: a task goes to an agent of its own domain with the memory it asks for.
+pub fn fits(agent_domain: u32, task_domain: u32, agent_free_mb: u32, need_mb: u32) -> bool {
+    if (agent_domain != task_domain) { return false; }
+    return agent_free_mb >= need_mb;
+}
+
+; --- 5. Domain agents persist; the task context does not ----------------------------------------------
+
+/// The domains of the agent population. A small fixed set, not an agent per task.
+pub const DOMAINS : [4]str = [
+    "t27-c: the C and assembler backends",
+    "t27-b: the native backend and the compiler",
+    "specs: .t27 specifications, seals and their tests",
+    "queen-ops: the supervisor, its reviewers and the board"
+];
+pub const DOMAIN_COUNT : u32 = 4;
+
+/// A domain is an AFFINITY, not a cap (owner, 2026-10-08, #6657). This card used to cap each domain at
+/// four runtimes, sixteen in all. The swarm it governs runs on 70 lanes, so the cap would have cut its
+/// parallelism by about four. A task is placed on a runtime of its own domain when one is idle (it
+/// keeps that domain's build and worktrees warm). Otherwise it is placed on any free lane, which then
+/// becomes a clone of that domain. A task waits only when every lane is busy.
+/// Domain codes, index = DOMAINS. specs/queen/domains.t27 reads a task's domain from its paths; it
+/// is kept apart from this card because the supervisor reads this card through a compiler wasm
+/// whose typechecker does not take that file's byte walks.
+pub const DOMAIN_T27C : u8 = 0;
+pub const DOMAIN_T27B : u8 = 1;
+pub const DOMAIN_SPECS : u8 = 2;
+pub const DOMAIN_QUEEN_OPS : u8 = 3;
+
+/// Agent runtime states. BOOT happens once per runtime; a finished task goes through COMPACT back to
+/// IDLE without a rebuild.
+pub const AG_BOOT : u8 = 0;
+pub const AG_IDLE : u8 = 1;
+pub const AG_BUSY : u8 = 2;
+pub const AG_COMPACT : u8 = 3;
+pub const AG_RETIRED : u8 = 4;
+pub const AG_ILLEGAL : u8 = 99;
+
+pub const AE_READY : u8 = 0;
+pub const AE_ASSIGN : u8 = 1;
+pub const AE_TASK_DONE : u8 = 2;
+pub const AE_INTERRUPT : u8 = 3;
+pub const AE_COMPACTED : u8 = 4;
+pub const AE_RETIRE : u8 = 5;
+
+pub fn agent_next(state: u8, ev: u8) -> u8 {
+    if (state == AG_BOOT) {
+        if (ev == AE_READY) { return AG_IDLE; }
+        return AG_ILLEGAL;
+    }
+    if (state == AG_IDLE) {
+        if (ev == AE_ASSIGN) { return AG_BUSY; }
+        if (ev == AE_RETIRE) { return AG_RETIRED; }
+        return AG_ILLEGAL;
+    }
+    if (state == AG_BUSY) {
+        if (ev == AE_TASK_DONE) { return AG_COMPACT; }
+        if (ev == AE_INTERRUPT) { return AG_COMPACT; }
+        return AG_ILLEGAL;
+    }
+    if (state == AG_COMPACT) {
+        if (ev == AE_COMPACTED) { return AG_IDLE; }
+        return AG_ILLEGAL;
+    }
+    return AG_ILLEGAL;
+}
+
+/// What compaction keeps. The active task context is cleared; the runtime, its identity, its build and
+/// its verified skill lineage stay. Skills are execution state, not truth: they are kept because they
+/// were verified, and they never stand in for task, lease or review state.
+pub fn context_after_compact(context_tokens: u32) -> u32 {
+    return 0;
+}
+
+pub fn lineage_after_compact(lineage: u64) -> u64 {
+    return lineage;
+}
+
+pub fn builds_after_task(builds: u32) -> u32 {
+    return builds;
+}
+
+/// How a task gets an agent: reuse an idle one of its domain, else clone one onto any free lane, else
+/// wait for a lane. The capacity is the lane count of section 4, recomputed at every wake. The Queen
+/// never takes the task herself.
+pub const P_REUSE : u8 = 0;
+pub const P_CLONE : u8 = 1;
+pub const P_WAIT : u8 = 2;
+
+pub fn placement(idle_in_domain: u32, running: u32, cap: u32) -> u8 {
+    if (idle_in_domain > 0) { return P_REUSE; }
+    if (running < cap) { return P_CLONE; }
+    return P_WAIT;
+}
+
+pub fn queen_executes_tasks() -> bool {
+    return false;
+}
+
+/// A clone shares its parent's skill lineage and nothing else: a new runtime identity, its own lease
+/// holder id, no task, no fence.
+pub fn clone_lineage(parent_lineage: u64) -> u64 {
+    return parent_lineage;
+}
+
+pub fn clone_holder(parent_holder: u32, next_free_id: u32) -> u32 {
+    if (next_free_id == parent_holder) { return NO_HOLDER; }
+    return next_free_id;
+}
+
+/// Authority. What an agent remembers about its task never overrides the store: the canonical state
+/// is the answer, and a write lands by its fence alone, whatever the agent believes.
+pub fn authoritative_state(canonical: u32, agent_belief: u32) -> u32 {
+    return canonical;
+}
+
+pub fn agent_write_lands(agent_believes_it_holds: bool, fence: u64, my_fence: u64) -> bool {
+    return write_lands(fence, my_fence);
+}
+
+; --- 6. A new attempt starts from the branch it inherits ----------------------------------------------
+
+/// Measured 2026-10-06 (#6657): the supervisor cuts every attempt from the base (queen-dispatch.ts
+/// prepareWorktree: `git worktree add -B queen-<issue> <path> <base>`), and the runner keeps the remote
+/// tip only when that tip is its own last push. So a re-dispatch over finished, unjudged work started
+/// over from the base. When the Queen then accepted the new attempt, its head did not descend from the
+/// tip already on the remote, the export (which never forces) refused it, and the accept never reached
+/// a pull request: 73 of the 102 accepted, never-pushed heads counted that day had exactly this shape,
+/// every one newer than the tip it could not replace, and 71 of those 73 tips had never been published.
+pub const ST_BASE : u8 = 0;
+pub const ST_TIP : u8 = 1;
+pub const ST_HOLD : u8 = 2;
+
+/// What the remote `queen-<issue>` tip carries when a new attempt is about to start.
+/// TIP_NONE: no branch, or a tip already on the base -- nothing to inherit.
+/// TIP_UNJUDGED: finished work the Queen has no verdict on yet.
+/// TIP_SENT_BACK: judged and not accepted (sendBack, escalate, wait, empty).
+/// TIP_ACCEPTED: accepted at this head, and no pull request on it has closed.
+/// TIP_PR_CLOSED: accepted and published, and the pull request closed unmerged.
+pub const TIP_NONE : u8 = 0;
+pub const TIP_UNJUDGED : u8 = 1;
+pub const TIP_SENT_BACK : u8 = 2;
+pub const TIP_ACCEPTED : u8 = 3;
+pub const TIP_PR_CLOSED : u8 = 4;
+
+/// Where the next attempt starts. Work that is still waiting -- for a verdict, or for publish and
+/// review after an accept -- is held, not restarted: the hold ends when that verdict or review lands
+/// (EV_REVIEW), so it needs no clock and no lease. Judged-and-declined work is inherited, so the next
+/// bee continues from it and its push is a fast-forward. A tip code this file does not know holds.
+pub fn attempt_start(tip: u8) -> u8 {
+    if (tip == TIP_NONE) { return ST_BASE; }
+    if (tip == TIP_SENT_BACK) { return ST_TIP; }
+    if (tip == TIP_PR_CLOSED) { return ST_TIP; }
+    return ST_HOLD;
+}
+
+/// A new attempt's push lands only as a fast-forward of the tip it started from, leased on that exact
+/// tip. An attempt started from the tip always descends from it, so a refusal means the tip moved
+/// under the attempt: the attempt is the stale one, never the tip.
+pub fn attempt_push_lands(tip_moved: bool, descends_from_tip: bool) -> bool {
+    if (tip_moved) { return false; }
+    return descends_from_tip;
+}
+
+/// Recovery for attempts already cut from the base; tools/queen/export_push.py `may_supersede` mirrors
+/// it. An exported head that does not descend from the remote tip replaces that tip only when the
+/// Queen accepted exactly that head, it is newer than the tip (a newer tip is a later attempt still
+/// waiting for her), and no open pull request heads the branch. The old tip is kept first, under the
+/// tag queen-superseded/<issue>/<sha12>, so no commit is lost.
+pub fn may_supersede(accepted: bool, exported_newer: bool, open_pull_request: bool) -> bool {
+    if (accepted == false) { return false; }
+    if (open_pull_request) { return false; }
+    return exported_newer;
+}
+
+pub fn supersede_keeps_old_tip() -> bool {
+    return true;
+}
+
+; --- 7. The effects journal: a new holder does not repeat what the old one did -----------------------
+
+/// A crashed agent restarts as a new pid with a new lease and a new fence (specs/queen/actors.t27), and
+/// nothing told it which of the old holder's effects -- a paid model call, a push, a pull request, a
+/// comment -- had already happened (#7006). Each effect is journaled in the task's store before it
+/// runs (an intent) and after it returns (done, with its result), both at the holder's fence, so a
+/// holder that was reclaimed journals nothing. The key of an entry is the task, the effect's kind and
+/// its target (the branch, the pull request's head, the comment's purpose). Two things are left out of
+/// the key on purpose. The step's position: Temporal and Restate replay by position because their code
+/// is deterministic, while a model turn is not, and a new holder may take its steps in another order.
+/// The fence: every retry has to see the same key, which is why Temporal's suggested key is the run id
+/// and the activity id without the attempt number.
+/// An intent with no result is the case #7006 left open, and it is real: Restate's SDK reference says
+/// that `ctx.run` "may be re-run" when the failure falls between the run and persisting its result,
+/// and AWS's durable execution SDK has an at-most-once mode that marks such a step interrupted instead
+/// of running it again. Here the new holder asks GitHub whether the effect landed, where that can be
+/// asked, and runs it again only when it cannot be asked or did not land -- at most EFFECT_RUN_LIMIT
+/// times under one key, after which the attempt gives up (#7059).
+pub const EFF_NONE : u8 = 0;
+pub const EFF_INTENT : u8 = 1;
+pub const EFF_DONE : u8 = 2;
+
+pub const EK_MODEL_CALL : u8 = 0;
+pub const EK_PUSH : u8 = 1;
+pub const EK_PULL_REQUEST : u8 = 2;
+pub const EK_COMMENT : u8 = 3;
+/// A GitHub release of a tag (specs/queen/jobs.t27, #7676). Publishing one starts the release pipeline
+/// (release.yml runs on `release: published` and publishes the crate), so it is the most irreversible
+/// effect in this file: a second one would be a second publish attempt of the same version.
+pub const EK_RELEASE : u8 = 4;
+pub const EFFECT_KINDS : u8 = 5;
+
+/// What a holder does before an effect. DO_LOOK: ask GitHub, then after_look.
+/// DO_NOTHING: the holder is fenced out and must not run the effect or journal anything.
+/// DO_GIVE_UP: the effect's key has run EFFECT_RUN_LIMIT times without a result; the holder ends the
+/// attempt as failed (give_up_counts_against_issue) instead of running it again.
+pub const DO_RUN : u8 = 0;
+pub const DO_SKIP : u8 = 1;
+pub const DO_LOOK : u8 = 2;
+pub const DO_NOTHING : u8 = 3;
+pub const DO_GIVE_UP : u8 = 4;
+
+/// How many runs one effect's key gets (#7059). Each crash that leaves an intent open runs the effect
+/// again, and a model call is paid on every run. Nothing else counted runs per task: actors.t27 bounds
+/// restarts per runtime and a reclaimed task moves to another runtime, and dispatch.t27 does not count
+/// an interrupted attempt against the issue. The count is part of the journal entry, written with each
+/// intent (runs_after_intent), so a new holder reads it and cannot reset it. Step Functions resets a
+/// retrier's count to 0 when an execution is redriven, and Temporal's default for an activity is
+/// unlimited attempts. Three is the number of free attempts dispatch.t27 RETRY_RULE gives an issue
+/// (written as a literal, T7), so one effect never spends more runs than an issue gets attempts.
+pub const EFFECT_RUN_LIMIT : u32 = 3;
+
+/// GitHub ends a REST request it has not finished in 10 seconds ("Troubleshooting the REST API").
+pub const GITHUB_REQUEST_LIMIT_SECONDS : u32 = 10;
+
+/// Whether GitHub can say if an effect landed: the branch's tip, the open pull request with that
+/// head, or a comment that carries the entry's key as a marker. The comment is found by listing the
+/// issue's comments, not by the search API, which lags. A model call leaves nothing to ask about.
+pub fn effect_can_be_looked_up(kind: u8) -> bool {
+    if (kind == EK_PUSH) { return true; }
+    if (kind == EK_PULL_REQUEST) { return true; }
+    if (kind == EK_COMMENT) { return true; }
+    if (kind == EK_RELEASE) { return true; }
+    return false;
+}
+
+/// Whether GitHub itself refuses a second copy, whoever sends it. A push is leased on the tip it
+/// started from (attempt_push_lands). A second pull request for the same head and base is answered
+/// 422 "A pull request already exists". A comment and a model call have no such key on GitHub's side.
+pub fn receiver_refuses_a_copy(kind: u8) -> bool {
+    if (kind == EK_PUSH) { return true; }
+    if (kind == EK_PULL_REQUEST) { return true; }
+    if (kind == EK_RELEASE) { return true; }
+    return false;
+}
+
+/// Effects run one at a time, as Restate runs no second action while the first one's result is not
+/// durable, so a crash leaves at most one intent without a result. Reads are not effects.
+pub fn intent_may_start(open_intents: u32) -> bool {
+    return open_intents == 0;
+}
+
+/// The count an intent carries: the runs started under its key, this one included. It is written
+/// before the effect runs, so a crash during the effect still counts.
+pub fn runs_after_intent(runs: u32) -> u32 {
+    return runs + 1;
+}
+
+/// An open intent that is not found, or cannot be looked for, runs again until its key has run
+/// EFFECT_RUN_LIMIT times.
+pub fn rerun_or_give_up(runs: u32) -> u8 {
+    if (runs >= EFFECT_RUN_LIMIT) { return DO_GIVE_UP; }
+    return DO_RUN;
+}
+
+/// The journal entry under an effect's key, and the runs its intents counted, decide what happens.
+/// An entry this file does not know counts as an intent, since the effect may have happened.
+pub fn effect_action(entry: u8, kind: u8, runs: u32, fence: u64, my_fence: u64) -> u8 {
+    if (write_lands(fence, my_fence) == false) { return DO_NOTHING; }
+    if (entry == EFF_NONE) { return DO_RUN; }
+    if (entry == EFF_DONE) { return DO_SKIP; }
+    if (effect_can_be_looked_up(kind)) { return DO_LOOK; }
+    return rerun_or_give_up(runs);
+}
+
+/// After a look: if the effect is found, it is journaled done with what was found, and skipped, at
+/// any count. Otherwise it runs again, or gives up past the limit.
+pub fn after_look(found: bool, runs: u32) -> u8 {
+    if (found) { return DO_SKIP; }
+    return rerun_or_give_up(runs);
+}
+
+/// A give-up is not an interruption: it counts against the issue (dispatch.t27 counts_against_issue
+/// with interrupted false), so the issue's send-back ceiling bounds the attempts around it, and
+/// review_valve.t27 takes what follows. No person is waited for.
+pub fn give_up_counts_against_issue() -> bool {
+    return true;
+}
+
+/// A look can trust "not found" only after every request the old runtime sent has finished on
+/// GitHub. Once the runtime is DOWN it sends nothing more, so the look waits until GitHub's request
+/// limit has passed since the DOWN. When the lease merely expired, the old holder may still be alive
+/// behind a partition and may send again, so waiting proves nothing, and the look does not wait.
+/// The 10 s is GitHub's documented limit, after which it terminates a request. That a write it
+/// terminated is never applied later is assumed here, not documented: if it fails, a comment can
+/// repeat even after a DOWN, and its marker shows the copy.
+pub fn look_wait_seconds(old_holder_down: bool, seconds_since_down: u32) -> u32 {
+    if (old_holder_down == false) { return 0; }
+    if (seconds_since_down > GITHUB_REQUEST_LIMIT_SECONDS) { return 0; }
+    return GITHUB_REQUEST_LIMIT_SECONDS + 1 - seconds_since_down;
+}
+
+/// Whether an effect can happen twice even with the journal and the look, assuming the look waited
+/// look_wait_seconds. The fence stops the old holder's journal writes, but not its requests, because
+/// GitHub never sees the fence. So:
+/// - an effect GitHub refuses to copy never repeats;
+/// - an effect that can be looked up does not repeat once the old holder is DOWN (under the
+///   assumption named at look_wait_seconds);
+/// - a comment may repeat behind a partition, and its marker shows the copy;
+/// - a model call runs again after a crash that leaves its intent open, as the at-least-once
+///   window of Restate and Temporal allows, and at most EFFECT_RUN_LIMIT times under one key.
+pub fn effect_may_repeat(kind: u8, old_holder_down: bool) -> bool {
+    if (receiver_refuses_a_copy(kind)) { return false; }
+    if (effect_can_be_looked_up(kind) and old_holder_down) { return false; }
+    return true;
+}
+
+invariant every_kind_has_a_name { assert EVENT_KINDS == 10 and EV_TICK == EVENT_KINDS - 1; }
+invariant the_heartbeat_beats_inside_the_ttl { assert TASK_HEARTBEAT_SECONDS * 3 == TASK_LEASE_TTL_SECONDS; }
+invariant the_lease_beats_the_age_reaper { assert TASK_LEASE_TTL_SECONDS < 120 * 60; }
+invariant the_tick_is_slower_than_a_lease { assert RECONCILE_SECONDS > TASK_LEASE_TTL_SECONDS; }
+invariant every_domain_has_a_name { assert DOMAIN_COUNT == 4 and DOMAIN_QUEEN_OPS == DOMAIN_COUNT - 1; }
+invariant illegal_is_outside_every_agent_state { assert AG_ILLEGAL > AG_RETIRED; }
+/// Every journal entry, effect kind and answer of section 7 is its own value. An answer that equals
+/// another one would read a fenced-out holder as a look.
+invariant the_effect_codes_are_distinct {
+    assert EFF_NONE == 0 and EFF_INTENT == 1 and EFF_DONE == 2;
+    assert EK_MODEL_CALL == 0 and EK_PUSH == 1 and EK_PULL_REQUEST == 2 and EK_COMMENT == 3;
+    assert EK_RELEASE == 4;
+    assert EFFECT_KINDS == EK_RELEASE + 1;
+    assert DO_RUN == 0 and DO_SKIP == 1 and DO_LOOK == 2 and DO_NOTHING == 3 and DO_GIVE_UP == 4;
+}
+/// One crash does not end an attempt (a limit of 1 would make every runtime crash a counted failure,
+/// AWS's at-most-once mode), and one key never gets more runs than dispatch.t27 RETRY_RULE's three free
+/// attempts of an issue.
+invariant a_crashed_effect_runs_again_but_not_forever { assert EFFECT_RUN_LIMIT > 1 and EFFECT_RUN_LIMIT <= 3; }
+/// A look's wait ends before the new holder's first heartbeat is due, so it never costs the lease.
+invariant a_look_waits_less_than_a_heartbeat { assert GITHUB_REQUEST_LIMIT_SECONDS + 1 < TASK_HEARTBEAT_SECONDS; }
+
+test a_synthetic_task_ended_event_wakes_the_queen_before_the_tick {
+    assert wakes_queen(EV_TASK_ENDED) == true;
+    assert reaction_of(EV_TASK_ENDED) == R_REVIEW;
+    assert wake_delay_seconds(EV_TASK_ENDED, 299) == 0;
+    assert wake_delay_seconds(EV_WORKER_IDLE, 299) == 0;
+    assert wake_delay_seconds(EV_LEASE_EXPIRED, 1) == 0;
+    assert wakes_queen(EV_HEARTBEAT) == false;
+    assert wake_delay_seconds(EV_HEARTBEAT, 299) == 299;
+    assert reaction_of(EV_TICK) == R_RECONCILE;
+    assert reaction_of(EV_ASSIGN) == R_ASSIGN;
+    assert reaction_of(EV_CANCEL) == R_CANCEL;
+    // #7074: the whole table, so no kind silently falls through to R_NONE
+    assert reaction_of(EV_TASK_CREATED) == R_DISPATCH;
+    assert reaction_of(EV_WORKER_IDLE) == R_DISPATCH;
+    assert reaction_of(EV_LEASE_EXPIRED) == R_RECLAIM;
+    assert reaction_of(EV_EVIDENCE) == R_REVIEW;
+    assert reaction_of(EV_REVIEW) == R_DISPATCH;
+    assert reaction_of(EV_HEARTBEAT) == R_NONE;
+    assert reaction_of(EV_TICK + 1) == R_NONE;
+}
+
+test a_redelivered_event_changes_nothing {
+    assert event_applies(41, 42) == true;
+    assert event_applies(42, 42) == false;
+    assert event_applies(42, 7) == false;
+    assert followup_reactions(9) == 1;
+    assert followup_reactions(0) == 0;
+}
+
+test the_tick_reconciles_only_after_a_quiet_period {
+    assert reconcile_due(10, 10) == false;
+    assert reconcile_due(300, 10) == true;
+    assert reconcile_due(10, 300) == true;
+    assert reconcile_due(299, 299) == false;
+}
+
+test two_claimants_on_one_fence_land_once {
+    // both read fence 0 on a free task; agent 7 writes first
+    assert claim_lands(NO_HOLDER, 7, false, 0, 0) == true;
+    var fence : u64 = fence_after_claim(0);
+    // agent 9 still holds the fence it read before agent 7 landed
+    assert claim_lands(7, 9, false, fence, 0) == false;
+    // agent 9 re-reads: the lease is live and not its own
+    assert claim_lands(7, 9, false, fence, 1) == false;
+    // agent 7 claiming again at the current fence is its own lease
+    assert claim_lands(7, 7, false, fence, 1) == true;
+    // both see agent 7's lease expired at fence 1; agent 9 lands, agent 11 read the same fence
+    assert claim_lands(7, 9, true, 1, 1) == true;
+    assert claim_lands(9, 11, true, fence_after_claim(1), 1) == false;
+    // nobody claims as holder zero
+    assert claim_lands(NO_HOLDER, NO_HOLDER, false, 0, 0) == false;
+}
+
+test an_expired_lease_is_reclaimed_and_the_old_holder_writes_nothing {
+    assert lease_expired(179) == false;
+    assert lease_expired(180) == true;
+    assert reclaimable(false, 180) == true;
+    assert reclaimable(true, 9999) == false;
+    assert reclaimable(false, 59) == false;
+    // agent 9 takes the expired lease of agent 7 at fence 1
+    assert claim_lands(7, 9, true, 1, 1) == true;
+    var fence : u64 = fence_after_claim(1);
+    assert renew_lands(9, 9, false, fence, 2) == true;
+    // agent 7 wakes up with fence 1: no renewal, no evidence
+    assert renew_lands(9, 7, false, fence, 1) == false;
+    assert write_lands(fence, 1) == false;
+    assert write_lands(fence, 2) == true;
+    // a holder that slept past the ttl renews nothing
+    assert renew_lands(9, 9, true, fence, 2) == false;
+    // a runtime that is not the holder renews nothing, even with the holder's fence
+    assert renew_lands(9, 7, false, fence, 2) == false;
+}
+
+test a_person_assigns_first_and_cannot_steal_a_live_lease {
+    assert next_source(true, true) == SRC_MANUAL;
+    assert next_source(false, true) == SRC_AUTO;
+    assert next_source(false, false) == SRC_NONE;
+    assert assign_answer(true, true, true) == A_HELD;
+    assert assign_answer(false, true, false) == A_WRONG_DOMAIN;
+    assert assign_answer(false, false, true) == A_AGENT_BUSY;
+    assert assign_answer(false, true, true) == A_OK;
+}
+
+test a_cancel_interrupts_frees_and_fences_out_the_bee {
+    assert cancel_allowed(false) == true;
+    assert cancel_allowed(true) == false;
+    assert cancel_counts_against_issue() == false;
+    var fence : u64 = fence_after_cancel(4);
+    assert fence == 5;
+    assert write_lands(fence, 4) == false;
+    // the next holder claims at the bumped fence and its writes land
+    assert write_lands(fence, 5) == true;
+    assert agent_next(AG_BUSY, AE_INTERRUPT) == AG_COMPACT;
+}
+
+test every_free_slot_is_offered_in_one_wake {
+    // the pulse of #6628: 70 workers, 17 running, about 145 dispatchable
+    var cap : u32 = capacity(14, 5, 70, 1000000, 1);
+    assert cap == 70;
+    assert free_slots(cap, 17) == 53;
+    assert offers_per_wake(free_slots(cap, 17), 145) == 53;
+    assert offers_per_wake(53, 3) == 3;
+    // memory and the ceiling each bound it
+    assert capacity(14, 5, 70, 4096, 512) == 8;
+    assert capacity(2, 2, 70, 4096, 512) == 4;
+    assert capacity(14, 5, 10, 4096, 0) == 10;
+    assert free_slots(4, 9) == 0;
+    assert fits(1, 1, 2048, 1024) == true;
+    assert fits(1, 2, 2048, 1024) == false;
+    assert fits(1, 1, 512, 1024) == false;
+    // exactly the memory it asks for is enough
+    assert fits(1, 1, 1024, 1024) == true;
+}
+
+test one_runtime_takes_task_b_after_task_a_without_a_rebuild {
+    var s0 : u8 = agent_next(AG_BOOT, AE_READY);
+    assert s0 == AG_IDLE;
+    // task A: assigned, 120000 tokens of context, done
+    var s1 : u8 = agent_next(s0, AE_ASSIGN);
+    assert s1 == AG_BUSY;
+    var s2 : u8 = agent_next(s1, AE_TASK_DONE);
+    assert s2 == AG_COMPACT;
+    assert context_after_compact(120000) == 0;
+    assert lineage_after_compact(6657) == 6657;
+    assert builds_after_task(1) == 1;
+    var s3 : u8 = agent_next(s2, AE_COMPACTED);
+    assert s3 == AG_IDLE;
+    // task B on the same runtime, with no BOOT in between
+    var s4 : u8 = agent_next(s3, AE_ASSIGN);
+    assert s4 == AG_BUSY;
+    assert agent_next(AG_IDLE, AE_READY) == AG_ILLEGAL;
+    assert agent_next(AG_BUSY, AE_ASSIGN) == AG_ILLEGAL;
+    assert agent_next(AG_COMPACT, AE_ASSIGN) == AG_ILLEGAL;
+    assert agent_next(AG_RETIRED, AE_READY) == AG_ILLEGAL;
+    // an idle runtime can be retired; a busy one is interrupted first
+    assert agent_next(AG_IDLE, AE_RETIRE) == AG_RETIRED;
+    assert agent_next(AG_BUSY, AE_RETIRE) == AG_ILLEGAL;
+}
+
+test a_clone_keeps_the_lineage_and_gets_its_own_lease {
+    assert placement(1, 3, 70) == P_REUSE;
+    assert placement(0, 3, 70) == P_CLONE;
+    assert placement(0, 70, 70) == P_WAIT;
+    assert queen_executes_tasks() == false;
+    assert clone_lineage(6657) == 6657;
+    var clone : u32 = clone_holder(7, 8);
+    assert clone == 8;
+    assert clone != 7;
+    assert clone_holder(7, 7) == NO_HOLDER;
+    // parent and clone race for one task: only one lands, through the same claim
+    assert claim_lands(NO_HOLDER, 7, false, 0, 0) == true;
+    assert claim_lands(7, clone, false, 1, 0) == false;
+}
+
+test a_domain_is_an_affinity_not_a_cap {
+    // owner 2026-10-08: no hard four per domain. A fifth, a sixteenth and a sixty-ninth task of one
+    // domain all get a lane while lanes are free.
+    assert placement(0, 4, 70) == P_CLONE;
+    assert placement(0, 16, 70) == P_CLONE;
+    assert placement(0, 69, 70) == P_CLONE;
+    // an idle runtime of the task's own domain is preferred, even with lanes free
+    assert placement(1, 0, 70) == P_REUSE;
+    // and a full swarm makes a task wait, whatever its domain
+    assert placement(0, 70, 70) == P_WAIT;
+    assert placement(0, 71, 70) == P_WAIT;
+}
+
+test agent_memory_never_overrides_the_store {
+    assert authoritative_state(3, 1) == 3;
+    assert agent_write_lands(true, 5, 4) == false;
+    assert agent_write_lands(false, 5, 5) == true;
+}
+
+test a_re_dispatch_inherits_the_tip_and_never_restarts_waiting_work {
+    assert attempt_start(TIP_NONE) == ST_BASE;
+    assert attempt_start(TIP_UNJUDGED) == ST_HOLD;
+    assert attempt_start(TIP_ACCEPTED) == ST_HOLD;
+    assert attempt_start(TIP_SENT_BACK) == ST_TIP;
+    assert attempt_start(TIP_PR_CLOSED) == ST_TIP;
+    assert attempt_start(99) == ST_HOLD;
+}
+
+test an_attempt_from_the_tip_pushes_as_a_fast_forward {
+    assert attempt_push_lands(false, true) == true;
+    assert attempt_push_lands(true, true) == false;
+    assert attempt_push_lands(false, false) == false;
+}
+
+test the_measured_jam_recovers_without_losing_a_commit {
+    // #6657, 2026-10-06: accepted heads, each newer than an older, unpublished tip
+    assert may_supersede(true, true, false) == true;
+    assert may_supersede(false, true, false) == false;
+    assert may_supersede(true, false, false) == false;
+    assert may_supersede(true, true, true) == false;
+    assert supersede_keeps_old_tip() == true;
+}
+
+test a_restarted_holder_skips_what_landed_and_looks_up_what_may_have {
+    // #7006: the old holder crashed at fence 7; the restarted agent claimed fence 8
+    assert effect_action(EFF_DONE, EK_PULL_REQUEST, 1, 8, 8) == DO_SKIP;
+    assert effect_action(EFF_DONE, EK_MODEL_CALL, 1, 8, 8) == DO_SKIP;
+    assert effect_action(EFF_NONE, EK_PULL_REQUEST, 0, 8, 8) == DO_RUN;
+    assert effect_action(EFF_INTENT, EK_PUSH, 1, 8, 8) == DO_LOOK;
+    assert effect_action(EFF_INTENT, EK_PULL_REQUEST, 1, 8, 8) == DO_LOOK;
+    assert effect_action(EFF_INTENT, EK_COMMENT, 1, 8, 8) == DO_LOOK;
+    assert effect_action(EFF_INTENT, EK_MODEL_CALL, 1, 8, 8) == DO_RUN;
+    assert effect_action(EFF_DONE + 1, EK_COMMENT, 1, 8, 8) == DO_LOOK;
+    assert effect_action(EFF_DONE + 1, EFFECT_KINDS, 1, 8, 8) == DO_RUN;
+    // the old holder, woken late at fence 7, does nothing whatever the journal says
+    assert effect_action(EFF_NONE, EK_COMMENT, 0, 8, 7) == DO_NOTHING;
+    assert effect_action(EFF_DONE, EK_COMMENT, 1, 8, 7) == DO_NOTHING;
+    assert after_look(true, 1) == DO_SKIP;
+    assert after_look(false, 1) == DO_RUN;
+    // one effect at a time, so a crash leaves at most one open intent
+    assert intent_may_start(0) == true;
+    assert intent_may_start(1) == false;
+    // after a DOWN the look outwaits GitHub's 10 s request limit; after a bare expiry waiting proves nothing
+    assert look_wait_seconds(true, 0) == 11;
+    assert look_wait_seconds(true, 10) == 1;
+    assert look_wait_seconds(true, 11) == 0;
+    // long after the limit the wait stays 0; without the guard the u32 subtraction would underflow
+    assert look_wait_seconds(true, 12) == 0;
+    assert look_wait_seconds(true, 3600) == 0;
+    assert look_wait_seconds(false, 0) == 0;
+    // what can still happen twice
+    assert effect_may_repeat(EK_PUSH, false) == false;
+    assert effect_may_repeat(EK_PULL_REQUEST, false) == false;
+    assert effect_may_repeat(EK_COMMENT, true) == false;
+    assert effect_may_repeat(EK_COMMENT, false) == true;
+    assert effect_may_repeat(EK_MODEL_CALL, true) == true;
+}
+test an_effect_that_keeps_crashing_its_holder_gives_up_after_three_runs {
+    // #7059: each intent carries the runs started under its key, bumped before the effect runs
+    assert runs_after_intent(0) == 1;
+    assert runs_after_intent(2) == 3;
+    // a model call left open by a first and a second crash runs again; after the third run it gives up
+    assert effect_action(EFF_INTENT, EK_MODEL_CALL, 1, 8, 8) == DO_RUN;
+    assert effect_action(EFF_INTENT, EK_MODEL_CALL, 2, 8, 8) == DO_RUN;
+    assert effect_action(EFF_INTENT, EK_MODEL_CALL, 3, 8, 8) == DO_GIVE_UP;
+    assert effect_action(EFF_INTENT, EK_MODEL_CALL, 4, 8, 8) == DO_GIVE_UP;
+    assert effect_action(EFF_DONE + 1, EFFECT_KINDS, 3, 8, 8) == DO_GIVE_UP;
+    // a push is looked up first at any count: found, it is skipped, not given up
+    assert effect_action(EFF_INTENT, EK_PUSH, 3, 8, 8) == DO_LOOK;
+    assert after_look(true, 3) == DO_SKIP;
+    assert after_look(false, 2) == DO_RUN;
+    assert after_look(false, 3) == DO_GIVE_UP;
+    // a done entry is skipped at any count, and a fenced-out holder does nothing
+    assert effect_action(EFF_DONE, EK_MODEL_CALL, 3, 8, 8) == DO_SKIP;
+    assert effect_action(EFF_INTENT, EK_MODEL_CALL, 3, 8, 7) == DO_NOTHING;
+    assert rerun_or_give_up(0) == DO_RUN;
+    assert rerun_or_give_up(2) == DO_RUN;
+    assert rerun_or_give_up(3) == DO_GIVE_UP;
+    // a give-up is counted against the issue; a cancel is an interruption and is not
+    assert give_up_counts_against_issue() == true;
+    assert give_up_counts_against_issue() != cancel_counts_against_issue();
+}
+
+// #7676: a release is found by its tag, and GitHub answers 422 "already_exists" to a second release
+// of the same tag, so a restarted Queen looks before it publishes and never publishes twice.
+test a_release_is_looked_up_by_its_tag_and_never_published_twice {
+    assert effect_can_be_looked_up(EK_RELEASE) == true;
+    assert receiver_refuses_a_copy(EK_RELEASE) == true;
+    assert effect_action(EFF_NONE, EK_RELEASE, 0, 8, 8) == DO_RUN;
+    assert effect_action(EFF_INTENT, EK_RELEASE, 1, 8, 8) == DO_LOOK;
+    assert effect_action(EFF_DONE, EK_RELEASE, 1, 8, 8) == DO_SKIP;
+    assert after_look(true, 3) == DO_SKIP;
+    assert after_look(false, 1) == DO_RUN;
+    assert effect_may_repeat(EK_RELEASE, false) == false;
+    // a fenced-out holder does nothing, a release included
+    assert effect_action(EFF_NONE, EK_RELEASE, 0, 8, 7) == DO_NOTHING;
+}

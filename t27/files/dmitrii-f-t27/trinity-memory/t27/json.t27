@@ -1,0 +1,356 @@
+// Strict, bounded UTF-8 JSON parser. Native algorithms; no heap allocation.
+// C adapter: double tm_json_strtod(uint8_t *nul_terminated), C numeric locale.
+// Caller provides nonoverlapping live input, tokens, and decoded-byte arena.
+// Failed parses may change scratch tokens/arena; result is written on success only.
+module TrinityMemoryJson {
+    const TM_JSON_NULL: i32 = 0;
+    const TM_JSON_FALSE: i32 = 1;
+    const TM_JSON_TRUE: i32 = 2;
+    const TM_JSON_INTEGER: i32 = 3;
+    const TM_JSON_REAL: i32 = 4;
+    const TM_JSON_STRING: i32 = 5;
+    const TM_JSON_ARRAY: i32 = 6;
+    const TM_JSON_OBJECT: i32 = 7;
+    const TM_JSON_ERR_SYNTAX: i32 = -30;
+    const TM_JSON_ERR_CAPACITY: i32 = -31;
+    const TM_JSON_ERR_DEPTH: i32 = -32;
+    const TM_JSON_ERR_DUPLICATE: i32 = -33;
+    const TM_JSON_ERR_NUMBER: i32 = -34;
+    const TM_JSON_ERR_UTF8: i32 = -35;
+
+    struct TMJsonToken {
+        kind: i32,
+        first: i64,
+        next: i64,
+        text: []u8,
+        text_size: usize,
+        integer: i64,
+        real: f64,
+        uinteger: u64,
+        negative: bool,
+        integer_fits_i64: bool,
+    }
+    struct TMJsonResult { root: i64, token_count: usize, arena_used: usize, }
+    struct TMJsonState {
+        data: []u8, size: usize, pos: usize,
+        tokens: []TMJsonToken, token_capacity: usize, token_count: usize,
+        arena: []u8, arena_capacity: usize, arena_used: usize,
+        max_depth: usize, error: i32,
+    }
+
+    fn tm_json_fail(s: *TMJsonState, error: i32) -> i64 { s.error = error; return -1; }
+    fn tm_json_space(s: *TMJsonState) -> void {
+        while (s.pos < s.size) {
+            var c: u8 = s.data[s.pos];
+            if (c != 32 && c != 9 && c != 10 && c != 13) { return; }
+            s.pos = s.pos + 1;
+        }
+    }
+    fn tm_json_put(s: *TMJsonState, value: u8) -> bool {
+        if (s.arena_used >= s.arena_capacity) { s.error = TM_JSON_ERR_CAPACITY; return false; }
+        s.arena[s.arena_used] = value;
+        s.arena_used = s.arena_used + 1;
+        return true;
+    }
+    fn tm_json_token(s: *TMJsonState, kind: i32) -> i64 {
+        if (s.token_count >= s.token_capacity) { return tm_json_fail(s, TM_JSON_ERR_CAPACITY); }
+        var index: usize = s.token_count;
+        s.token_count = s.token_count + 1;
+        s.tokens[index].kind = kind;
+        s.tokens[index].first = -1; s.tokens[index].next = -1;
+        s.tokens[index].text = s.data; s.tokens[index].text_size = 0;
+        s.tokens[index].integer = 0; s.tokens[index].real = 0.0;
+        s.tokens[index].uinteger = 0; s.tokens[index].negative = false;
+        s.tokens[index].integer_fits_i64 = false;
+        return index as i64;
+    }
+    fn tm_json_utf8_width(data: []u8, size: usize, pos: usize) -> usize {
+        if (pos >= size) { return 0; }
+        var a: u8 = data[pos];
+        if (a < 128) { return 1; }
+        var width: usize = 0;
+        if (a >= 194 && a <= 223) { width = 2; }
+        if (a >= 224 && a <= 239) { width = 3; }
+        if (a >= 240 && a <= 244) { width = 4; }
+        if (width == 0 || width > size - pos) { return 0; }
+        var i: usize = 1;
+        while (i < width) {
+            if (data[pos + i] < 128 || data[pos + i] > 191) { return 0; }
+            i = i + 1;
+        }
+        if (a == 224 && data[pos + 1] < 160) { return 0; }
+        if (a == 237 && data[pos + 1] > 159) { return 0; }
+        if (a == 240 && data[pos + 1] < 144) { return 0; }
+        if (a == 244 && data[pos + 1] > 143) { return 0; }
+        return width;
+    }
+    fn tm_json_hex4(s: *TMJsonState) -> i32 {
+        if (s.size - s.pos < 4) { s.error = TM_JSON_ERR_SYNTAX; return -1; }
+        var value: i32 = 0;
+        var i: usize = 0;
+        while (i < 4) {
+            var c: u8 = s.data[s.pos]; var digit: i32 = -1;
+            if (c >= 48 && c <= 57) { digit = (c - 48) as i32; }
+            if (c >= 65 && c <= 70) { digit = (c - 55) as i32; }
+            if (c >= 97 && c <= 102) { digit = (c - 87) as i32; }
+            if (digit < 0) { s.error = TM_JSON_ERR_SYNTAX; return -1; }
+            value = value * 16 + digit; s.pos = s.pos + 1; i = i + 1;
+        }
+        return value;
+    }
+    fn tm_json_codepoint(s: *TMJsonState, value: u32) -> bool {
+        if (value < 128) { return tm_json_put(s, value as u8); }
+        if (value < 2048) {
+            return tm_json_put(s, (192 | (value >> 6)) as u8) && tm_json_put(s, (128 | (value & 63)) as u8);
+        }
+        if (value < 65536) {
+            return tm_json_put(s, (224 | (value >> 12)) as u8) &&
+                tm_json_put(s, (128 | ((value >> 6) & 63)) as u8) && tm_json_put(s, (128 | (value & 63)) as u8);
+        }
+        return tm_json_put(s, (240 | (value >> 18)) as u8) &&
+            tm_json_put(s, (128 | ((value >> 12) & 63)) as u8) &&
+            tm_json_put(s, (128 | ((value >> 6) & 63)) as u8) && tm_json_put(s, (128 | (value & 63)) as u8);
+    }
+
+    fn tm_json_string(s: *TMJsonState) -> i64 {
+        if (s.pos >= s.size || s.data[s.pos] != 34) { return tm_json_fail(s, TM_JSON_ERR_SYNTAX); }
+        var token: i64 = tm_json_token(s, TM_JSON_STRING);
+        if (token < 0) { return -1; }
+        var start: usize = s.arena_used;
+        s.pos = s.pos + 1;
+        while (s.pos < s.size) {
+            var c: u8 = s.data[s.pos];
+            if (c == 34) {
+                var length: usize = s.arena_used - start;
+                if (!tm_json_put(s, 0)) { return -1; }
+                s.tokens[token as usize].text = &s.arena[start];
+                s.tokens[token as usize].text_size = length;
+                s.pos = s.pos + 1;
+                return token;
+            }
+            if (c < 32) { return tm_json_fail(s, TM_JSON_ERR_SYNTAX); }
+            if (c == 92) {
+                s.pos = s.pos + 1;
+                if (s.pos >= s.size) { return tm_json_fail(s, TM_JSON_ERR_SYNTAX); }
+                var escape: u8 = s.data[s.pos]; s.pos = s.pos + 1;
+                if (escape == 117) {
+                    var first: i32 = tm_json_hex4(s);
+                    if (first < 0) { return -1; }
+                    var point: u32 = first as u32;
+                    if (first >= 55296 && first <= 56319) {
+                        if (s.size - s.pos < 2 || s.data[s.pos] != 92 || s.data[s.pos + 1] != 117) {
+                            return tm_json_fail(s, TM_JSON_ERR_UTF8);
+                        }
+                        s.pos = s.pos + 2;
+                        var second: i32 = tm_json_hex4(s);
+                        if (second < 0) { return -1; }
+                        if (second < 56320 || second > 57343) { return tm_json_fail(s, TM_JSON_ERR_UTF8); }
+                        point = 65536 + (((first - 55296) as u32) * 1024) + ((second - 56320) as u32);
+                    } else {
+                        if (first >= 56320 && first <= 57343) { return tm_json_fail(s, TM_JSON_ERR_UTF8); }
+                    }
+                    if (!tm_json_codepoint(s, point)) { return -1; }
+                } else {
+                    var decoded: i32 = -1;
+                    if (escape == 34 || escape == 92 || escape == 47) { decoded = escape as i32; }
+                    if (escape == 98) { decoded = 8; }
+                    if (escape == 102) { decoded = 12; }
+                    if (escape == 110) { decoded = 10; }
+                    if (escape == 114) { decoded = 13; }
+                    if (escape == 116) { decoded = 9; }
+                    if (decoded < 0) { return tm_json_fail(s, TM_JSON_ERR_SYNTAX); }
+                    if (!tm_json_put(s, decoded as u8)) { return -1; }
+                }
+            } else {
+                var width: usize = tm_json_utf8_width(s.data, s.size, s.pos);
+                if (width == 0) { return tm_json_fail(s, TM_JSON_ERR_UTF8); }
+                var i: usize = 0;
+                while (i < width) {
+                    if (!tm_json_put(s, s.data[s.pos + i])) { return -1; }
+                    i = i + 1;
+                }
+                s.pos = s.pos + width;
+            }
+        }
+        return tm_json_fail(s, TM_JSON_ERR_SYNTAX);
+    }
+
+    fn tm_json_number(s: *TMJsonState) -> i64 {
+        var start: usize = s.pos; var minus: bool = false; var real: bool = false;
+        if (s.data[s.pos] == 45) { minus = true; s.pos = s.pos + 1; }
+        if (s.pos >= s.size) { return tm_json_fail(s, TM_JSON_ERR_SYNTAX); }
+        var digit_start: usize = s.pos;
+        if (s.data[s.pos] == 48) { s.pos = s.pos + 1; }
+        else {
+            if (s.data[s.pos] < 49 || s.data[s.pos] > 57) { return tm_json_fail(s, TM_JSON_ERR_SYNTAX); }
+            while (s.pos < s.size && s.data[s.pos] >= 48 && s.data[s.pos] <= 57) { s.pos = s.pos + 1; }
+        }
+        // An integer part beginning with zero cannot have another digit.
+        if (s.pos < s.size && s.data[s.pos] >= 48 && s.data[s.pos] <= 57) {
+            return tm_json_fail(s, TM_JSON_ERR_SYNTAX);
+        }
+        if (s.pos < s.size && s.data[s.pos] == 46) {
+            real = true; s.pos = s.pos + 1;
+            var fraction: usize = s.pos;
+            while (s.pos < s.size && s.data[s.pos] >= 48 && s.data[s.pos] <= 57) { s.pos = s.pos + 1; }
+            if (s.pos == fraction) { return tm_json_fail(s, TM_JSON_ERR_SYNTAX); }
+        }
+        if (s.pos < s.size && (s.data[s.pos] == 101 || s.data[s.pos] == 69)) {
+            real = true; s.pos = s.pos + 1;
+            if (s.pos < s.size && (s.data[s.pos] == 43 || s.data[s.pos] == 45)) { s.pos = s.pos + 1; }
+            var exponent: usize = s.pos;
+            while (s.pos < s.size && s.data[s.pos] >= 48 && s.data[s.pos] <= 57) { s.pos = s.pos + 1; }
+            if (s.pos == exponent) { return tm_json_fail(s, TM_JSON_ERR_SYNTAX); }
+        }
+        var length: usize = s.pos - start;
+        var magnitude: u64 = 0;
+        if (!real) {
+            if (length > 20) { return tm_json_fail(s, TM_JSON_ERR_NUMBER); }
+            var i: usize = digit_start;
+            while (i < s.pos) {
+                var digit: u64 = (s.data[i] - 48) as u64;
+                if (magnitude > (0xffffffffffffffff - digit) / 10) { return tm_json_fail(s, TM_JSON_ERR_NUMBER); }
+                magnitude = magnitude * 10 + digit; i = i + 1;
+            }
+            if (minus && magnitude > 0x8000000000000000) { return tm_json_fail(s, TM_JSON_ERR_NUMBER); }
+        }
+        var kind: i32 = TM_JSON_INTEGER;
+        if (real) { kind = TM_JSON_REAL; }
+        var token: i64 = tm_json_token(s, kind);
+        if (token < 0) { return -1; }
+        var text_start: usize = s.arena_used;
+        var i: usize = start;
+        while (i < s.pos) { if (!tm_json_put(s, s.data[i])) { return -1; } i = i + 1; }
+        if (!tm_json_put(s, 0)) { return -1; }
+        s.tokens[token as usize].text = &s.arena[text_start];
+        s.tokens[token as usize].text_size = length;
+        if (real) {
+            var value: f64 = tm_json_strtod(&s.arena[text_start]);
+            if (!(value >= -1.7976931348623157e308 && value <= 1.7976931348623157e308)) {
+                return tm_json_fail(s, TM_JSON_ERR_NUMBER);
+            }
+            s.tokens[token as usize].real = value;
+        } else {
+            s.tokens[token as usize].uinteger = magnitude;
+            s.tokens[token as usize].negative = minus && magnitude != 0;
+            if (minus) {
+                s.tokens[token as usize].integer_fits_i64 = true;
+                if (magnitude == 0x8000000000000000) { s.tokens[token as usize].integer = -9223372036854775807 - 1; }
+                else { s.tokens[token as usize].integer = -(magnitude as i64); }
+            } else {
+                if (magnitude <= 0x7fffffffffffffff) {
+                    s.tokens[token as usize].integer_fits_i64 = true;
+                    s.tokens[token as usize].integer = magnitude as i64;
+                }
+            }
+        }
+        return token;
+    }
+
+    fn tm_json_equal(a: []u8, an: usize, b: []u8, bn: usize) -> bool {
+        if (an != bn) { return false; }
+        var i: usize = 0;
+        while (i < an) { if (a[i] != b[i]) { return false; } i = i + 1; }
+        return true;
+    }
+
+    fn tm_json_value(s: *TMJsonState, depth: usize) -> i64 {
+        tm_json_space(s);
+        if (s.pos >= s.size) { return tm_json_fail(s, TM_JSON_ERR_SYNTAX); }
+        var c: u8 = s.data[s.pos];
+        if (c == 34) { return tm_json_string(s); }
+        if (c == 45 || (c >= 48 && c <= 57)) { return tm_json_number(s); }
+        if (c == 91 || c == 123) {
+            if (depth >= s.max_depth) { return tm_json_fail(s, TM_JSON_ERR_DEPTH); }
+            var kind: i32 = TM_JSON_ARRAY; var closer: u8 = 93;
+            if (c == 123) { kind = TM_JSON_OBJECT; closer = 125; }
+            var container: i64 = tm_json_token(s, kind);
+            if (container < 0) { return -1; }
+            s.pos = s.pos + 1; tm_json_space(s);
+            if (s.pos < s.size && s.data[s.pos] == closer) { s.pos = s.pos + 1; return container; }
+            var previous: i64 = -1;
+            var done: bool = false;
+            while (!done) {
+                var child: i64 = -1;
+                if (kind == TM_JSON_OBJECT) {
+                    child = tm_json_string(s);
+                    if (child < 0) { return -1; }
+                    var key: i64 = s.tokens[container as usize].first;
+                    while (key >= 0) {
+                        if (tm_json_equal(s.tokens[key as usize].text, s.tokens[key as usize].text_size,
+                                          s.tokens[child as usize].text, s.tokens[child as usize].text_size)) {
+                            return tm_json_fail(s, TM_JSON_ERR_DUPLICATE);
+                        }
+                        key = s.tokens[key as usize].next;
+                    }
+                    tm_json_space(s);
+                    if (s.pos >= s.size || s.data[s.pos] != 58) { return tm_json_fail(s, TM_JSON_ERR_SYNTAX); }
+                    s.pos = s.pos + 1;
+                    var value: i64 = tm_json_value(s, depth + 1);
+                    if (value < 0) { return -1; }
+                    s.tokens[child as usize].first = value;
+                } else {
+                    child = tm_json_value(s, depth + 1);
+                    if (child < 0) { return -1; }
+                }
+                if (previous < 0) { s.tokens[container as usize].first = child; }
+                else { s.tokens[previous as usize].next = child; }
+                previous = child;
+                tm_json_space(s);
+                if (s.pos >= s.size) { return tm_json_fail(s, TM_JSON_ERR_SYNTAX); }
+                if (s.data[s.pos] == closer) { s.pos = s.pos + 1; done = true; }
+                else {
+                    if (s.data[s.pos] != 44) { return tm_json_fail(s, TM_JSON_ERR_SYNTAX); }
+                    s.pos = s.pos + 1; tm_json_space(s);
+                    if (s.pos >= s.size || s.data[s.pos] == closer) { return tm_json_fail(s, TM_JSON_ERR_SYNTAX); }
+                }
+            }
+            return container;
+        }
+        var length: usize = 0; var kind: i32 = TM_JSON_NULL;
+        if (c == 110 && s.size - s.pos >= 4 && s.data[s.pos + 1] == 117 &&
+            s.data[s.pos + 2] == 108 && s.data[s.pos + 3] == 108) { length = 4; }
+        if (c == 116 && s.size - s.pos >= 4 && s.data[s.pos + 1] == 114 &&
+            s.data[s.pos + 2] == 117 && s.data[s.pos + 3] == 101) { length = 4; kind = TM_JSON_TRUE; }
+        if (c == 102 && s.size - s.pos >= 5 && s.data[s.pos + 1] == 97 &&
+            s.data[s.pos + 2] == 108 && s.data[s.pos + 3] == 115 && s.data[s.pos + 4] == 101) { length = 5; kind = TM_JSON_FALSE; }
+        if (length == 0) { return tm_json_fail(s, TM_JSON_ERR_SYNTAX); }
+        s.pos = s.pos + length;
+        return tm_json_token(s, kind);
+    }
+
+    fn tm_json_parse(data: []u8, size: usize, tokens: []TMJsonToken, token_capacity: usize,
+                     arena: []u8, arena_capacity: usize, max_depth: usize, result: *TMJsonResult) -> i32 {
+        if (max_depth == 0 || max_depth > 64) { return TM_JSON_ERR_DEPTH; }
+        if ((token_capacity as u64) > 0x7fffffffffffffff) { return TM_JSON_ERR_CAPACITY; }
+        var state: TMJsonState = TMJsonState{ .data = data, .size = size, .pos = 0,
+            .tokens = tokens, .token_capacity = token_capacity, .token_count = 0,
+            .arena = arena, .arena_capacity = arena_capacity, .arena_used = 0,
+            .max_depth = max_depth, .error = 0 };
+        var root: i64 = tm_json_value(&state, 0);
+        if (root < 0) { return state.error; }
+        tm_json_space(&state);
+        if (state.pos != state.size) { return TM_JSON_ERR_SYNTAX; }
+        result.root = root; result.token_count = state.token_count; result.arena_used = state.arena_used;
+        return 0;
+    }
+
+    fn tm_json_field(tokens: []TMJsonToken, token_count: usize, object_index: i64,
+                     key: []u8, key_size: usize) -> i64 {
+        if (object_index < 0 || (object_index as u64) >= (token_count as u64)) { return -2; }
+        if (tokens[object_index as usize].kind != TM_JSON_OBJECT) { return -2; }
+        var child: i64 = tokens[object_index as usize].first;
+        var visited: usize = 0;
+        while (child >= 0) {
+            if ((child as u64) >= (token_count as u64) || visited >= token_count) { return -2; }
+            if (tokens[child as usize].kind != TM_JSON_STRING) { return -2; }
+            if (tm_json_equal(tokens[child as usize].text, tokens[child as usize].text_size, key, key_size)) {
+                var value: i64 = tokens[child as usize].first;
+                if (value < 0 || (value as u64) >= (token_count as u64)) { return -2; }
+                return value;
+            }
+            child = tokens[child as usize].next; visited = visited + 1;
+        }
+        return -1;
+    }
+}

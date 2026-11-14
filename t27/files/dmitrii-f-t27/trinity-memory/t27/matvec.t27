@@ -1,0 +1,371 @@
+// Real-layer matrix-vector products on decoded ternary weights (issue #33).
+// Canonical executable source: the shared library, the test harness and
+// formats.wasm are generated from it. The decoders of t27/formats.t27 emit one
+// i32 per weight in C order [rows = out_features, cols = in_features]; this
+// module multiplies such a matrix with an int8 activation vector in exact
+// integer arithmetic and then applies the stored scales in a stated order.
+//
+// y_int[r] = sum_j p[r][j], p[r][j] = sum_{k < group} W[r][j*group + k] * x[j*group + k]
+// Every partial p is one tm_dot_i64 call of t27/compute.t27 on an i64-widened
+// row (i64 accumulators); a row is widened once into caller scratch.
+//
+// Statuses reuse the reject classes of t27/formats.t27 (specs/formats/OWNERS.md):
+//   TF_ERR_FORMAT (-50)          unknown scale kind
+//   TF_ERR_LENGTH (-51)          a shape or group that does not tile, a scale
+//                                count that does not match the shape, or a value
+//                                beyond the exactness bound of a float step
+//   TF_ERR_CAPACITY (-52)        caller buffer too small
+//   TF_ERR_CODE (-53)            a weight outside {-1, 0, +1}, for example the +2
+//                                of 2-bit code 3, which decoders flag as
+//                                outside_ternary; the product refuses it
+//   TF_ERR_SCALE_NONFINITE (-58) NaN or infinite scale word
+// Every input is validated before the first output is written: a rejecting
+// call leaves its outputs untouched (scratch buffers excepted).
+// This module needs compute.h (tm_dot_i64, tm_add_i64_checked), formats.h
+// (TF_*, tf_scale_class, tf_scale_value, tf_pow2) and random.h (TMRandom)
+// earlier in the same translation unit.
+module TrinityMemoryMatvec {
+    // |y| below 2^29 keeps y * scale exact in f64: a scale word has at most 24
+    // significant bits (f32; bf16 has 8, f16 11) and 29 + 24 = 53.
+    const TMV_EXACT_PRODUCT_LIMIT: i64 = 536870912;
+    // |p| up to 2^22 keeps p * (f16 * 2^24) below 2^62: f16 * 2^24 < 2^40.
+    const TMV_EXACT_PARTIAL_LIMIT: i64 = 4194304;
+    // f16 values are integers once multiplied by 2^24 (the subnormal step).
+    const TMV_F16_SHIFT: i32 = 24;
+
+    // x[i] = CPython random.Random(seed).randint(-128, 127), i = 0 .. count-1,
+    // drawn in index order (t27/random.t27 restates MT19937 and _randbelow).
+    // The vector for n columns is the first n draws of the same stream.
+    fn tmv_activations(seed: i64, x: []i8, count: usize) -> i32 {
+        var random: TMRandom;
+        tm_random_init_i64(&random, seed);
+        var drawn: [1]i64 = [0];
+        var i: usize = 0;
+        while (i < count) {
+            if (tm_random_randint(&random, -128, 127, drawn) != 0) { return TF_ERR_LENGTH; }
+            x[i] = drawn[0] as i8;
+            i = i + 1;
+        }
+        return 0;
+    }
+
+    // Number of weights outside {-1, 0, +1}.
+    fn tmv_outside_ternary(weights: []i32, count: usize) -> i64 {
+        var total: i64 = 0;
+        var i: usize = 0;
+        while (i < count) {
+            if (weights[i] < -1 || weights[i] > 1) { total = total + 1; }
+            i = i + 1;
+        }
+        return total;
+    }
+
+    // partials[r * groups + j] = p[r][j] and out[r] = y_int[r], groups = cols / group.
+    // row64 and x64 are caller scratch of at least cols lanes each.
+    fn tmv_matvec(weights: []i32, rows: usize, cols: usize, x: []i8, group: usize,
+                  row64: []i64, x64: []i64, scratch_capacity: usize,
+                  partials: []i64, partial_capacity: usize,
+                  out: []i64, out_capacity: usize) -> i32 {
+        if (rows == 0 || cols == 0 || group == 0) { return TF_ERR_LENGTH; }
+        if (cols % group != 0) { return TF_ERR_LENGTH; }
+        // One product is at most 128 in magnitude: this keeps every row sum in i64.
+        if ((cols as u64) > 72057594037927935) { return TF_ERR_LENGTH; }
+        var groups: usize = cols / group;
+        if (scratch_capacity < cols || out_capacity < rows) { return TF_ERR_CAPACITY; }
+        if (rows > partial_capacity / groups) { return TF_ERR_CAPACITY; }
+        if (tmv_outside_ternary(weights, rows * cols) != 0) { return TF_ERR_CODE; }
+        var k: usize = 0;
+        while (k < cols) { x64[k] = x[k] as i64; k = k + 1; }
+        var r: usize = 0;
+        while (r < rows) {
+            k = 0;
+            while (k < cols) { row64[k] = weights[r * cols + k] as i64; k = k + 1; }
+            var sum: i64 = 0;
+            var j: usize = 0;
+            while (j < groups) {
+                var status: i32 = tm_dot_i64(&row64[j * group], group as u64, &x64[j * group], group as u64,
+                                             1, group as u64, &partials[r * groups + j], 1);
+                if (status != 0) { return TF_ERR_CODE; }
+                sum = sum + partials[r * groups + j];
+                j = j + 1;
+            }
+            out[r] = sum;
+            r = r + 1;
+        }
+        return 0;
+    }
+
+    // Largest |v|, or TF_ERR_LENGTH for INT64_MIN, whose magnitude is not an i64.
+    fn tmv_max_abs(values: []i64, count: usize) -> i64 {
+        var lowest: i64 = 0;
+        var i: usize = 0;
+        while (i < count) {
+            var v: i64 = values[i];
+            if (v > 0) { v = 0 - v; }
+            if (v < lowest) { lowest = v; }
+            i = i + 1;
+        }
+        if (lowest < -9223372036854775807) { return TF_ERR_LENGTH as i64; }
+        return 0 - lowest;
+    }
+
+    // Positions where two i64 vectors differ; first[0] is the first one or -1.
+    fn tmv_mismatches_i64(a: []i64, b: []i64, count: usize, first: []i64) -> i64 {
+        var total: i64 = 0;
+        first[0] = -1;
+        var i: usize = 0;
+        while (i < count) {
+            if (a[i] != b[i]) {
+                if (total == 0) { first[0] = i as i64; }
+                total = total + 1;
+            }
+            i = i + 1;
+        }
+        return total;
+    }
+
+    // Positions where two f64 vectors differ as values; first[0] is the first or -1.
+    fn tmv_mismatches_f64(a: []f64, b: []f64, count: usize, first: []i64) -> i64 {
+        var total: i64 = 0;
+        first[0] = -1;
+        var i: usize = 0;
+        while (i < count) {
+            if (a[i] != b[i]) {
+                if (total == 0) { first[0] = i as i64; }
+                total = total + 1;
+            }
+            i = i + 1;
+        }
+        return total;
+    }
+
+    // out[i] = a[i] - b[i] for two trit tensors. Returns the number of nonzero
+    // differences, or TF_ERR_CODE when one lies outside {-1, 0, +1} (a pair
+    // +1/-1): then out is untouched.
+    fn tmv_difference(a: []i32, b: []i32, count: usize, out: []i32, out_capacity: usize) -> i64 {
+        if (count > out_capacity) { return TF_ERR_CAPACITY as i64; }
+        var i: usize = 0;
+        while (i < count) {
+            var d: i64 = (a[i] as i64) - (b[i] as i64);
+            if (d < -1 || d > 1) { return TF_ERR_CODE as i64; }
+            i = i + 1;
+        }
+        var nonzero: i64 = 0;
+        i = 0;
+        while (i < count) {
+            out[i] = a[i] - b[i];
+            if (out[i] != 0) { nonzero = nonzero + 1; }
+            i = i + 1;
+        }
+        return nonzero;
+    }
+
+    // Rows of a [rows, cols] tensor that hold at least one nonzero value.
+    fn tmv_rows_nonzero(values: []i32, rows: usize, cols: usize) -> i64 {
+        var total: i64 = 0;
+        var r: usize = 0;
+        while (r < rows) {
+            var k: usize = 0;
+            var found: bool = false;
+            while (k < cols && !found) {
+                if (values[r * cols + k] != 0) { found = true; }
+                k = k + 1;
+            }
+            if (found) { total = total + 1; }
+            r = r + 1;
+        }
+        return total;
+    }
+
+    // Rows where ya - yb differs from yd (0 when the difference of two products
+    // is exactly the product of the difference tensor); first[0] or -1.
+    fn tmv_residual(ya: []i64, yb: []i64, yd: []i64, count: usize, first: []i64) -> i64 {
+        var total: i64 = 0;
+        first[0] = -1;
+        var i: usize = 0;
+        while (i < count) {
+            if (ya[i] - yd[i] != yb[i]) {
+                if (total == 0) { first[0] = i as i64; }
+                total = total + 1;
+            }
+            i = i + 1;
+        }
+        return total;
+    }
+
+    fn tmv_kind_known(kind: i32) -> bool {
+        return kind == TF_KIND_F16 || kind == TF_KIND_BF16 || kind == TF_KIND_F32;
+    }
+
+    // Float step with one scale per tensor: out[r] = y[r] * scale in f64.
+    // Every product is exact (|y| < 2^29, see TMV_EXACT_PRODUCT_LIMIT), so the
+    // result does not depend on evaluation order or platform.
+    fn tmv_scale_tensor(y: []i64, rows: usize, word: u32, kind: i32, out: []f64, out_capacity: usize) -> i32 {
+        if (!tmv_kind_known(kind)) { return TF_ERR_FORMAT; }
+        if (rows == 0) { return TF_ERR_LENGTH; }
+        if (out_capacity < rows) { return TF_ERR_CAPACITY; }
+        if (tf_scale_class(word, kind) == TF_ERR_SCALE_NONFINITE) { return TF_ERR_SCALE_NONFINITE; }
+        var r: usize = 0;
+        while (r < rows) {
+            if (y[r] >= TMV_EXACT_PRODUCT_LIMIT || y[r] <= 0 - TMV_EXACT_PRODUCT_LIMIT) { return TF_ERR_LENGTH; }
+            r = r + 1;
+        }
+        var s: f64 = tf_scale_value(word, kind);
+        r = 0;
+        while (r < rows) {
+            out[r] = (y[r] as f64) * s;
+            r = r + 1;
+        }
+        return 0;
+    }
+
+    // Shared validation of group scales: `groups` partials per row, one scale
+    // per `per_scale` consecutive partials of a row, scales in row order.
+    fn tmv_groups_valid(partials: []i64, rows: usize, groups: usize, scales: []u32, scale_count: usize,
+                        kind: i32, per_scale: usize, limit: i64) -> i32 {
+        if (!tmv_kind_known(kind)) { return TF_ERR_FORMAT; }
+        if (rows == 0 || groups == 0 || per_scale == 0) { return TF_ERR_LENGTH; }
+        if (groups % per_scale != 0) { return TF_ERR_LENGTH; }
+        if (rows > scale_count || scale_count / rows != groups / per_scale || scale_count % rows != 0) {
+            return TF_ERR_LENGTH;
+        }
+        var i: usize = 0;
+        while (i < scale_count) {
+            if (tf_scale_class(scales[i], kind) == TF_ERR_SCALE_NONFINITE) { return TF_ERR_SCALE_NONFINITE; }
+            i = i + 1;
+        }
+        i = 0;
+        while (i < rows * groups) {
+            if (partials[i] > limit || partials[i] < 0 - limit) { return TF_ERR_LENGTH; }
+            i = i + 1;
+        }
+        return 0;
+    }
+
+    // Float step with group scales, in f64 and in a fixed order:
+    // out[r] = (...((0 + v(s[r][0]) * p[r][0]) + v(s[r][1]) * p[r][1]) + ...), j ascending,
+    // where s[r][j] is scale (r * groups + j) / per_scale. Each product is exact
+    // (|p| < 2^29); the running sum rounds to nearest-even whenever it needs
+    // more than 53 bits, which tmv_exact_groups_f16 detects for f16 scales.
+    fn tmv_scale_groups(partials: []i64, rows: usize, groups: usize, scales: []u32, scale_count: usize,
+                        kind: i32, per_scale: usize, out: []f64, out_capacity: usize) -> i32 {
+        var status: i32 = tmv_groups_valid(partials, rows, groups, scales, scale_count, kind, per_scale,
+                                           TMV_EXACT_PRODUCT_LIMIT - 1);
+        if (status != 0) { return status; }
+        if (out_capacity < rows) { return TF_ERR_CAPACITY; }
+        var r: usize = 0;
+        while (r < rows) {
+            var sum: f64 = 0.0;
+            var value: f64 = 0.0;
+            var j: usize = 0;
+            while (j < groups) {
+                var at: usize = r * groups + j;
+                if (j % per_scale == 0) { value = tf_scale_value(scales[at / per_scale], kind); }
+                sum = sum + value * (partials[at] as f64);
+                j = j + 1;
+            }
+            out[r] = sum;
+            r = r + 1;
+        }
+        return 0;
+    }
+
+    // f16 word times 2^24, an exact integer (|value| < 2^40). Requires a finite word.
+    fn tmv_f16_scaled(word: u32) -> i64 {
+        var exponent: u32 = (word >> 10) & 31;
+        var value: i64 = (word & 1023) as i64;
+        if (exponent != 0) {
+            value = value + 1024;
+            var e: u32 = exponent - 1;
+            while (e > 0) { value = value * 2; e = e - 1; }
+        }
+        if (((word >> 15) & 1) != 0) { value = 0 - value; }
+        return value;
+    }
+
+    // Exact integer form of the f16 group float step:
+    // out[r] = sum_j (f16(s[r][j]) * 2^24) * p[r][j], so that the exact real
+    // result is out[r] / 2^24. Checked i64 arithmetic; TF_ERR_LENGTH when a
+    // partial exceeds 2^22 or a row sum leaves i64. Validated before writing.
+    fn tmv_exact_groups_f16(partials: []i64, rows: usize, groups: usize, scales: []u32, scale_count: usize,
+                            per_scale: usize, out: []i64, out_capacity: usize) -> i32 {
+        var status: i32 = tmv_groups_valid(partials, rows, groups, scales, scale_count, TF_KIND_F16, per_scale,
+                                           TMV_EXACT_PARTIAL_LIMIT);
+        if (status != 0) { return status; }
+        if (out_capacity < rows) { return TF_ERR_CAPACITY; }
+        var acc: [1]i64 = [0];
+        var pass: i32 = 0;
+        while (pass < 2) {
+            var r: usize = 0;
+            while (r < rows) {
+                acc[0] = 0;
+                var j: usize = 0;
+                while (j < groups) {
+                    var at: usize = r * groups + j;
+                    var term: i64 = tmv_f16_scaled(scales[at / per_scale]) * partials[at];
+                    if (tm_add_i64_checked(acc[0], term, acc) != 0) { return TF_ERR_LENGTH; }
+                    j = j + 1;
+                }
+                if (pass == 1) { out[r] = acc[0]; }
+                r = r + 1;
+            }
+            pass = pass + 1;
+        }
+        return 0;
+    }
+
+    // Rows where the f64 value differs from the exact rational exact[r] / 2^shift
+    // (0 when every f64 result is the exact value); first[0] or -1.
+    fn tmv_exact_mismatches(exact: []i64, shift: i32, values: []f64, count: usize, first: []i64) -> i64 {
+        var unit: f64 = tf_pow2(shift);
+        var total: i64 = 0;
+        first[0] = -1;
+        var i: usize = 0;
+        while (i < count) {
+            var scaled: f64 = values[i] * unit;
+            var same: bool = false;
+            if (scaled > -9.0e18 && scaled < 9.0e18) {
+                var whole: i64 = scaled as i64;
+                if ((whole as f64) == scaled && whole == exact[i]) { same = true; }
+            }
+            if (!same) {
+                if (total == 0) { first[0] = i as i64; }
+                total = total + 1;
+            }
+            i = i + 1;
+        }
+        return total;
+    }
+
+    test tmv_cpython_prefix {
+        var x: [8]i8 = [0, 0, 0, 0, 0, 0, 0, 0];
+        assert(tmv_activations(27, x, 8) == 0);
+        assert(x[0] == 117);
+        assert(x[3] == -28);
+        assert(x[5] == -95);
+        assert(x[7] == 42);
+    }
+
+    test tmv_small_product {
+        var w: [6]i32 = [1, -1, 0, -1, 1, 1];
+        var x: [3]i8 = [-128, 127, -128];
+        var row64: [3]i64 = [0, 0, 0];
+        var x64: [3]i64 = [0, 0, 0];
+        var partials: [2]i64 = [0, 0];
+        var y: [2]i64 = [0, 0];
+        assert(tmv_matvec(w, 2, 3, x, 3, row64, x64, 3, partials, 2, y, 2) == 0);
+        assert(y[0] == -255);
+        assert(y[1] == 127);
+        w[2] = 2;
+        y[0] = 5;
+        assert(tmv_matvec(w, 2, 3, x, 3, row64, x64, 3, partials, 2, y, 2) == TF_ERR_CODE);
+        assert(y[0] == 5);
+    }
+
+    test tmv_f16_scaled_words {
+        assert(tmv_f16_scaled(15360) == 16777216);
+        assert(tmv_f16_scaled(1) == 1);
+        assert(tmv_f16_scaled(33792) == -1024);
+        assert(tmv_f16_scaled(31743) == 1098974756864);
+    }
+}
