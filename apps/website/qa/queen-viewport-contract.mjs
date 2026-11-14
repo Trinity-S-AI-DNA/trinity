@@ -625,7 +625,7 @@ for (const [w, h] of (DEAD ? SIZES.filter(([w]) => w === 1440 || w === 390) : SI
       const live = !!document.querySelector('#stat-status.is-live');
       const dead = !!document.querySelector('#stat-status.is-cold');
       const rows = document.querySelectorAll('.queen27-sectors-row').length;
-      const data = ${DEAD} ? dead : (live || rows === 6);
+      const data = ${DEAD} ? dead : rows === 6;
       const rail = document.querySelector('.queen27-hud-command');
       const declared = rail ? Number(rail.getAttribute('data-views')) : 0;
       // the rail declares its own count (data-views from commandItems); the gate follows it rather than a hardcoded eight
