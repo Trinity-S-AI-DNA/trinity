@@ -11,6 +11,10 @@ export const CHAT_ANSWER_MAX = 1200 satisfies number;
 export const CHAT_PER_IP_HOUR = 20 satisfies number;
 export const CHAT_PER_KEY_DAY = 60 satisfies number;
 export const CHAT_TIMEOUT_MS = 20000 satisfies number;
+export const CHAT_GLOBAL_DAY = 500 satisfies number;
+export const CHAT_TURNS_MAX = 8 satisfies number;
+export const CHAT_PROBE_RETRY_MS = 30000 satisfies number;
+export const CHAT_PAID_FALLBACK = 0 satisfies number;
 export const REASON_NONE = 0 satisfies number;
 export const REASON_UNREACHABLE = 1 satisfies number;
 export const REASON_TIMEOUT = 2 satisfies number;
@@ -19,6 +23,7 @@ export const REASON_EMPTY = 4 satisfies number;
 export const REASON_LIMIT = 5 satisfies number;
 export const REASON_OFF = 6 satisfies number;
 export const REASON_BAD_REQUEST = 7 satisfies number;
+export const REASON_BUSY = 8 satisfies number;
 export const CHAT_TITLE = "Course helper" satisfies string;
 export const CHAT_HINT = "Ask about this lesson. Nothing you type is stored." satisfies string;
 export const CHAT_PLACEHOLDER = "Ask a question" satisfies string;
@@ -29,6 +34,7 @@ export const CHAT_WORKING = "The helper is thinking." satisfies string;
 export const CHAT_OFFLINE = "The assistant is offline." satisfies string;
 export const CHAT_OFFLINE_LIMIT = "The assistant is offline for now: the question limit is reached. Try again later." satisfies string;
 export const CHAT_OFFLINE_BAD = "The assistant is offline: this question cannot be sent. Shorten it and try again." satisfies string;
+export const CHAT_OFFLINE_BUSY = "The assistant is busy right now. Try again in a moment." satisfies string;
 export const CHAT_PROMPT_HEAD = "You are the course helper on t27.ai for the course \"" satisfies string;
 export const CHAT_PROMPT_LESSON = "\", open at the lesson \"" satisfies string;
 export const CHAT_PROMPT_TAIL = "\". Answer the reader's question about this course and lesson in at most five short sentences, in the language the reader writes in. If you do not know, say \"I do not know\" and do not guess or invent facts. Never ask for or repeat a key, a token or a password. You have no tools: you cannot run code, open links or remember earlier chats." satisfies string;
@@ -43,12 +49,21 @@ export const CHAT_CSS_SHEET = "@media (max-width:999px){.course-main:has(.cc){pa
 // t27c gen-ts: fn msg_ok was not emitted -- this backend lowers declarations, not bodies.
 // t27c gen-ts: fn request_reason was not emitted -- this backend lowers declarations, not bodies.
 // t27c gen-ts: fn limit_reason was not emitted -- this backend lowers declarations, not bodies.
+// t27c gen-ts: fn turn_reason was not emitted -- this backend lowers declarations, not bodies.
+// t27c gen-ts: fn global_reason was not emitted -- this backend lowers declarations, not bodies.
+// t27c gen-ts: fn gate_reason was not emitted -- this backend lowers declarations, not bodies.
+// t27c gen-ts: fn fallback_allowed was not emitted -- this backend lowers declarations, not bodies.
 // t27c gen-ts: fn client_reason was not emitted -- this backend lowers declarations, not bodies.
+// t27c gen-ts: fn probe_reason was not emitted -- this backend lowers declarations, not bodies.
 // t27c gen-ts: fn answer_keep was not emitted -- this backend lowers declarations, not bodies.
 // t27c gen-ts: fn put was not emitted -- this backend lowers declarations, not bodies.
 // t27c gen-ts: fn system_prompt was not emitted -- this backend lowers declarations, not bodies.
 // t27c gen-ts: fn has_text was not emitted -- this backend lowers declarations, not bodies.
-// t27c gen-ts: fn limit_reason_bug was not emitted -- this backend lowers declarations, not bodies.
+// t27c gen-ts: a TestBlock was not emitted -- it is checked by the compiler, not by the artifact.
+// t27c gen-ts: a TestBlock was not emitted -- it is checked by the compiler, not by the artifact.
+// t27c gen-ts: a TestBlock was not emitted -- it is checked by the compiler, not by the artifact.
+// t27c gen-ts: a TestBlock was not emitted -- it is checked by the compiler, not by the artifact.
+// t27c gen-ts: a TestBlock was not emitted -- it is checked by the compiler, not by the artifact.
 // t27c gen-ts: a TestBlock was not emitted -- it is checked by the compiler, not by the artifact.
 // t27c gen-ts: a TestBlock was not emitted -- it is checked by the compiler, not by the artifact.
 // t27c gen-ts: a TestBlock was not emitted -- it is checked by the compiler, not by the artifact.
@@ -72,7 +87,7 @@ export const CHAT_CSS_SHEET = "@media (max-width:999px){.course-main:has(.cc){pa
 
 // Declaration order, which the spec's own laws depend on.
 export const __STRUCT_ORDER__ = [] as const;
-export const __DECL_ORDER__ = ["CHAT_ROUTE", "CHAT_COURSES", "CHAT_MSG_MAX", "CHAT_TITLE_MAX", "CHAT_ANSWER_MAX", "CHAT_PER_IP_HOUR", "CHAT_PER_KEY_DAY", "CHAT_TIMEOUT_MS", "REASON_NONE", "REASON_UNREACHABLE", "REASON_TIMEOUT", "REASON_STATUS", "REASON_EMPTY", "REASON_LIMIT", "REASON_OFF", "REASON_BAD_REQUEST", "CHAT_TITLE", "CHAT_HINT", "CHAT_PLACEHOLDER", "CHAT_SEND", "CHAT_OPEN", "CHAT_CLOSE", "CHAT_WORKING", "CHAT_OFFLINE", "CHAT_OFFLINE_LIMIT", "CHAT_OFFLINE_BAD", "CHAT_PROMPT_HEAD", "CHAT_PROMPT_LESSON", "CHAT_PROMPT_TAIL", "CHAT_WIDE_MIN", "CHAT_CSS", "CHAT_CSS_SHEET"] as const;
+export const __DECL_ORDER__ = ["CHAT_ROUTE", "CHAT_COURSES", "CHAT_MSG_MAX", "CHAT_TITLE_MAX", "CHAT_ANSWER_MAX", "CHAT_PER_IP_HOUR", "CHAT_PER_KEY_DAY", "CHAT_TIMEOUT_MS", "CHAT_GLOBAL_DAY", "CHAT_TURNS_MAX", "CHAT_PROBE_RETRY_MS", "CHAT_PAID_FALLBACK", "REASON_NONE", "REASON_UNREACHABLE", "REASON_TIMEOUT", "REASON_STATUS", "REASON_EMPTY", "REASON_LIMIT", "REASON_OFF", "REASON_BAD_REQUEST", "REASON_BUSY", "CHAT_TITLE", "CHAT_HINT", "CHAT_PLACEHOLDER", "CHAT_SEND", "CHAT_OPEN", "CHAT_CLOSE", "CHAT_WORKING", "CHAT_OFFLINE", "CHAT_OFFLINE_LIMIT", "CHAT_OFFLINE_BAD", "CHAT_OFFLINE_BUSY", "CHAT_PROMPT_HEAD", "CHAT_PROMPT_LESSON", "CHAT_PROMPT_TAIL", "CHAT_WIDE_MIN", "CHAT_CSS", "CHAT_CSS_SHEET"] as const;
 
 // What this spec holds and this backend did not print. Empty is the whole
 // story most of the time; an entry here is a promise the artifact does not
