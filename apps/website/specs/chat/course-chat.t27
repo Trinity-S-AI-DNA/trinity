@@ -1,0 +1,619 @@
+module chat_course_chat;
+
+; The course helper chat (Trinity-S-AI-DNA/trinity#1813): a chat panel beside the
+; lessons of a course, where a reader types a question and gets an answer from an
+; assistant that knows which course and lesson is open.
+; This module is the whole rule. The page (src/components/CourseChat.tsx) and the
+; answer route on the render host both read these numbers and call these fns; neither
+; keeps a copy. The module is self-contained on purpose (no `use`), so `t27c gen-ts`
+; turns it into src/lib/courseChat.gen.ts without resolving other specs.
+; Wire shape. One POST to CHAT_ROUTE on the render host, JSON both ways.
+;   request : {"course": "vibecoding", "lesson": "<lesson id>", "title": "<lesson title>",
+;              "message": "<what the reader typed>", "turn": <questions already asked>,
+;              "key": "<course key, optional>"}
+;   probe   : {"course": "vibecoding", "probe": true}, sent when the panel opens; the route
+;             answers {"ok": true, "probe": true} with no model call (probe_reason)
+;   answer  : {"ok": true, "answer": "<text>"}  or  {"ok": false, "offline": true, "reason": "<name>"}
+; The route runs gate_reason() before any model call and never falls back to a paid model
+; (fallback_allowed): a free provider that is down gives an offline answer, nothing else.
+; The reason names are the ones reason_name() returns. A page that cannot reach the
+; route builds the same offline state itself, from client_reason().
+; Honesty. The panel shows generated text only when the reason is REASON_NONE
+; (show_answer). Every offline reason shows one fixed sentence from this module and
+; nothing the model said. The model runs on the server, on the free tier only; the
+; key lives in a server env file and is never in this module, in the bundle, in git,
+; in a chat or in a log.
+; Scope. The chat is on for the courses in CHAT_COURSES only. Another course turns it
+; on by adding its id there. No history is stored, no account is made, and the helper
+; has no tools (the system prompt says so).
+
+pub const CHAT_ROUTE : str = "/api/course/chat";
+
+pub const CHAT_COURSES : [1]str = ["vibecoding"];
+
+pub const CHAT_MSG_MAX : u32 = 600;
+pub const CHAT_TITLE_MAX : u32 = 120;
+pub const CHAT_ANSWER_MAX : u32 = 1200;
+pub const CHAT_PER_IP_HOUR : u32 = 20;
+pub const CHAT_PER_KEY_DAY : u32 = 60;
+pub const CHAT_TIMEOUT_MS : u32 = 20000;
+pub const CHAT_GLOBAL_DAY : u32 = 500;
+pub const CHAT_TURNS_MAX : u32 = 8;
+pub const CHAT_PROBE_RETRY_MS : u32 = 30000;
+pub const CHAT_PAID_FALLBACK : u32 = 0;
+
+pub const REASON_NONE : u32 = 0;
+pub const REASON_UNREACHABLE : u32 = 1;
+pub const REASON_TIMEOUT : u32 = 2;
+pub const REASON_STATUS : u32 = 3;
+pub const REASON_EMPTY : u32 = 4;
+pub const REASON_LIMIT : u32 = 5;
+pub const REASON_OFF : u32 = 6;
+pub const REASON_BAD_REQUEST : u32 = 7;
+pub const REASON_BUSY : u32 = 8;
+
+pub const CHAT_TITLE : str = "Course helper";
+pub const CHAT_HINT : str = "Ask about this lesson. Nothing you type is stored.";
+pub const CHAT_PLACEHOLDER : str = "Ask a question";
+pub const CHAT_SEND : str = "Send";
+pub const CHAT_OPEN : str = "Ask the helper";
+pub const CHAT_CLOSE : str = "Close";
+pub const CHAT_WORKING : str = "The helper is thinking.";
+pub const CHAT_OFFLINE : str = "The assistant is offline.";
+pub const CHAT_OFFLINE_LIMIT : str = "The assistant is offline for now: the question limit is reached. Try again later.";
+pub const CHAT_OFFLINE_BAD : str = "The assistant is offline: this question cannot be sent. Shorten it and try again.";
+pub const CHAT_OFFLINE_BUSY : str = "The assistant is busy right now. Try again in a moment.";
+
+; The reader's message is never dropped (trinity#1824). Send and Return put the reader's line in the
+; log and clear the box in every state; send_plan says what happens next. While the helper is offline
+; the line is followed by one plain sentence (CHAT_UNANSWERED), and while it is still answering the
+; last question by CHAT_WAIT_NOTE. Each new string has a Russian form, the one the page shows on a
+; Russian page; the same digits in both (there are none yet).
+pub const CHAT_UNANSWERED : str = "The helper is offline, so your message was not answered. Try again later.";
+pub const CHAT_UNANSWERED_RU : str = "Помощник сейчас не в сети, поэтому ваше сообщение осталось без ответа. Попробуйте позже.";
+pub const CHAT_WAIT_NOTE : str = "The helper is still answering your last question, so this message was not sent. Ask again in a moment.";
+pub const CHAT_WAIT_NOTE_RU : str = "Помощник ещё отвечает на прошлый вопрос, поэтому это сообщение не отправлено. Спросите ещё раз чуть позже.";
+
+pub const ACT_IGNORE : u32 = 0;
+pub const ACT_SEND : u32 = 1;
+pub const ACT_REPROBE : u32 = 2;
+pub const ACT_WAIT : u32 = 3;
+pub const ACT_LIMIT : u32 = 4;
+
+; The system prompt, in three parts. system_prompt() joins them around the course id and
+; the lesson title; the route on the render host does the same with these constants.
+pub const CHAT_PROMPT_HEAD : str = "You are the course helper on t27.ai for the course \"";
+pub const CHAT_PROMPT_LESSON : str = "\", open at the lesson \"";
+pub const CHAT_PROMPT_TAIL : str = "\". Answer the reader's question about this course and lesson in at most five short sentences, in the language the reader writes in. If you do not know, say \"I do not know\" and do not guess or invent facts. Never ask for or repeat a key, a token or a password. You have no tools: you cannot run code, open links or remember earlier chats.";
+
+; The panel's style, black and white like the rest of the course page (no colour, no glow).
+; A column beside the lesson from CHAT_WIDE_MIN px; below that a button opens a sheet.
+pub const CHAT_WIDE_MIN : u32 = 1000;
+
+; The opener below CHAT_WIDE_MIN (trinity#1820): a round button that carries the owner's GitHub
+; avatar. The image is a copy kept in public/ under CHAT_AVATAR, so the page never asks GitHub
+; for it. CHAT_AVATAR_PX is the circle's side, CHAT_TAP_MIN the smallest tap target allowed.
+; The button keeps its name CHAT_OPEN as an aria-label; the image has an empty alt.
+pub const CHAT_AVATAR : str = "ghashtag-avatar.jpg";
+pub const CHAT_AVATAR_PX : u32 = 56;
+pub const CHAT_TAP_MIN : u32 = 44;
+pub const CHAT_CSS : str = ".course-main:has(.cc){padding-right:360px}.cc{position:fixed;top:84px;right:20px;bottom:20px;width:320px;display:flex;flex-direction:column;background:#000;color:#f2f2f2;border:1px solid #fff;z-index:30;font-family:var(--font)}.cc-head{display:flex;justify-content:space-between;align-items:center;padding:10px 12px;border-bottom:1px solid #fff}.cc-title{font-size:11px;letter-spacing:.16em;text-transform:uppercase;margin:0}.cc-x{display:none;background:none;border:0;color:#f2f2f2;font:inherit;cursor:pointer}.cc-hint{font-size:12px;color:#8a8a8a;margin:0;padding:8px 12px 0}.cc-log{flex:1;overflow:auto;padding:12px;display:flex;flex-direction:column;gap:8px;font-size:14px;line-height:1.45}.cc-m{margin:0;padding:8px 10px;border:1px solid #333;white-space:pre-wrap;overflow-wrap:anywhere}.cc-you{border-color:#fff;align-self:flex-end}.cc-off{color:#8a8a8a;border-style:dashed}.cc-form{display:flex;gap:8px;padding:12px;border-top:1px solid #fff}.cc-in{flex:1;min-width:0;min-height:44px;max-height:120px;resize:none;background:#000;color:#f2f2f2;border:1px solid #fff;padding:8px;font:inherit;font-size:16px}.cc-go{background:#fff;color:#000;border:0;padding:0 14px;min-width:44px;min-height:44px;font:inherit;font-weight:700;cursor:pointer}.cc-go:disabled{background:#8a8a8a;cursor:default}.cc-open{display:none}";
+pub const CHAT_CSS_SHEET : str = "@media (max-width:999px){.course-main:has(.cc){padding-right:20px}.cc{display:none;top:auto;left:0;right:0;bottom:0;width:auto;height:70vh}.cc.is-open{display:flex}.cc-x{display:block}.cc-open{display:block;position:fixed;right:16px;bottom:16px;z-index:30;width:56px;height:56px;padding:0;overflow:hidden;background:#000;border:1px solid #fff;border-radius:50%;cursor:pointer}.cc-open img{display:block;width:100%;height:100%;object-fit:cover}.cc-open:focus-visible{outline:2px solid #fff;outline-offset:3px}.cc.is-open ~ .cc-open{display:none}}";
+
+/// Is the chat switched on for this course?
+pub fn chat_enabled(course: []const u8) -> bool {
+    var i : usize = 0;
+    while (i < CHAT_COURSES.len) {
+        if (same(course, CHAT_COURSES[i])) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// Byte-for-byte equality of two texts.
+pub fn same(a: []const u8, b: []const u8) -> bool {
+    if (a.len != b.len) { return false; }
+    var i : usize = 0;
+    while (i < a.len) {
+        if (a[i] != b[i]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// The name of an offline reason on the wire.
+pub fn reason_name(r: u32) -> []const u8 {
+    if (r == REASON_UNREACHABLE) { return "unreachable"; }
+    if (r == REASON_TIMEOUT) { return "timeout"; }
+    if (r == REASON_STATUS) { return "status"; }
+    if (r == REASON_EMPTY) { return "empty"; }
+    if (r == REASON_LIMIT) { return "limit"; }
+    if (r == REASON_OFF) { return "off"; }
+    if (r == REASON_BAD_REQUEST) { return "bad_request"; }
+    if (r == REASON_BUSY) { return "busy"; }
+    return "none";
+}
+
+/// The one sentence the panel shows for an offline reason. No generated text.
+pub fn offline_text(r: u32) -> []const u8 {
+    if (r == REASON_LIMIT) { return CHAT_OFFLINE_LIMIT; }
+    if (r == REASON_BAD_REQUEST) { return CHAT_OFFLINE_BAD; }
+    if (r == REASON_BUSY) { return CHAT_OFFLINE_BUSY; }
+    return CHAT_OFFLINE;
+}
+
+/// Generated text is shown only when nothing went wrong.
+pub fn show_answer(r: u32) -> bool {
+    return r == REASON_NONE;
+}
+
+/// Is the reader's message the right size to send?
+pub fn msg_ok(len: u32) -> bool {
+    return len >= 1 and len <= CHAT_MSG_MAX;
+}
+
+/// The check the route and the page both run before a model call.
+/// course_on is chat_enabled(course); the lengths are those of the title and the message.
+pub fn request_reason(course_on: bool, title_len: u32, msg_len: u32) -> u32 {
+    if (!course_on) { return REASON_OFF; }
+    if (title_len > CHAT_TITLE_MAX) { return REASON_BAD_REQUEST; }
+    if (!msg_ok(msg_len)) { return REASON_BAD_REQUEST; }
+    return REASON_NONE;
+}
+
+/// The limits. ip_count and key_count are the messages already counted in the window
+/// (an hour for the IP, a day for the key) before this one. Past a limit the answer is
+/// offline with reason limit and no model is called. A request with no key is held by
+/// the IP limit alone.
+pub fn limit_reason(ip_count: u32, key_count: u32, has_key: bool) -> u32 {
+    if (ip_count >= CHAT_PER_IP_HOUR) { return REASON_LIMIT; }
+    if (has_key and key_count >= CHAT_PER_KEY_DAY) { return REASON_LIMIT; }
+    return REASON_NONE;
+}
+
+/// The cap on turns in one conversation. turn is the number of questions the reader already
+/// asked since the panel opened; the page sends it and the route checks it, so a long thread
+/// stops at CHAT_TURNS_MAX with reason limit. The route keeps no history.
+pub fn turn_reason(turn: u32) -> u32 {
+    if (turn >= CHAT_TURNS_MAX) { return REASON_LIMIT; }
+    return REASON_NONE;
+}
+
+/// The cap on all readers together in a day (the free tier is shared). global_count is the
+/// number of model calls already made today. Past it the answer is offline with reason busy.
+pub fn global_reason(global_count: u32) -> u32 {
+    if (global_count >= CHAT_GLOBAL_DAY) { return REASON_BUSY; }
+    return REASON_NONE;
+}
+
+/// All the checks the route runs before a model call, in a fixed order: the request, the
+/// turns of the conversation, the IP and key limits, then the shared daily cap.
+pub fn gate_reason(course_on: bool, title_len: u32, msg_len: u32, turn: u32, ip_count: u32, key_count: u32, has_key: bool, global_count: u32) -> u32 {
+    var r : u32 = request_reason(course_on, title_len, msg_len);
+    if (r != REASON_NONE) { return r; }
+    r = turn_reason(turn);
+    if (r != REASON_NONE) { return r; }
+    r = limit_reason(ip_count, key_count, has_key);
+    if (r != REASON_NONE) { return r; }
+    return global_reason(global_count);
+}
+
+/// Never a paid fallback: when the free model is down the answer is offline, and no paid
+/// model is tried. free_tier says the provider the route is about to call is a free one.
+pub fn fallback_allowed(free_tier: bool) -> bool {
+    if (free_tier) { return true; }
+    return CHAT_PAID_FALLBACK != 0;
+}
+
+/// What the page decides from what it saw. reached: the request got an answer at all.
+/// timed_out: it took longer than CHAT_TIMEOUT_MS. status: the HTTP status. answer_len:
+/// the length of the answer text in a 200 body.
+pub fn client_reason(reached: bool, timed_out: bool, status: u32, answer_len: u32) -> u32 {
+    if (!reached) { return REASON_UNREACHABLE; }
+    if (timed_out) { return REASON_TIMEOUT; }
+    if (status == 429) { return REASON_LIMIT; }
+    if (status == 503) { return REASON_BUSY; }
+    if (status != 200) { return REASON_STATUS; }
+    if (answer_len == 0) { return REASON_EMPTY; }
+    return REASON_NONE;
+}
+
+/// What the page decides from its probe, the empty POST it sends when the panel opens (and
+/// again every CHAT_PROBE_RETRY_MS while the panel shows offline). The route answers a probe
+/// with 200 and no model call; any other outcome keeps the panel offline.
+pub fn probe_reason(reached: bool, timed_out: bool, status: u32) -> u32 {
+    if (reached and !timed_out and status == 503) { return REASON_OFF; }
+    return client_reason(reached, timed_out, status, 1);
+}
+
+/// The one sentence that follows the reader's message when it could not be answered. A real
+/// busy or limit keeps its own sentence; every other reason is the offline sentence, which
+/// says the message was not answered and never says busy.
+pub fn unanswered_text(r: u32) -> []const u8 {
+    if (r == REASON_LIMIT) { return CHAT_OFFLINE_LIMIT; }
+    if (r == REASON_BAD_REQUEST) { return CHAT_OFFLINE_BAD; }
+    if (r == REASON_BUSY) { return CHAT_OFFLINE_BUSY; }
+    return CHAT_UNANSWERED;
+}
+
+/// What Send or Return does. msg_len is the length of the trimmed text; up says the last probe
+/// answered; in_flight says a request or a probe is still running; turn is the number of
+/// questions already sent. Order: nothing to send, the turn cap, a request still running,
+/// offline (probe once more and send when it answers), else send.
+pub fn send_plan(msg_len: u32, up: bool, in_flight: bool, turn: u32) -> u32 {
+    if (!msg_ok(msg_len)) { return ACT_IGNORE; }
+    if (turn_reason(turn) != REASON_NONE) { return ACT_LIMIT; }
+    if (in_flight) { return ACT_WAIT; }
+    if (!up) { return ACT_REPROBE; }
+    return ACT_SEND;
+}
+
+/// Does the plan put the reader's line in the log and clear the box? Every plan but ignore.
+pub fn logs_line(act: u32) -> bool {
+    return act != ACT_IGNORE;
+}
+
+/// How much of an answer the panel keeps.
+pub fn answer_keep(len: u32) -> u32 {
+    if (len > CHAT_ANSWER_MAX) { return CHAT_ANSWER_MAX; }
+    return len;
+}
+
+/// Write the text s into o at n and return the new length.
+pub fn put(o: []u8, n0: u32, s: []const u8) -> u32 {
+    var n : u32 = n0;
+    var i : usize = 0;
+    while (i < s.len) {
+        o[n] = s[i];
+        n = n + 1;
+        i = i + 1;
+    }
+    return n;
+}
+
+/// The system prompt, built from the open course and lesson. The lesson title is empty
+/// on the course overview.
+pub fn system_prompt(o: []u8, n0: u32, course: []const u8, title: []const u8) -> u32 {
+    var n : u32 = put(o, n0, CHAT_PROMPT_HEAD);
+    n = put(o, n, course);
+    if (title.len > 0) {
+        n = put(o, n, CHAT_PROMPT_LESSON);
+        n = put(o, n, title);
+    }
+    n = put(o, n, CHAT_PROMPT_TAIL);
+    return n;
+}
+
+/// Does the buffer o[0..n] contain the text s?
+pub fn has_text(o: []u8, n: u32, s: []const u8) -> bool {
+    if (s.len == 0 or s.len > n) { return false; }
+    var i : usize = 0;
+    while (i + s.len <= n) {
+        var j : usize = 0;
+        var hit : bool = true;
+        while (j < s.len) {
+            if (o[i + j] != s[j]) { hit = false; }
+            j = j + 1;
+        }
+        if (hit) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+test enabled_for_course_12_only {
+    assert chat_enabled("vibecoding");
+    assert !chat_enabled("queen");
+    assert !chat_enabled("");
+    assert !chat_enabled("vibecodin");
+    assert !chat_enabled("vibecodingx");
+    assert !chat_enabled("Vibecoding");
+}
+
+test message_size_edges {
+    assert !msg_ok(0);
+    assert msg_ok(1);
+    assert msg_ok(CHAT_MSG_MAX);
+    assert !msg_ok(CHAT_MSG_MAX + 1);
+}
+
+test request_is_checked_before_a_model_call {
+    assert request_reason(true, 10, 10) == REASON_NONE;
+    assert request_reason(false, 10, 10) == REASON_OFF;
+    assert request_reason(true, 10, 0) == REASON_BAD_REQUEST;
+    assert request_reason(true, 10, CHAT_MSG_MAX + 1) == REASON_BAD_REQUEST;
+    assert request_reason(true, CHAT_TITLE_MAX, 10) == REASON_NONE;
+    assert request_reason(true, CHAT_TITLE_MAX + 1, 10) == REASON_BAD_REQUEST;
+    assert request_reason(true, 0, 10) == REASON_NONE;
+}
+
+test limit_per_ip_per_hour {
+    assert limit_reason(0, 0, false) == REASON_NONE;
+    assert limit_reason(CHAT_PER_IP_HOUR - 1, 0, false) == REASON_NONE;
+    assert limit_reason(CHAT_PER_IP_HOUR, 0, false) == REASON_LIMIT;
+    assert limit_reason(CHAT_PER_IP_HOUR + 5, 0, true) == REASON_LIMIT;
+}
+
+test limit_per_key_per_day {
+    assert limit_reason(0, CHAT_PER_KEY_DAY - 1, true) == REASON_NONE;
+    assert limit_reason(0, CHAT_PER_KEY_DAY, true) == REASON_LIMIT;
+    assert limit_reason(0, CHAT_PER_KEY_DAY + 5, true) == REASON_LIMIT;
+}
+
+test no_key_is_held_by_the_ip_limit_alone {
+    assert limit_reason(0, CHAT_PER_KEY_DAY, false) == REASON_NONE;
+    assert limit_reason(CHAT_PER_IP_HOUR, 0, false) == REASON_LIMIT;
+}
+
+test limits_are_sane {
+    assert CHAT_PER_IP_HOUR >= 1;
+    assert CHAT_PER_KEY_DAY >= CHAT_PER_IP_HOUR;
+    assert CHAT_ANSWER_MAX > CHAT_MSG_MAX;
+    assert CHAT_TIMEOUT_MS >= 5000;
+    assert CHAT_GLOBAL_DAY >= CHAT_PER_KEY_DAY;
+    assert CHAT_TURNS_MAX >= 1;
+    assert CHAT_TURNS_MAX <= CHAT_PER_IP_HOUR;
+}
+
+test client_sees_every_way_the_route_can_fail {
+    assert client_reason(false, false, 0, 0) == REASON_UNREACHABLE;
+    assert client_reason(true, true, 200, 50) == REASON_TIMEOUT;
+    assert client_reason(true, false, 404, 0) == REASON_STATUS;
+    assert client_reason(true, false, 500, 50) == REASON_STATUS;
+    assert client_reason(true, false, 401, 50) == REASON_STATUS;
+    assert client_reason(true, false, 429, 0) == REASON_LIMIT;
+    assert client_reason(true, false, 200, 0) == REASON_EMPTY;
+    assert client_reason(true, false, 200, 1) == REASON_NONE;
+}
+
+test an_unreachable_route_beats_everything_else {
+    assert client_reason(false, true, 200, 50) == REASON_UNREACHABLE;
+    assert client_reason(false, false, 200, 50) == REASON_UNREACHABLE;
+}
+
+test generated_text_is_shown_only_when_nothing_went_wrong {
+    assert show_answer(REASON_NONE);
+    assert !show_answer(REASON_UNREACHABLE);
+    assert !show_answer(REASON_TIMEOUT);
+    assert !show_answer(REASON_STATUS);
+    assert !show_answer(REASON_EMPTY);
+    assert !show_answer(REASON_LIMIT);
+    assert !show_answer(REASON_OFF);
+    assert !show_answer(REASON_BAD_REQUEST);
+    assert !show_answer(REASON_BUSY);
+}
+
+test offline_says_so_in_one_fixed_sentence {
+    assert same(offline_text(REASON_UNREACHABLE), CHAT_OFFLINE);
+    assert same(offline_text(REASON_TIMEOUT), CHAT_OFFLINE);
+    assert same(offline_text(REASON_STATUS), CHAT_OFFLINE);
+    assert same(offline_text(REASON_EMPTY), CHAT_OFFLINE);
+    assert same(offline_text(REASON_OFF), CHAT_OFFLINE);
+    assert same(offline_text(REASON_LIMIT), CHAT_OFFLINE_LIMIT);
+    assert same(offline_text(REASON_BAD_REQUEST), CHAT_OFFLINE_BAD);
+    assert offline_text(REASON_LIMIT).len > 0;
+}
+
+test reason_names_are_distinct_on_the_wire {
+    assert same(reason_name(REASON_LIMIT), "limit");
+    assert same(reason_name(REASON_EMPTY), "empty");
+    assert same(reason_name(REASON_TIMEOUT), "timeout");
+    assert !same(reason_name(REASON_LIMIT), reason_name(REASON_EMPTY));
+    assert !same(reason_name(REASON_STATUS), reason_name(REASON_UNREACHABLE));
+    assert same(reason_name(REASON_NONE), "none");
+}
+
+test an_answer_is_kept_up_to_its_cap {
+    assert answer_keep(0) == 0;
+    assert answer_keep(CHAT_ANSWER_MAX) == CHAT_ANSWER_MAX;
+    assert answer_keep(CHAT_ANSWER_MAX + 1) == CHAT_ANSWER_MAX;
+    assert answer_keep(5) == 5;
+}
+
+test system_prompt_names_course_and_lesson {
+    var o : [1024]u8 = [0; 1024];
+    const n : u32 = system_prompt(o[0..], 0, "vibecoding", "Plant a bug");
+    assert n > 0;
+    assert n < 1024;
+    assert has_text(o[0..], n, "course helper");
+    assert has_text(o[0..], n, "vibecoding");
+    assert has_text(o[0..], n, "Plant a bug");
+    assert has_text(o[0..], n, "I do not know");
+    assert has_text(o[0..], n, "You have no tools");
+}
+
+test system_prompt_on_the_overview_has_no_lesson {
+    var o : [1024]u8 = [0; 1024];
+    const n : u32 = system_prompt(o[0..], 0, "vibecoding", "");
+    assert has_text(o[0..], n, "vibecoding");
+    assert !has_text(o[0..], n, "open at the lesson");
+}
+
+test system_prompt_keeps_keys_out {
+    var o : [1024]u8 = [0; 1024];
+    const n : u32 = system_prompt(o[0..], 0, "vibecoding", "x");
+    assert has_text(o[0..], n, "Never ask for or repeat a key");
+}
+
+test system_prompt_is_the_three_parts_joined {
+    var o : [1024]u8 = [0; 1024];
+    const n : u32 = system_prompt(o[0..], 0, "vibecoding", "x");
+    assert n == CHAT_PROMPT_HEAD.len + 10 + CHAT_PROMPT_LESSON.len + 1 + CHAT_PROMPT_TAIL.len;
+    assert CHAT_PROMPT_HEAD.len > 0;
+    assert CHAT_PROMPT_LESSON.len > 0;
+    assert CHAT_PROMPT_TAIL.len > 0;
+}
+
+test sheet_starts_where_the_column_ends {
+    var o : [2048]u8 = [0; 2048];
+    const n : u32 = put(o[0..], 0, CHAT_CSS_SHEET);
+    assert CHAT_WIDE_MIN == 1000;
+    assert has_text(o[0..], n, "max-width:999px");
+}
+
+test panel_style_has_no_glow_and_no_colour {
+    var o : [2048]u8 = [0; 2048];
+    const n : u32 = put(o[0..], 0, CHAT_CSS);
+    assert n > 0;
+    assert has_text(o[0..], n, ".cc{");
+    assert !has_text(o[0..], n, "box-shadow");
+    assert !has_text(o[0..], n, "gradient");
+    assert !has_text(o[0..], n, "rgb");
+}
+
+test opener_is_a_circle_with_the_avatar {
+    var o : [2048]u8 = [0; 2048];
+    const n : u32 = put(o[0..], 0, CHAT_CSS_SHEET);
+    assert has_text(o[0..], n, ".cc-open{display:block;position:fixed;right:16px;bottom:16px");
+    assert has_text(o[0..], n, "border:1px solid #fff");
+    assert has_text(o[0..], n, "border-radius:50%");
+    assert has_text(o[0..], n, ".cc-open img{");
+    assert has_text(o[0..], n, ".cc-open:focus-visible{outline:2px solid #fff");
+    assert has_text(o[0..], n, ".cc.is-open ~ .cc-open{display:none}");
+    assert same(CHAT_AVATAR, "ghashtag-avatar.jpg");
+    assert same(CHAT_OPEN, "Ask the helper");
+}
+
+test opener_is_at_least_a_tap_target {
+    var o : [2048]u8 = [0; 2048];
+    const n : u32 = put(o[0..], 0, CHAT_CSS_SHEET);
+    assert CHAT_TAP_MIN == 44;
+    assert CHAT_AVATAR_PX >= CHAT_TAP_MIN;
+    assert has_text(o[0..], n, "width:56px;height:56px");
+    assert CHAT_AVATAR_PX == 56;
+}
+
+test limit_global_per_day {
+    assert global_reason(0) == REASON_NONE;
+    assert global_reason(CHAT_GLOBAL_DAY - 1) == REASON_NONE;
+    assert global_reason(CHAT_GLOBAL_DAY) == REASON_BUSY;
+    assert global_reason(CHAT_GLOBAL_DAY + 1) == REASON_BUSY;
+}
+
+test limit_turns_per_conversation {
+    assert turn_reason(0) == REASON_NONE;
+    assert turn_reason(CHAT_TURNS_MAX - 1) == REASON_NONE;
+    assert turn_reason(CHAT_TURNS_MAX) == REASON_LIMIT;
+    assert turn_reason(CHAT_TURNS_MAX + 3) == REASON_LIMIT;
+}
+
+test never_a_paid_fallback {
+    assert CHAT_PAID_FALLBACK == 0;
+    assert fallback_allowed(true);
+    assert !fallback_allowed(false);
+}
+
+test the_gate_checks_in_a_fixed_order {
+    assert gate_reason(true, 10, 10, 0, 0, 0, false, 0) == REASON_NONE;
+    assert gate_reason(false, 10, 10, CHAT_TURNS_MAX, CHAT_PER_IP_HOUR, 0, false, CHAT_GLOBAL_DAY) == REASON_OFF;
+    assert gate_reason(true, 10, 0, CHAT_TURNS_MAX, CHAT_PER_IP_HOUR, 0, false, CHAT_GLOBAL_DAY) == REASON_BAD_REQUEST;
+    assert gate_reason(true, 10, 10, CHAT_TURNS_MAX, 0, 0, false, CHAT_GLOBAL_DAY) == REASON_LIMIT;
+    assert gate_reason(true, 10, 10, 0, CHAT_PER_IP_HOUR, 0, false, CHAT_GLOBAL_DAY) == REASON_LIMIT;
+    assert gate_reason(true, 10, 10, 0, 0, CHAT_PER_KEY_DAY, true, CHAT_GLOBAL_DAY) == REASON_LIMIT;
+    assert gate_reason(true, 10, 10, 0, 0, 0, false, CHAT_GLOBAL_DAY) == REASON_BUSY;
+    assert gate_reason(true, 10, 10, CHAT_TURNS_MAX - 1, CHAT_PER_IP_HOUR - 1, 0, false, CHAT_GLOBAL_DAY - 1) == REASON_NONE;
+}
+
+test a_busy_assistant_says_so_and_shows_no_generated_text {
+    assert client_reason(true, false, 503, 0) == REASON_BUSY;
+    assert client_reason(true, false, 503, 50) == REASON_BUSY;
+    assert same(offline_text(REASON_BUSY), CHAT_OFFLINE_BUSY);
+    assert same(reason_name(REASON_BUSY), "busy");
+    assert !show_answer(REASON_BUSY);
+    assert !same(CHAT_OFFLINE_BUSY, CHAT_OFFLINE);
+    assert !same(CHAT_OFFLINE_BUSY, CHAT_OFFLINE_LIMIT);
+}
+
+test the_probe_takes_the_panel_live_by_itself {
+    assert probe_reason(true, false, 200) == REASON_NONE;
+    assert probe_reason(true, false, 404) == REASON_STATUS;
+    assert probe_reason(false, false, 0) == REASON_UNREACHABLE;
+    assert probe_reason(true, true, 200) == REASON_TIMEOUT;
+    assert probe_reason(true, false, 429) == REASON_LIMIT;
+    assert probe_reason(true, false, 503) == REASON_OFF;
+    assert CHAT_PROBE_RETRY_MS >= 10000;
+}
+
+test a_message_is_kept_in_every_state {
+    assert send_plan(5, true, false, 0) == ACT_SEND;
+    assert send_plan(5, false, false, 0) == ACT_REPROBE;
+    assert send_plan(5, true, true, 0) == ACT_WAIT;
+    assert send_plan(5, false, true, 0) == ACT_WAIT;
+    assert send_plan(5, true, false, CHAT_TURNS_MAX) == ACT_LIMIT;
+    assert send_plan(5, false, false, CHAT_TURNS_MAX) == ACT_LIMIT;
+    assert send_plan(5, false, true, CHAT_TURNS_MAX) == ACT_LIMIT;
+    assert logs_line(ACT_SEND);
+    assert logs_line(ACT_REPROBE);
+    assert logs_line(ACT_WAIT);
+    assert logs_line(ACT_LIMIT);
+    assert !logs_line(ACT_IGNORE);
+}
+
+test an_empty_or_oversized_message_does_nothing {
+    assert send_plan(0, true, false, 0) == ACT_IGNORE;
+    assert send_plan(0, false, false, 0) == ACT_IGNORE;
+    assert send_plan(CHAT_MSG_MAX + 1, true, false, 0) == ACT_IGNORE;
+    assert send_plan(CHAT_MSG_MAX, false, false, 0) == ACT_REPROBE;
+    assert send_plan(1, true, false, CHAT_TURNS_MAX - 1) == ACT_SEND;
+}
+
+test an_offline_probe_says_offline_not_busy {
+    var o : [512]u8 = [0; 512];
+    assert probe_reason(true, false, 503) == REASON_OFF;
+    assert probe_reason(false, false, 0) == REASON_UNREACHABLE;
+    assert probe_reason(true, true, 503) == REASON_TIMEOUT;
+    assert probe_reason(true, false, 200) == REASON_NONE;
+    assert same(offline_text(probe_reason(true, false, 503)), CHAT_OFFLINE);
+    const n : u32 = put(o[0..], 0, CHAT_OFFLINE);
+    assert !has_text(o[0..], n, "busy");
+}
+
+test the_line_after_the_message_says_offline_and_not_answered {
+    var o : [512]u8 = [0; 512];
+    assert same(unanswered_text(REASON_UNREACHABLE), CHAT_UNANSWERED);
+    assert same(unanswered_text(REASON_TIMEOUT), CHAT_UNANSWERED);
+    assert same(unanswered_text(REASON_STATUS), CHAT_UNANSWERED);
+    assert same(unanswered_text(REASON_EMPTY), CHAT_UNANSWERED);
+    assert same(unanswered_text(REASON_OFF), CHAT_UNANSWERED);
+    assert same(unanswered_text(REASON_LIMIT), CHAT_OFFLINE_LIMIT);
+    assert same(unanswered_text(REASON_BUSY), CHAT_OFFLINE_BUSY);
+    const n : u32 = put(o[0..], 0, CHAT_UNANSWERED);
+    assert has_text(o[0..], n, "offline");
+    assert has_text(o[0..], n, "not answered");
+    assert !has_text(o[0..], n, "busy");
+    assert !has_text(o[0..], n, "Busy");
+}
+
+test the_waiting_note_is_its_own_line {
+    var o : [512]u8 = [0; 512];
+    const n : u32 = put(o[0..], 0, CHAT_WAIT_NOTE);
+    assert has_text(o[0..], n, "was not sent");
+    assert !has_text(o[0..], n, "busy");
+    assert !same(CHAT_WAIT_NOTE, CHAT_UNANSWERED);
+    assert !same(CHAT_WAIT_NOTE_RU, CHAT_UNANSWERED_RU);
+}
+
+test each_new_string_has_a_russian_form {
+    assert CHAT_UNANSWERED.len > 0;
+    assert CHAT_UNANSWERED_RU.len > 0;
+    assert CHAT_WAIT_NOTE.len > 0;
+    assert CHAT_WAIT_NOTE_RU.len > 0;
+    assert !same(CHAT_UNANSWERED, CHAT_UNANSWERED_RU);
+    assert !same(CHAT_WAIT_NOTE, CHAT_WAIT_NOTE_RU);
+}
+
+test send_is_a_real_button_with_a_tap_target {
+    var o : [4096]u8 = [0; 4096];
+    const n : u32 = put(o[0..], 0, CHAT_CSS);
+    assert CHAT_TAP_MIN == 44;
+    assert has_text(o[0..], n, ".cc-go{");
+    assert has_text(o[0..], n, "min-width:44px;min-height:44px");
+    assert has_text(o[0..], n, "min-height:44px;max-height:120px");
+    assert has_text(o[0..], n, "font-size:16px");
+    assert !has_text(o[0..], n, "pointer-events:none");
+}
+
+test the_message_and_turn_caps_are_unchanged {
+    assert CHAT_MSG_MAX == 600;
+    assert CHAT_TURNS_MAX == 8;
+}
