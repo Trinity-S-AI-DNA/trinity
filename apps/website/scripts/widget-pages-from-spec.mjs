@@ -37,8 +37,17 @@ export const TOOL_REQUIRED = {
   KIND: 'str', ID: 'str', TITLE: 'str', DESCRIPTION: 'str', IMAGE_ALT: 'str', HOOK: 'str',
   CATEGORY: 'str', DATA_SOURCES: 'arr', READS_LOCAL_FILES: 'bool', SENDS_NOTHING: 'bool',
 }
+// Named debt: these tools predate the render-through-a-shared-kit rule and still write their own
+// SVG in their tool.js. The rule holds for every new tool; each of these moves to dsp-kit, hive-kit
+// or graph-kit in its own review, and leaves this list one by one. Adding an id here is an edit to
+// this hand-owned script, visible in the diff -- but no in-band gate enforces that: keeping this
+// list short is a review responsibility, not a machine check.
+const LEGACY_SVG_TOOLS = new Set(['build-receipt', 'cost-curves', 'eye-isi', 'fsm-sketch', 'line-bounce', 'pin-map', 't27-cell', 'uart-bucket'])
+// The only shared code a tool.js may import from outside its own directory. A widget's own files
+// (./logic.js and friends) are always allowed; anything else is rejected by name.
+const TRUSTED_KITS = new Set(['dsp-kit.js', 'hive-kit.js', 'graph-kit.js', 'infographic.js', 'ternary-kit.js', 'nn-kit.js', 'site.js'])
 // The page's own words, from the gallery spec.
-export const PAGE_WORDS = ['TOOL_BRAND', 'TOOL_GALLERY_LINK', 'TOOL_SOURCE_LINK', 'TOOL_DATA_LABEL', 'TOOL_PRIVACY', 'TOOL_PRIVACY_FILES', 'TOOL_NOSCRIPT']
+export const PAGE_WORDS = ['TOOL_BRAND', 'TOOL_GALLERY_LINK', 'TOOL_SOURCE_LINK', 'TOOL_DATA_LABEL', 'TOOL_PRIVACY', 'TOOL_PRIVACY_FILES', 'TOOL_GRADE_PRIVACY', 'TOOL_NOSCRIPT']
 
 // The Russian words of the pages: a contract spec (no Cyrillic) names the bundle that holds them.
 export const RU_SPEC = 'specs/widgets/i18n/widgets-ru.t27'
@@ -140,7 +149,13 @@ export function toolProblems(f, file, root = SITE) {
     if (!String(f[name] ?? '').trim()) p.push(`${file}: ${name} is empty`)
     else if (f[name].length > max) p.push(`${file}: ${name} is ${f[name].length} characters, over ${max}`)
   }
-  if (f.SENDS_NOTHING !== true) p.push(`${file}: SENDS_NOTHING must be true; a widget sends the reader's data nowhere`)
+  // A GRADED widget may send the reader's answer to exactly one named road;
+  // anything else still must send nothing.
+  if (f.SENDS_NOTHING !== true && f.SENDS_NOTHING !== false) {
+    p.push(`${file}: SENDS_NOTHING must be true or false`)
+  } else if (f.SENDS_NOTHING === false && (typeof f.K_GRADE_ROAD !== 'string' || !f.K_GRADE_ROAD.trim())) {
+    p.push(`${file}: SENDS_NOTHING false requires GRADE_ROAD, the one road the answer takes`)
+  }
   if (!f.DATA_SOURCES?.length || f.DATA_SOURCES.some((s) => !s.trim())) p.push(`${file}: DATA_SOURCES must name where every number came from`)
   const dir = `public/widgets/${f.ID}`
   const tool = join(root, dir, 'tool.js')
@@ -149,6 +164,30 @@ export function toolProblems(f, file, root = SITE) {
     const js = readFileSync(tool, 'utf8')
     if (/\b(fetch|import)\s*\(\s*['"`]https?:/.test(js) || /\bfrom\s+['"]https?:/.test(js)) p.push(`${file}: ${dir}/tool.js loads from another host; a widget reads only its own files`)
     if (/\b(localStorage|document\.cookie)\b/.test(js)) p.push(`${file}: ${dir}/tool.js keeps state in the reader's browser; the page sets nothing`)
+    // Origin of the tool: string scans, not a parse of behaviour -- a filter, not a proof. What it
+    // does hold: the WHOLE local import chain (static `from` and dynamic `import()`), so a hand
+    // renderer cannot hide in ./logic.js or any deeper local file.
+    const widgetsRoot = join(root, 'public/widgets')
+    const queue = [[join(root, dir, 'tool.js'), `${dir}/tool.js`]]
+    const seen = new Set()
+    while (queue.length) {
+      const [path, label] = queue.pop()
+      if (seen.has(path)) continue
+      seen.add(path)
+      const src = existsSync(path) ? readFileSync(path, 'utf8') : null
+      if (src == null) { p.push(`${file}: ${label} is imported but missing`); continue }
+      if (!LEGACY_SVG_TOOLS.has(f.ID) && /\b(createElementNS|innerHTML|insertAdjacentHTML)\b/.test(src)) p.push(`${file}: ${label} draws or writes markup itself; a widget renders through the shared kit it imports, never its own SVG or DOM writer`)
+      for (const m of src.matchAll(/\b(?:from|import)\s*\(?\s*['"](\.[^'"]+)['"]/g)) {
+        const target = m[1].replace(/[?#].*$/, '')
+        if (!target.startsWith('./')) {
+          if (!TRUSTED_KITS.has(target.split('/').pop())) p.push(`${file}: ${label} imports ${target}; a widget imports only its own files and the shared kits (${[...TRUSTED_KITS].sort().join(', ')})`)
+          continue
+        }
+        const resolved = join(dirname(path), target)
+        if (!resolved.startsWith(widgetsRoot)) { p.push(`${file}: ${label} imports ${target}, outside public/widgets`); continue }
+        queue.push([resolved, `public/widgets/${resolved.slice(widgetsRoot.length + 1)}`])
+      }
+    }
   }
   const card = join(root, dir, 'card.png')
   if (!existsSync(card)) p.push(`${file}: ${dir}/card.png is missing`)
@@ -205,7 +244,7 @@ export function renderPage(f, g, { specSha, toolSha, cardSha, shared = [], ru = 
 <main id="widget" class="t27-widget-main" aria-live="polite"></main>
 <noscript><p class="t27-widget-noscript">${esc(g.TOOL_NOSCRIPT)}</p></noscript>
 <footer class="t27-widget-foot">
-<p>${esc(f.READS_LOCAL_FILES ? g.TOOL_PRIVACY_FILES : g.TOOL_PRIVACY)}</p>
+<p>${esc(f.SENDS_NOTHING === false ? g.TOOL_GRADE_PRIVACY : f.READS_LOCAL_FILES ? g.TOOL_PRIVACY_FILES : g.TOOL_PRIVACY)}</p>
 <details><summary>${esc(g.TOOL_DATA_LABEL)}</summary><ul>${sources}</ul></details>
 <p><a href="./${esc(f.ID)}.t27" target="_blank" rel="noopener">${esc(g.TOOL_SOURCE_LINK)}</a> &middot; <a href="../../#/queen?tab=widgets" target="_top">${esc(g.TOOL_GALLERY_LINK)}</a></p>
 </footer>
@@ -267,7 +306,16 @@ export async function buildAll({ analyze, root = SITE }) {
   const tools = []
   if (problems.length) return { problems, tools }
   for (const file of toolSpecs(root)) {
-    const out = buildTool({ file, specText: readFileSync(join(root, file), 'utf8'), analyze, gallery: g, root })
+    const specText = readFileSync(join(root, file), 'utf8')
+    // A spec in this directory that is not a widget tool (the view descriptors, say) is a
+    // sibling source, not a tool: skip it here and let its own generator step handle it.
+    // KIND is read off its const node directly -- constsOf would evaluate the whole spec,
+    // and a logic spec's test blocks hold calls and identifiers it refuses.
+    const analysis = analyze(specText)
+    const kindNode = analysis.ast?.children?.find((n) => n.kind === 'ConstDecl' && n.name === 'KIND')
+    const kind = kindNode ? String(kindNode.children?.[0]?.value ?? '') : undefined
+    if (typeof kind === 'string' && kind !== TOOL_KIND) continue
+    const out = buildTool({ file, specText, analyze, gallery: g, root })
     problems.push(...out.problems)
     tools.push({ file, ...out })
   }
@@ -283,13 +331,113 @@ async function main() {
   const json = process.argv.includes('--json')
   const analyze = await loadCompiler(readFileSync(join(SITE, WASM)))
   const { problems, tools } = await buildAll({ analyze })
+  // The app-level theme templates: specs/widgets/themes.t27 owns the token values; this emits
+  // public/widgets/theme.css from them and --check guards it like every generated file. A missing
+  // constant or a failing test in the spec fails the run here, not in a hand-edited stylesheet.
+  const themeFile = 'specs/widgets/themes.t27'
+  const themeConsts = Object.fromEntries(Object.entries(constsOf(analyze(readFileSync(join(SITE, themeFile), 'utf8')))).map(([k, v]) => [k, v.value]))
+  const SUFFIXES = ['BG', 'PANEL', 'LINE', 'GREEN', 'GOLD', 'RED', 'TEXT', 'MUTED', 'SUBTLE']
+  const tokenNames = themeConsts.SAY_TOKEN_NAMES
+  const templateIds = themeConsts.SAY_TEMPLATE_IDS
+  if (!Array.isArray(tokenNames) || tokenNames.length !== SUFFIXES.length) problems.push(`${themeFile}: SAY_TOKEN_NAMES must name exactly ${SUFFIXES.length} tokens in widget.css order`)
+  if (!Array.isArray(templateIds) || templateIds.length !== themeConsts.TEMPLATE_COUNT) problems.push(`${themeFile}: SAY_TEMPLATE_IDS must hold TEMPLATE_COUNT ids`)
+  for (const id of Array.isArray(templateIds) ? templateIds : []) {
+    for (const s of SUFFIXES) {
+      const v = themeConsts[`T_${String(id).toUpperCase()}_${s}`]
+      if (typeof v !== 'string' || !v.trim()) problems.push(`${themeFile}: T_${String(id).toUpperCase()}_${s} is missing or empty`)
+    }
+  }
   if (problems.length) {
     console.error(`widget-pages-from-spec: ${problems.length} problem(s)`)
     for (const p of problems) console.error('  ' + p)
     process.exit(1)
   }
-  if (json) { process.stdout.write(JSON.stringify(Object.fromEntries(tools.map((t) => [t.fields.ID, t.fields])), null, 2) + '\n'); return }
-  const targets = tools.flatMap((t) => [[pageOut(t.fields.ID), t.page], [specOut(t.fields.ID), t.publicSpec]])
+  let targets = tools.flatMap((t) => [[pageOut(t.fields.ID), t.page], [specOut(t.fields.ID), t.publicSpec]])
+  // A generated logic module a slice depends on must be whole: one announced
+  // omission in __NOT_EMITTED__ fails the build here, before any page ships.
+  // The module itself is emitted by `t27c gen-js` over the logic spec; this is
+  // the check that keeps a partial artifact out of the tree.
+  const logicArtifacts = [
+    ['public/widgets/second-brain/second-brain-logic.js', 'specs/widgets/second-brain-view-logic.t27'],
+    ['public/widgets/second-brain/second-brain-view.js', 'specs/widgets/second-brain-view.t27'],
+    ['public/widgets/second-brain/second-brain-kit.js', 'specs/widgets/second-brain-kit.t27'],
+    ['public/widgets/second-brain/second-brain-flow.js', 'specs/widgets/second-brain-flow.t27'],
+  ]
+  const { execFileSync } = await import('node:child_process')
+  const { createHash } = await import('node:crypto')
+  const manifest = JSON.parse(readFileSync(new URL('./t27c-manifest.json', import.meta.url), 'utf8'))
+  const t27c = manifest.path
+  // Identity, not convenience: the manifest pins the exact binary this slice's
+  // artifacts were generated with (sha256 + compiler commit). Any other t27c
+  // -- a rebuild, a different clone, whatever PATH offers today -- refuses to
+  // run, because a silently different lowering is worse than a failed build.
+  let binaryOk = existsSync(t27c)
+  if (binaryOk) {
+    const digest = createHash('sha256').update(readFileSync(t27c)).digest('hex')
+    if (digest !== manifest.sha256) {
+      problems.push(`t27c at ${t27c} is sha256 ${digest.slice(0, 16)}..., but this slice was generated with ${manifest.sha256.slice(0, 16)}... (compiler commit ${manifest.commit.slice(0, 10)}); rebuild the pinned commit or refresh t27c-manifest.json together with the artifacts`)
+      binaryOk = false
+    }
+  } else {
+    problems.push(`the pinned t27c is missing at ${t27c} (manifest expects sha256 ${manifest.sha256.slice(0, 16)}..., compiler commit ${manifest.commit.slice(0, 10)})`)
+  }
+  for (const [artifact, source] of logicArtifacts) {
+    const p = join(SITE, artifact)
+    if (!existsSync(p)) { problems.push(`${source}: its generated module ${artifact} is missing; run t27c gen-js over the spec`) ; continue }
+    const text = readFileSync(p, 'utf8')
+    const m = text.match(/export const __NOT_EMITTED__ = Object\.freeze\(\[([\s\S]*?)\]\)/)
+    if (!m) problems.push(`${artifact}: no __NOT_EMITTED__ record found -- a generated module without one cannot be trusted`)
+    else if (m[1].trim()) problems.push(`${artifact}: __NOT_EMITTED__ holds ${m[1].trim().split('),').length} unlowered declaration(s) from ${source}; the slice refuses a partial module`)
+    // Freshness by regenerating, not by trusting the committed bytes: the
+    // artifact must equal what the pinned compiler emits from the spec right
+    // now. A stale module (spec moved, compiler moved) fails here.
+    if (binaryOk) {
+      const fresh = execFileSync(t27c, ['gen-js', join(SITE, source)], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })
+      if (fresh !== text) problems.push(`${artifact}: does not match a fresh t27c gen-js run over ${source} (compiler ${t27c}); regenerate it`)
+    }
+  }
+  if (problems.length) {
+    console.error(`widget-pages-from-spec: ${problems.length} problem(s)`)
+    for (const p of problems) console.error('  ' + p)
+    process.exit(1)
+  }
+  {
+    const header = `/* theme.css -- GENERATED from ${themeFile} by scripts/widget-pages-from-spec.mjs; do not edit.\n   widget.css owns the token names; the spec owns the values. */\n`
+    const blocks = templateIds.map((id) => {
+      const idKey = String(id).toUpperCase()
+      const body = tokenNames.map((tok, i) => `  ${tok}: ${themeConsts[`T_${idKey}_${SUFFIXES[i]}`]};`).join('\n')
+      return `html.sb-theme-${id} {\n${body}\n  color-scheme: ${idKey === 'SLATE' ? 'dark' : 'light'};\n}`
+    }).join('\n\n')
+    const metrics = [
+      ['--sb2-font', 'SB2_FONT_STACK'], ['--sb2-fz-base', 'SB2_FONT_SIZE_BASE'],
+      ['--sb2-fz-sm', 'SB2_FONT_SIZE_SM'], ['--sb2-fz-btn', 'SB2_FONT_SIZE_BTN'],
+      ['--sb2-letter', 'SB2_LETTER_SPACING'], ['--sb2-radius-pill', 'SB2_RADIUS_PILL'],
+      ['--sb2-btn-pad-y', 'SB2_BTN_PAD_Y'], ['--sb2-btn-pad-x', 'SB2_BTN_PAD_X'],
+      ['--sb2-btn-lh', 'SB2_BTN_LINE_H'], ['--sb2-gap', 'SB2_GAP'],
+      ['--sb2-max-w', 'SB2_MAX_W'], ['--sb2-lh-base', 'SB2_LINE_H_BASE'], ['--sb2-label-cap', 'SB2_LABEL_CAP'],
+      ['--sb2-layout-gap-x', 'SB2_LAYOUT_GAP_X'], ['--sb2-layout-gap-y', 'SB2_LAYOUT_GAP_Y'],
+    ]
+    const metricBlock = '.sb2 {\n' + metrics.map(([tok, key]) => {
+      const v = themeConsts[key]
+      if (v == null || (typeof v === 'string' && !v.trim())) problems.push(`${themeFile}: ${key} is missing or empty`)
+      return `  ${tok}: ${v};`
+    }).join('\n') + '\n}\n'
+    targets = [...targets, ['public/widgets/theme.css', header + blocks + '\n' + metricBlock]]
+  }
+  // The index and flow extracts are deterministic scripts over the same pinned
+  // compiler; run them here so the explorer's data is as fresh as the pages.
+  for (const script of ['spec-index.mjs', 'flow-extract.mjs']) {
+    try {
+      execFileSync(process.execPath, [join(SITE, 'scripts', script)], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
+    } catch (e) {
+      problems.push(`scripts/${script} failed: ${String(e.message).split('\n')[0]}`)
+    }
+  }
+  if (problems.length) {
+    console.error(`widget-pages-from-spec: ${problems.length} problem(s)`)
+    for (const p of problems) console.error('  ' + p)
+    process.exit(1)
+  }
   if (check) {
     const stale = targets.filter(([rel, text]) => !existsSync(join(SITE, rel)) || readFileSync(join(SITE, rel), 'utf8') !== text)
     if (stale.length) {
