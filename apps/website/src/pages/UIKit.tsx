@@ -340,6 +340,15 @@ export default function UIKit() {
 
   useEffect(() => { setStepResults([]) }, [activeId])
 
+  useEffect(() => {
+    const p = new URLSearchParams(window.location.hash.split('?')[1] ?? '')
+    const s = STORIES.find(x => x.id === p.get('story'))
+    if (s) setActiveId(s.id)
+  }, [])
+  useEffect(() => {
+    history.replaceState(null, '', window.location.hash.split('?')[0] + '?story=' + activeId)
+  }, [activeId])
+
   const runSteps = async () => {
     const el = document.getElementById('uikit-canvas')?.querySelector('[data-testid]') as HTMLElement | null
     const run = async (s: InteractionStep) => { if (!el) return { pass: false, msg: 'not found' }; s.action === 'hover' ? el.dispatchEvent(new MouseEvent('mouseenter')) : s.action === 'click' ? el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true })) : el.focus(); await new Promise<void>(r => setTimeout(r, 80)); return { pass: el.dataset.state === s.expect, msg: `${s.action} → "${el.dataset.state}"` } }
@@ -369,24 +378,33 @@ export default function UIKit() {
             </button>
             {openGroups.has(comp) && STORIES.filter(s => s.component === comp).map(s => (
               <button key={s.id} onClick={() => { setActiveId(s.id); setTab('stories') }} style={{ display: 'block', width: '100%', textAlign: 'left', padding: '5px 20px', background: activeId === s.id ? (theme === 't27' ? '#111' : '#EEE') : 'none', border: 'none', borderLeft: activeId === s.id ? `2px solid ${t.accent}` : '2px solid transparent', color: activeId === s.id ? t.accent : t.text, fontSize: '12px', cursor: 'pointer', fontFamily: 'inherit' }}>
-                {s.title.split(' / ').pop()}
+                {s.title.split(' / ').slice(-2).join(' / ')}
               </button>
             ))}
           </div>
         ))}
+        <div style={{ borderTop: `1px solid ${t.cardBorder}`, marginTop: '8px' }}>
+          <div style={{ color: t.muted, fontSize: '11px', letterSpacing: '0.1em', textTransform: 'uppercase', padding: '6px 12px' }}>Tools</div>
+          {(['netlist', 'badge-vr'] as Tab[]).map(id => (
+            <button key={id} onClick={() => setTab(id)} style={{ display: 'block', width: '100%', textAlign: 'left', padding: '5px 20px', background: tab === id ? (theme === 't27' ? '#111' : '#EEE') : 'none', border: 'none', borderLeft: tab === id ? `2px solid ${t.accent}` : '2px solid transparent', color: tab === id ? t.accent : t.text, fontSize: '12px', cursor: 'pointer', fontFamily: 'inherit' }}>
+              {id === 'badge-vr' ? 'Badge VR' : 'Netlist'}
+            </button>
+          ))}
+        </div>
       </aside>
 
       {/* Main */}
       <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
         {/* Toolbar */}
         <div style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '10px 16px', borderBottom: `1px solid ${t.cardBorder}`, background: theme === 't27' ? '#080808' : '#FFFFFF', flexShrink: 0 }}>
-          {(['stories', 'gallery', 'netlist', 'badge-vr'] as Tab[]).map(tabId => (
+          <span style={{ color: t.muted, fontSize: '12px', flex: 1, fontFamily: 'monospace' }}>{tab === 'netlist' ? 'Tools / Netlist' : tab === 'badge-vr' ? 'Tools / Badge VR' : story.title}</span>
+          {(['stories', 'gallery'] as Tab[]).map(tabId => (
             <button key={tabId} onClick={() => setTab(tabId)} style={{ padding: '5px 12px', fontSize: '12px', border: `1px solid ${tab === tabId ? t.accent : t.cardBorder}`, background: tab === tabId ? (theme === 't27' ? '#111' : '#EEE') : 'none', color: tab === tabId ? t.accent : t.muted, cursor: 'pointer', borderRadius: '4px', fontFamily: 'inherit' }}>
-              {tabId === 'badge-vr' ? 'Badge VR' : tabId.charAt(0).toUpperCase() + tabId.slice(1)}
+              {tabId === 'stories' ? 'Preview' : 'Gallery'}
             </button>
           ))}
-          <button onClick={() => setTheme(t => t === 't27' ? 'paper' : 't27')} style={{ marginLeft: 'auto', padding: '5px 14px', fontSize: '12px', border: `1px solid ${t.accent}`, background: 'none', color: t.accent, cursor: 'pointer', borderRadius: '4px', fontFamily: 'inherit', fontWeight: 600 }}>
-            {theme === 't27' ? '◑ TH_T27 (Dark)' : '◐ TH_PAPER (Light)'}
+          <button onClick={() => setTheme(th => th === 't27' ? 'paper' : 't27')} style={{ padding: '5px 14px', fontSize: '12px', border: `1px solid ${t.accent}`, background: 'none', color: t.accent, cursor: 'pointer', borderRadius: '4px', fontFamily: 'inherit', fontWeight: 600 }}>
+            {theme === 't27' ? '◑ Dark' : '◐ Light'}
           </button>
         </div>
 
