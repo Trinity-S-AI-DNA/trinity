@@ -464,7 +464,7 @@ function figHero() {
   const nodeEls = WG_NODES.map((nd, i) => {
     const g = svgEl('g', { style: 'cursor:pointer' }, svg);
     svgEl('rect', {
-      x: nd.x, y: nd.y, width: W, height: H, rx: 7, fill: '#161b22',
+      x: nd.x, y: nd.y, width: W, height: H, rx: 7, fill: '#000000',
       stroke: KIND_COLOR[NK[nd.k]], 'stroke-width': 1.4,
       'stroke-dasharray': nd.lab === 'EXACT' ? '' : '4 3',
     }, g);
@@ -526,8 +526,8 @@ function figMatrix() {
         const x = lab + pad + j * cell, y = lab + pad + i * cell;
         svgEl('rect', {
           x, y, width: cell - 1, height: cell - 1, rx: 2,
-          fill: v > 0 ? `rgba(210,153,34,${0.15 + 0.7 * (v / (maxw || 1))})` : '#161b22',
-          stroke: '#30363d', 'stroke-width': 0.5,
+          fill: v > 0 ? `rgba(210,153,34,${0.15 + 0.7 * (v / (maxw || 1))})` : '#000000',
+          stroke: '#333', 'stroke-width': 0.5,
         }, svg);
         if (v > 0 && v < 100) svgEl('text', { x: x + cell / 2 - 0.5, y: y + 13.5, 'text-anchor': 'middle', fill: v > maxw / 2 ? '#0d1117' : '#d29922', 'font-size': 8.5, 'font-family': 'JetBrains Mono,monospace' }, svg).textContent = String(v);
       }
@@ -549,7 +549,7 @@ function figMatrix() {
         const x = lab + pad + j * cell, y = lab + pad + i * cell;
         const ei = present.get(key(i, j));
         const [c, dash] = ei !== undefined ? EDGE_STYLE[EK[edges[ei].k]] : ['#21262d', ''];
-        const r = svgEl('rect', { x, y, width: cell - 1, height: cell - 1, rx: 2, fill: ei !== undefined ? c : '#161b22', 'fill-opacity': ei !== undefined ? 0.85 : 1, stroke: edited.has(key(i, j)) ? '#3fb950' : '#30363d', 'stroke-width': edited.has(key(i, j)) ? 1.6 : 0.5, style: 'cursor:pointer' }, svg);
+        const r = svgEl('rect', { x, y, width: cell - 1, height: cell - 1, rx: 2, fill: ei !== undefined ? c : '#000000', 'fill-opacity': ei !== undefined ? 0.85 : 1, stroke: edited.has(key(i, j)) ? '#3fb950' : '#333', 'stroke-width': edited.has(key(i, j)) ? 1.6 : 0.5, style: 'cursor:pointer' }, svg);
         r.addEventListener('click', () => {
           const kk = key(i, j);
           const at = present.get(kk);
@@ -603,7 +603,7 @@ function figPermute() {
       svgEl('text', { x: lab - 5, y: lab + pad + i * cell + 11, 'text-anchor': 'end', fill: '#8b949e', 'font-size': 7.5, 'font-family': 'JetBrains Mono,monospace' }, svg).textContent = `${WG_NODES[orig].name}`.slice(0, 6);
       for (let j = 0; j < n; j++) {
         const on = es.has(orig * n + order[j]);
-        svgEl('rect', { x: lab + pad + j * cell, y: lab + pad + i * cell, width: cell - 1, height: cell - 1, rx: 1.5, fill: on ? '#58a6ff' : '#161b22', 'fill-opacity': on ? 0.8 : 1, stroke: '#30363d', 'stroke-width': 0.4 }, svg);
+        svgEl('rect', { x: lab + pad + j * cell, y: lab + pad + i * cell, width: cell - 1, height: cell - 1, rx: 1.5, fill: on ? '#58a6ff' : '#000000', 'fill-opacity': on ? 0.8 : 1, stroke: '#333', 'stroke-width': 0.4 }, svg);
       }
     }
   }
