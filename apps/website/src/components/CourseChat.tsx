@@ -185,7 +185,7 @@ export default function CourseChat(p: Props) {
           {lines.map((l, i) => <p key={i} className={l.who === 'you' ? 'cc-m cc-you' : l.who === 'off' ? 'cc-m cc-off' : 'cc-m'}>{l.text}</p>)}
           {streamingText !== null ? <p className="cc-m">{streamingText || G.CHAT_WORKING}</p> : busy ? <p className="cc-m cc-off">{G.CHAT_WORKING}</p> : null}
           {!up && why > G.REASON_NONE && lines.length === 0 ? <p className="cc-m cc-off">{offlineText(why)}</p> : null}
-          {capped ? <p className="cc-m cc-off">{offlineText(G.REASON_LIMIT)}</p> : null}
+          {capped ? <p className="cc-m cc-off">{G.CHAT_OFFLINE_TURN_LIMIT}</p> : null}
         </div>
         <form className="cc-form" onSubmit={(e) => { e.preventDefault(); void send() }}>
           <textarea className="cc-in" value={text} maxLength={G.CHAT_MSG_MAX} placeholder={G.CHAT_PLACEHOLDER} aria-label={G.CHAT_PLACEHOLDER} onChange={(e) => setText(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); void send() } }} />
