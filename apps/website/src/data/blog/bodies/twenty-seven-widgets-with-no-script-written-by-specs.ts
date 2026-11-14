@@ -1,0 +1,99 @@
+import type { Block } from '../types'
+
+// Written by t27c gen-text --fn body_ts from apps/website/specs/blog/static_widgets.t27, never by hand (FR-106, Trinity-S-AI-DNA/trinity#1807).
+
+export const body: Block[] = [
+  {
+    "kind": "p",
+    "text": "Course 12 of t27.ai, Vibecoding from zero, has 27 widgets, and none of them runs a script. Each widget is one HTML page. Every state of the widget is one section of that page, every click is a link to a fragment such as #plant, and a CSS rule, :target, shows the one section the address names. The browser does the switching, so there is no JavaScript to load, to break or to review."
+  },
+  {
+    "kind": "h",
+    "text": "A page is written by a spec"
+  },
+  {
+    "kind": "p",
+    "text": "No page is typed by hand. Each widget has a t27 spec in apps/website/specs/widgets/views/ with a function such as page_vc_the_loop that fills a buffer with the whole page, through a small writer, html_out, and a shared frame, page_kit. On Actions, t27c gen-text --fn compiles the spec, runs that function and writes its bytes, unchanged, to apps/website/public/widgets/vc-the-loop/index.html. A workflow fails when a committed page differs from the emitted one by a single byte."
+  },
+  {
+    "kind": "p",
+    "text": "Of the 27 pages, 18 are infographics: a table and a flow, two sections with a tab link between them. The other 9 have state: the four phases, the loop, the message loop, planting a bug, reading a diff, secrets out, unstuck, the test judge and the spec-to-bot table. Each of those is written out as a finite-state machine with a cap on its states. The loop widget is the largest: 92 sections, 55,132 bytes of plain HTML."
+  },
+  {
+    "kind": "figure",
+    "svg": "<svg viewBox='0 0 720 100' xmlns='http://www.w3.org/2000/svg' role='img' aria-label='27 static widget pages: 18 infographics and 9 with state' style='width:100%;height:auto;font-family:inherit'><text x='182' y='38' fill='currentColor' fill-opacity='0.8' font-size='13' text-anchor='end'>Infographics</text><rect x='190' y='22' width='432' height='22' rx='4' fill='currentColor' fill-opacity='0.35'/><text x='630' y='38' fill='currentColor' font-size='13'>18</text><text x='182' y='78' fill='currentColor' fill-opacity='0.8' font-size='13' text-anchor='end'>With state</text><rect x='190' y='62' width='216' height='22' rx='4' fill='#e0a800'/><text x='414' y='78' fill='currentColor' font-size='13'>9</text></svg>",
+    "caption": "The 27 static widget pages of course 12: 18 infographics and 9 with state, counted from view_pages.t27 in the pull request that ships them."
+  },
+  {
+    "kind": "h",
+    "text": "What a page cannot do"
+  },
+  {
+    "kind": "ul",
+    "items": [
+      "It cannot read what you type: every state is written out in advance, so each page with state has a cap on its states and stops there.",
+      "It sends nothing: the widgets collect and transmit nothing, and the tests of every view check that its page has no script and no form.",
+      "Its size grows with its states: the loop page is 55,132 bytes for 92 sections, which is why the pages with state carry a cap."
+    ]
+  },
+  {
+    "kind": "h",
+    "text": "Try it"
+  },
+  {
+    "kind": "ul",
+    "items": [
+      "Course: t27.ai/#/vibecoding",
+      "Pages: t27.ai/widgets/vc-the-loop/ and t27.ai/widgets/vc-key-pair/",
+      "Specs: apps/website/specs/widgets/views/ in Trinity-S-AI-DNA/trinity, pull request 1808"
+    ]
+  },
+]
+
+export const ruBody: Block[] = [
+  {
+    "kind": "p",
+    "text": "В курсе 12 на t27.ai, Вайбкодинг с нуля, 27 виджетов, и ни один из них не запускает скрипт. Каждый виджет - одна HTML-страница. Каждое состояние виджета - одна секция этой страницы, каждый клик - ссылка на фрагмент вроде #plant, а CSS-правило :target показывает ту единственную секцию, которую называет адрес. Переключает браузер, поэтому нет JavaScript, который надо загружать, который может сломаться и который надо ревьюить."
+  },
+  {
+    "kind": "h",
+    "text": "Страницу пишет спека"
+  },
+  {
+    "kind": "p",
+    "text": "Ни одна страница не набрана руками. У каждого виджета есть t27-спека в apps/website/specs/widgets/views/ с функцией вроде page_vc_the_loop: она заполняет буфер всей страницей через маленький writer html_out и общую раму page_kit. На Actions t27c gen-text --fn компилирует спеку, запускает эту функцию и пишет её байты без изменений в apps/website/public/widgets/vc-the-loop/index.html. Workflow падает, если закоммиченная страница отличается от выпущенной хотя бы на один байт."
+  },
+  {
+    "kind": "p",
+    "text": "Из 27 страниц 18 - инфографики: таблица и схема шагов, две секции со ссылкой-вкладкой между ними. Остальные 9 имеют состояние: четыре фазы, цикл, цикл сообщений, подбросить баг, прочитать дифф, секреты наружу, застрял, судья тестов и таблица spec-to-bot. Каждая из них выписана как конечный автомат с потолком числа состояний. Самый большой виджет - цикл: 92 секции, 55 132 байта обычного HTML."
+  },
+  {
+    "kind": "figure",
+    "svg": "<svg viewBox='0 0 720 100' xmlns='http://www.w3.org/2000/svg' role='img' aria-label='27 статических страниц виджетов: 18 инфографик и 9 с состоянием' style='width:100%;height:auto;font-family:inherit'><text x='182' y='38' fill='currentColor' fill-opacity='0.8' font-size='13' text-anchor='end'>Инфографики</text><rect x='190' y='22' width='432' height='22' rx='4' fill='currentColor' fill-opacity='0.35'/><text x='630' y='38' fill='currentColor' font-size='13'>18</text><text x='182' y='78' fill='currentColor' fill-opacity='0.8' font-size='13' text-anchor='end'>С состоянием</text><rect x='190' y='62' width='216' height='22' rx='4' fill='#e0a800'/><text x='414' y='78' fill='currentColor' font-size='13'>9</text></svg>",
+    "caption": "27 статических страниц виджетов курса 12: 18 инфографик и 9 с состоянием, посчитано по view_pages.t27 в пулл-реквесте, который их выпускает."
+  },
+  {
+    "kind": "h",
+    "text": "Чего страница не умеет"
+  },
+  {
+    "kind": "ul",
+    "items": [
+      "Она не читает, что вы печатаете: каждое состояние выписано заранее, поэтому у каждой страницы с состоянием есть потолок числа состояний, и на нём она останавливается.",
+      "Она ничего не отправляет: виджеты ничего не собирают и не передают, а тесты каждого вида проверяют, что в его странице нет ни скрипта, ни формы.",
+      "Её размер растёт вместе с состояниями: страница цикла - 55 132 байта на 92 секции, поэтому у страниц с состоянием есть потолок."
+    ]
+  },
+  {
+    "kind": "h",
+    "text": "Попробуйте"
+  },
+  {
+    "kind": "ul",
+    "items": [
+      "Курс: t27.ai/#/vibecoding",
+      "Страницы: t27.ai/widgets/vc-the-loop/ и t27.ai/widgets/vc-key-pair/",
+      "Спеки: apps/website/specs/widgets/views/ в Trinity-S-AI-DNA/trinity, пулл-реквест 1808"
+    ]
+  },
+]

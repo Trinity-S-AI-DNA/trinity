@@ -3,6 +3,36 @@ import type { PostMeta } from './types'
 /** Индекс блога: список и метаданные без тяжёлых тел публикаций. */
 export const postsIndex: PostMeta[] = [
   {
+    slug: "twenty-seven-widgets-with-no-script-written-by-specs",
+    title: "Twenty-seven widgets with no script, written by specs",
+    summary: "[counts and sizes are read from the specs and the emitted pages of the pull request that ships the course; a page cannot read what you type] Course 12, Vibecoding from zero, has 27 widgets and none runs a script: every widget state is one section of one HTML page, every click is a link to a fragment, and the CSS :target rule shows the one section the address names. A t27 spec writes each page, and a workflow fails when a committed page differs from the emitted one by a single byte. 18 pages are infographics, 9 have state, and the loop page, the largest, is 92 sections and 55,132 bytes.",
+    date: "2026-11-14",
+    readingMinutes: 3,
+    tags: ["t27", "Course", "Widgets"],
+    receipts: [
+      { label: "trinity#1807: the course issue, 27 lessons and 27 widgets", href: "https://github.com/Trinity-S-AI-DNA/trinity/issues/1807" },
+      { label: "trinity pull request 1808: the pages, the workflow and this post", href: "https://github.com/Trinity-S-AI-DNA/trinity/pull/1808" },
+      { label: "The course: Vibecoding from zero", href: "https://t27.ai/#/vibecoding" },
+      { label: "The loop widget, 92 sections", href: "https://t27.ai/widgets/vc-the-loop/" },
+      { label: "The key pair widget, an infographic", href: "https://t27.ai/widgets/vc-key-pair/" },
+    ],
+    openQuestions: [
+      "A page with state is a finite-state machine written out in advance, with a cap on its states; a state nobody wrote out does not exist, and no widget reads what you type.",
+      "The 18 and 9 split is counted from view_pages.t27, and the sizes are those of the emitted pages in pull request 1808.",
+      "The pages were looked at in one browser; :target is old CSS, but other browsers were not tried for this post.",
+    ],
+    published: true,
+    ru: {
+      title: "Двадцать семь виджетов без скрипта, написанных спеками",
+      summary: "[числа и размеры прочитаны из спек и выпущенных страниц пулл-реквеста, который выпускает курс; страница не читает, что вы печатаете] В курсе 12, Вайбкодинг с нуля, 27 виджетов, и ни один не запускает скрипт: каждое состояние виджета - одна секция одной HTML-страницы, каждый клик - ссылка на фрагмент, а CSS-правило :target показывает ту единственную секцию, которую называет адрес. Каждую страницу пишет t27-спека, и workflow падает, если закоммиченная страница отличается от выпущенной хотя бы на один байт. 18 страниц - инфографики, 9 имеют состояние, а самая большая страница, цикл, - 92 секции и 55 132 байта.",
+      openQuestions: [
+        "Страница с состоянием - конечный автомат, выписанный заранее, с потолком числа состояний; состояния, которого никто не выписал, не существует, и ни один виджет не читает, что вы печатаете.",
+        "Разбивка 18 и 9 посчитана по view_pages.t27, а размеры - это размеры выпущенных страниц в пулл-реквесте 1808.",
+        "Страницы смотрели в одном браузере; :target - старый CSS, но другие браузеры для этого поста не пробовали.",
+      ],
+    },
+  },
+  {
     slug: "one-spec-five-targets-the-t27-backend-shootout",
     title: "One spec, five targets: the t27 backend shootout",
     summary: "[measured on arm64 Mac, warm cache, median of three runs] One spec — specs/t27os/heartbeat_monitor.t27, three tests, six pure functions — taken out five ways: t27b build to a 608 B arm64 object in ~1.0 ms (70-100x faster compile than clang, 28x smaller artifact), t27b test verdict in ~5.3 ms, and t27b verilog to ~311 lines RTL. Runtime sits within 2.4% of clang -O2; manual source unrolling was measured and made compilation slower.",
