@@ -109,10 +109,11 @@ function UiInput({ theme, state }: { theme: Theme; state: InputState }) {
 }
 
 type BadgeVariant = 'primary' | 'secondary' | 'ghost' | 'success' | 'warn'
+type BadgeState = 'default' | 'hover' | 'active' | 'disabled'
 
-function UiBadge({ theme, variant }: { theme: Theme; variant: BadgeVariant }) {
+function UiBadge({ theme, variant, state = 'default', label }: { theme: Theme; variant: BadgeVariant; state?: BadgeState; label?: string }) {
   const t = tok(theme)
-  const fills: Record<BadgeVariant, string> = {
+  const baseFills: Record<BadgeVariant, string> = {
     primary: t.accent, secondary: 'transparent', ghost: 'transparent',
     success: t.accentDark, warn: t.gold,
   }
@@ -125,13 +126,16 @@ function UiBadge({ theme, variant }: { theme: Theme; variant: BadgeVariant }) {
     success: '#000000', warn: '#000000',
   }
   const names: Record<BadgeVariant, string> = { primary: 'Primary', secondary: 'Secondary', ghost: 'Ghost', success: 'Success', warn: 'Warn' }
+  const base = baseFills[variant]
+  const fill = state === 'hover' ? base + 'CC' : state === 'active' ? base + 'DD' : base
   return (
     <span style={{
       display: 'inline-flex', alignItems: 'center', padding: '3px 10px',
       borderRadius: '99px', border: `1px solid ${borders[variant]}`,
-      background: fills[variant], color: textColors[variant],
+      background: fill, color: textColors[variant],
       fontSize: '12px', fontWeight: 600, letterSpacing: '0.04em',
-    }}>{names[variant]}</span>
+      opacity: state === 'disabled' ? 0.4 : 1, cursor: state === 'disabled' ? 'not-allowed' : 'default',
+    }}>{label ?? names[variant]}</span>
   )
 }
 
@@ -279,7 +283,10 @@ const STORIES: Story[] = [
   { id: 'input-default',             title: 'Input / Default',               component: 'input',     render: t => <UiInput theme={t} state="default" />,  specPath: 'specs/t27f/vf_storybook.t27', pngPath: 'stories/s17_t0.png' },
   { id: 'input-error',               title: 'Input / Error',                 component: 'input',     render: t => <UiInput theme={t} state="error" />,    specPath: 'specs/t27f/vf_storybook.t27', pngPath: 'stories/s18_t0.png' },
   { id: 'input-focus',               title: 'Input / Focus',                 component: 'input',     render: t => <UiInput theme={t} state="focus" />,    specPath: 'specs/t27f/vf_storybook.t27', pngPath: 'stories/s19_t0.png' },
-  { id: 'badge-primary',             title: 'Badge / Primary',               component: 'badge',     render: t => <UiBadge theme={t} variant="primary" />,   specPath: 'specs/t27f/vf_storybook.t27', pngPath: 'stories/s20_t0.png' },
+  { id: 'badge-primary',             title: 'Badge / Primary / Default',     component: 'badge',     render: t => <UiBadge theme={t} variant="primary" />,                           specPath: 'specs/uikit/stories.t27', pngPath: 'stories/s20_t0.png' },
+  { id: 'badge-primary-hover',       title: 'Badge / Primary / Hover',       component: 'badge',     render: t => <UiBadge theme={t} variant="primary" state="hover" />,             specPath: 'specs/uikit/stories.t27' },
+  { id: 'badge-primary-active',      title: 'Badge / Primary / Active',      component: 'badge',     render: t => <UiBadge theme={t} variant="primary" state="active" />,            specPath: 'specs/uikit/stories.t27' },
+  { id: 'badge-primary-disabled',    title: 'Badge / Primary / Disabled',    component: 'badge',     render: t => <UiBadge theme={t} variant="primary" state="disabled" />,          specPath: 'specs/uikit/stories.t27' },
   { id: 'badge-secondary',           title: 'Badge / Secondary',             component: 'badge',     render: t => <UiBadge theme={t} variant="secondary" />, specPath: 'specs/t27f/vf_storybook.t27', pngPath: 'stories/s21_t0.png' },
   { id: 'badge-ghost',               title: 'Badge / Ghost',                 component: 'badge',     render: t => <UiBadge theme={t} variant="ghost" />,     specPath: 'specs/t27f/vf_storybook.t27', pngPath: 'stories/s22_t0.png' },
   { id: 'badge-success',             title: 'Badge / Success',               component: 'badge',     render: t => <UiBadge theme={t} variant="success" />,   specPath: 'specs/t27f/vf_storybook.t27', pngPath: 'stories/s23_t0.png' },
