@@ -29,7 +29,7 @@ const tok = (theme: Theme): Tok => TOKENS[theme]
 
 // ── Components ─────────────────────────────────────────────────
 type BtnVariant = 'primary' | 'secondary' | 'ghost' | 'success' | 'warn'
-type BtnState = 'default' | 'hover' | 'disabled'
+type BtnState = 'default' | 'hover' | 'active' | 'disabled'
 
 function buttonStyle(theme: Theme, variant: BtnVariant, state: BtnState): CSSProperties {
   const t = tok(theme)
@@ -50,7 +50,9 @@ function buttonStyle(theme: Theme, variant: BtnVariant, state: BtnState): CSSPro
   }
   const fill = state === 'hover'
     ? (variant === 'secondary' ? t.text + '18' : fills[variant] + 'CC')
-    : fills[variant]
+    : state === 'active'
+      ? (variant === 'secondary' ? t.text + '30' : fills[variant] + 'DD')
+      : fills[variant]
   return {
     display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
     padding: '12px 20px', borderRadius: '999px', border: `1px solid ${borders[variant]}`,
@@ -256,9 +258,10 @@ interface Story {
 }
 
 const STORIES: Story[] = [
-  { id: 'button-primary-default',    title: 'Button / Primary / Default',    component: 'button',    render: t => <UiButton theme={t} variant="primary"   state="default" />,  specPath: 'specs/t27f/vf_storybook.t27', pngPath: 'stories/s00_t0.png' },
-  { id: 'button-primary-hover',      title: 'Button / Primary / Hover',      component: 'button',    render: t => <UiButton theme={t} variant="primary"   state="hover" />,    specPath: 'specs/t27f/vf_storybook.t27', pngPath: 'stories/s01_t0.png' },
-  { id: 'button-primary-disabled',   title: 'Button / Primary / Disabled',   component: 'button',    render: t => <UiButton theme={t} variant="primary"   state="disabled" />, specPath: 'specs/t27f/vf_storybook.t27', pngPath: 'stories/s02_t0.png' },
+  { id: 'button-primary-default',    title: 'Button / Primary / Default',    component: 'button',    render: t => <UiButton theme={t} variant="primary"   state="default" />,  specPath: 'specs/uikit/stories.t27', pngPath: 'stories/s00_t0.png' },
+  { id: 'button-primary-hover',      title: 'Button / Primary / Hover',      component: 'button',    render: t => <UiButton theme={t} variant="primary"   state="hover" />,    specPath: 'specs/uikit/stories.t27', pngPath: 'stories/s01_t0.png' },
+  { id: 'button-primary-active',     title: 'Button / Primary / Active',     component: 'button',    render: t => <UiButton theme={t} variant="primary"   state="active" />,   specPath: 'specs/uikit/stories.t27' },
+  { id: 'button-primary-disabled',   title: 'Button / Primary / Disabled',   component: 'button',    render: t => <UiButton theme={t} variant="primary"   state="disabled" />, specPath: 'specs/uikit/stories.t27', pngPath: 'stories/s02_t0.png' },
   { id: 'button-secondary-default',  title: 'Button / Secondary / Default',  component: 'button',    render: t => <UiButton theme={t} variant="secondary" state="default" />,  specPath: 'specs/t27f/vf_storybook.t27', pngPath: 'stories/s03_t0.png' },
   { id: 'button-secondary-hover',    title: 'Button / Secondary / Hover',    component: 'button',    render: t => <UiButton theme={t} variant="secondary" state="hover" />,    specPath: 'specs/t27f/vf_storybook.t27', pngPath: 'stories/s04_t0.png' },
   { id: 'button-secondary-disabled', title: 'Button / Secondary / Disabled', component: 'button',    render: t => <UiButton theme={t} variant="secondary" state="disabled" />, specPath: 'specs/t27f/vf_storybook.t27', pngPath: 'stories/s05_t0.png' },
@@ -356,9 +359,15 @@ export default function UIKit() {
           {tab === 'stories' && (
             <div>
               <div style={{ color: t.text, fontSize: '13px', fontWeight: 600, marginBottom: '6px', letterSpacing: '0.04em' }}>{story.title}</div>
-              <div style={{ color: t.muted, fontSize: '11px', marginBottom: '28px', fontFamily: 'monospace' }}>
-                {story.specPath}
-                {story.pngPath && <> · <a href={`/uikit/${story.pngPath.replace('t0', theme === 't27' ? 't0' : 't1')}`} style={{ color: t.accent, textDecoration: 'none' }} target="_blank" rel="noreferrer">PNG evidence ↗</a></>}
+              <div style={{ display: 'flex', gap: '16px', fontSize: '11px', color: t.muted, marginBottom: '8px', flexWrap: 'wrap', fontFamily: 'monospace' }}>
+                <span>id: {story.id}</span>
+                <span>component: {story.component}</span>
+                <span>theme: TH_{theme.toUpperCase()}</span>
+                <span>state: {story.title.split(' / ').pop()}</span>
+              </div>
+              <div style={{ color: t.muted, fontSize: '11px', marginBottom: '24px', fontFamily: 'monospace' }}>
+                spec: <a href={`https://github.com/Trinity-S-AI-DNA/t27/blob/master/${story.specPath}`} style={{ color: t.accent, textDecoration: 'none' }} target="_blank" rel="noreferrer">{story.specPath} ↗</a>
+                {story.pngPath && <> · <a href={`/uikit/${story.pngPath.replace('t0', theme === 't27' ? 't0' : 't1')}`} style={{ color: t.accent, textDecoration: 'none' }} target="_blank" rel="noreferrer">PNG ↗</a></>}
               </div>
               <div style={{ padding: '32px', border: `1px solid ${t.border}`, borderRadius: '8px', display: 'inline-flex', alignItems: 'center', justifyContent: 'center', minWidth: '200px', minHeight: '80px', background: theme === 't27' ? '#050505' : '#FEFEFE' }}>
                 {story.render(theme)}
