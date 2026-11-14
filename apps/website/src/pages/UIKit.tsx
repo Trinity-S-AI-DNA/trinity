@@ -321,7 +321,7 @@ export default function UIKit() {
   return (
     <div style={{ display: 'flex', height: '100vh', fontFamily: 'Outfit, system-ui, sans-serif', background: t.bg, color: t.text, overflow: 'hidden' }}>
       {/* Sidebar */}
-      <aside style={{ width: '230px', borderRight: `1px solid ${t.cardBorder}`, overflow: 'auto', flexShrink: 0, background: theme === 't27' ? '#080808' : '#F7F7F7' }}>
+      <aside style={{ width: '230px', borderRight: `1px solid ${t.cardBorder}`, overflow: 'auto', flexShrink: 0, background: theme === 't27' ? '#080808' : '#FFFFFF' }}>
         <div style={{ padding: '14px 12px 10px', borderBottom: `1px solid ${t.cardBorder}` }}>
           <div style={{ color: t.accent, fontWeight: 800, fontSize: '15px', letterSpacing: '0.04em' }}>t27 UI Kit</div>
           <div style={{ color: t.muted, fontSize: '11px', marginTop: '2px' }}>M0 · 35 stories</div>
@@ -343,7 +343,7 @@ export default function UIKit() {
       {/* Main */}
       <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
         {/* Toolbar */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '10px 16px', borderBottom: `1px solid ${t.cardBorder}`, background: theme === 't27' ? '#080808' : '#F7F7F7', flexShrink: 0 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '10px 16px', borderBottom: `1px solid ${t.cardBorder}`, background: theme === 't27' ? '#080808' : '#FFFFFF', flexShrink: 0 }}>
           {(['stories', 'gallery', 'netlist', 'badge-vr'] as Tab[]).map(tabId => (
             <button key={tabId} onClick={() => setTab(tabId)} style={{ padding: '5px 12px', fontSize: '12px', border: `1px solid ${tab === tabId ? t.accent : t.cardBorder}`, background: tab === tabId ? (theme === 't27' ? '#111' : '#EEE') : 'none', color: tab === tabId ? t.accent : t.muted, cursor: 'pointer', borderRadius: '4px', fontFamily: 'inherit' }}>
               {tabId === 'badge-vr' ? 'Badge VR' : tabId.charAt(0).toUpperCase() + tabId.slice(1)}
