@@ -116,7 +116,7 @@ export default function CourseChat(p: Props) {
   }
   return (
     <>
-      <style>{G.CHAT_CSS + G.CHAT_CSS_SHEET + G.CHAT_CSS_MOTION}</style>
+      <style>{G.CHAT_CSS + G.CHAT_CSS_SHEET + G.CHAT_CSS_MOTION + G.CHAT_CSS_GLASS}</style>
       <aside className={open ? 'cc is-open' : 'cc'} aria-label={G.CHAT_TITLE}>
         <div className="cc-head">
           <img className="cc-av" src={`${import.meta.env.BASE_URL}${G.CHAT_AVATAR}`} alt="" width={G.CHAT_HEAD_AVATAR_PX} height={G.CHAT_HEAD_AVATAR_PX} />
