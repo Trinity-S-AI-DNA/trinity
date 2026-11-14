@@ -3,6 +3,36 @@ import type { PostMeta } from './types'
 /** Индекс блога: список и метаданные без тяжёлых тел публикаций. */
 export const postsIndex: PostMeta[] = [
   {
+    slug: "the-course-names-its-bench-board",
+    title: "The FPGA course names its bench board",
+    summary: "[the board is the one identified on the bench on 2026-10-08; the still was checked by decoding the PNG, not in a browser] Two lessons of the FPGA course now name the board on our bench, an ALINX AX7203 with the XC7A200T in the 484-ball FBG484 package, and the course lead lists the two X accounts.",
+    date: "2026-11-14",
+    readingMinutes: 2,
+    tags: ["t27", "Course", "FPGA"],
+    receipts: [
+      { label: "trinity#1804: bench-board facts in lessons 1 and 3 and the X handles", href: "https://github.com/Trinity-S-AI-DNA/trinity/issues/1804" },
+      { label: "trinity pull request 1806: the course text and this post", href: "https://github.com/Trinity-S-AI-DNA/trinity/pull/1806" },
+      { label: "Lesson 1: An FPGA is a grid you configure", href: "https://t27.ai/learn/fpga-is-a-grid/" },
+      { label: "Lesson 3: Pins, balls and the package", href: "https://t27.ai/learn/pins-and-package/" },
+      { label: "t27 specs/boards/ax7203.t27: the board constants", href: "https://github.com/Trinity-S-AI-DNA/t27/blob/master/specs/boards/ax7203.t27" },
+    ],
+    openQuestions: [
+      "The audit rules in t27 specs/tri/course/audit.t27 check the triggers they list; other drift in the course text is not ruled out.",
+      "The pin map widget of lesson 3 still draws the FGG676 package of the Wukong board; only the text around it changed.",
+      "The still was checked by decoding the PNG; nobody looked at it in a browser for this post.",
+    ],
+    published: true,
+    ru: {
+      title: "Курс по FPGA называет плату нашего стенда",
+      summary: "[плата - та, что определена на стенде 2026-10-08; кадр проверен декодированием PNG, не в браузере] Два урока курса по FPGA теперь называют плату нашего стенда, ALINX AX7203 с XC7A200T в корпусе FBG484 на 484 шарика, а в шапке курса указаны два аккаунта в X.",
+      openQuestions: [
+        "Правила аудита в t27 specs/tri/course/audit.t27 проверяют перечисленные в них триггеры; другие расхождения в тексте курса не исключены.",
+        "Виджет карты выводов урока 3 по-прежнему рисует корпус FGG676 платы Wukong; изменился только текст вокруг него.",
+        "Кадр проверен декодированием PNG; в браузере его для этого поста никто не смотрел.",
+      ],
+    },
+  },
+  {
     slug: "twenty-seven-widgets-with-no-script-written-by-specs",
     title: "Twenty-seven widgets with no script, written by specs",
     summary: "[counts and sizes are read from the specs and the emitted pages of the pull request that ships the course; a page cannot read what you type] Course 12, Vibecoding from zero, has 27 widgets and none runs a script: every widget state is one section of one HTML page, every click is a link to a fragment, and the CSS :target rule shows the one section the address names. A t27 spec writes each page, and a workflow fails when a committed page differs from the emitted one by a single byte. 18 pages are infographics, 9 have state, and the loop page, the largest, is 92 sections and 55,132 bytes.",

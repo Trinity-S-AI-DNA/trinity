@@ -117,6 +117,7 @@ import { body as body_real_value_in_integer_container, ruBody as ruBody_real_val
 import { body as body_features_that_change_no_bits, ruBody as ruBody_features_that_change_no_bits } from './bodies/features-that-change-no-bits'
 import { body as body_one_commit_nine_workflow_outcomes, ruBody as ruBody_one_commit_nine_workflow_outcomes } from './bodies/one-commit-nine-workflow-outcomes'
 import { body as body_twenty_seven_widgets_with_no_script_written_by_specs, ruBody as ruBody_twenty_seven_widgets_with_no_script_written_by_specs } from './bodies/twenty-seven-widgets-with-no-script-written-by-specs'
+import { body as body_the_course_names_its_bench_board, ruBody as ruBody_the_course_names_its_bench_board } from './bodies/the-course-names-its-bench-board'
 
 const bodies: Record<string, PostBody> = {
   'one-spec-five-targets-the-t27-backend-shootout': { body: body_one_spec_five_targets_the_t27_backend_shootout, ruBody: ruBody_one_spec_five_targets_the_t27_backend_shootout },
@@ -170,6 +171,7 @@ const bodies: Record<string, PostBody> = {
   'queen-review-lifecycle-queues': { body: body_queen_review_lifecycle_queues, ruBody: ruBody_queen_review_lifecycle_queues },
   'one-commit-nine-workflow-outcomes': { body: body_one_commit_nine_workflow_outcomes, ruBody: ruBody_one_commit_nine_workflow_outcomes },
   'twenty-seven-widgets-with-no-script-written-by-specs': { body: body_twenty_seven_widgets_with_no_script_written_by_specs, ruBody: ruBody_twenty_seven_widgets_with_no_script_written_by_specs },
+  'the-course-names-its-bench-board': { body: body_the_course_names_its_bench_board, ruBody: ruBody_the_course_names_its_bench_board },
   'real-value-in-integer-container': { body: body_real_value_in_integer_container, ruBody: ruBody_real_value_in_integer_container },
   'features-that-change-no-bits': { body: body_features_that_change_no_bits, ruBody: ruBody_features_that_change_no_bits },
   'physical-width-changed-the-question': { body: body_physical_width_changed_the_question, ruBody: ruBody_physical_width_changed_the_question },
