@@ -367,7 +367,7 @@ export default function UIKit() {
               </div>
               <div style={{ color: t.muted, fontSize: '11px', marginBottom: '24px', fontFamily: 'monospace' }}>
                 spec: <a href={`https://github.com/Trinity-S-AI-DNA/t27/blob/master/${story.specPath}`} style={{ color: t.accent, textDecoration: 'none' }} target="_blank" rel="noreferrer">{story.specPath} ↗</a>
-                {story.pngPath && <> · <a href={`/uikit/${story.pngPath.replace('t0', theme === 't27' ? 't0' : 't1')}`} style={{ color: t.accent, textDecoration: 'none' }} target="_blank" rel="noreferrer">PNG ↗</a></>}
+                {story.pngPath && <> · <a href={`https://t27.ai/uikit/${story.pngPath.replace('t0', theme === 't27' ? 't0' : 't1')}`} style={{ color: t.accent, textDecoration: 'none' }} target="_blank" rel="noreferrer">PNG ↗</a></>}
               </div>
               <div style={{ padding: '32px', border: `1px solid ${t.border}`, borderRadius: '8px', display: 'inline-flex', alignItems: 'center', justifyContent: 'center', minWidth: '200px', minHeight: '80px', background: theme === 't27' ? '#050505' : '#FEFEFE' }}>
                 {story.render(theme)}
@@ -377,7 +377,7 @@ export default function UIKit() {
           {tab === 'gallery' && (
             <div style={{ maxWidth: '900px' }}>
               <div style={{ color: t.text, fontWeight: 700, fontSize: '16px', marginBottom: '16px' }}>All stories — M0 overview</div>
-              <img src="/uikit/gallery/overview.png" alt="All stories overview" style={{ maxWidth: '100%', border: `1px solid ${t.cardBorder}`, borderRadius: '4px' }} />
+              <img src="https://t27.ai/uikit/gallery/overview.png" alt="All stories overview" style={{ maxWidth: '100%', border: `1px solid ${t.cardBorder}`, borderRadius: '4px' }} />
             </div>
           )}
           {tab === 'netlist' && (
@@ -387,8 +387,8 @@ export default function UIKit() {
                 {[1,2,3].map(i => <UiNetlistCard key={i} theme={theme} />)}
               </div>
               <div style={{ color: t.text, fontWeight: 700, fontSize: '14px', marginBottom: '12px', marginTop: '8px' }}>PNG evidence (nc11 run)</div>
-              <img src="/uikit/netlist/gallery-t0.png" alt="Netlist cards light" style={{ maxWidth: '100%', border: `1px solid ${t.cardBorder}`, marginBottom: '12px', display: 'block' }} />
-              <img src="/uikit/netlist/gallery-t1.png" alt="Netlist cards dark" style={{ maxWidth: '100%', border: `1px solid ${t.cardBorder}` }} />
+              <img src="https://t27.ai/uikit/netlist/gallery-t0.png" alt="Netlist cards light" style={{ maxWidth: '100%', border: `1px solid ${t.cardBorder}`, marginBottom: '12px', display: 'block' }} />
+              <img src="https://t27.ai/uikit/netlist/gallery-t1.png" alt="Netlist cards dark" style={{ maxWidth: '100%', border: `1px solid ${t.cardBorder}` }} />
             </div>
           )}
           {tab === 'badge-vr' && (
@@ -404,7 +404,7 @@ export default function UIKit() {
                 ))}
               </div>
               <div style={{ color: t.text, fontWeight: 600, fontSize: '13px', marginBottom: '12px' }}>PNG diff evidence</div>
-              <img src="/uikit/gallery/before_after_badges.png" alt="Badge before/after" style={{ maxWidth: '100%', border: `1px solid ${t.cardBorder}` }} />
+              <img src="https://t27.ai/uikit/gallery/before_after_badges.png" alt="Badge before/after" style={{ maxWidth: '100%', border: `1px solid ${t.cardBorder}` }} />
             </div>
           )}
         </div>
