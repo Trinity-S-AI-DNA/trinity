@@ -1,13 +1,15 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { LADDER } from '../lib/courseLadder.generated'
 import * as G from '../lib/courseChat.gen'
 
 // The helper chat beside a course (trinity#1813). The words, the numbers, the limits and the
 // styles are specs/chat/course-chat.t27, through src/lib/courseChat.gen.ts; the branching below
-// mirrors that spec's client_reason, probe_reason, turn_reason and offline_text (t27c gen-ts
-// lowers declarations, not function bodies). Nothing is stored: the lines live in state.
-// When the panel opens it probes the route and goes live by itself, and while it shows offline
-// it probes again every CHAT_PROBE_RETRY_MS.
+// mirrors that spec's client_reason, probe_reason, turn_reason, offline_text, unanswered_text and
+// send_plan (the generator lowers declarations, not function bodies). Nothing is stored: the lines
+// live in state. When the panel opens it probes the route and goes live by itself, and while it
+// shows offline it probes again every CHAT_PROBE_RETRY_MS.
+// The reader's message is never dropped (trinity#1824): the box and Send work in every state, and
+// send_plan decides what follows the reader's line (send, probe once more, a note, the turn cap).
 
 type Line = { who: 'you' | 'bot' | 'off'; text: string }
 type Props = { course: string; lesson?: string; title?: string; ckey?: string }
@@ -15,10 +17,14 @@ type Reply = { reached: boolean; timedOut: boolean; status: number; answer: stri
 
 const offlineText = (r: number) =>
   r === G.REASON_LIMIT ? G.CHAT_OFFLINE_LIMIT : r === G.REASON_BUSY ? G.CHAT_OFFLINE_BUSY : r === G.REASON_BAD_REQUEST ? G.CHAT_OFFLINE_BAD : G.CHAT_OFFLINE
+const unansweredText = (r: number) =>
+  r === G.REASON_LIMIT ? G.CHAT_OFFLINE_LIMIT : r === G.REASON_BAD_REQUEST ? G.CHAT_OFFLINE_BAD : r === G.REASON_BUSY ? G.CHAT_OFFLINE_BUSY : G.CHAT_UNANSWERED
 const clientReason = (reached: boolean, timedOut: boolean, status: number, len: number) =>
   !reached ? G.REASON_UNREACHABLE : timedOut ? G.REASON_TIMEOUT : status === 429 ? G.REASON_LIMIT : status === 503 ? G.REASON_BUSY : status !== 200 ? G.REASON_STATUS : len === 0 ? G.REASON_EMPTY : G.REASON_NONE
-const probeReason = (r: Reply) => clientReason(r.reached, r.timedOut, r.status, 1)
+const probeReason = (r: Reply) => (r.reached && !r.timedOut && r.status === 503 ? G.REASON_OFF : clientReason(r.reached, r.timedOut, r.status, 1))
 const turnReason = (turn: number) => (turn >= G.CHAT_TURNS_MAX ? G.REASON_LIMIT : G.REASON_NONE)
+const sendPlan = (len: number, up: boolean, flight: boolean, turn: number) =>
+  len < 1 || len > G.CHAT_MSG_MAX ? G.ACT_IGNORE : turnReason(turn) !== G.REASON_NONE ? G.ACT_LIMIT : flight ? G.ACT_WAIT : !up ? G.ACT_REPROBE : G.ACT_SEND
 
 async function call(p: Props, extra: Record<string, unknown>): Promise<Reply> {
   const ctl = new AbortController()
@@ -49,6 +55,8 @@ export default function CourseChat(p: Props) {
   const [up, setUp] = useState(false)
   const [why, setWhy] = useState(-1)
   const [wide, setWide] = useState(false)
+  const [sent, setSent] = useState(0)
+  const flight = useRef(false)
   const allowed = (G.CHAT_COURSES as readonly string[]).includes(p.course)
 
   useEffect(() => {
@@ -76,19 +84,35 @@ export default function CourseChat(p: Props) {
   }, [allowed, open, wide, up, p.course])
 
   if (!allowed) return null
-  const turn = lines.filter((l) => l.who === 'you').length
-  const capped = turnReason(turn) !== G.REASON_NONE
+  const capped = turnReason(sent) !== G.REASON_NONE
   const send = async () => {
     const message = text.trim()
-    if (!up || busy || capped || message.length < 1 || message.length > G.CHAT_MSG_MAX) return
+    const act = sendPlan(message.length, up, flight.current, sent)
+    if (act === G.ACT_IGNORE) return
     setText('')
-    setBusy(true)
     setLines((l) => [...l, { who: 'you', text: message }])
-    const r = await call(p, { message, turn })
+    if (act === G.ACT_WAIT) { setLines((l) => [...l, { who: 'off', text: G.CHAT_WAIT_NOTE }]); return }
+    if (act === G.ACT_LIMIT) return
+    flight.current = true
+    if (act === G.ACT_REPROBE) {
+      const gone = probeReason(await call(p, { probe: true }))
+      if (gone !== G.REASON_NONE) {
+        setWhy(gone)
+        setLines((l) => [...l, { who: 'off', text: unansweredText(gone) }])
+        flight.current = false
+        return
+      }
+      setWhy(G.REASON_NONE)
+      setUp(true)
+    }
+    setBusy(true)
+    setSent(sent + 1)
+    const r = await call(p, { message, turn: sent })
     const reason = clientReason(r.reached, r.timedOut, r.status, r.answer.length)
-    setLines((l) => [...l, reason === G.REASON_NONE ? { who: 'bot', text: r.answer } : { who: 'off', text: offlineText(reason) }])
+    setLines((l) => [...l, reason === G.REASON_NONE ? { who: 'bot', text: r.answer } : { who: 'off', text: unansweredText(reason) }])
     if (reason === G.REASON_UNREACHABLE || reason === G.REASON_TIMEOUT || reason === G.REASON_STATUS) { setWhy(reason); setUp(false) }
     setBusy(false)
+    flight.current = false
   }
   return (
     <>
@@ -102,12 +126,12 @@ export default function CourseChat(p: Props) {
         <div className="cc-log" role="log" aria-live="polite">
           {lines.map((l, i) => <p key={i} className={l.who === 'you' ? 'cc-m cc-you' : l.who === 'off' ? 'cc-m cc-off' : 'cc-m'}>{l.text}</p>)}
           {busy ? <p className="cc-m cc-off">{G.CHAT_WORKING}</p> : null}
-          {!up && why > G.REASON_NONE ? <p className="cc-m cc-off">{offlineText(why)}</p> : null}
+          {!up && why > G.REASON_NONE && lines.length === 0 ? <p className="cc-m cc-off">{offlineText(why)}</p> : null}
           {capped ? <p className="cc-m cc-off">{offlineText(G.REASON_LIMIT)}</p> : null}
         </div>
         <form className="cc-form" onSubmit={(e) => { e.preventDefault(); void send() }}>
-          <textarea className="cc-in" value={text} maxLength={G.CHAT_MSG_MAX} disabled={!up || capped} placeholder={G.CHAT_PLACEHOLDER} aria-label={G.CHAT_PLACEHOLDER} onChange={(e) => setText(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); void send() } }} />
-          <button type="submit" className="cc-go" disabled={!up || capped || busy || text.trim().length < 1}>{G.CHAT_SEND}</button>
+          <textarea className="cc-in" value={text} maxLength={G.CHAT_MSG_MAX} placeholder={G.CHAT_PLACEHOLDER} aria-label={G.CHAT_PLACEHOLDER} onChange={(e) => setText(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); void send() } }} />
+          <button type="submit" className="cc-go" disabled={text.trim().length < 1}>{G.CHAT_SEND}</button>
         </form>
       </aside>
       <button type="button" className="cc-open" aria-label={G.CHAT_OPEN} onClick={() => setOpen(true)}>
