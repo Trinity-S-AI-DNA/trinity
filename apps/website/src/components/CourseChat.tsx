@@ -12,7 +12,7 @@ import * as G from '../lib/courseChat.gen'
 // send_plan decides what follows the reader's line (send, probe once more, a note, the turn cap).
 
 type Line = { who: 'you' | 'bot' | 'off'; text: string }
-type Props = { course: string; lesson?: string; title?: string; ckey?: string }
+type Props = { course: string; lesson?: string; title?: string; ckey?: string; goal?: string; lessonText?: string }
 type Reply = { reached: boolean; timedOut: boolean; status: number; answer: string }
 
 const offlineText = (r: number) =>
@@ -35,7 +35,7 @@ async function call(p: Props, extra: Record<string, unknown>): Promise<Reply> {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       signal: ctl.signal,
-      body: JSON.stringify({ course: p.course, lesson: p.lesson ?? '', title: (p.title ?? '').slice(0, G.CHAT_TITLE_MAX), key: p.ckey, ...extra }),
+      body: JSON.stringify({ course: p.course, lesson: p.lesson ?? '', title: (p.title ?? '').slice(0, G.CHAT_TITLE_MAX), goal: (p.goal ?? '').slice(0, 300), lessonText: (p.lessonText ?? '').slice(0, 1500), key: p.ckey, ...extra }),
     })
     const body = r.status === 200 ? await r.json().catch(() => null) : null
     const answer = typeof body?.answer === 'string' ? body.answer.slice(0, G.CHAT_ANSWER_MAX) : ''
@@ -57,7 +57,7 @@ async function callStream(p: Props, extra: Record<string, unknown>, onDelta: (to
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       signal: ctl.signal,
-      body: JSON.stringify({ course: p.course, lesson: p.lesson ?? '', title: (p.title ?? '').slice(0, G.CHAT_TITLE_MAX), key: p.ckey, ...extra }),
+      body: JSON.stringify({ course: p.course, lesson: p.lesson ?? '', title: (p.title ?? '').slice(0, G.CHAT_TITLE_MAX), goal: (p.goal ?? '').slice(0, 300), lessonText: (p.lessonText ?? '').slice(0, 1500), key: p.ckey, ...extra }),
     })
     if (r.status !== 200) return { reached: true, timedOut, status: r.status, answer: '' }
     const reader = r.body?.getReader()
