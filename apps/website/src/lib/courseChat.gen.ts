@@ -8,7 +8,7 @@ export const CHAT_COURSES = ["vibecoding"] as const satisfies readonly [string];
 export const CHAT_MSG_MAX = 600 satisfies number;
 export const CHAT_TITLE_MAX = 120 satisfies number;
 export const CHAT_ANSWER_MAX = 1200 satisfies number;
-export const CHAT_PER_IP_HOUR = 20 satisfies number;
+export const CHAT_PER_IP_HOUR = 50 satisfies number;
 export const CHAT_PER_KEY_DAY = 60 satisfies number;
 export const CHAT_TIMEOUT_MS = 20000 satisfies number;
 export const CHAT_GLOBAL_DAY = 500 satisfies number;
@@ -92,6 +92,7 @@ export const CHAT_CSS_GLASS = ".cc{background:#000000d1;-webkit-backdrop-filter:
 // t27c gen-ts: fn put was not emitted -- this backend lowers declarations, not bodies.
 // t27c gen-ts: fn system_prompt was not emitted -- this backend lowers declarations, not bodies.
 // t27c gen-ts: fn has_text was not emitted -- this backend lowers declarations, not bodies.
+// t27c gen-ts: a TestBlock was not emitted -- it is checked by the compiler, not by the artifact.
 // t27c gen-ts: a TestBlock was not emitted -- it is checked by the compiler, not by the artifact.
 // t27c gen-ts: a TestBlock was not emitted -- it is checked by the compiler, not by the artifact.
 // t27c gen-ts: a TestBlock was not emitted -- it is checked by the compiler, not by the artifact.
