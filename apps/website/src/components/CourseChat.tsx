@@ -116,9 +116,10 @@ export default function CourseChat(p: Props) {
   }
   return (
     <>
-      <style>{G.CHAT_CSS + G.CHAT_CSS_SHEET}</style>
+      <style>{G.CHAT_CSS + G.CHAT_CSS_SHEET + G.CHAT_CSS_MOTION}</style>
       <aside className={open ? 'cc is-open' : 'cc'} aria-label={G.CHAT_TITLE}>
         <div className="cc-head">
+          <img className="cc-av" src={`${import.meta.env.BASE_URL}${G.CHAT_AVATAR}`} alt="" width={G.CHAT_HEAD_AVATAR_PX} height={G.CHAT_HEAD_AVATAR_PX} />
           <h2 className="cc-title">{G.CHAT_TITLE}</h2>
           <button type="button" className="cc-x" onClick={() => setOpen(false)}>{G.CHAT_CLOSE}</button>
         </div>
