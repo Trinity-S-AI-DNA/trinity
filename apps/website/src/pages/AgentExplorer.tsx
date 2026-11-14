@@ -85,7 +85,7 @@ const UI = {
     register: 'register',
     archetype: 'archetype',
     layer: 'layer',
-    clara: 'CLARA role',
+    clara: 'AR role',
     noClara: 'none',
     keyFiles: 'key files',
     noKeyFiles: 'none listed',
@@ -156,7 +156,7 @@ const UI = {
     register: 'регистр',
     archetype: 'архетип',
     layer: 'слой',
-    clara: 'роль CLARA',
+    clara: 'роль AR',
     noClara: 'нет',
     keyFiles: 'ключевые файлы',
     noKeyFiles: 'не перечислены',
@@ -177,7 +177,7 @@ const TAG_FAMILIES = [
   { prefix: 'layer/', label: 'layer' },
   { prefix: 'witness/', label: 'witness' },
   { prefix: 'skills/', label: 'skills' },
-  { prefix: 'clara/', label: 'CLARA' },
+  { prefix: 'ar/', label: 'AR' },
   { prefix: 'enabled/', label: 'enabled' },
 ]
 
@@ -192,7 +192,7 @@ function tagsOf(a: AgentSpecEntry): string[] {
     `layer/${a.fields.LAYER.toLowerCase()}`,
     `witness/${a.witness}`,
     `skills/${a.skills.length > 0 ? 'bound' : 'none'}`,
-    `clara/${a.fields.CLARA_ROLE ? 'yes' : 'no'}`,
+    `ar/${a.fields.AR_ROLE ? 'yes' : 'no'}`,
     `enabled/${a.fields.ENABLED ? 'true' : 'false'}`,
   ]
 }
@@ -298,7 +298,7 @@ export default function AgentExplorer() {
       return (
         a.letter.toLowerCase() === q ||
         a.id.toLowerCase().includes(q) ||
-        `${f.LETTER_NAME} ${f.NAME} ${f.DOMAIN} ${f.ARCHETYPE} ${f.REGISTER} ${f.CLARA_ROLE}`.toLowerCase().includes(q) ||
+        `${f.LETTER_NAME} ${f.NAME} ${f.DOMAIN} ${f.ARCHETYPE} ${f.REGISTER} ${f.AR_ROLE}`.toLowerCase().includes(q) ||
         Object.values(a.summary).join(' ').toLowerCase().includes(q) ||
         Object.values(a.name).join(' ').toLowerCase().includes(q) ||
         a.skills.some((s) => s.id.toLowerCase().includes(q))
@@ -644,7 +644,7 @@ export default function AgentExplorer() {
                   {row(ui.archetype, live(selected.fields.ARCHETYPE))}
                   {row(ui.register, live(selected.fields.REGISTER))}
                   {row(ui.layer, live(LAYER_LABEL[selected.fields.LAYER]?.[short] ?? selected.fields.LAYER))}
-                  {row(ui.clara, selected.fields.CLARA_ROLE ? live(selected.fields.CLARA_ROLE) : ui.noClara)}
+                  {row(ui.clara, selected.fields.AR_ROLE ? live(selected.fields.AR_ROLE) : ui.noClara)}
                   {row(
                     ui.keyFiles,
                     selected.fields.KEY_FILES.length === 0 ? (
