@@ -1,7 +1,7 @@
 // t27 UI Kit — live Storybook-like viewer
 // Design tokens from specs/t27f/vf_theme.t27
 // Issue: gHashTag/t27#13426 (epic M0)
-import { useState } from 'react'
+import { useState, useEffect, type HTMLAttributes } from 'react'
 import type { CSSProperties, ReactNode } from 'react'
 
 // ── Design tokens ──────────────────────────────────────────────
@@ -110,8 +110,9 @@ function UiInput({ theme, state }: { theme: Theme; state: InputState }) {
 
 type BadgeVariant = 'primary' | 'secondary' | 'ghost' | 'success' | 'warn'
 type BadgeState = 'default' | 'hover' | 'active' | 'disabled'
+interface InteractionStep { action: 'hover' | 'click' | 'focus'; expect: string }
 
-function UiBadge({ theme, variant, state = 'default', label }: { theme: Theme; variant: BadgeVariant; state?: BadgeState; label?: string }) {
+function UiBadge({ theme, variant, state = 'default', label, ...rest }: { theme: Theme; variant: BadgeVariant; state?: BadgeState; label?: string } & HTMLAttributes<HTMLSpanElement>) {
   const t = tok(theme)
   const baseFills: Record<BadgeVariant, string> = {
     primary: t.accent, secondary: 'transparent', ghost: 'transparent',
@@ -135,8 +136,14 @@ function UiBadge({ theme, variant, state = 'default', label }: { theme: Theme; v
       background: fill, color: textColors[variant],
       fontSize: '12px', fontWeight: 600, letterSpacing: '0.04em',
       opacity: state === 'disabled' ? 0.4 : 1, cursor: state === 'disabled' ? 'not-allowed' : 'default',
-    }}>{label ?? names[variant]}</span>
+    }} data-testid={`badge-${variant}`} data-state={state} {...rest}>{label ?? names[variant]}</span>
   )
+}
+
+function InteractiveBadge({ theme, variant }: { theme: Theme; variant: BadgeVariant }) {
+  const [s, setS] = useState<BadgeState>('default')
+  return <UiBadge theme={theme} variant={variant} state={s} tabIndex={0}
+    onMouseEnter={() => setS('hover')} onMouseLeave={() => setS('default')} onMouseDown={() => setS('active')} onMouseUp={() => setS('hover')} onFocus={() => setS('hover')} onBlur={() => setS('default')} />
 }
 
 function UiNav({ theme, activeIdx }: { theme: Theme; activeIdx: number }) {
@@ -253,12 +260,9 @@ function UiNetlistCard({ theme }: { theme: Theme }) {
 
 // ── Story registry ─────────────────────────────────────────────
 interface Story {
-  id: string
-  title: string
-  component: string
+  id: string; title: string; component: string
   render: (theme: Theme) => ReactNode
-  specPath: string
-  pngPath?: string
+  specPath: string; pngPath?: string; description?: string; interactions?: InteractionStep[]
 }
 
 const STORIES: Story[] = [
@@ -283,7 +287,14 @@ const STORIES: Story[] = [
   { id: 'input-default',             title: 'Input / Default',               component: 'input',     render: t => <UiInput theme={t} state="default" />,  specPath: 'specs/t27f/vf_storybook.t27', pngPath: 'stories/s17_t0.png' },
   { id: 'input-error',               title: 'Input / Error',                 component: 'input',     render: t => <UiInput theme={t} state="error" />,    specPath: 'specs/t27f/vf_storybook.t27', pngPath: 'stories/s18_t0.png' },
   { id: 'input-focus',               title: 'Input / Focus',                 component: 'input',     render: t => <UiInput theme={t} state="focus" />,    specPath: 'specs/t27f/vf_storybook.t27', pngPath: 'stories/s19_t0.png' },
-  { id: 'badge-primary',             title: 'Badge / Primary / Default',     component: 'badge',     render: t => <UiBadge theme={t} variant="primary" />,                           specPath: 'specs/uikit/stories.t27', pngPath: 'stories/s20_t0.png' },
+  { id: 'badge-primary',             title: 'Badge / Primary / Default',     component: 'badge',
+    render: t => <InteractiveBadge theme={t} variant="primary" />,
+    specPath: 'specs/uikit/stories.t27', pngPath: 'stories/s20_t0.png',
+    interactions: [
+      { action: 'hover', expect: 'hover' },
+      { action: 'click', expect: 'active' },
+      { action: 'focus', expect: 'hover' },
+    ] },
   { id: 'badge-primary-hover',       title: 'Badge / Primary / Hover',       component: 'badge',     render: t => <UiBadge theme={t} variant="primary" state="hover" />,             specPath: 'specs/uikit/stories.t27' },
   { id: 'badge-primary-active',      title: 'Badge / Primary / Active',      component: 'badge',     render: t => <UiBadge theme={t} variant="primary" state="active" />,            specPath: 'specs/uikit/stories.t27' },
   { id: 'badge-primary-disabled',    title: 'Badge / Primary / Disabled',    component: 'badge',     render: t => <UiBadge theme={t} variant="primary" state="disabled" />,          specPath: 'specs/uikit/stories.t27' },
@@ -313,9 +324,18 @@ export default function UIKit() {
   const [activeId, setActiveId] = useState(STORIES[0].id)
   const [tab, setTab] = useState<Tab>('stories')
   const [openGroups, setOpenGroups] = useState<Set<string>>(new Set(COMPONENTS))
+  const [stepResults, setStepResults] = useState<{ pass: boolean; msg: string }[]>([])
 
   const t = tok(theme)
   const story = STORIES.find(s => s.id === activeId)!
+
+  useEffect(() => { setStepResults([]) }, [activeId])
+
+  const runSteps = async () => {
+    const el = document.getElementById('uikit-canvas')?.querySelector('[data-testid]') as HTMLElement | null
+    const run = async (s: InteractionStep) => { if (!el) return { pass: false, msg: 'not found' }; s.action === 'hover' ? el.dispatchEvent(new MouseEvent('mouseenter')) : s.action === 'click' ? el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true })) : el.focus(); await new Promise<void>(r => setTimeout(r, 80)); return { pass: el.dataset.state === s.expect, msg: `${s.action} → "${el.dataset.state}"` } }
+    setStepResults(await Promise.all((story.interactions ?? []).map(run)))
+  }
 
   const toggle = (comp: string) => {
     setOpenGroups(prev => {
@@ -376,9 +396,16 @@ export default function UIKit() {
                 spec: <a href={`https://github.com/Trinity-S-AI-DNA/t27/blob/master/${story.specPath}`} style={{ color: t.accent, textDecoration: 'none' }} target="_blank" rel="noreferrer">{story.specPath} ↗</a>
                 {story.pngPath && <> · <a href={`https://t27.ai/uikit/${story.pngPath.replace('t0', theme === 't27' ? 't0' : 't1')}`} style={{ color: t.accent, textDecoration: 'none' }} target="_blank" rel="noreferrer">PNG ↗</a></>}
               </div>
-              <div style={{ padding: '32px', border: `1px solid ${t.border}`, borderRadius: '8px', display: 'inline-flex', alignItems: 'center', justifyContent: 'center', minWidth: '200px', minHeight: '80px', background: theme === 't27' ? '#050505' : '#FEFEFE' }}>
+              <div id="uikit-canvas" style={{ padding: '32px', border: `1px solid ${t.border}`, borderRadius: '8px', display: 'inline-flex', alignItems: 'center', justifyContent: 'center', minWidth: '200px', minHeight: '80px', background: theme === 't27' ? '#050505' : '#FEFEFE' }}>
                 {story.render(theme)}
               </div>
+              {story.interactions && <div style={{ marginTop: '20px' }}>
+                <div style={{ display: 'flex', gap: '8px', marginBottom: '8px', alignItems: 'center' }}>
+                  <span style={{ fontSize: '11px', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.08em', color: t.muted }}>Steps</span>
+                  <button onClick={runSteps} style={{ fontSize: '11px', padding: '2px 8px', borderRadius: '4px', border: `1px solid ${t.cardBorder}`, background: 'none', color: t.text, cursor: 'pointer', fontFamily: 'inherit' }}>▶ Run</button>
+                </div>
+                {story.interactions.map((s, i) => <div key={i} style={{ display: 'flex', gap: '8px', fontSize: '12px', marginBottom: '4px', fontFamily: 'monospace' }}><span style={{ color: stepResults[i]?.pass === true ? '#00C853' : stepResults[i] ? '#FF1744' : t.muted }}>{stepResults[i] ? (stepResults[i].pass ? '✓' : '✗') : '○'}</span><span>{s.action}</span><span style={{ color: t.muted }}>{stepResults[i]?.msg ?? s.expect}</span></div>)}
+              </div>}
             </div>
           )}
           {tab === 'gallery' && (
