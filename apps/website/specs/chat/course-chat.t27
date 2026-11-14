@@ -1,0 +1,366 @@
+module chat_course_chat;
+
+; The course helper chat (Trinity-S-AI-DNA/trinity#1813): a chat panel beside the
+; lessons of a course, where a reader types a question and gets an answer from an
+; assistant that knows which course and lesson is open.
+; This module is the whole rule. The page (src/components/CourseChat.tsx) and the
+; answer route on the render host both read these numbers and call these fns; neither
+; keeps a copy. The module is self-contained on purpose (no `use`), so `t27c gen-ts`
+; turns it into src/lib/courseChat.gen.ts without resolving other specs.
+; Wire shape. One POST to CHAT_ROUTE on the render host, JSON both ways.
+;   request : {"course": "vibecoding", "lesson": "<lesson id>", "title": "<lesson title>",
+;              "message": "<what the reader typed>", "key": "<course key, optional>"}
+;   answer  : {"ok": true, "answer": "<text>"}  or  {"ok": false, "offline": true, "reason": "<name>"}
+; The reason names are the ones reason_name() returns. A page that cannot reach the
+; route builds the same offline state itself, from client_reason().
+; Honesty. The panel shows generated text only when the reason is REASON_NONE
+; (show_answer). Every offline reason shows one fixed sentence from this module and
+; nothing the model said. The model runs on the server, on the free tier only; the
+; key lives in a server env file and is never in this module, in the bundle, in git,
+; in a chat or in a log.
+; Scope. The chat is on for the courses in CHAT_COURSES only. Another course turns it
+; on by adding its id there. No history is stored, no account is made, and the helper
+; has no tools (the system prompt says so).
+
+pub const CHAT_ROUTE : str = "/api/course/chat";
+
+pub const CHAT_COURSES : [1]str = ["vibecoding"];
+
+pub const CHAT_MSG_MAX : u32 = 600;
+pub const CHAT_TITLE_MAX : u32 = 120;
+pub const CHAT_ANSWER_MAX : u32 = 1200;
+pub const CHAT_PER_IP_HOUR : u32 = 20;
+pub const CHAT_PER_KEY_DAY : u32 = 60;
+pub const CHAT_TIMEOUT_MS : u32 = 20000;
+
+pub const REASON_NONE : u32 = 0;
+pub const REASON_UNREACHABLE : u32 = 1;
+pub const REASON_TIMEOUT : u32 = 2;
+pub const REASON_STATUS : u32 = 3;
+pub const REASON_EMPTY : u32 = 4;
+pub const REASON_LIMIT : u32 = 5;
+pub const REASON_OFF : u32 = 6;
+pub const REASON_BAD_REQUEST : u32 = 7;
+
+pub const CHAT_TITLE : str = "Course helper";
+pub const CHAT_HINT : str = "Ask about this lesson. Nothing you type is stored.";
+pub const CHAT_PLACEHOLDER : str = "Ask a question";
+pub const CHAT_SEND : str = "Send";
+pub const CHAT_OPEN : str = "Ask the helper";
+pub const CHAT_CLOSE : str = "Close";
+pub const CHAT_WORKING : str = "The helper is thinking.";
+pub const CHAT_OFFLINE : str = "The assistant is offline.";
+pub const CHAT_OFFLINE_LIMIT : str = "The assistant is offline for now: the question limit is reached. Try again later.";
+pub const CHAT_OFFLINE_BAD : str = "The assistant is offline: this question cannot be sent. Shorten it and try again.";
+
+; The system prompt, in three parts. system_prompt() joins them around the course id and
+; the lesson title; the route on the render host does the same with these constants.
+pub const CHAT_PROMPT_HEAD : str = "You are the course helper on t27.ai for the course \"";
+pub const CHAT_PROMPT_LESSON : str = "\", open at the lesson \"";
+pub const CHAT_PROMPT_TAIL : str = "\". Answer the reader's question about this course and lesson in at most five short sentences, in the language the reader writes in. If you do not know, say \"I do not know\" and do not guess or invent facts. Never ask for or repeat a key, a token or a password. You have no tools: you cannot run code, open links or remember earlier chats.";
+
+; The panel's style, black and white like the rest of the course page (no colour, no glow).
+; A column beside the lesson from CHAT_WIDE_MIN px; below that a button opens a sheet.
+pub const CHAT_WIDE_MIN : u32 = 1000;
+pub const CHAT_CSS : str = ".course-main:has(.cc){padding-right:360px}.cc{position:fixed;top:84px;right:20px;bottom:20px;width:320px;display:flex;flex-direction:column;background:#000;color:#f2f2f2;border:1px solid #fff;z-index:30;font-family:var(--font)}.cc-head{display:flex;justify-content:space-between;align-items:center;padding:10px 12px;border-bottom:1px solid #fff}.cc-title{font-size:11px;letter-spacing:.16em;text-transform:uppercase;margin:0}.cc-x{display:none;background:none;border:0;color:#f2f2f2;font:inherit;cursor:pointer}.cc-hint{font-size:12px;color:#8a8a8a;margin:0;padding:8px 12px 0}.cc-log{flex:1;overflow:auto;padding:12px;display:flex;flex-direction:column;gap:8px;font-size:14px;line-height:1.45}.cc-m{margin:0;padding:8px 10px;border:1px solid #333;white-space:pre-wrap;overflow-wrap:anywhere}.cc-you{border-color:#fff;align-self:flex-end}.cc-off{color:#8a8a8a;border-style:dashed}.cc-form{display:flex;gap:8px;padding:12px;border-top:1px solid #fff}.cc-in{flex:1;min-width:0;min-height:40px;max-height:120px;resize:none;background:#000;color:#f2f2f2;border:1px solid #fff;padding:8px;font:inherit;font-size:16px}.cc-go{background:#fff;color:#000;border:0;padding:0 14px;font:inherit;font-weight:700;cursor:pointer}.cc-go:disabled{background:#8a8a8a;cursor:default}.cc-open{display:none}";
+pub const CHAT_CSS_SHEET : str = "@media (max-width:999px){.course-main:has(.cc){padding-right:20px}.cc{display:none;top:auto;left:0;right:0;bottom:0;width:auto;height:70vh}.cc.is-open{display:flex}.cc-x{display:block}.cc-open{display:block;position:fixed;right:16px;bottom:16px;z-index:30;background:#fff;color:#000;border:0;padding:12px 16px;font:inherit;font-weight:700;cursor:pointer}.cc.is-open ~ .cc-open{display:none}}";
+
+/// Is the chat switched on for this course?
+pub fn chat_enabled(course: []const u8) -> bool {
+    var i : usize = 0;
+    while (i < CHAT_COURSES.len) {
+        if (same(course, CHAT_COURSES[i])) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// Byte-for-byte equality of two texts.
+pub fn same(a: []const u8, b: []const u8) -> bool {
+    if (a.len != b.len) { return false; }
+    var i : usize = 0;
+    while (i < a.len) {
+        if (a[i] != b[i]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// The name of an offline reason on the wire.
+pub fn reason_name(r: u32) -> []const u8 {
+    if (r == REASON_UNREACHABLE) { return "unreachable"; }
+    if (r == REASON_TIMEOUT) { return "timeout"; }
+    if (r == REASON_STATUS) { return "status"; }
+    if (r == REASON_EMPTY) { return "empty"; }
+    if (r == REASON_LIMIT) { return "limit"; }
+    if (r == REASON_OFF) { return "off"; }
+    if (r == REASON_BAD_REQUEST) { return "bad_request"; }
+    return "none";
+}
+
+/// The one sentence the panel shows for an offline reason. No generated text.
+pub fn offline_text(r: u32) -> []const u8 {
+    if (r == REASON_LIMIT) { return CHAT_OFFLINE_LIMIT; }
+    if (r == REASON_BAD_REQUEST) { return CHAT_OFFLINE_BAD; }
+    return CHAT_OFFLINE;
+}
+
+/// Generated text is shown only when nothing went wrong.
+pub fn show_answer(r: u32) -> bool {
+    return r == REASON_NONE;
+}
+
+/// Is the reader's message the right size to send?
+pub fn msg_ok(len: u32) -> bool {
+    return len >= 1 and len <= CHAT_MSG_MAX;
+}
+
+/// The check the route and the page both run before a model call.
+/// course_on is chat_enabled(course); the lengths are those of the title and the message.
+pub fn request_reason(course_on: bool, title_len: u32, msg_len: u32) -> u32 {
+    if (!course_on) { return REASON_OFF; }
+    if (title_len > CHAT_TITLE_MAX) { return REASON_BAD_REQUEST; }
+    if (!msg_ok(msg_len)) { return REASON_BAD_REQUEST; }
+    return REASON_NONE;
+}
+
+/// The limits. ip_count and key_count are the messages already counted in the window
+/// (an hour for the IP, a day for the key) before this one. Past a limit the answer is
+/// offline with reason limit and no model is called. A request with no key is held by
+/// the IP limit alone.
+pub fn limit_reason(ip_count: u32, key_count: u32, has_key: bool) -> u32 {
+    if (ip_count >= CHAT_PER_IP_HOUR) { return REASON_LIMIT; }
+    if (has_key and key_count >= CHAT_PER_KEY_DAY) { return REASON_LIMIT; }
+    return REASON_NONE;
+}
+
+/// What the page decides from what it saw. reached: the request got an answer at all.
+/// timed_out: it took longer than CHAT_TIMEOUT_MS. status: the HTTP status. answer_len:
+/// the length of the answer text in a 200 body.
+pub fn client_reason(reached: bool, timed_out: bool, status: u32, answer_len: u32) -> u32 {
+    if (!reached) { return REASON_UNREACHABLE; }
+    if (timed_out) { return REASON_TIMEOUT; }
+    if (status == 429) { return REASON_LIMIT; }
+    if (status != 200) { return REASON_STATUS; }
+    if (answer_len == 0) { return REASON_EMPTY; }
+    return REASON_NONE;
+}
+
+/// How much of an answer the panel keeps.
+pub fn answer_keep(len: u32) -> u32 {
+    if (len > CHAT_ANSWER_MAX) { return CHAT_ANSWER_MAX; }
+    return len;
+}
+
+/// Write the text s into o at n and return the new length.
+pub fn put(o: []u8, n0: u32, s: []const u8) -> u32 {
+    var n : u32 = n0;
+    var i : usize = 0;
+    while (i < s.len) {
+        o[n] = s[i];
+        n = n + 1;
+        i = i + 1;
+    }
+    return n;
+}
+
+/// The system prompt, built from the open course and lesson. The lesson title is empty
+/// on the course overview.
+pub fn system_prompt(o: []u8, n0: u32, course: []const u8, title: []const u8) -> u32 {
+    var n : u32 = put(o, n0, CHAT_PROMPT_HEAD);
+    n = put(o, n, course);
+    if (title.len > 0) {
+        n = put(o, n, CHAT_PROMPT_LESSON);
+        n = put(o, n, title);
+    }
+    n = put(o, n, CHAT_PROMPT_TAIL);
+    return n;
+}
+
+/// Does the buffer o[0..n] contain the text s?
+pub fn has_text(o: []u8, n: u32, s: []const u8) -> bool {
+    if (s.len == 0 or s.len > n) { return false; }
+    var i : usize = 0;
+    while (i + s.len <= n) {
+        var j : usize = 0;
+        var hit : bool = true;
+        while (j < s.len) {
+            if (o[i + j] != s[j]) { hit = false; }
+            j = j + 1;
+        }
+        if (hit) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// The planted bug of the negative control: the IP limit off by one (">" for ">=").
+/// It is not used by the route or the page; the tests below must see it differ from
+/// limit_reason at the boundary, so a suite that cannot see it is not testing the limit.
+pub fn limit_reason_bug(ip_count: u32, key_count: u32, has_key: bool) -> u32 {
+    if (ip_count > CHAT_PER_IP_HOUR) { return REASON_LIMIT; }
+    if (has_key and key_count >= CHAT_PER_KEY_DAY) { return REASON_LIMIT; }
+    return REASON_NONE;
+}
+
+test enabled_for_course_12_only {
+    assert chat_enabled("vibecoding");
+    assert !chat_enabled("queen");
+    assert !chat_enabled("");
+    assert !chat_enabled("vibecodin");
+    assert !chat_enabled("vibecodingx");
+    assert !chat_enabled("Vibecoding");
+}
+
+test message_size_edges {
+    assert !msg_ok(0);
+    assert msg_ok(1);
+    assert msg_ok(CHAT_MSG_MAX);
+    assert !msg_ok(CHAT_MSG_MAX + 1);
+}
+
+test request_is_checked_before_a_model_call {
+    assert request_reason(true, 10, 10) == REASON_NONE;
+    assert request_reason(false, 10, 10) == REASON_OFF;
+    assert request_reason(true, 10, 0) == REASON_BAD_REQUEST;
+    assert request_reason(true, 10, CHAT_MSG_MAX + 1) == REASON_BAD_REQUEST;
+    assert request_reason(true, CHAT_TITLE_MAX, 10) == REASON_NONE;
+    assert request_reason(true, CHAT_TITLE_MAX + 1, 10) == REASON_BAD_REQUEST;
+    assert request_reason(true, 0, 10) == REASON_NONE;
+}
+
+test limit_per_ip_per_hour {
+    assert limit_reason(0, 0, false) == REASON_NONE;
+    assert limit_reason(CHAT_PER_IP_HOUR - 1, 0, false) == REASON_NONE;
+    assert limit_reason(CHAT_PER_IP_HOUR, 0, false) == REASON_LIMIT;
+    assert limit_reason(CHAT_PER_IP_HOUR + 5, 0, true) == REASON_LIMIT;
+}
+
+test limit_per_key_per_day {
+    assert limit_reason(0, CHAT_PER_KEY_DAY - 1, true) == REASON_NONE;
+    assert limit_reason(0, CHAT_PER_KEY_DAY, true) == REASON_LIMIT;
+    assert limit_reason(0, CHAT_PER_KEY_DAY + 5, true) == REASON_LIMIT;
+}
+
+test no_key_is_held_by_the_ip_limit_alone {
+    assert limit_reason(0, CHAT_PER_KEY_DAY, false) == REASON_NONE;
+    assert limit_reason(CHAT_PER_IP_HOUR, 0, false) == REASON_LIMIT;
+}
+
+test limits_are_sane {
+    assert CHAT_PER_IP_HOUR >= 1;
+    assert CHAT_PER_KEY_DAY >= CHAT_PER_IP_HOUR;
+    assert CHAT_ANSWER_MAX > CHAT_MSG_MAX;
+    assert CHAT_TIMEOUT_MS >= 5000;
+}
+
+test client_sees_every_way_the_route_can_fail {
+    assert client_reason(false, false, 0, 0) == REASON_UNREACHABLE;
+    assert client_reason(true, true, 200, 50) == REASON_TIMEOUT;
+    assert client_reason(true, false, 404, 0) == REASON_STATUS;
+    assert client_reason(true, false, 500, 50) == REASON_STATUS;
+    assert client_reason(true, false, 401, 50) == REASON_STATUS;
+    assert client_reason(true, false, 429, 0) == REASON_LIMIT;
+    assert client_reason(true, false, 200, 0) == REASON_EMPTY;
+    assert client_reason(true, false, 200, 1) == REASON_NONE;
+}
+
+test an_unreachable_route_beats_everything_else {
+    assert client_reason(false, true, 200, 50) == REASON_UNREACHABLE;
+    assert client_reason(false, false, 200, 50) == REASON_UNREACHABLE;
+}
+
+test generated_text_is_shown_only_when_nothing_went_wrong {
+    assert show_answer(REASON_NONE);
+    assert !show_answer(REASON_UNREACHABLE);
+    assert !show_answer(REASON_TIMEOUT);
+    assert !show_answer(REASON_STATUS);
+    assert !show_answer(REASON_EMPTY);
+    assert !show_answer(REASON_LIMIT);
+    assert !show_answer(REASON_OFF);
+    assert !show_answer(REASON_BAD_REQUEST);
+}
+
+test offline_says_so_in_one_fixed_sentence {
+    assert same(offline_text(REASON_UNREACHABLE), CHAT_OFFLINE);
+    assert same(offline_text(REASON_TIMEOUT), CHAT_OFFLINE);
+    assert same(offline_text(REASON_STATUS), CHAT_OFFLINE);
+    assert same(offline_text(REASON_EMPTY), CHAT_OFFLINE);
+    assert same(offline_text(REASON_OFF), CHAT_OFFLINE);
+    assert same(offline_text(REASON_LIMIT), CHAT_OFFLINE_LIMIT);
+    assert same(offline_text(REASON_BAD_REQUEST), CHAT_OFFLINE_BAD);
+    assert offline_text(REASON_LIMIT).len > 0;
+}
+
+test reason_names_are_distinct_on_the_wire {
+    assert same(reason_name(REASON_LIMIT), "limit");
+    assert same(reason_name(REASON_EMPTY), "empty");
+    assert same(reason_name(REASON_TIMEOUT), "timeout");
+    assert !same(reason_name(REASON_LIMIT), reason_name(REASON_EMPTY));
+    assert !same(reason_name(REASON_STATUS), reason_name(REASON_UNREACHABLE));
+    assert same(reason_name(REASON_NONE), "none");
+}
+
+test an_answer_is_kept_up_to_its_cap {
+    assert answer_keep(0) == 0;
+    assert answer_keep(CHAT_ANSWER_MAX) == CHAT_ANSWER_MAX;
+    assert answer_keep(CHAT_ANSWER_MAX + 1) == CHAT_ANSWER_MAX;
+    assert answer_keep(5) == 5;
+}
+
+test system_prompt_names_course_and_lesson {
+    var o : [1024]u8 = undefined;
+    const n : u32 = system_prompt(o, 0, "vibecoding", "Plant a bug");
+    assert n > 0;
+    assert n < 1024;
+    assert has_text(o, n, "course helper");
+    assert has_text(o, n, "vibecoding");
+    assert has_text(o, n, "Plant a bug");
+    assert has_text(o, n, "I do not know");
+    assert has_text(o, n, "You have no tools");
+}
+
+test system_prompt_on_the_overview_has_no_lesson {
+    var o : [1024]u8 = undefined;
+    const n : u32 = system_prompt(o, 0, "vibecoding", "");
+    assert has_text(o, n, "vibecoding");
+    assert !has_text(o, n, "open at the lesson");
+}
+
+test system_prompt_keeps_keys_out {
+    var o : [1024]u8 = undefined;
+    const n : u32 = system_prompt(o, 0, "vibecoding", "x");
+    assert has_text(o, n, "Never ask for or repeat a key");
+}
+
+test system_prompt_is_the_three_parts_joined {
+    var o : [1024]u8 = undefined;
+    const n : u32 = system_prompt(o, 0, "vibecoding", "x");
+    assert n == CHAT_PROMPT_HEAD.len + 10 + CHAT_PROMPT_LESSON.len + 1 + CHAT_PROMPT_TAIL.len;
+    assert CHAT_PROMPT_HEAD.len > 0;
+    assert CHAT_PROMPT_LESSON.len > 0;
+    assert CHAT_PROMPT_TAIL.len > 0;
+}
+
+test sheet_starts_where_the_column_ends {
+    var o : [2048]u8 = undefined;
+    const n : u32 = put(o, 0, CHAT_CSS_SHEET);
+    assert CHAT_WIDE_MIN == 1000;
+    assert has_text(o, n, "max-width:999px");
+}
+
+test panel_style_has_no_glow_and_no_colour {
+    var o : [2048]u8 = undefined;
+    const n : u32 = put(o, 0, CHAT_CSS);
+    assert n > 0;
+    assert has_text(o, n, ".cc{");
+    assert !has_text(o, n, "box-shadow");
+    assert !has_text(o, n, "gradient");
+    assert !has_text(o, n, "rgb");
+}
+
+test planted_bug_is_seen_at_the_boundary {
+    assert limit_reason_bug(CHAT_PER_IP_HOUR, 0, false) != limit_reason(CHAT_PER_IP_HOUR, 0, false);
+    assert limit_reason_bug(CHAT_PER_IP_HOUR - 1, 0, false) == limit_reason(CHAT_PER_IP_HOUR - 1, 0, false);
+    assert limit_reason_bug(CHAT_PER_IP_HOUR + 1, 0, false) == limit_reason(CHAT_PER_IP_HOUR + 1, 0, false);
+}

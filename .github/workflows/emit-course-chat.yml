@@ -1,0 +1,119 @@
+name: Course chat spec (t27c test-report and gen-ts)
+
+# FR-201..FR-208 of Trinity-S-AI-DNA/trinity#1813: the course helper chat is one spec,
+# apps/website/specs/chat/course-chat.t27. The Mac never runs t27c, so this job is the lab. It
+#   1. builds t27c from the pinned t27 revision and sets up the Zig that t27 runs its harness with,
+#   2. runs the tests of the chat spec (test-report prints its verdicts; this job reads what it prints),
+#   3. runs the negative control: a copy of the spec with the IP limit off by one (">=" turned into ">")
+#      must turn the suite red, and the job fails when it does not,
+#   4. writes src/lib/courseChat.gen.ts with `t27c gen-ts` and uploads it as the artifact "course-chat"
+#      (to commit by hand, because a push made with GITHUB_TOKEN starts no workflow),
+#   5. fails when a test did not pass, when the planted bug stayed green, or when the committed
+#      courseChat.gen.ts differs from the emitted one.
+# The shell lines below are plumbing around t27c, one tool call per line; the rule is t27.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "apps/website/specs/chat/**"
+      - "apps/website/src/lib/courseChat.gen.ts"
+      - ".github/workflows/emit-course-chat.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: emit-course-chat-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The same t27 revision the widget-page job pins (gHashTag/t27#13568).
+  T27_EMITTER_REVISION: 06522649ba5006c206d89af4c70c45590461a691
+  T27_ZIG_VERSION: 0.16.0
+
+jobs:
+  emit:
+    name: Test the chat spec and emit its TypeScript
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check out gHashTag/t27 at the emitter revision
+        uses: actions/checkout@v4
+        with:
+          repository: gHashTag/t27
+          ref: ${{ env.T27_EMITTER_REVISION }}
+          path: t27-pinned
+          fetch-depth: 1
+
+      # plumbing: build the compiler from that revision with its own Cargo.lock
+      - name: Build t27c
+        run: cargo build --release --locked -p t27c --manifest-path t27-pinned/Cargo.toml --target-dir t27c-target
+
+      - name: Setup the Zig that t27 runs its harness with
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.T27_ZIG_VERSION }}
+          use-cache: false
+
+      # plumbing: put t27c on the PATH, make the output folders
+      - name: Put t27c on the PATH
+        run: |
+          echo "$PWD/t27c-target/release" >> "$GITHUB_PATH"
+          mkdir -p emit-out/logs emit-out/negative
+
+      # plumbing: test-report prints its verdicts and the gates below read them
+      - name: Test the chat spec
+        run: t27c test-report apps/website/specs/chat/course-chat.t27 --specs-dir apps/website/specs > emit-out/logs/test-report.log 2>&1 || true
+
+      # plumbing: the planted bug of the negative control, one sed line on a copy of the spec
+      - name: Plant the bug in a copy of the spec
+        run: sed 's/ip_count >= CHAT_PER_IP_HOUR/ip_count > CHAT_PER_IP_HOUR/' apps/website/specs/chat/course-chat.t27 > emit-out/negative/course-chat-bug.t27
+
+      - name: Test the copy with the planted bug
+        run: t27c test-report emit-out/negative/course-chat-bug.t27 --specs-dir apps/website/specs > emit-out/logs/test-report-bug.log 2>&1 || true
+
+      # plumbing: gen-ts prints the module to stdout; its first line is the only one this job keeps apart
+      - name: Emit courseChat.gen.ts
+        run: |
+          mkdir -p emit-out/apps/website/src/lib
+          t27c gen-ts apps/website/specs/chat/course-chat.t27 > emit-out/apps/website/src/lib/courseChat.gen.ts 2> emit-out/logs/gen-ts.err || echo gen-ts >> emit-out/failed.txt
+          cp emit-out/apps/website/src/lib/courseChat.gen.ts apps/website/src/lib/courseChat.gen.ts
+          wc -c apps/website/src/lib/courseChat.gen.ts > emit-out/logs/sizes.txt
+
+      - name: Upload the module and the logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: course-chat
+          path: emit-out
+          if-no-files-found: warn
+
+      - name: Gate, courseChat.gen.ts emitted
+        run: |
+          test -f emit-out/failed.txt && cat emit-out/failed.txt
+          test ! -f emit-out/failed.txt
+          test -s apps/website/src/lib/courseChat.gen.ts
+
+      # test-report prints FAIL <name>, FAIL <n>, BLOCKED <why> and tests <n>; a spec with no test is no proof
+      - name: Gate, every chat test passed
+        run: |
+          grep -E '^  (FAIL  [^ ]|BLOCKED|FAIL +[1-9]|tests +0$)' emit-out/logs/test-report.log || true
+          ! grep -qE '^  (FAIL  [^ ]|BLOCKED|FAIL +[1-9]|tests +0$)' emit-out/logs/test-report.log
+          grep -E '^  (PASS|tests)' emit-out/logs/test-report.log | tail -3
+
+      # FR-208: the suite must be red on the copy with the planted bug, and red on the IP limit test
+      - name: Gate, the planted bug turns the suite red
+        run: |
+          grep -E '^  FAIL ' emit-out/logs/test-report-bug.log || true
+          grep -qE '^  FAIL  limit_per_ip_per_hour' emit-out/logs/test-report-bug.log
+          ! cmp -s apps/website/specs/chat/course-chat.t27 emit-out/negative/course-chat-bug.t27
+
+      # the committed module is the emitted one, byte for byte
+      - name: Gate, the committed module equals the emitted one
+        run: |
+          git status --porcelain -- apps/website/src/lib/courseChat.gen.ts
+          test -z "$(git status --porcelain -- apps/website/src/lib/courseChat.gen.ts)"
