@@ -58,6 +58,7 @@ import { body as body_the_only_stable_speed_belonged_to_the_tool, ruBody as ruBo
 import { body as body_queen_review_lifecycle_queues, ruBody as ruBody_queen_review_lifecycle_queues } from './bodies/queen-review-lifecycle-queues'
 import { body as body_physical_width_changed_the_question, ruBody as ruBody_physical_width_changed_the_question } from './bodies/physical-width-changed-the-question'
 import { body as body_nobodys_example, ruBody as ruBody_nobodys_example } from './bodies/nobodys-example'
+import { body as body_five_backends_single_source_verification, ruBody as ruBody_five_backends_single_source_verification } from './bodies/five-backends-single-source-verification'
 import { body as body_the_silence_was_a_saturated_readout, ruBody as ruBody_the_silence_was_a_saturated_readout } from './bodies/the-silence-was-a-saturated-readout'
 import { body as body_twenty_merged_in_three_days, ruBody as ruBody_twenty_merged_in_three_days } from './bodies/twenty-merged-in-three-days'
 import { body as body_energy_asymmetry_activations, ruBody as ruBody_energy_asymmetry_activations } from './bodies/energy-asymmetry-activations'
@@ -177,6 +178,7 @@ const bodies: Record<string, PostBody> = {
   'real-value-in-integer-container': { body: body_real_value_in_integer_container, ruBody: ruBody_real_value_in_integer_container },
   'features-that-change-no-bits': { body: body_features_that_change_no_bits, ruBody: ruBody_features_that_change_no_bits },
   'physical-width-changed-the-question': { body: body_physical_width_changed_the_question, ruBody: ruBody_physical_width_changed_the_question },
+  'five-backends-single-source-verification': { body: body_five_backends_single_source_verification, ruBody: ruBody_five_backends_single_source_verification },
   'nobodys-example': { body: body_nobodys_example, ruBody: ruBody_nobodys_example },
   'the-silence-was-a-saturated-readout': { body: body_the_silence_was_a_saturated_readout, ruBody: ruBody_the_silence_was_a_saturated_readout },
   'twenty-merged-in-three-days': { body: body_twenty_merged_in_three_days, ruBody: ruBody_twenty_merged_in_three_days },
