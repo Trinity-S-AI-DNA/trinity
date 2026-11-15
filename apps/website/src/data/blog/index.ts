@@ -3,6 +3,41 @@ import type { PostMeta } from './types'
 /** Индекс блога: список и метаданные без тяжёлых тел публикаций. */
 export const postsIndex: PostMeta[] = [
   {
+    slug: "five-backends-single-source-verification",
+    title: "What five backends teach about single-source verification",
+    summary: "[numbers are from docs/reports/t27b-bench-2026-10.md and the receipts it cites; not rerun for this publication] Five backends, one spec source: the whole-corpus differential run compares t27b against the reference test by test - 0 of 8,344 tests disagree - while Zig, clang and gcc pipelines disagree with themselves across optimization levels. The article also states what the zero does not prove: no independent front end exists, the fuzzer still finds 7 disagreements per 1,000 programs, and only 12% of the code t27b runs is generated.",
+    date: "2026-11-15",
+    readingMinutes: 9,
+    tags: ["verification", "compilers", "differential-testing", "trust", "backends"],
+    receipts: [
+      { label: "t27 #8817 - the bench report the article cites", href: "https://github.com/gHashTag/t27/issues/8817" },
+      { label: "trinity #12907 - the shootout measurements", href: "https://github.com/gHashTag/trinity/issues/12907" },
+      { label: "trinity #12908 - the superiority column", href: "https://github.com/gHashTag/trinity/issues/12908" },
+      { label: "t27 #6441 - the signed receipts chain", href: "https://github.com/gHashTag/t27/issues/6441" },
+      { label: "t27 #6442 - the fuzzer receipt", href: "https://github.com/gHashTag/t27/issues/6442" },
+      { label: "t27 #7706 - the DDC receipt (DDC_BACKEND_AGREEMENT)", href: "https://github.com/gHashTag/t27/issues/7706" },
+      { label: "t27 #7576 - the coverage/blockers receipt", href: "https://github.com/gHashTag/t27/issues/7576" },
+      { label: "The approved article source", href: "https://github.com/gHashTag/t27/blob/master/docs/blog/seo-01-five-backends-single-source-verification.md" },
+    ],
+    openQuestions: [
+      "The zero-disagreement result is backend agreement, not independent verification: all compared routes share one hand-written front end, and no independently written t27 front end exists.",
+      "The fuzzer's 7 disagreements per 1,000 programs is one run at seed 1791653965 (1,000 programs); it is a live number, not a solved quantity.",
+      "The 98.9% coverage figure is over the 1,311 files the reference passes, not over the full 1,819-file corpus; 15 files the reference passes do not pass in t27b.",
+      "The speed, size and instruction-count figures (4.8 ms/spec, 3.08 MB, 3.4x gcc -O2 instructions, 1.8x size) come from the bench report and were not rerun for this publication.",
+    ],
+    published: true,
+    ru: {
+      title: "Чему учат пять бэкендов: верификация с одним источником",
+      summary: "Пять бэкендов, один источник спецификаций: диффинг по каждому тесту показывает, что компилятор может доказать о своём доверии - и чего он честно доказать не может.",
+      openQuestions: [
+        "Результат нуля расхождений - согласие бэкендов, а не независимая верификация: все сравненные маршруты делят один рукописный фронтенд, и независимо написанного фронтенда t27 не существует.",
+        "7 расхождений на 1,000 программ у фаззера - один запуск с seed 1791653965 (1,000 программ); это живое число, а не решённая величина.",
+        "Цифра покрытия 98.9% - по 1,311 файлам, которые проходит эталон, а не по полному корпусу в 1,819 файлов; 15 файлов, которые проходит эталон, в t27b не проходят.",
+        "Цифры скорости, размера и числа инструкций (4.8 мс/спека, 3.08 MB, в 3.4 раза больше инструкций gcc -O2, размер в 1.8 раза больше) взяты из бенч-отчёта и для этой публикации не повторялись.",
+      ],
+    },
+  },
+  {
     slug: "vibecoding-lesson-texts-fill-chat-budget",
     title: "Vibecoding course: lesson texts expanded to fill the chat grounding budget",
     summary: "[lengths are from course-from-spec --check on eb7d0c2a7; API probes done in-browser] All 27 English lesson texts in the Vibecoding from Zero course were expanded from 361–685 bytes to 1170–1403 bytes each to fill the 1500-byte CHAT_BODY_MAX slot that course-chat.t27 injects into the system prompt. Nine Russian texts were updated for number parity, and eight superlative phrases were rephrased.",
