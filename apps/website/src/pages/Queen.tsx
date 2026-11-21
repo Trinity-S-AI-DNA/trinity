@@ -823,6 +823,7 @@ const COPY = {
     // ---- single-screen HUD ----
     hudBrand: "TRINITY QUEEN",
     hudBees: "BEES",
+    hudBeesCeiling: "hive ceiling: {cap}",
     hudDone: "DONE",
     hudVerdicts: "VERDICTS",
     hud24h: "24h",
@@ -1351,6 +1352,7 @@ const COPY = {
     // ---- single-screen HUD ----
     hudBrand: "TRINITY QUEEN",
     hudBees: "ПЧЁЛЫ",
+    hudBeesCeiling: "потолок улья: {cap}",
     hudDone: "ГОТОВО",
     hudVerdicts: "ВЕРДИКТЫ",
     hud24h: "24ч",
@@ -5339,16 +5341,20 @@ export default function Queen({sharedCatalog}:{sharedCatalog?:UniverseAtlas}={})
           <TrinityLogo withLabel={false} height="34px" />
         </Link>
 
-        <div className="queen27-hud-res queen27-hud-res-bees">
+        <div
+          className="queen27-hud-res queen27-hud-res-bees"
+          title={data?.workers ? c.hudBeesCeiling.replace("{cap}", String(data.workers.capacity)) : undefined}
+        >
           <i aria-hidden="true">◆</i>
           <small>{c.hudBees}</small>
           {/* One response for the whole tile: /queen/status's started, unfinished
-              bees over its slots, the reading idleReason takes free slots from.
-              The research poll's reading only when the status carries none. */}
+              bees, the reading idleReason takes free slots from. The research
+              poll's reading only when the status carries none. The count is the
+              number alone (#1711): the owner reads the tile as "how many bees
+              work", so the ceiling moved out of the number and into the title,
+              where hover and a screen reader still find it. */}
           <strong id="stat-bees">
-            {data?.workers
-              ? `${data.workers.active}/${data.workers.capacity}`
-              : `${data ? data.dispatches.running : "—"}/${workers?.capacity ?? "—"}`}
+            {data?.workers ? data.workers.active : data ? data.dispatches.running : "—"}
           </strong>
           {/* The whole reason lives here now: the head short enough for the tile,
               the sentence on hover and for a screen reader, and -- when the

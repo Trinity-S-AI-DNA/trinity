@@ -93,7 +93,8 @@ try {
   const until = async (expr, ms) => { const t0 = Date.now(); while (Date.now() - t0 < ms) { try { const v = await evaluate(expr); if (v) return v; } catch {} await wait(500); } return null; };
   const size = (w, h) => call('Emulation.setDeviceMetricsOverride', { width: w, height: h, deviceScaleFactor: 1, mobile: w < 768 || h <= 500 });
   const tap = async (x, y) => { for (const type of ['mouseMoved', 'mousePressed', 'mouseReleased']) await call('Input.dispatchMouseEvent', { type, x, y, button: 'left', buttons: type === 'mousePressed' ? 1 : 0, clickCount: 1 }); };
-  const ready = `(() => { const b = document.getElementById('stat-bees'); return !!document.querySelector('main[data-view]') && !!b && /^\\s*\\d+\\s*\\//.test(b.textContent); })()`;
+  // #1711: the tile answers with the working count alone -- digits to the end, no "/capacity" fraction.
+  const ready = `(() => { const b = document.getElementById('stat-bees'); return !!document.querySelector('main[data-view]') && !!b && /^\\s*\\d+\\s*$/.test(b.textContent); })()`;
   const load = async (w, h, lang, tag) => {
     await size(w, h);
     await call('Page.navigate', { url: `${ORIGIN}/?lang=${lang}&idle-layout=${process.pid}-${tag}#/queen` });
