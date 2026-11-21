@@ -20,6 +20,58 @@ Read the blog skill before writing content. Preserve the user's img2img
 triptych, mandatory hashtags, truthful limitations and relevant service offer.
 Never omit the work report for a small, documentation-only or automation PR.
 
+## New course to open a topic (Queen and every bee)
+
+When a topic needs explaining, the answer is a course: **9 modules of 3
+lessons each, 27 lessons** (owner, 2026-10-07). One topic is one course; two topics are two
+courses, chained (the last lesson opens lesson 1 of the next). Live chain:
+0 t27 basics -> 1 FPGA -> 2 AI numbers.
+
+The recipe is a t27 module, not this prose:
+[specs/course_recipe/course-27.t27](specs/course_recipe/course-27.t27) (steps,
+rules, gates, cast commands; its tests hold the order). Planned courses:
+[specs/course_recipe/roadmap.t27](specs/course_recipe/roadmap.t27). Read both
+first; this section only points at them.
+
+In short, so the Queen can assign it:
+
+1. Copy the newest course spec in `apps/website/specs/course/` with its `-ru`
+   twin, rename ID / ROUTE / SHARE_PATH, register it in `courses.t27`.
+2. Every lesson: one widget unique across all courses, one t27 spec that
+   compiles in the browser, black-and-white infographic or card.
+3. Run the generators from `apps/website` (all-or-nothing):
+   `widgets-from-spec.mjs`, `widget-pages-from-spec.mjs`,
+   `course-from-spec.mjs`, `course-pages.mjs`; then the `check:course*`,
+   `check:widgets`, `check:onboarding` gates.
+4. Casts are recorded only through `tri` commands; a lesson without a recording
+   says "pending", never fakes one.
+5. The same PR carries its blog post (`body` English + `ruBody` Russian) and the
+   work report above.
+6. Main moved under the PR: merge `origin/main` in, never rebase/force push.
+   A merged trinity PR is not live: ship through the
+   `release(board): ship trinity <sha>` PR in gHashTag/999-multibots-telegraf.
+
+Traps found by the first course built from this section alone (trinity#1470,
+full list in its "Recipe gaps"):
+
+- Rename **ID, ROUTE, SHARE_PATH, RU_CONTRACT and GENERATED** in the copied spec.
+- Code edits the recipe needs: route, starfield root and nav entry in `src/`;
+  blog post registered in `src/data/blog/index.ts` and `posts.ts`.
+- `gallery.t27` keeps each category as one unbroken block: insert the new
+  widgets inside their category, then fix the index asserts in the gallery
+  tests; `course-from-spec.test.mjs` asserts the course count, bump it.
+- Full gate list: `check:widgets`, `test:widgets-spec`, `check:widget-pages`
+  (run widget-pages before widgets), `check:course`, `test:course`,
+  `check:course-pages`, `check:course-recipe`, `check:onboarding`,
+  `check:play`, `tsc --noEmit`.
+- A pending lesson still needs a gallery entry; ship it as a
+  `public/term/<id>/` placeholder with `pending`, never a fake widget.
+- Russian widget words go in `i18n/widgets.ru.json` under the contract
+  `specs/widgets/i18n/widgets-ru.t27` (no Cyrillic in specs); the Russian text
+  must keep the same digits as the English.
+- Work-report format: copy the `<!-- t27-work-report -->` block of trinity#1463.
+- A lesson's widget card is generated, never drawn by hand: `npm run cards:widgets` in `apps/website` draws `public/widgets/<id>/card.png` in black and white from the widget spec's TITLE and DESCRIPTION (`--id <id>` redraws one), and `check:widget-cards` fails on a missing or stale card.
+
 **Version**: 2.0
 **Date**: 2026-04-04
 **Status**: Active
