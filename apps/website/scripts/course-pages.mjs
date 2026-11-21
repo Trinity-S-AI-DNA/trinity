@@ -175,8 +175,7 @@ function pageHtml(C, lang, lesson, cardUrl, all = []) {
   const catalog = !lesson && all.length > 1 && C === all[0] ? `<ol class="courses">${all.map((c) => `<li${c === C ? ' aria-current="page"' : ''}><a href="/${lang === 'ru' ? 'ru/' : ''}${c.share}">${esc(c.say[lang].TITLE)}</a></li>`).join('')}</ol>` : ''
   const thumb = lesson && thumbOf(lesson.widget) ? `/${relative(PUBLIC, thumbOf(lesson.widget))}` : null
   const body = lesson
-    ? `<nav class="crumbs"><a href="/${pathOf(C, lang)}">${esc(say.ALL)}</a><span>${esc(fmt(say.MODULE, mod.n))} · ${esc(mod[lang].title)}</span><span>${esc(fmt(say.LESSON, lesson.n, total))}</span></nav>
-<h1>${esc(t.title)}</h1>
+    ? `<h1>${esc(t.title)}</h1>
 <section><h2>${esc(say.GOAL)}</h2><p class="goal">${esc(t.goal)}</p></section>
 <p>${esc(t.text)}</p>
 <section><h2>${esc(say.TRY)}</h2><p>${esc(t.task)}</p></section>
@@ -225,16 +224,15 @@ ${ld.map((x) => `<script type="application/ld+json">${JSON.stringify(x).replace(
 @font-face { font-family: 'Outfit'; font-weight: 400 800; font-display: swap; src: url(/fonts/outfit-latin.woff2) format('woff2'); }
 :root { color-scheme: dark; }
 body { margin: 0; background: #000; color: #e8eeec; font: 18px/1.6 'Outfit', system-ui, sans-serif; }
-main { max-width: 760px; margin: 0 auto; padding: 32px 20px 64px; }
-header { display: flex; justify-content: space-between; max-width: 760px; margin: 0 auto; padding: 20px 20px 0; font-size: 15px; }
-a { color: #08FAB5; } a:focus-visible { outline: 2px solid #08FAB5; outline-offset: 2px; }
+main { max-width: none; margin: 0; padding: 12px 14px 24px; }
+a { color: #fff; text-decoration: underline; text-underline-offset: 3px; } a:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
 h1 { font-size: clamp(32px, 6vw, 48px); line-height: 1.1; margin: 12px 0 20px; color: #fff; }
 h2 { font-size: 14px; letter-spacing: 2px; text-transform: uppercase; color: #8fa19d; margin: 28px 0 4px; }
 h3 { font-size: 17px; margin: 18px 0 2px; color: #fff; }
 .goal { font-size: 21px; color: #fff; }
 .kicker, .crumbs { font-size: 14px; letter-spacing: 1px; color: #8fa19d; display: flex; gap: 14px; flex-wrap: wrap; }
-.cta { display: inline-block; margin: 20px 0; padding: 12px 22px; border: 1px solid #08FAB5; border-radius: 10px; text-decoration: none; font-weight: 600; }
-.cta:hover { background: #08FAB5; color: #000; }
+.cta { display: inline-block; margin: 20px 0; padding: 12px 22px; border: 1px solid #fff; border-radius: 10px; text-decoration: none; font-weight: 600; }
+.cta:hover { background: #fff; color: #000; }
 figure { margin: 24px 0; } figure img { width: 100%; height: auto; border: 1px solid #22302c; border-radius: 12px; display: block; }
 figcaption { font-size: 15px; margin-top: 8px; }
 .courses { margin: 24px 0; padding-left: 1.4em; } .courses li { margin: 6px 0; } .courses [aria-current] a { font-weight: 600; }
@@ -247,7 +245,6 @@ pre { overflow-x: auto; background: #0b0f0e; border: 1px solid #1e2624; border-r
 </style>
 </head>
 <body>
-<header><a href="/${lang === 'ru' ? 'ru/' : ''}">t27.ai</a><a href="/${pathOf(C, other, id)}" hreflang="${other}" lang="${other}">${other === 'ru' ? 'Русский' : 'English'}</a></header>
 <main>
 ${body}
 <section><h2>${esc(say.ALL)}</h2><ul class="outline">${outline}</ul></section>
