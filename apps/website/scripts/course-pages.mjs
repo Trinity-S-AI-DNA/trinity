@@ -175,21 +175,12 @@ function pageHtml(C, lang, lesson, cardUrl, all = []) {
   const catalog = !lesson && all.length > 1 && C === all[0] ? `<ol class="courses">${all.map((c) => `<li${c === C ? ' aria-current="page"' : ''}><a href="/${lang === 'ru' ? 'ru/' : ''}${c.share}">${esc(c.say[lang].TITLE)}</a></li>`).join('')}</ol>` : ''
   const thumb = lesson && thumbOf(lesson.widget) ? `/${relative(PUBLIC, thumbOf(lesson.widget))}` : null
   const body = lesson
-    ? `<h1>${esc(t.title)}</h1>
-<section><h2>${esc(say.GOAL)}</h2><p class="goal">${esc(t.goal)}</p></section>
-<p>${esc(t.text)}</p>
-<section><h2>${esc(say.TRY)}</h2><p>${esc(t.task)}</p></section>
-<p><a class="cta" href="${appOf(C, id)}">${esc(say.OPEN_LESSON)} →</a></p>
-<figure><a href="${esc(lesson.widget.url.slice(ORIGIN.length))}">${thumb ? `<img src="${esc(thumb)}" width="600" height="315" alt="${esc(lesson.widget.title)}" loading="lazy">` : ''}<figcaption>${esc(lesson.widget.title)} ↗</figcaption></a></figure>
-${about ? `<p class="about" lang="en">${esc(about)}</p>` : ''}
-${lesson.spec ? `<section><h2>${esc(lesson.spec.path)}</h2>${code ? `<pre lang="en"><code>${esc(code)}</code></pre>` : ''}<p><a href="/${esc(lesson.spec.preview)}">${esc(say.SPEC)} ↗</a></p></section>` : ''}
-<nav class="pager">${back}${fwd}</nav>`
-    : `<p class="kicker">${esc(say.KICKER)}</p>
-<h1>${esc(say.TITLE)}</h1>
-<p class="goal">${esc(say.LEAD)}</p>
-<p>${esc(say.DESCRIPTION)}</p>
-<p><a class="cta" href="${appOf(C)}">${esc(say.OPEN_COURSE)} →</a></p>
-${catalog}${courses}`
+    ? `<div class="hd"><h1>${esc(t.title)}</h1><p class="lab">${esc(say.GOAL)}</p><p class="goal">${esc(t.goal)}</p></div>
+<div class="txt"><p>${esc(t.text)}</p></div>
+<div class="ft"><aside class="try"><h2>${esc(say.TRY)}</h2><p>${esc(t.task)}</p></aside><a class="cta" href="${appOf(C, id)}">${esc(say.OPEN_LESSON)} →</a></div>`
+    : `<div class="hd"><p class="lab">${esc(say.KICKER)}</p><h1>${esc(say.TITLE)}</h1><p class="goal">${esc(say.LEAD)}</p></div>
+<div class="txt"><p>${esc(say.DESCRIPTION)}</p>${catalog}${courses}</div>
+<div class="ft"><a class="cta" href="${appOf(C)}">${esc(say.OPEN_COURSE)} →</a></div>`
   return `<!doctype html>
 <html lang="${lang}">
 <head>
@@ -223,32 +214,24 @@ ${ld.map((x) => `<script type="application/ld+json">${JSON.stringify(x).replace(
 <style>
 @font-face { font-family: 'Outfit'; font-weight: 400 800; font-display: swap; src: url(/fonts/outfit-latin.woff2) format('woff2'); }
 :root { color-scheme: dark; }
-body { margin: 0; background: #000; color: #e8eeec; font: 18px/1.6 'Outfit', system-ui, sans-serif; }
-main { max-width: none; margin: 0; padding: 12px 14px 24px; }
-a { color: #fff; text-decoration: underline; text-underline-offset: 3px; } a:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
-h1 { font-size: clamp(32px, 6vw, 48px); line-height: 1.1; margin: 12px 0 20px; color: #fff; }
-h2 { font-size: 14px; letter-spacing: 2px; text-transform: uppercase; color: #8fa19d; margin: 28px 0 4px; }
-h3 { font-size: 17px; margin: 18px 0 2px; color: #fff; }
-.goal { font-size: 21px; color: #fff; }
-.kicker, .crumbs { font-size: 14px; letter-spacing: 1px; color: #8fa19d; display: flex; gap: 14px; flex-wrap: wrap; }
-.cta { display: inline-block; margin: 20px 0; padding: 12px 22px; border: 1px solid #fff; border-radius: 10px; text-decoration: none; font-weight: 600; }
-.cta:hover { background: #fff; color: #000; }
-figure { margin: 24px 0; } figure img { width: 100%; height: auto; border: 1px solid #22302c; border-radius: 12px; display: block; }
-figcaption { font-size: 15px; margin-top: 8px; }
-.courses { margin: 24px 0; padding-left: 1.4em; } .courses li { margin: 6px 0; } .courses [aria-current] a { font-weight: 600; }
-.pager { display: flex; justify-content: space-between; gap: 16px; margin: 32px 0; padding-top: 20px; border-top: 1px solid #1e2624; } .pager .chain { font-weight: 600; }
-.outline { list-style: none; padding: 0; } .outline ol { list-style: none; padding-left: 0; margin: 4px 0; } .outline p { margin: 0; color: #8fa19d; font-size: 15px; }
-pre { overflow-x: auto; background: #0b0f0e; border: 1px solid #1e2624; border-radius: 10px; padding: 14px 16px; font: 13px/1.5 'JetBrains Mono', ui-monospace, monospace; color: #cfe3de; max-height: 520px; }
-.about { color: #b9c4c2; font-size: 16px; }
-.outline li.on a { color: #fff; font-weight: 600; } footer { color: #8fa19d; font-size: 15px; }
+body { margin: 0; background: #000; color: #e6e6e6; font: clamp(13px, 2.3vh, 19px)/1.55 'Outfit', system-ui, sans-serif; }
+main { box-sizing: border-box; height: 100vh; display: grid; grid-template-rows: auto minmax(0, 1fr) auto; gap: clamp(6px, 1.6vh, 16px); padding: clamp(8px, 2vh, 20px) clamp(12px, 3vw, 32px); overflow: auto; }
+a { color: #fff; text-underline-offset: 3px; } a:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
+h1 { font-size: clamp(20px, 4.4vh, 38px); line-height: 1.12; margin: 0 0 .35em; color: #fff; }
+.lab, .try h2 { font-size: .72em; font-weight: 600; letter-spacing: .14em; text-transform: uppercase; color: #9a9a9a; margin: 0; }
+.goal { font-size: 1.18em; color: #fff; margin: .15em 0 0; }
+.txt { min-height: 0; overflow: auto; border-top: 1px solid #333; padding-top: clamp(6px, 1.4vh, 14px); } .txt p { margin: 0 0 .8em; }
+@media (min-width: 700px) { .txt { height: 100%; columns: 32ch; column-gap: clamp(16px, 3vw, 40px); column-fill: auto; } }
+@media (max-width: 699px) { main { height: auto; min-height: 100vh; } .txt { overflow: visible; } }
+.ft { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; } .try { flex: 1 1 260px; border: 1px solid #333; padding: .5em 1em .6em; } .try p { margin: .2em 0 0; }
+.cta { padding: .55em 1.3em; border: 1px solid #fff; text-decoration: none; font-weight: 600; white-space: nowrap; } .cta:hover { background: #fff; color: #000; }
+.courses { margin: 0; padding-left: 1.4em; } .courses [aria-current] a { font-weight: 600; } .pager { display: flex; justify-content: space-between; gap: 16px; }
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
 </style>
 </head>
 <body>
 <main>
 ${body}
-<section><h2>${esc(say.ALL)}</h2><ul class="outline">${outline}</ul></section>
-<footer><p><a href="/${C.source.publicSpec.replace(/^public\//, '')}">${esc(say.SOURCE)}</a></p><p>${esc(say.WIDGET_LANG)}</p></footer>
 </main>
 ${CARRY_UTM}
 </body>
