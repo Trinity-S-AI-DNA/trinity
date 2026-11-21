@@ -1,0 +1,974 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/tri/t27b/wide_plan.t27 -- how t27b folds integer constants wider than 64 bits (issue #7423, t27b coverage
+; epic #6063; written in t27 under the port epic #6198).
+; t27c's Zig backend prints `const X: u128 = <literal>;` unchanged, so X is a compile-time value and Zig's compiler
+; does every operation on it, at any width. t27b has no run-time integer wider than 64 bits, so it folds the same
+; expressions here, with exact integers and Zig's comptime rules, and keeps only what leaves the wide world: a
+; comparison (a constant bool) or an `as` back to an integer type of at most 64 bits (t27c prints `@intCast`, so
+; the value must fit). Everything t27b decides about such a constant is in this file and reaches cli/t27b through
+; `t27c gen-rust` (gen/rust/tri/t27b/wide_plan.rs). The Rust glue in cli/t27b/src/lower.rs only walks the
+; expression: it hands this file each integer literal (`literal`), each module constant declared with a wide type
+; (`is_wide`, `constant`) and each operator (`apply`), and asks `verdict` whether the whole folds; it builds the
+; constant `low64` reads, or the refusal `why` words.
+; --
+; The rules (Zig 0.16 comptime, checked under `t27c test-report` for #7423):
+;   - `+ - *` of a typed operand must stay inside the type; an untyped literal beside a typed operand must fit it;
+;     `+% -% *%` wrap a typed operand and are refused on an untyped one.
+;   - `<<` drops the bits a typed operand shifts out (Zig's comptime shift truncates); the amount is an untyped
+;     integer below the width. `>>` rounds toward minus infinity.
+;   - `/` and `%` need a divisor that is not zero and, as Zig asks of them without `@divTrunc` / `@rem`, operands
+;     that are not negative; `& | ^` are taken only on operands that are not negative here.
+;   - unary `-` negates an untyped or a signed operand; `~` inverts a typed one.
+;   - two typed operands of one operator have one type; a comparison takes any two and is exact.
+;   - a constant's value must fit its declared type, and a typed initializer must already have that type.
+; Anything else is refused, never folded to a guess: a wide constant beside a run-time value, a call or a typed
+; constant of at most 64 bits; a wide value where t27b needs a run-time one; mixed wide types in arithmetic; and
+; everything Zig's compiler rejects (overflow, a value or a cast outside its type, a shift by the full width, a
+; division by zero). Values are held as a sign and a magnitude of LIMBS 32-bit limbs; a value or a type wider
+; than CAP_BITS is refused as too wide.
+; --
+; The oracle is the hand-written Rust of draft PR #7440 (cli/t27b/src/lower/wide.rs, 701 lines): its `Big`, its
+; `Wide::fits` / `wrap` and its `wide_arith`. Its expected values were checked against i128 in that PR and against
+; the reference here. specs/tri/t27b/conformance/wide_int_const.t27 is the end-to-end check.
+; No unary operator (#6549) and no char literal (#7604) below: a byte is compared with its ASCII code.
+; ASCII only (L3)
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module T27bWidePlan;
+
+pub const LIMBS : usize = 66;
+pub const CAP_BITS : u32 = 2048;
+const LOW32 : u64 = 4294967295;
+const ONE32 : u32 = 1;
+
+/// A folded value. `state` is OK or why it does not fold. `width` is its type: 0 for an untyped integer (Zig's
+/// comptime_int), else the bits of a wide type, signed when `is_signed`. `is_bool` marks a comparison's result,
+/// held in mag[0]. `neg` and `mag` are the sign and the magnitude, least significant limb first; zero is never
+/// negative. `named` is the width of the wide constant a refusal is reported under (0: none was named),
+/// `named_signed` its signedness.
+pub const WideFold = struct {
+    state : u8,
+    width : u32,
+    is_signed : bool,
+    is_bool : bool,
+    neg : bool,
+    mag : [66]u32,
+    named : u32,
+    named_signed : bool,
+};
+
+// Why a fold gives no value.
+pub const OK : u8 = 0;
+pub const OTHER : u8 = 1;
+pub const OVERFLOW : u8 = 2;
+pub const RANGE : u8 = 3;
+pub const MIXED : u8 = 4;
+pub const SHIFT : u8 = 5;
+pub const DIV_ZERO : u8 = 6;
+pub const NEGATIVE : u8 = 7;
+pub const OPERATOR : u8 = 8;
+pub const TOO_WIDE : u8 = 9;
+pub const RUNTIME : u8 = 10;
+pub const NOT_INT : u8 = 11;
+
+// The operators `apply` folds.
+const OP_NONE : u8 = 0;
+const OP_ADD : u8 = 1;
+const OP_SUB : u8 = 2;
+const OP_MUL : u8 = 3;
+const OP_ADDW : u8 = 4;
+const OP_SUBW : u8 = 5;
+const OP_MULW : u8 = 6;
+const OP_DIV : u8 = 7;
+const OP_REM : u8 = 8;
+const OP_SHL : u8 = 9;
+const OP_SHR : u8 = 10;
+const OP_AND : u8 = 11;
+const OP_OR : u8 = 12;
+const OP_XOR : u8 = 13;
+const OP_EQ : u8 = 14;
+const OP_NE : u8 = 15;
+const OP_LT : u8 = 16;
+const OP_LE : u8 = 17;
+const OP_GT : u8 = 18;
+const OP_GE : u8 = 19;
+const OP_NEG : u8 = 20;
+const OP_NOT : u8 = 21;
+
+// The order of two magnitudes or two values.
+const LESS : u8 = 0;
+const SAME : u8 = 1;
+const MORE : u8 = 2;
+
+// ---------------------------------------------------------------- magnitudes
+
+fn zero_mag() -> [66]u32 {
+    const m : [66]u32 = [0] ** 66;
+    return m;
+}
+
+fn small_mag(x: u32) -> [66]u32 {
+    var m : [66]u32 = [0] ** 66;
+    m[0] = x;
+    return m;
+}
+
+/// The number of bits in m: 0 for zero.
+fn bit_len(m: [66]u32) -> u32 {
+    var i : usize = LIMBS;
+    while (i > 0) {
+        i = i - 1;
+        if (m[i] != 0) {
+            var top : u32 = m[i];
+            var n : u32 = 0;
+            while (top != 0) {
+                n = n + 1;
+                top = top >> 1;
+            }
+            return (i as u32) * 32 + n;
+        }
+    }
+    return 0;
+}
+
+fn bit_at(m: [66]u32, k: u32) -> bool {
+    return ((m[(k / 32) as usize] >> (k % 32)) & 1) == 1;
+}
+
+fn cmp_mag(a: [66]u32, b: [66]u32) -> u8 {
+    var i : usize = LIMBS;
+    while (i > 0) {
+        i = i - 1;
+        if (a[i] != b[i]) {
+            if (a[i] < b[i]) { return LESS; }
+            return MORE;
+        }
+    }
+    return SAME;
+}
+
+/// a + b; the callers keep both below 2^2111, so nothing is carried out of the top limb.
+fn add_mag(a: [66]u32, b: [66]u32) -> [66]u32 {
+    var r : [66]u32 = [0] ** 66;
+    var carry : u64 = 0;
+    var i : usize = 0;
+    while (i < LIMBS) {
+        const s : u64 = (a[i] as u64) + (b[i] as u64) + carry;
+        r[i] = (s & LOW32) as u32;
+        carry = s >> 32;
+        i = i + 1;
+    }
+    return r;
+}
+
+/// a - b, for a >= b.
+fn sub_mag(a: [66]u32, b: [66]u32) -> [66]u32 {
+    var r : [66]u32 = [0] ** 66;
+    var borrow : u64 = 0;
+    var i : usize = 0;
+    while (i < LIMBS) {
+        const x : u64 = a[i] as u64;
+        const y : u64 = (b[i] as u64) + borrow;
+        if (x >= y) {
+            r[i] = (x - y) as u32;
+            borrow = 0;
+        } else {
+            r[i] = (x + 4294967296 - y) as u32;
+            borrow = 1;
+        }
+        i = i + 1;
+    }
+    return r;
+}
+
+/// a * k + add, both below 2^32; what passes the top limb is dropped.
+fn mul_small(a: [66]u32, k: u32, add: u32) -> [66]u32 {
+    var r : [66]u32 = [0] ** 66;
+    var carry : u64 = add as u64;
+    var i : usize = 0;
+    while (i < LIMBS) {
+        const t : u64 = (a[i] as u64) * (k as u64) + carry;
+        r[i] = (t & LOW32) as u32;
+        carry = t >> 32;
+        i = i + 1;
+    }
+    return r;
+}
+
+/// a * b modulo 2^(32 * LIMBS): exact when bit_len(a) + bit_len(b) <= 32 * LIMBS.
+fn mul_mag(a: [66]u32, b: [66]u32) -> [66]u32 {
+    var r : [66]u32 = [0] ** 66;
+    var i : usize = 0;
+    while (i < LIMBS) {
+        if (a[i] != 0) {
+            var carry : u64 = 0;
+            var j : usize = 0;
+            while (i + j < LIMBS) {
+                const t : u64 = (r[i + j] as u64) + (a[i] as u64) * (b[j] as u64) + carry;
+                r[i + j] = (t & LOW32) as u32;
+                carry = t >> 32;
+                j = j + 1;
+            }
+        }
+        i = i + 1;
+    }
+    return r;
+}
+
+/// m shifted left by k bits; the bits shifted past the top limb are dropped.
+fn shl_mag(m: [66]u32, k: u32) -> [66]u32 {
+    var r : [66]u32 = [0] ** 66;
+    const ls : usize = (k / 32) as usize;
+    const bs : u32 = k % 32;
+    var i : usize = ls;
+    while (i < LIMBS) {
+        const lo : u64 = m[i - ls] as u64;
+        var below : u64 = 0;
+        if (i > ls) { below = m[i - ls - 1] as u64; }
+        r[i] = (((lo << bs) & LOW32) | (below >> (32 - bs))) as u32;
+        i = i + 1;
+    }
+    return r;
+}
+
+/// m shifted right by k bits.
+fn shr_mag(m: [66]u32, k: u32) -> [66]u32 {
+    var r : [66]u32 = [0] ** 66;
+    const ls : usize = (k / 32) as usize;
+    const bs : u32 = k % 32;
+    var i : usize = 0;
+    while (i + ls < LIMBS) {
+        const lo : u64 = m[i + ls] as u64;
+        var above : u64 = 0;
+        if (i + ls + 1 < LIMBS) { above = m[i + ls + 1] as u64; }
+        r[i] = ((lo >> bs) | ((above << (32 - bs)) & LOW32)) as u32;
+        i = i + 1;
+    }
+    return r;
+}
+
+/// The low k bits of m.
+fn low_bits(m: [66]u32, k: u32) -> [66]u32 {
+    var r : [66]u32 = m;
+    const top : usize = (k / 32) as usize;
+    var i : usize = top;
+    while (i < LIMBS) {
+        if (i == top) {
+            r[i] = m[i] & ((ONE32 << (k % 32)) - 1);
+        } else {
+            r[i] = 0;
+        }
+        i = i + 1;
+    }
+    return r;
+}
+
+/// 2^k, for k < 32 * LIMBS.
+fn pow2(k: u32) -> [66]u32 {
+    return shl_mag(small_mag(1), k);
+}
+
+/// The quotient of a by b (b not zero), or the remainder when `rem`. A divisor below 2^32 takes one pass;
+/// any other shifts and subtracts, bit by bit.
+fn divmod_mag(a: [66]u32, b: [66]u32, rem: bool) -> [66]u32 {
+    var q : [66]u32 = [0] ** 66;
+    if (bit_len(b) <= 32) {
+        const d : u64 = b[0] as u64;
+        var r : u64 = 0;
+        var i : usize = LIMBS;
+        while (i > 0) {
+            i = i - 1;
+            const cur : u64 = (r << 32) | (a[i] as u64);
+            q[i] = (cur / d) as u32;
+            r = cur % d;
+        }
+        if (rem) { return small_mag(r as u32); }
+        return q;
+    }
+    var r2 : [66]u32 = [0] ** 66;
+    var k : u32 = bit_len(a);
+    while (k > 0) {
+        k = k - 1;
+        r2 = shl_mag(r2, 1);
+        if (bit_at(a, k)) { r2[0] = r2[0] | 1; }
+        if (cmp_mag(r2, b) != LESS) {
+            r2 = sub_mag(r2, b);
+            q[(k / 32) as usize] = q[(k / 32) as usize] | (ONE32 << (k % 32));
+        }
+    }
+    if (rem) { return r2; }
+    return q;
+}
+
+fn bitwise_mag(a: [66]u32, b: [66]u32, op: u8) -> [66]u32 {
+    var r : [66]u32 = [0] ** 66;
+    var i : usize = 0;
+    while (i < LIMBS) {
+        if (op == OP_AND) { r[i] = a[i] & b[i]; }
+        if (op == OP_OR) { r[i] = a[i] | b[i]; }
+        if (op == OP_XOR) { r[i] = a[i] ^ b[i]; }
+        i = i + 1;
+    }
+    return r;
+}
+
+// ---------------------------------------------------------------- values
+
+fn make(state: u8, width: u32, is_signed: bool, is_bool: bool, neg: bool, mag: [66]u32) -> WideFold {
+    return WideFold{ .state = state, .width = width, .is_signed = is_signed, .is_bool = is_bool, .neg = neg and bit_len(mag) != 0, .mag = mag, .named = 0, .named_signed = false };
+}
+
+/// A value that does not fold, and why.
+fn refused(state: u8) -> WideFold {
+    return make(state, 0, false, false, false, zero_mag());
+}
+
+/// Something that is not an integer literal, a wide constant or an operator between them.
+pub fn other() -> WideFold {
+    return refused(OTHER);
+}
+
+/// An untyped value, refused as too wide past CAP_BITS.
+fn untyped(neg: bool, m: [66]u32) -> WideFold {
+    if (bit_len(m) > CAP_BITS) { return refused(TOO_WIDE); }
+    return make(OK, 0, false, false, neg, m);
+}
+
+fn typed(v: WideFold, width: u32, is_signed: bool) -> WideFold {
+    return make(v.state, width, is_signed, false, v.neg, v.mag);
+}
+
+/// Does v fit the integer type (width, is_signed)?
+fn fits(v: WideFold, width: u32, is_signed: bool) -> bool {
+    if (v.is_bool) { return false; }
+    const n : u32 = bit_len(v.mag);
+    if (is_signed == false) { return v.neg == false and n <= width; }
+    if (v.neg == false) { return n < width; }
+    // -2^(width-1) <= v, that is |v| - 1 < 2^(width-1)
+    return bit_len(sub_mag(v.mag, small_mag(1))) < width;
+}
+
+/// v modulo 2^width, read back as the type (two's complement), for width <= CAP_BITS.
+fn wrap(v: WideFold, width: u32, is_signed: bool) -> WideFold {
+    var m : [66]u32 = low_bits(v.mag, width);
+    var neg : bool = false;
+    if (v.neg and bit_len(m) != 0) { m = sub_mag(pow2(width), m); }
+    if (is_signed and bit_len(m) == width) {
+        m = sub_mag(pow2(width), m);
+        neg = true;
+    }
+    return make(OK, width, is_signed, false, neg, m);
+}
+
+fn order(a: WideFold, b: WideFold) -> u8 {
+    if (a.neg != b.neg) {
+        if (a.neg) { return LESS; }
+        return MORE;
+    }
+    const c : u8 = cmp_mag(a.mag, b.mag);
+    if (a.neg) { return 2 - c; }
+    return c;
+}
+
+/// a + (b_neg ? -1 : 1) * b_mag, exact and untyped; the callers hold both to CAP_BITS, so it fits the limbs.
+fn add_signed(a: WideFold, b_neg: bool, b_mag: [66]u32) -> WideFold {
+    if (a.neg == b_neg) { return make(OK, 0, false, false, a.neg, add_mag(a.mag, b_mag)); }
+    if (cmp_mag(a.mag, b_mag) != LESS) { return make(OK, 0, false, false, a.neg, sub_mag(a.mag, b_mag)); }
+    return make(OK, 0, false, false, b_neg, sub_mag(b_mag, a.mag));
+}
+
+/// a * b, untyped; `trunc` keeps only the low 32 * LIMBS bits of the magnitude, for a wrapping product.
+fn mul_signed(a: WideFold, b: WideFold, trunc: bool) -> WideFold {
+    if (trunc == false and bit_len(a.mag) + bit_len(b.mag) > 32 * 66) { return refused(TOO_WIDE); }
+    return make(OK, 0, false, false, a.neg != b.neg, mul_mag(a.mag, b.mag));
+}
+
+/// v >> k, rounded toward minus infinity: -(((|v| - 1) >> k) + 1) for a negative v.
+fn shr_floor(v: WideFold, k: u32) -> WideFold {
+    if (v.neg == false) { return make(OK, v.width, v.is_signed, false, false, shr_mag(v.mag, k)); }
+    const m : [66]u32 = shr_mag(sub_mag(v.mag, small_mag(1)), k);
+    return make(OK, v.width, v.is_signed, false, true, add_mag(m, small_mag(1)));
+}
+
+// ---------------------------------------------------------------- what the glue asks
+
+/// `t` names a Zig integer type wider than 64 bits: u65 .. u65535, i65 .. i65535.
+pub fn is_wide(t: []const u8) -> bool {
+    return type_width(t) != 0;
+}
+
+/// The bits of wide type `t`, or 0 when it is none.
+pub fn type_width(t: []const u8) -> u32 {
+    if (t.len < 3 or t.len > 6) { return 0; }
+    if (t[0] != 117 and t[0] != 105) { return 0; }
+    if (t[1] == 48) { return 0; }
+    var n : u32 = 0;
+    var i : usize = 1;
+    while (i < t.len) {
+        if (t[i] < 48 or t[i] > 57) { return 0; }
+        n = n * 10 + ((t[i] - 48) as u32);
+        i = i + 1;
+    }
+    if (n < 65 or n > 65535) { return 0; }
+    return n;
+}
+
+/// The value of digit c in base `radix`, or `radix` when c is not one.
+fn digit(c: u8, radix: u32) -> u32 {
+    var d : u32 = radix;
+    if (c >= 48 and c <= 57) { d = (c - 48) as u32; }
+    if (c >= 97 and c <= 102) { d = (c - 87) as u32; }
+    if (c >= 65 and c <= 70) { d = (c - 55) as u32; }
+    if (d >= radix) { return radix; }
+    return d;
+}
+
+fn digits(body: []const u8, radix: u32, neg: bool) -> WideFold {
+    var m : [66]u32 = [0] ** 66;
+    var any : bool = false;
+    var i : usize = 0;
+    while (i < body.len) {
+        if (body[i] != 95) {
+            const d : u32 = digit(body[i], radix);
+            if (d == radix) { return other(); }
+            m = mul_small(m, radix, d);
+            if (bit_len(m) > CAP_BITS) { return refused(TOO_WIDE); }
+            any = true;
+        }
+        i = i + 1;
+    }
+    if (any == false) { return other(); }
+    return untyped(neg, m);
+}
+
+/// An integer literal as the t27c lexer keeps it: an optional `-`, then decimal, `0x`, `0o` or `0b` digits, `_`
+/// allowed between them. A literal with a type suffix, a string, a float, a char or a bool is something else.
+pub fn literal(text: []const u8, suffix: []const u8, is_string: bool) -> WideFold {
+    if (is_string or suffix.len != 0 or text.len == 0) { return other(); }
+    var at : usize = 0;
+    if (text[0] == 45) { at = 1; }
+    var radix : u32 = 10;
+    if (text.len >= at + 2 and text[at] == 48) {
+        if (text[at + 1] == 120 or text[at + 1] == 88) { radix = 16; }
+        if (text[at + 1] == 111) { radix = 8; }
+        if (text[at + 1] == 98) { radix = 2; }
+    }
+    if (radix != 10) { at = at + 2; }
+    return digits(text[at .. text.len], radix, text[0] == 45);
+}
+
+/// The value of a module constant declared with wide type `t` (`is_wide(t)`), its initializer folded to `init`:
+/// it must fit `t`, and a typed initializer must already have type `t`. A refusal is now reported under `t`.
+pub fn constant(init: WideFold, t: []const u8) -> WideFold {
+    const w : u32 = type_width(t);
+    const s : bool = t[0] == 105;
+    var r : WideFold = init;
+    r.named = w;
+    r.named_signed = s;
+    if (r.state != OK) { return r; }
+    if (w > CAP_BITS) {
+        r.state = TOO_WIDE;
+        return r;
+    }
+    if (r.is_bool or (r.width != 0 and (r.width != w or r.is_signed != s))) {
+        r.state = MIXED;
+        return r;
+    }
+    if (fits(r, w, s) == false) {
+        r.state = RANGE;
+        return r;
+    }
+    r.width = w;
+    r.is_signed = s;
+    return r;
+}
+
+/// `text` spells `word`, byte for byte.
+fn spells(text: []const u8, word: []const u8) -> bool {
+    var i : usize = 0;
+    while (i < text.len and i < word.len and text[i] == word[i]) {
+        i = i + 1;
+    }
+    return i == text.len and i == word.len;
+}
+
+/// The operator `op` of `arity` operands, as the t27c parser spells it.
+fn op_code(op: []const u8, arity: usize) -> u8 {
+    if (arity == 1) {
+        if (spells(op, "-")) { return OP_NEG; }
+        if (spells(op, "~")) { return OP_NOT; }
+        return OP_NONE;
+    }
+    if (arity != 2) { return OP_NONE; }
+    if (spells(op, "+")) { return OP_ADD; }
+    if (spells(op, "-")) { return OP_SUB; }
+    if (spells(op, "*")) { return OP_MUL; }
+    if (spells(op, "+%")) { return OP_ADDW; }
+    if (spells(op, "-%")) { return OP_SUBW; }
+    if (spells(op, "*%")) { return OP_MULW; }
+    if (spells(op, "/")) { return OP_DIV; }
+    if (spells(op, "%")) { return OP_REM; }
+    if (spells(op, "<<")) { return OP_SHL; }
+    if (spells(op, ">>")) { return OP_SHR; }
+    if (spells(op, "&")) { return OP_AND; }
+    if (spells(op, "|")) { return OP_OR; }
+    if (spells(op, "^")) { return OP_XOR; }
+    if (spells(op, "==")) { return OP_EQ; }
+    if (spells(op, "!=")) { return OP_NE; }
+    if (spells(op, "<")) { return OP_LT; }
+    if (spells(op, "<=")) { return OP_LE; }
+    if (spells(op, ">")) { return OP_GT; }
+    if (spells(op, ">=")) { return OP_GE; }
+    return OP_NONE;
+}
+
+fn compare(code: u8, a: WideFold, b: WideFold) -> WideFold {
+    const o : u8 = order(a, b);
+    var yes : bool = false;
+    if (code == OP_EQ) { yes = o == SAME; }
+    if (code == OP_NE) { yes = o != SAME; }
+    if (code == OP_LT) { yes = o == LESS; }
+    if (code == OP_LE) { yes = o != MORE; }
+    if (code == OP_GT) { yes = o == MORE; }
+    if (code == OP_GE) { yes = o != LESS; }
+    var m : [66]u32 = [0] ** 66;
+    if (yes) { m[0] = 1; }
+    return make(OK, 0, false, true, false, m);
+}
+
+/// `a << b` and `a >> b`: b an untyped integer below the width of a typed a.
+fn shift(code: u8, a: WideFold, b: WideFold) -> WideFold {
+    var limit : u32 = 65536;
+    if (a.width != 0) { limit = a.width; }
+    if (b.width != 0 or b.neg or bit_len(b.mag) > 17 or b.mag[0] >= limit) { return refused(SHIFT); }
+    const k : u32 = b.mag[0];
+    if (code == OP_SHR) { return shr_floor(a, k); }
+    if (a.width != 0) { return wrap(make(OK, 0, false, false, a.neg, shl_mag(a.mag, k)), a.width, a.is_signed); }
+    if (bit_len(a.mag) == 0) { return a; }
+    if (bit_len(a.mag) + k > CAP_BITS) { return refused(TOO_WIDE); }
+    return untyped(a.neg, shl_mag(a.mag, k));
+}
+
+fn unary(code: u8, a: WideFold) -> WideFold {
+    if (code == OP_NEG and a.width == 0) { return untyped(a.neg == false, a.mag); }
+    if (code == OP_NEG and a.is_signed) {
+        const v : WideFold = make(OK, 0, false, false, a.neg == false, a.mag);
+        if (fits(v, a.width, true)) { return typed(v, a.width, true); }
+        return refused(OVERFLOW);
+    }
+    // ~a = -a - 1, read back as a's type
+    if (code == OP_NOT and a.width != 0) { return wrap(add_signed(make(OK, 0, false, false, a.neg == false, a.mag), true, small_mag(1)), a.width, a.is_signed); }
+    return refused(OPERATOR);
+}
+
+/// `a op b` for every operator but a comparison or a shift: one type for both operands.
+fn arith(code: u8, a: WideFold, b: WideFold) -> WideFold {
+    if (a.width != 0 and b.width != 0 and (a.width != b.width or a.is_signed != b.is_signed)) { return refused(MIXED); }
+    var w : u32 = a.width;
+    var s : bool = a.is_signed;
+    if (w == 0) {
+        w = b.width;
+        s = b.is_signed;
+    }
+    if (w != 0 and (fits(a, w, s) == false or fits(b, w, s) == false)) { return refused(RANGE); }
+    var v : WideFold = refused(OPERATOR);
+    if (code == OP_ADD or code == OP_ADDW) { v = add_signed(a, b.neg, b.mag); }
+    if (code == OP_SUB or code == OP_SUBW) { v = add_signed(a, b.neg == false, b.mag); }
+    if (code == OP_MUL or code == OP_MULW) { v = mul_signed(a, b, code == OP_MULW); }
+    if (code == OP_ADDW or code == OP_SUBW or code == OP_MULW) {
+        if (w == 0) { return refused(OPERATOR); }
+        if (v.state != OK) { return v; }
+        return wrap(v, w, s);
+    }
+    if (code == OP_DIV or code == OP_REM) {
+        if (bit_len(b.mag) == 0) { return refused(DIV_ZERO); }
+        if (a.neg or b.neg) { return refused(NEGATIVE); }
+        v = make(OK, 0, false, false, false, divmod_mag(a.mag, b.mag, code == OP_REM));
+    }
+    if (code == OP_AND or code == OP_OR or code == OP_XOR) {
+        if (a.neg or b.neg) { return refused(NEGATIVE); }
+        v = make(OK, 0, false, false, false, bitwise_mag(a.mag, b.mag, code));
+    }
+    if (v.state != OK) { return v; }
+    if (w == 0) { return untyped(v.neg, v.mag); }
+    if (fits(v, w, s) == false) { return refused(OVERFLOW); }
+    return typed(v, w, s);
+}
+
+/// Operator `op` of `arity` operands (1 or 2) folded over a and b (for one operand the glue passes it twice).
+/// The first refusal among the operands wins, and the result is reported under the first wide constant named.
+pub fn apply(op: []const u8, a: WideFold, b: WideFold, arity: usize) -> WideFold {
+    var named : u32 = a.named;
+    var named_signed : bool = a.named_signed;
+    if (named == 0) {
+        named = b.named;
+        named_signed = b.named_signed;
+    }
+    var r : WideFold = a;
+    if (a.state == OK and b.state != OK) { r = b; }
+    if (r.state == OK) {
+        const code : u8 = op_code(op, arity);
+        if (code == OP_NONE or a.is_bool or b.is_bool) {
+            r = refused(OPERATOR);
+        } else {
+            if (code >= OP_EQ and code <= OP_GE) {
+                r = compare(code, a, b);
+            } else {
+                if (code == OP_SHL or code == OP_SHR) {
+                    r = shift(code, a, b);
+                } else {
+                    if (arity == 1) {
+                        r = unary(code, a);
+                    } else {
+                        r = arith(code, a, b);
+                    }
+                }
+            }
+        }
+    }
+    r.named = named;
+    r.named_signed = named_signed;
+    return r;
+}
+
+/// Did the fold name a wide constant? If not, the expression is none of this plan's business.
+pub fn folds(v: WideFold) -> bool {
+    return v.named != 0;
+}
+
+/// OK when v gives a value where t27b needs one, else why not. A comparison (`is_cast` false) must give a bool;
+/// an `as` must give an integer that fits its target, which must be an integer type of at most 64 bits.
+pub fn verdict(v: WideFold, is_cast: bool, to_int: bool, to_width: u32, to_signed: bool) -> u8 {
+    if (v.state != OK) { return v.state; }
+    if (is_cast == false) {
+        if (v.is_bool) { return OK; }
+        return RUNTIME;
+    }
+    if (v.is_bool or to_int == false) { return NOT_INT; }
+    if (fits(v, to_width, to_signed) == false) { return RANGE; }
+    return OK;
+}
+
+/// The low 64 bits of v, two's complement: the constant t27b builds once `verdict` said OK.
+pub fn low64(v: WideFold) -> u64 {
+    const m : u64 = (v.mag[0] as u64) | ((v.mag[1] as u64) << 32);
+    if (v.neg and m != 0) { return (m ^ 18446744073709551615) + 1; }
+    return m;
+}
+
+/// The letter of the wide type a refusal is reported under: `type u128`, `type i128`.
+pub fn letter(v: WideFold) -> str {
+    if (v.named_signed) { return "i"; }
+    return "u";
+}
+
+/// The words of a refusal.
+pub fn why(state: u8) -> str {
+    if (state == OTHER) { return "beside a value t27b does not fold: only integer literals, wide constants and operators between them do"; }
+    if (state == OVERFLOW) { return "compile-time arithmetic overflows its type"; }
+    if (state == RANGE) { return "a value does not fit its integer type"; }
+    if (state == MIXED) { return "operands of two different integer types"; }
+    if (state == SHIFT) { return "a shift amount that is not an untyped integer below the width"; }
+    if (state == DIV_ZERO) { return "division by zero"; }
+    if (state == NEGATIVE) { return "`/ % & | ^` of a negative compile-time integer"; }
+    if (state == OPERATOR) { return "an operator t27b does not fold on these operands"; }
+    if (state == TOO_WIDE) { return "a value wider than the 2048 bits t27b folds"; }
+    if (state == RUNTIME) { return "a value wider than 64 bits where t27b needs it at run time"; }
+    if (state == NOT_INT) { return "an `as` whose operand or target is not an integer"; }
+    return "";
+}
+
+// ---------------------------------------------------------------- tests
+
+fn wp_lit(text: []const u8) -> WideFold {
+    return literal(text, "", false);
+}
+
+fn wp_u128(text: []const u8) -> WideFold {
+    return constant(wp_lit(text), "u128");
+}
+
+fn wp_i128(text: []const u8) -> WideFold {
+    return constant(wp_lit(text), "i128");
+}
+
+/// v folds and equals the integer literal `text`.
+fn wp_is(v: WideFold, text: []const u8) -> bool {
+    const c : WideFold = apply("==", v, wp_lit(text), 2);
+    return v.state == OK and c.state == OK and c.is_bool and low64(c) == 1;
+}
+
+fn wp_bin(op: []const u8, a: WideFold, b: WideFold) -> WideFold {
+    return apply(op, a, b, 2);
+}
+
+fn wp_un(op: []const u8, a: WideFold) -> WideFold {
+    return apply(op, a, a, 1);
+}
+
+test wide_type_names_are_u65_to_u65535 {
+    assert type_width("u128") == 128;
+    assert type_width("i128") == 128;
+    assert type_width("u65") == 65;
+    assert type_width("i65535") == 65535;
+    assert type_width("u1024") == 1024;
+    assert type_width("u64") == 0;
+    assert type_width("i8") == 0;
+    assert type_width("u65536") == 0;
+    assert type_width("u0128") == 0;
+    assert type_width("u12a") == 0;
+    assert type_width("f128") == 0;
+    assert type_width("u") == 0;
+    assert type_width("usize") == 0;
+    assert is_wide("u256");
+    assert is_wide("u64") == false;
+}
+
+test literals_in_every_radix {
+    assert low64(wp_lit("0b1010")) == 10;
+    assert low64(wp_lit("0o777")) == 511;
+    assert low64(wp_lit("0xff_FF")) == 65535;
+    assert low64(wp_lit("0XAb")) == 171;
+    assert low64(wp_lit("1_000_000")) == 1000000;
+    assert low64(wp_lit("18446744073709551615")) == 18446744073709551615;
+    assert wp_is(wp_lit("0x1_0000_0000_0000_0000"), "18446744073709551616");
+    assert wp_is(wp_lit("340282366920938463463374607431768211455"), "0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF");
+    assert wp_is(wp_lit("-170141183460469231731687303715884105728"), "-0x80000000000000000000000000000000");
+    assert wp_lit("-1").neg;
+    assert wp_lit("-0").neg == false;
+    assert wp_lit("0").width == 0;
+}
+
+test what_is_not_an_integer_literal_does_not_fold {
+    assert wp_lit("1.5").state == OTHER;
+    assert wp_lit("1e10").state == OTHER;
+    assert wp_lit("true").state == OTHER;
+    assert wp_lit("0x").state == OTHER;
+    assert wp_lit("-").state == OTHER;
+    assert wp_lit("0b102").state == OTHER;
+    assert wp_lit("").state == OTHER;
+    assert literal("5", "u8", false).state == OTHER;
+    assert literal("5", "", true).state == OTHER;
+    assert literal("5", "", false).state == OK;
+    // 2^2048 takes 2049 bits, one past CAP_BITS, however it is reached
+    const h : WideFold = wp_bin("<<", wp_lit("1"), wp_lit("2047"));
+    assert h.state == OK;
+    assert wp_bin("<<", wp_lit("1"), wp_lit("2048")).state == TOO_WIDE;
+    assert wp_bin("+", h, h).state == TOO_WIDE;
+    assert wp_bin("*", h, wp_lit("2")).state == TOO_WIDE;
+    assert wp_bin("-", wp_bin("+", h, h), wp_lit("1")).state == TOO_WIDE;
+    assert wp_bin("+", wp_bin("-", h, wp_lit("1")), h).state == OK;
+    assert wp_bin("*", wp_bin("<<", wp_lit("1"), wp_lit("1100")), wp_bin("<<", wp_lit("1"), wp_lit("1100"))).state == TOO_WIDE;
+}
+
+test constants_must_fit_their_type {
+    assert wp_is(wp_u128("340282366920938463463374607431768211455"), "340282366920938463463374607431768211455");
+    assert wp_u128("340282366920938463463374607431768211456").state == RANGE;
+    assert wp_u128("-1").state == RANGE;
+    assert wp_i128("-170141183460469231731687303715884105728").state == OK;
+    assert wp_i128("-170141183460469231731687303715884105729").state == RANGE;
+    assert wp_i128("170141183460469231731687303715884105727").state == OK;
+    assert wp_i128("170141183460469231731687303715884105728").state == RANGE;
+    assert constant(wp_lit("36893488147419103231"), "u65").state == OK;
+    assert constant(wp_lit("36893488147419103232"), "u65").state == RANGE;
+    assert constant(wp_lit("1"), "u4096").state == TOO_WIDE;
+    // a typed initializer of another wide type: refused, never converted
+    assert constant(wp_u128("5"), "u256").state == MIXED;
+    assert constant(wp_u128("5"), "u128").state == OK;
+    assert constant(wp_u128("5"), "i128").state == MIXED;
+    // the refusal is reported under the constant's own type
+    assert constant(wp_lit("1.5"), "i256").named == 256;
+    assert constant(wp_lit("1.5"), "i256").named_signed;
+    assert constant(wp_lit("1.5"), "i256").state == OTHER;
+    assert wp_u128("7").width == 128;
+    assert wp_i128("7").is_signed;
+}
+
+test checked_arithmetic_stays_inside_the_type {
+    const top : WideFold = wp_u128("340282366920938463463374607431768211455");
+    assert wp_bin("+", top, wp_lit("1")).state == OVERFLOW;
+    assert wp_bin("-", wp_bin("-", top, top), wp_lit("1")).state == OVERFLOW;
+    assert wp_bin("*", top, wp_lit("2")).state == OVERFLOW;
+    assert wp_is(wp_bin("-", top, wp_lit("1")), "340282366920938463463374607431768211454");
+    assert wp_bin("-", top, wp_lit("1")).width == 128;
+    // (2^64 - 1)^2 = 2^128 - 2^65 + 1
+    const m : WideFold = wp_u128("18446744073709551615");
+    assert wp_is(wp_bin("*", m, m), "340282366920938463426481119284349108225");
+    // an untyped operand must fit the typed one
+    assert wp_bin("+", wp_u128("1"), wp_lit("340282366920938463463374607431768211456")).state == RANGE;
+    assert wp_bin("+", wp_u128("1"), wp_lit("-1")).state == RANGE;
+    assert wp_is(wp_bin("+", wp_i128("1"), wp_lit("-2")), "-1");
+    const lo : WideFold = wp_i128("-170141183460469231731687303715884105728");
+    assert wp_bin("-", lo, wp_lit("1")).state == OVERFLOW;
+    assert wp_is(wp_bin("+", lo, wp_i128("170141183460469231731687303715884105727")), "-1");
+    // untyped arithmetic is exact
+    assert wp_is(wp_bin("-", wp_lit("0"), wp_lit("5")), "-5");
+    assert wp_is(wp_bin("*", wp_lit("-3"), wp_lit("-4")), "12");
+    assert wp_is(wp_bin("*", wp_lit("-3"), wp_lit("4")), "-12");
+    assert wp_bin("+", wp_lit("1"), wp_lit("2")).width == 0;
+}
+
+test two_wide_types_do_not_mix {
+    assert wp_bin("+", wp_u128("1"), constant(wp_lit("1"), "u256")).state == MIXED;
+    assert wp_bin("+", wp_u128("1"), wp_i128("1")).state == MIXED;
+    assert wp_bin("&", wp_u128("1"), constant(wp_lit("1"), "u256")).state == MIXED;
+    // a comparison takes any two, exactly
+    assert low64(wp_bin("<", wp_u128("5"), constant(wp_lit("6"), "u256"))) == 1;
+    assert low64(wp_bin(">", wp_u128("5"), wp_i128("-6"))) == 1;
+    assert low64(wp_bin("<", wp_u128("5"), wp_lit("340282366920938463463374607431768211456"))) == 1;
+}
+
+test wrapping_operators_wrap_a_typed_operand {
+    const top : WideFold = wp_u128("340282366920938463463374607431768211455");
+    assert wp_is(wp_bin("+%", top, wp_lit("2")), "1");
+    assert wp_is(wp_bin("-%", wp_u128("0"), wp_lit("1")), "340282366920938463463374607431768211455");
+    assert wp_is(wp_bin("*%", top, top), "1");
+    const imax : WideFold = wp_i128("170141183460469231731687303715884105727");
+    assert wp_is(wp_bin("+%", imax, wp_lit("1")), "-170141183460469231731687303715884105728");
+    assert wp_is(wp_bin("*%", imax, wp_lit("2")), "-2");
+    assert wp_bin("+%", wp_lit("1"), wp_lit("2")).state == OPERATOR;
+    // at the widest type: a sum past 2^2048 and a product past the limbs still wrap exactly
+    const h : WideFold = wp_bin("<<", wp_lit("1"), wp_lit("2047"));
+    const max : WideFold = constant(wp_bin("+", wp_bin("-", h, wp_lit("1")), h), "u2048");
+    assert max.state == OK;
+    assert wp_is(wp_bin("+%", max, wp_lit("5")), "4");
+    assert wp_bin("+", max, wp_lit("5")).state == OVERFLOW;
+    const b2 : WideFold = constant(h, "u2048");
+    assert wp_is(wp_bin("*%", b2, wp_lit("2")), "0");
+    assert low64(wp_bin(">>", wp_bin("*%", b2, wp_lit("3")), wp_lit("2047"))) == 1;
+    assert wp_is(wp_bin("*%", b2, b2), "0");
+    assert wp_is(wp_bin("*%", max, max), "1");
+}
+
+test shifts_truncate_and_floor {
+    const top : WideFold = wp_u128("340282366920938463463374607431768211455");
+    assert low64(wp_bin(">>", wp_bin("<<", top, wp_lit("4")), wp_lit("124"))) == 15;
+    assert wp_bin("<<", top, wp_lit("128")).state == SHIFT;
+    assert wp_bin(">>", top, wp_lit("128")).state == SHIFT;
+    assert wp_bin("<<", top, wp_u128("1")).state == SHIFT;
+    assert wp_bin("<<", top, wp_lit("-1")).state == SHIFT;
+    assert low64(wp_bin(">>", top, wp_lit("127"))) == 1;
+    assert wp_bin("<<", top, wp_lit("1")).width == 128;
+    const k1000 : WideFold = wp_bin("<<", wp_lit("1"), wp_lit("1000"));
+    assert low64(wp_bin(">>", k1000, wp_lit("990"))) == 1024;
+    assert low64(wp_bin("==", k1000, wp_bin("*", wp_bin("<<", wp_lit("1"), wp_lit("500")), wp_bin("<<", wp_lit("1"), wp_lit("500"))))) == 1;
+    assert low64(wp_bin("==", wp_bin("<<", wp_lit("3"), wp_lit("33")), wp_lit("25769803776"))) == 1;
+    assert wp_is(wp_bin(">>", wp_lit("-7"), wp_lit("1")), "-4");
+    assert wp_is(wp_bin(">>", wp_i128("-1"), wp_lit("100")), "-1");
+    assert wp_is(wp_bin(">>", wp_lit("7"), wp_lit("3000")), "0");
+    assert wp_is(wp_bin("<<", wp_lit("0"), wp_lit("5000")), "0");
+    assert wp_bin("<<", wp_lit("1"), wp_lit("65536")).state == SHIFT;
+    assert wp_is(wp_bin("<<", wp_i128("1"), wp_lit("127")), "-170141183460469231731687303715884105728");
+    assert wp_is(wp_bin("<<", wp_i128("-3"), wp_lit("1")), "-6");
+}
+
+test division_needs_a_divisor_and_no_negative {
+    const w : WideFold = constant(wp_lit("9544028161703913537712243143807801346335324481"), "u256");
+    const w2 : WideFold = constant(wp_lit("19088056323407827075424486287615602692670648962"), "u256");
+    assert low64(wp_bin("/", w2, w)) == 2;
+    assert low64(wp_bin("%", w, wp_lit("1000000"))) == 324481;
+    assert wp_is(wp_bin("/", w, wp_lit("1000000")), "9544028161703913537712243143807801346335");
+    assert wp_is(wp_bin("%", w2, wp_bin("+", w, wp_lit("1"))), "9544028161703913537712243143807801346335324480");
+    assert wp_is(wp_bin("/", w2, wp_bin("+", w, wp_lit("1"))), "1");
+    assert wp_is(wp_bin("%", wp_lit("340282366920938463463374607431768211457"), wp_lit("18446744073709551616")), "1");
+    assert wp_bin("/", w, wp_lit("0")).state == DIV_ZERO;
+    assert wp_bin("%", w, wp_bin("-", w, w)).state == DIV_ZERO;
+    assert wp_bin("/", wp_i128("-4"), wp_lit("2")).state == NEGATIVE;
+    assert wp_bin("%", wp_lit("4"), wp_lit("-2")).state == NEGATIVE;
+    assert wp_bin("/", w, wp_lit("3")).width == 256;
+}
+
+test bitwise_takes_operands_that_are_not_negative {
+    const hex : WideFold = wp_u128("0xFFFF0000000000000000000000000001");
+    assert low64(wp_bin("&", hex, wp_lit("65535"))) == 1;
+    assert low64(wp_bin(">>", hex, wp_lit("112"))) == 65535;
+    assert wp_is(wp_bin("|", hex, wp_lit("6")), "0xFFFF0000000000000000000000000007");
+    assert wp_is(wp_bin("^", hex, hex), "0");
+    assert wp_bin("&", wp_i128("-1"), wp_lit("1")).state == NEGATIVE;
+    assert wp_bin("|", wp_u128("1"), wp_lit("-1")).state == RANGE;
+}
+
+test unary_minus_and_tilde {
+    assert wp_is(wp_un("-", wp_lit("5")), "-5");
+    assert wp_is(wp_un("-", wp_i128("5")), "-5");
+    assert wp_un("-", wp_u128("5")).state == OPERATOR;
+    assert wp_un("-", wp_i128("-170141183460469231731687303715884105728")).state == OVERFLOW;
+    assert wp_is(wp_un("~", wp_u128("0")), "340282366920938463463374607431768211455");
+    assert wp_is(wp_un("~", wp_i128("5")), "-6");
+    assert wp_is(wp_un("~", wp_i128("-1")), "0");
+    assert wp_un("~", wp_lit("5")).state == OPERATOR;
+    assert wp_un("!", wp_u128("5")).state == OPERATOR;
+    assert apply("+", wp_u128("1"), wp_u128("1"), 3).state == OPERATOR;
+}
+
+test comparisons_are_exact_bools {
+    const half : WideFold = wp_u128("119649664615308764795041");
+    const full : WideFold = wp_u128("239299329230617529590082");
+    assert low64(wp_bin("==", wp_bin("*", half, wp_lit("2")), full)) == 1;
+    assert low64(wp_bin("!=", wp_bin("+", half, half), full)) == 0;
+    assert low64(wp_bin("<", half, full)) == 1;
+    assert low64(wp_bin("<=", full, full)) == 1;
+    assert low64(wp_bin(">", half, full)) == 0;
+    assert low64(wp_bin(">=", half, full)) == 0;
+    assert low64(wp_bin("<", wp_i128("-2"), wp_i128("-1"))) == 1;
+    assert low64(wp_bin("<", wp_i128("-1"), wp_i128("-2"))) == 0;
+    assert wp_bin("==", half, full).is_bool;
+    // a bool takes no further arithmetic
+    assert wp_bin("==", wp_bin("==", half, full), wp_lit("0")).state == OPERATOR;
+}
+
+test the_verdict_and_the_readout {
+    const half : WideFold = wp_u128("119649664615308764795041");
+    const cmp : WideFold = wp_bin("<", half, wp_lit("1"));
+    assert verdict(cmp, false, false, 8, false) == OK;
+    assert low64(cmp) == 0;
+    assert verdict(half, false, false, 8, false) == RUNTIME;
+    assert verdict(half, true, true, 64, false) == RANGE;
+    assert verdict(wp_bin(">>", half, wp_lit("64")), true, true, 64, false) == OK;
+    assert low64(wp_bin(">>", half, wp_lit("64"))) == 6486;
+    assert verdict(wp_bin(">>", half, wp_lit("64")), true, true, 12, false) == RANGE;
+    assert verdict(wp_bin(">>", half, wp_lit("64")), true, true, 13, false) == OK;
+    assert verdict(wp_bin(">>", half, wp_lit("64")), true, false, 64, false) == NOT_INT;
+    assert verdict(cmp, true, true, 64, false) == NOT_INT;
+    const m1 : WideFold = wp_bin("+", wp_i128("-170141183460469231731687303715884105728"), wp_i128("170141183460469231731687303715884105727"));
+    assert verdict(m1, true, true, 64, true) == OK;
+    assert verdict(m1, true, true, 64, false) == RANGE;
+    assert low64(m1) == 18446744073709551615;
+    assert low64(wp_i128("-9223372036854775808")) == 9223372036854775808;
+    assert verdict(wp_i128("-9223372036854775808"), true, true, 64, true) == OK;
+    assert verdict(wp_i128("-9223372036854775809"), true, true, 64, true) == RANGE;
+    assert verdict(wp_u128("1"), true, true, 64, false) == OK;
+    assert verdict(wp_bin("+", wp_u128("1"), wp_lit("1.5")), true, true, 64, false) == OTHER;
+}
+
+test refusals_carry_the_first_wide_type_named {
+    const o : WideFold = other();
+    assert folds(o) == false;
+    assert folds(wp_lit("5")) == false;
+    assert folds(wp_bin("+", wp_lit("5"), o)) == false;
+    const a : WideFold = wp_bin("+", o, wp_i128("5"));
+    assert folds(a);
+    assert a.state == OTHER;
+    assert a.named == 128;
+    assert a.named_signed;
+    assert spells(letter(a), "i");
+    assert spells(letter(wp_bin("+", wp_u128("1"), wp_i128("1"))), "u");
+    assert wp_bin("+", wp_u128("1"), wp_i128("1")).named == 128;
+    assert wp_bin("+", wp_bin("/", wp_u128("1"), wp_lit("0")), o).state == DIV_ZERO;
+    assert wp_bin("+", o, wp_bin("/", wp_u128("1"), wp_lit("0"))).state == OTHER;
+    assert wp_bin("+", wp_lit("1"), constant(wp_lit("1"), "u1024")).named == 1024;
+}
+
+test every_refusal_has_its_own_words {
+    var s : u8 = OTHER;
+    while (s <= NOT_INT) {
+        assert why(s).len > 10;
+        var t : u8 = OTHER;
+        while (t < s) {
+            assert spells(why(s), why(t)) == false;
+            t = t + 1;
+        }
+        s = s + 1;
+    }
+    assert why(OK).len == 0;
+}

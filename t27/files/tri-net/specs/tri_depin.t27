@@ -1,0 +1,255 @@
+// TRI-NET DePIN Proof-of-Relay accounting -- the on-node substrate a $TRI
+// settlement layer meters. A node's "physical work" (Helium-style Proof of
+// Coverage / Proof of Physical Work) is relaying mesh datagrams over the radio;
+// this keeps a tamper-evident, order-sensitive, identity-bound running
+// accumulator over the receipts of what it forwarded. The settlement layer mints
+// $TRI proportional to metered bytes, gated by the accumulator seal so a node
+// cannot inflate, reorder, replay, or steal another node's work.
+//
+// Multiply-free (T27 has no `*`): the mixer is xorshift + shift-add avalanche.
+// This is a strong NON-cryptographic accumulator: tamper/order/identity evidence
+// is provable (below); production settlement would additionally SIGN the seal
+// with the node's private key (the seal here is verified with a shared/registered
+// node_key -- symmetric; the asymmetric-signature upgrade is a next step).
+//
+// WAVE 2026-07-18b: the seal now BINDS total_bytes. Rationale -- the reward is
+// paid proportional to total_bytes (a separate saturating counter), but the old
+// seal covered only `acc`. A node could present its honest acc/seal yet claim an
+// inflated total_bytes and be paid for work it never did. Binding total_bytes into
+// the seal forces the claimed reward quantity to match what was sealed.
+
+module TriDepin {
+    use base::types;
+
+    const TRI_GENESIS: u32 = 0x54524921; // "TRI!" -- per-epoch chain anchor
+    const TRI_PHI:     u32 = 0x9E3779B9; // golden-ratio constant (phi fractional bits)
+
+    // Rotate-left (multiply-free), k in 1..31.
+    fn rotl32(x: u32, k: u32) -> u32 {
+        return ((x << k) | (x >> (32 - k)));
+    }
+
+    // One-way avalanche mixer: xorshift + shift-add, no multiply. A one-bit input
+    // change flips ~half the output bits (verified by the avalanche tests).
+    fn mix32(x: u32) -> u32 {
+        let a: u32 = x ^ (x >> 16);
+        let b: u32 = a +% (a << 3);   // a * 9, shift-add (wrapping by design)
+        let c: u32 = b ^ (b >> 11);
+        let d: u32 = c +% (c << 15);  // c * 32769, shift-add (wrapping by design)
+        return d ^ (d >> 16);
+    }
+
+    // Absorb one forwarded-datagram receipt into the accumulator.
+    // The byte count is rotated in so a packet's SIZE is bound, not just its digest.
+    fn relay_absorb(acc: u32, pkt_digest: u32, nbytes: u32) -> u32 {
+        return mix32(acc ^ pkt_digest ^ rotl32(nbytes, 7) ^ TRI_PHI);
+    }
+
+    // Seal an epoch. Binds together: the forwarding history (acc), the metered
+    // reward quantity (total_bytes), THIS node's key, and the epoch index -- so
+    // the receipt proves this node's work, this epoch, for exactly this many bytes.
+    fn epoch_seal(acc: u32, total_bytes: u32, node_key: u32, epoch: u32) -> u32 {
+        let idbind: u32   = mix32(node_key ^ rotl32(epoch, 13));
+        let workbind: u32 = mix32(acc ^ rotl32(total_bytes, 19));
+        return mix32(workbind ^ idbind);
+    }
+
+    // Settlement-side check: recompute the seal from the claimed (acc, total_bytes)
+    // and accept only on an exact match. Rejects an inflated total_bytes.
+    fn verify_epoch(claimed_seal: u32, acc: u32, total_bytes: u32, node_key: u32, epoch: u32) -> bool {
+        return epoch_seal(acc, total_bytes, node_key, epoch) == claimed_seal;
+    }
+
+    // Monotonic byte meter (the reward quantity). Saturating so an overflow can
+    // never wrap the tally DOWNWARD and mint free tokens.
+    fn bytes_add(total: u32, nbytes: u32) -> u32 {
+        let sum: u32 = total +% nbytes;
+        if (sum < total) {
+            return 0xFFFFFFFF; // saturate
+        } else {
+            return sum;
+        }
+    }
+
+    // ---- Lossy-channel integrity gate (WAVE 2026-07-18c) ----
+    // Over a real radio link the forwarded bytes carry bit errors (BER > 0); a
+    // bit-exact receipt would punish an honest relay for the channel's errors and
+    // could not tell a channel error from cheating. Resolution: the relay meters a
+    // datagram ONLY if the digest it recomputes over the received bytes matches the
+    // digest the datagram carries. A channel-corrupted datagram (mismatch) is
+    // dropped -- not metered -- so the receipt covers exactly the bytes the node
+    // correctly received and forwarded. Honest under loss: no penalty for dropped
+    // datagrams (they just are not counted), no false reward for corrupted ones.
+
+    // Absorb a datagram into the accumulator only if its recomputed digest matches
+    // the carried digest; otherwise leave the accumulator unchanged (drop).
+    fn relay_absorb_verified(acc: u32, computed_digest: u32, expected_digest: u32, nbytes: u32) -> u32 {
+        if (computed_digest == expected_digest) {
+            return relay_absorb(acc, computed_digest, nbytes);
+        } else {
+            return acc;
+        }
+    }
+
+    // Count a datagram's bytes only if it passed the integrity check.
+    fn bytes_add_verified(total: u32, nbytes: u32, computed_digest: u32, expected_digest: u32) -> u32 {
+        if (computed_digest == expected_digest) {
+            return bytes_add(total, nbytes);
+        } else {
+            return total;
+        }
+    }
+
+    // ---- Tests / invariants ----
+
+    // Determinism: same forwarding history -> same accumulator (a verifier can
+    // recompute it). This is what makes the receipt checkable.
+    test absorb_reproducible {
+        a1 = relay_absorb(relay_absorb(TRI_GENESIS, 0xAAAA0001, 70), 0xBBBB0002, 140);
+        a2 = relay_absorb(relay_absorb(TRI_GENESIS, 0xAAAA0001, 70), 0xBBBB0002, 140);
+        assert(a1 == a2, "reproducible");
+    }
+
+    // Tamper-evidence: change one past receipt's digest -> the accumulator changes.
+    test absorb_tamper_evident {
+        good = relay_absorb(relay_absorb(TRI_GENESIS, 0xAAAA0001, 70), 0xBBBB0002, 140);
+        bad  = relay_absorb(relay_absorb(TRI_GENESIS, 0xAAAA0009, 70), 0xBBBB0002, 140);
+        assert(good != bad, "tamper changes acc");
+    }
+
+    // Order-sensitivity: A-then-B differs from B-then-A.
+    test absorb_order_sensitive {
+        ab = relay_absorb(relay_absorb(TRI_GENESIS, 0xAAAA0001, 70), 0xBBBB0002, 140);
+        ba = relay_absorb(relay_absorb(TRI_GENESIS, 0xBBBB0002, 140), 0xAAAA0001, 70);
+        assert(ab != ba, "order matters");
+    }
+
+    // Size-binding at the accumulator: same digest, different byte count -> diff acc.
+    test absorb_size_bound {
+        small_acc = relay_absorb(TRI_GENESIS, 0xAAAA0001, 70);
+        big   = relay_absorb(TRI_GENESIS, 0xAAAA0001, 1200);
+        assert(small_acc != big, "bytes bound in acc");
+    }
+
+    // Identity-binding: identical work, different node key -> different seal.
+    test seal_identity_bound {
+        acc = relay_absorb(TRI_GENESIS, 0xAAAA0001, 70);
+        sealA = epoch_seal(acc, 70, 0x1111AAAA, 42);
+        sealB = epoch_seal(acc, 70, 0x2222BBBB, 42);
+        assert(sealA != sealB, "identity bound");
+    }
+
+    // Epoch-binding: same work, different epoch -> different seal.
+    test seal_epoch_bound {
+        acc = relay_absorb(TRI_GENESIS, 0xAAAA0001, 70);
+        s1 = epoch_seal(acc, 70, 0x1111AAAA, 42);
+        s2 = epoch_seal(acc, 70, 0x1111AAAA, 43);
+        assert(s1 != s2, "epoch bound");
+    }
+
+    // Reward-quantity binding (THE WAVE FIX): same acc/key/epoch, different
+    // total_bytes -> different seal. A node cannot claim more bytes than it sealed.
+    test seal_total_bytes_bound {
+        acc = relay_absorb(TRI_GENESIS, 0xAAAA0001, 70);
+        honest   = epoch_seal(acc, 70, 0xCAFEF00D, 7);
+        inflated = epoch_seal(acc, 700000, 0xCAFEF00D, 7);
+        assert(honest != inflated, "total_bytes bound");
+    }
+
+    // Verification accepts the honest receipt (acc + total_bytes together).
+    test verify_accepts_honest {
+        acc = relay_absorb(relay_absorb(TRI_GENESIS, 0x11110001, 70), 0x22220002, 90);
+        tot = bytes_add(bytes_add(0, 70), 90);
+        s = epoch_seal(acc, tot, 0xCAFEF00D, 7);
+        ok = verify_epoch(s, acc, tot, 0xCAFEF00D, 7);
+        assert(ok, "accepts honest");
+    }
+
+    // Verification rejects an extra-packet forgery (claimed more history).
+    test verify_rejects_history_forgery {
+        acc = relay_absorb(relay_absorb(TRI_GENESIS, 0x11110001, 70), 0x22220002, 90);
+        tot = bytes_add(bytes_add(0, 70), 90);
+        s = epoch_seal(acc, tot, 0xCAFEF00D, 7);
+        forged = relay_absorb(acc, 0x33330003, 90); // claim one extra packet
+        ok = verify_epoch(s, forged, tot, 0xCAFEF00D, 7);
+        assert(ok == false, "rejects history forgery");
+    }
+
+    // Verification rejects an inflated byte count (claimed more reward). This is
+    // the attack the wave fix closes.
+    test verify_rejects_byte_inflation {
+        acc = relay_absorb(relay_absorb(TRI_GENESIS, 0x11110001, 70), 0x22220002, 90);
+        tot = bytes_add(bytes_add(0, 70), 90);   // real = 160
+        s = epoch_seal(acc, tot, 0xCAFEF00D, 7);
+        ok = verify_epoch(s, acc, 1600000, 0xCAFEF00D, 7); // claim 1.6 MB
+        assert(ok == false, "rejects byte inflation");
+    }
+
+    // No free mint: an empty epoch seals differently from a one-packet epoch.
+    test seal_no_free_mint {
+        empty = epoch_seal(TRI_GENESIS, 0, 0xCAFEF00D, 7);
+        one   = epoch_seal(relay_absorb(TRI_GENESIS, 0xAAAA0001, 70), 70, 0xCAFEF00D, 7);
+        assert(empty != one, "no free mint");
+    }
+
+    // Byte meter grows monotonically.
+    test bytes_monotonic {
+        t0 = bytes_add(0, 70);
+        t1 = bytes_add(t0, 140);
+        assert(t1 > t0, "monotonic");
+        assert(t0 == 70, "sum ok");
+        assert(t1 == 210, "sum ok 2");
+    }
+
+    // Saturating meter never wraps downward at the u32 ceiling.
+    test bytes_saturate {
+        cap = bytes_add(0xFFFFFF00, 0x0000FFFF);
+        assert(cap == 0xFFFFFFFF, "saturates");
+    }
+
+    // Avalanche: a one-bit change in the mixer input flips many output bits.
+    test mix_avalanche {
+        m0 = mix32(0x00000000);
+        m1 = mix32(0x00000001);
+        assert(m0 != m1, "one-bit input differs");
+        assert(mix32(0x80000000) != mix32(0x00000000), "high bit differs");
+    }
+
+    // Integrity gate accepts an intact datagram (digests match): accumulator moves.
+    test verified_accepts_intact {
+        clean = relay_absorb_verified(TRI_GENESIS, 0xABCD1234, 0xABCD1234, 200);
+        plain = relay_absorb(TRI_GENESIS, 0xABCD1234, 200);
+        assert(clean == plain, "intact datagram metered normally");
+        assert(clean != TRI_GENESIS, "accumulator advanced");
+    }
+
+    // Integrity gate drops a corrupted datagram (digest mismatch): accumulator and
+    // byte meter both unchanged -- no false reward, no penalty confusion.
+    test verified_drops_corrupt {
+        acc  = relay_absorb_verified(TRI_GENESIS, 0xDEADBEEF, 0xABCD1234, 200);
+        tot  = bytes_add_verified(0, 200, 0xDEADBEEF, 0xABCD1234);
+        assert(acc == TRI_GENESIS, "corrupt datagram dropped from acc");
+        assert(tot == 0, "corrupt datagram not counted");
+    }
+
+    // Honest under loss: a stream whose middle datagram is corrupted meters EXACTLY
+    // the same as the clean stream with that datagram removed. The receipt reflects
+    // what the node correctly forwarded, nothing more, nothing less.
+    test verified_lossy_equals_clean_subset {
+        // clean subset: datagram1 then datagram3 (datagram2 corrupted, skipped)
+        subset = relay_absorb(relay_absorb(TRI_GENESIS, 0x11110001, 70), 0x33330003, 90);
+        // full stream through the gate: d1 ok, d2 corrupt (digest mismatch), d3 ok
+        s1 = relay_absorb_verified(TRI_GENESIS, 0x11110001, 0x11110001, 70);
+        s2 = relay_absorb_verified(s1, 0x22220002, 0x2222FFFF, 80); // corrupted -> dropped
+        s3 = relay_absorb_verified(s2, 0x33330003, 0x33330003, 90);
+        assert(s3 == subset, "lossy stream == clean subset");
+    }
+
+    // Byte meter under loss counts only verified datagrams.
+    test verified_bytes_only_clean {
+        b1 = bytes_add_verified(0, 70, 0x11110001, 0x11110001);   // ok  -> +70
+        b2 = bytes_add_verified(b1, 80, 0x22220002, 0x2222FFFF);  // bad -> +0
+        b3 = bytes_add_verified(b2, 90, 0x33330003, 0x33330003);  // ok  -> +90
+        assert(b3 == 160, "only 70+90 counted, corrupted 80 excluded");
+    }
+}

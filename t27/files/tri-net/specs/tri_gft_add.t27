@@ -1,0 +1,289 @@
+// TRI-NET verifiable GF-T16 ADDITION (same-sign). tri_gft_arith recomputes a GF-T
+// multiply so a verifier can catch a wrong product; ADD is the other hosted skill
+// (SKILL_GFT16_ADD) and was NOT verifiable. This adds the same-sign add recompute:
+// align the smaller operand to the larger exponent, add the significands, and
+// renormalize a single carry -- so a receipt claiming a GF-T add result can be
+// checked, not just trusted.
+//
+// GF-T16 value = (1 + M/512) * 2^e (see t27 specs/numeric/gft16.t27,
+// [sign | 4 exp trits | 9 mant bits]); offsets are the biased exponents. For two
+// SAME-SIGN operands the magnitudes add: put the larger exponent's significand as
+// (512 + Ma), shift the smaller's (512 + Mb) right by the exponent difference d,
+// add. The 10-bit significand sum is in [512, 2046); if it reaches 1024 the result
+// gains one exponent step and the significand halves. Rounding is toward zero (must
+// match the executor's convention). DIFFERENT-sign (subtractive) add -- which needs
+// variable-width cancellation normalization -- is deferred; use gft_add only when
+// the operand signs are equal (gft_mul_sign == 0 for the pair is NOT the test; the
+// caller supplies same-sign magnitudes).
+
+module TriGftAdd {
+    use base::types;
+
+    const MANT_ONE: u32 = 512;           // 2^9 GF-T16 significand scale (implicit 1)
+    const SIG_BITS: u32 = 10;            // GF-T16 significand 512..1023 is 10 bits wide
+
+    // --- Per-rung parametric same-sign add. `mant_one` = 2^MANT and `sig_bits` =
+    // MANT + 1 for the rung (GF-T4 -> 2/2, GF-T8 -> 16/5, GF-T16 -> 512/10; see
+    // tri_gft_ladder.gft_mant_one). u32-safe for these rungs; GF-T32 (25-bit mantissa)
+    // needs u64 and is blocked by the t27c u64-compare codegen defect.
+
+    // The smaller operand's significand aligned to the larger exponent, 0 once shifted out.
+    fn gft_add_sb_p(mb: u32, d: u32, mant_one: u32, sig_bits: u32) -> u32 {
+        if (d >= sig_bits) {
+            return 0;
+        } else {
+            return (mant_one + mb) >> d;
+        }
+    }
+
+    fn gft_add_offset_p(offset_a: u32, offset_b: u32, ma: u32, mb: u32, offset_max: u32, mant_one: u32, sig_bits: u32) -> u32 {
+        let d: u32 = offset_a - offset_b;
+        let sum: u32 = (mant_one + ma) + gft_add_sb_p(mb, d, mant_one, sig_bits);
+        if (sum >= (2 * mant_one)) {
+            let e: u32 = offset_a + 1;
+            if (e >= offset_max) {
+                return offset_max;
+            } else {
+                return e;
+            }
+        } else {
+            return offset_a;
+        }
+    }
+
+    fn gft_add_mant_p(offset_a: u32, offset_b: u32, ma: u32, mb: u32, mant_one: u32, sig_bits: u32) -> u32 {
+        let d: u32 = offset_a - offset_b;
+        let sum: u32 = (mant_one + ma) + gft_add_sb_p(mb, d, mant_one, sig_bits);
+        if (sum >= (2 * mant_one)) {
+            return (sum >> 1) - mant_one;
+        } else {
+            return sum - mant_one;
+        }
+    }
+
+    // GF-T16 entry points: thin views of the parametric form (behavior unchanged).
+    fn gft_add_sb(mb: u32, d: u32) -> u32 {
+        return gft_add_sb_p(mb, d, MANT_ONE, SIG_BITS);
+    }
+    fn gft_add_offset(offset_a: u32, offset_b: u32, ma: u32, mb: u32, offset_max: u32) -> u32 {
+        return gft_add_offset_p(offset_a, offset_b, ma, mb, offset_max, MANT_ONE, SIG_BITS);
+    }
+    fn gft_add_mant(offset_a: u32, offset_b: u32, ma: u32, mb: u32) -> u32 {
+        return gft_add_mant_p(offset_a, offset_b, ma, mb, MANT_ONE, SIG_BITS);
+    }
+
+    // Order-independent entries: the caller need not pre-sort the operands.
+    fn gft_add_offset_c(oa: u32, ob: u32, ma: u32, mb: u32, offset_max: u32) -> u32 {
+        if (oa >= ob) {
+            return gft_add_offset(oa, ob, ma, mb, offset_max);
+        } else {
+            return gft_add_offset(ob, oa, mb, ma, offset_max);
+        }
+    }
+    fn gft_add_mant_c(oa: u32, ob: u32, ma: u32, mb: u32) -> u32 {
+        if (oa >= ob) {
+            return gft_add_mant(oa, ob, ma, mb);
+        } else {
+            return gft_add_mant(ob, oa, mb, ma);
+        }
+    }
+
+    // A verifier accepts a claimed same-sign GF-T add result iff BOTH its exponent
+    // offset and its mantissa recompute.
+    fn verify_gft_add(oa: u32, ob: u32, ma: u32, mb: u32, claimed_offset: u32, claimed_mant: u32, offset_max: u32) -> bool {
+        if (gft_add_offset_c(oa, ob, ma, mb, offset_max) == claimed_offset) {
+            return gft_add_mant_c(oa, ob, ma, mb) == claimed_mant;
+        } else {
+            return oa != oa;
+        }
+    }
+
+    // Per-rung order-independent entries + verify (thread mant_one / sig_bits).
+    fn gft_add_offset_c_p(oa: u32, ob: u32, ma: u32, mb: u32, offset_max: u32, mant_one: u32, sig_bits: u32) -> u32 {
+        if (oa >= ob) {
+            return gft_add_offset_p(oa, ob, ma, mb, offset_max, mant_one, sig_bits);
+        } else {
+            return gft_add_offset_p(ob, oa, mb, ma, offset_max, mant_one, sig_bits);
+        }
+    }
+    fn gft_add_mant_c_p(oa: u32, ob: u32, ma: u32, mb: u32, mant_one: u32, sig_bits: u32) -> u32 {
+        if (oa >= ob) {
+            return gft_add_mant_p(oa, ob, ma, mb, mant_one, sig_bits);
+        } else {
+            return gft_add_mant_p(ob, oa, mb, ma, mant_one, sig_bits);
+        }
+    }
+    fn verify_gft_add_p(oa: u32, ob: u32, ma: u32, mb: u32, claimed_offset: u32, claimed_mant: u32, offset_max: u32, mant_one: u32, sig_bits: u32) -> bool {
+        if (gft_add_offset_c_p(oa, ob, ma, mb, offset_max, mant_one, sig_bits) == claimed_offset) {
+            return gft_add_mant_c_p(oa, ob, ma, mb, mant_one, sig_bits) == claimed_mant;
+        } else {
+            return oa != oa;
+        }
+    }
+
+    // Canonical 4-lane dot reduction: the balanced tree (p0+p1)+(p2+p3) the silicon
+    // gft_dot4.v uses. GF-T add is NON-ASSOCIATIVE (round-toward-zero renorm), so this
+    // fold order is NORMATIVE -- a verifier that reduces a dot claim any other way (e.g.
+    // a left fold) computes a different value and would slash an honest executor. The
+    // divergence is real and 1 ULP wide: for p=[(40,64),(45,0),(46,256),(40,64)] this
+    // tree gives (47,9) but a left fold gives (47,8) (iverilog witness on gft_add.v; see
+    // tests/gft_dot_reduction_order.rs). Lane products are (offset, mant) pairs; offset_max
+    // threads the rung (GF-T16 = 80). Both entries recompute the two sub-sums identically.
+    fn gft_dot4_offset(o0: u32, m0: u32, o1: u32, m1: u32, o2: u32, m2: u32, o3: u32, m3: u32, offset_max: u32) -> u32 {
+        let s01o: u32 = gft_add_offset_c(o0, o1, m0, m1, offset_max);
+        let s01m: u32 = gft_add_mant_c(o0, o1, m0, m1);
+        let s23o: u32 = gft_add_offset_c(o2, o3, m2, m3, offset_max);
+        let s23m: u32 = gft_add_mant_c(o2, o3, m2, m3);
+        return gft_add_offset_c(s01o, s23o, s01m, s23m, offset_max);
+    }
+    fn gft_dot4_mant(o0: u32, m0: u32, o1: u32, m1: u32, o2: u32, m2: u32, o3: u32, m3: u32, offset_max: u32) -> u32 {
+        let s01o: u32 = gft_add_offset_c(o0, o1, m0, m1, offset_max);
+        let s01m: u32 = gft_add_mant_c(o0, o1, m0, m1);
+        let s23o: u32 = gft_add_offset_c(o2, o3, m2, m3, offset_max);
+        let s23m: u32 = gft_add_mant_c(o2, o3, m2, m3);
+        return gft_add_mant_c(s01o, s23o, s01m, s23m);
+    }
+
+    // Per-rung canonical dot4: the SAME balanced tree, threaded with mant_one / sig_bits so the
+    // order is normative up the ladder (GF-T8 16/5, GF-T16 512/10, GF-T32 2^25/26). GF-T64 uses a
+    // 2^64 significand that overflows u32, so it is guarded in Rust (tests/gft64_dot_reduction_order).
+    fn gft_dot4_offset_p(o0: u32, m0: u32, o1: u32, m1: u32, o2: u32, m2: u32, o3: u32, m3: u32, offset_max: u32, mant_one: u32, sig_bits: u32) -> u32 {
+        let s01o: u32 = gft_add_offset_c_p(o0, o1, m0, m1, offset_max, mant_one, sig_bits);
+        let s01m: u32 = gft_add_mant_c_p(o0, o1, m0, m1, mant_one, sig_bits);
+        let s23o: u32 = gft_add_offset_c_p(o2, o3, m2, m3, offset_max, mant_one, sig_bits);
+        let s23m: u32 = gft_add_mant_c_p(o2, o3, m2, m3, mant_one, sig_bits);
+        return gft_add_offset_c_p(s01o, s23o, s01m, s23m, offset_max, mant_one, sig_bits);
+    }
+    fn gft_dot4_mant_p(o0: u32, m0: u32, o1: u32, m1: u32, o2: u32, m2: u32, o3: u32, m3: u32, offset_max: u32, mant_one: u32, sig_bits: u32) -> u32 {
+        let s01o: u32 = gft_add_offset_c_p(o0, o1, m0, m1, offset_max, mant_one, sig_bits);
+        let s01m: u32 = gft_add_mant_c_p(o0, o1, m0, m1, mant_one, sig_bits);
+        let s23o: u32 = gft_add_offset_c_p(o2, o3, m2, m3, offset_max, mant_one, sig_bits);
+        let s23m: u32 = gft_add_mant_c_p(o2, o3, m2, m3, mant_one, sig_bits);
+        return gft_add_mant_c_p(s01o, s23o, s01m, s23m, mant_one, sig_bits);
+    }
+
+    // ---- Tests / invariants ---- (GF-T16 offset 40 = 2^0; M=0 -> 1.0, M=256 -> 1.5)
+
+    // Equal operands double: 1.0 + 1.0 = 2.0 (exponent +1, mantissa 0).
+    test add_doubles {
+        assert(gft_add_offset_c(40, 40, 0, 0, 80) == 41, "1.0 + 1.0 = 2.0 -> exponent 41");
+        assert(gft_add_mant_c(40, 40, 0, 0) == 0, "2.0 mantissa 0");
+        assert(gft_add_offset_c(40, 40, 256, 256, 80) == 41, "1.5 + 1.5 = 3.0 -> exponent 41");
+        assert(gft_add_mant_c(40, 40, 256, 256) == 256, "3.0 = 1.5 * 2^1 -> mantissa 256");
+    }
+
+    // Unequal exponents align: 1.0 (2^0) + 1.0 (2^-1 = 0.5) = 1.5, no carry.
+    test add_aligns {
+        assert(gft_add_offset_c(40, 39, 0, 0, 80) == 40, "1.0 + 0.5 = 1.5 -> exponent 40");
+        assert(gft_add_mant_c(40, 39, 0, 0) == 256, "1.5 -> mantissa 256");
+        // order independence
+        assert(gft_add_offset_c(39, 40, 0, 0, 80) == 40, "0.5 + 1.0 == 1.0 + 0.5 (offset)");
+        assert(gft_add_mant_c(39, 40, 0, 0) == 256, "0.5 + 1.0 == 1.0 + 0.5 (mant)");
+    }
+
+    // A far-smaller operand is absorbed: 2^20 + 2^0 ~= 2^20 (b negligible).
+    test add_absorbs_small {
+        assert(gft_add_offset_c(60, 40, 100, 200, 80) == 60, "big + tiny keeps big's exponent");
+        assert(gft_add_mant_c(60, 40, 100, 200) == 100, "big + tiny keeps big's mantissa");
+    }
+
+    // The verifier accepts an honest add and rejects a wrong claimed result.
+    test verify_catches_add_fraud {
+        assert(verify_gft_add(40, 40, 0, 0, 41, 0, 80) == true, "honest 1.0+1.0=2.0 accepted");
+        assert(verify_gft_add(40, 40, 0, 0, 40, 0, 80) == false, "wrong exponent (missed carry) rejected");
+        assert(verify_gft_add(40, 39, 0, 0, 40, 255, 80) == false, "wrong mantissa rejected");
+    }
+
+    // Per-rung same-sign add (mant_one/sig_bits from tri_gft_ladder): GF-T16 (512/10)
+    // unchanged; GF-T8 (16/5) and GF-T4 (2/2) now verify. GF-T8 bias 13 / offset_max 26;
+    // GF-T4 bias 4 / offset_max 8.
+    test per_rung_add {
+        // GF-T16 view equals the original entry point.
+        assert(gft_add_offset_p(40, 40, 0, 0, 80, 512, 10) == 41, "GF-T16 1.0+1.0=2.0 -> offset 41");
+        assert(gft_add_mant_p(40, 40, 0, 0, 512, 10) == 0, "GF-T16 2.0 mantissa 0");
+        // GF-T8: 1.0 + 1.0 = 2.0 (offset 13,13 -> 14, mant 0); 1.0 + 0.5 = 1.5 (M 8).
+        assert(verify_gft_add_p(13, 13, 0, 0, 14, 0, 26, 16, 5) == true, "GF-T8 1.0+1.0 = exp 14, mant 0");
+        assert(verify_gft_add_p(13, 12, 0, 0, 13, 8, 26, 16, 5) == true, "GF-T8 1.0+0.5 = 1.5 (M 8), exp 13");
+        assert(verify_gft_add_p(13, 13, 0, 0, 13, 0, 26, 16, 5) == false, "GF-T8 missed carry rejected");
+        // GF-T4: 1.0 + 1.0 = 2.0 (offset 4,4 -> 5, mant 0).
+        assert(verify_gft_add_p(4, 4, 0, 0, 5, 0, 8, 2, 2) == true, "GF-T4 1.0+1.0 = exp 5, mant 0");
+    }
+
+    // GF-T32 add (u32-safe via the existing _p: sum < 2^27): mant_one 2^25 = 33554432,
+    // sig_bits 26, offset_max 728. 1.0 + 1.0 = 2.0 -> offset 365, mantissa 0.
+    test gft32_add {
+        assert(verify_gft_add_p(364, 364, 0, 0, 365, 0, 728, 33554432, 26) == true, "GF-T32 1.0+1.0 = 2.0 -> offset 365");
+        assert(gft_add_mant_c_p(364, 364, 0, 0, 33554432, 26) == 0, "GF-T32 2.0 mantissa 0");
+        assert(verify_gft_add_p(364, 364, 0, 0, 364, 0, 728, 33554432, 26) == false, "GF-T32 missed carry rejected");
+    }
+
+    // The canonical 4-lane dot reduction is the silicon gft_dot4.v tree, and because GF-T
+    // add is non-associative that order is normative (a left fold would give a different,
+    // slashable value). Values are the iverilog witnesses on gft_add.v.
+    test dot4_uses_the_canonical_tree_order {
+        // Divergent vector p=[(40,64),(45,0),(46,256),(40,64)]: the tree gives (47,9); a
+        // left fold ((p0+p1)+p2)+p3 gives (47,8). Pinning the tree result here fixes the order.
+        assert(gft_dot4_offset(40, 64, 45, 0, 46, 256, 40, 64, 80) == 47, "tree dot4 offset 47");
+        assert(gft_dot4_mant(40, 64, 45, 0, 46, 256, 40, 64, 80) == 9, "tree dot4 mantissa 9 (the left fold's 8 is wrong)");
+        // Plain sanity: four 1.0 lanes sum to 4.0 -> exponent 42, mantissa 0.
+        assert(gft_dot4_offset(40, 0, 40, 0, 40, 0, 40, 0, 80) == 42, "4 x 1.0 = 4.0 -> offset 42");
+        assert(gft_dot4_mant(40, 0, 40, 0, 40, 0, 40, 0, 80) == 0, "4.0 mantissa 0");
+    }
+
+    // The per-rung dot4 uses the SAME canonical tree threaded with mant_one / sig_bits, so the
+    // reduction order is normative across the ladder, not only GF-T16.
+    test dot4_p_canonical_tree_per_rung {
+        // GF-T16 (512/10, offset_max 80) reproduces the non-parametric divergent result (47,9).
+        assert(gft_dot4_offset_p(40, 64, 45, 0, 46, 256, 40, 64, 80, 512, 10) == 47, "GF-T16 _p tree offset 47");
+        assert(gft_dot4_mant_p(40, 64, 45, 0, 46, 256, 40, 64, 80, 512, 10) == 9, "GF-T16 _p tree mantissa 9");
+        // GF-T8 (16/5, offset_max 26): four 1.0 lanes = (13,0) sum to 4.0 -> exponent 15.
+        assert(gft_dot4_offset_p(13, 0, 13, 0, 13, 0, 13, 0, 26, 16, 5) == 15, "GF-T8 4 x 1.0 = 4.0 -> offset 15");
+        assert(gft_dot4_mant_p(13, 0, 13, 0, 13, 0, 13, 0, 26, 16, 5) == 0, "GF-T8 4.0 mantissa 0");
+        // GF-T32 (2^25/26, offset_max 728): four 1.0 lanes = (364,0) sum to 4.0 -> exponent 366.
+        assert(gft_dot4_offset_p(364, 0, 364, 0, 364, 0, 364, 0, 728, 33554432, 26) == 366, "GF-T32 4 x 1.0 = 4.0 -> offset 366");
+        assert(gft_dot4_mant_p(364, 0, 364, 0, 364, 0, 364, 0, 728, 33554432, 26) == 0, "GF-T32 4.0 mantissa 0");
+    }
+
+    // First executable bench block of the ring (L4): a mantissa sweep through the
+    // GF-T16 adder. Where a test pins single KAT points, the bench walks a range --
+    // 16 mantissa steps through gft_add_mant/gft_add_offset at equal exponents,
+    // pinning the closed forms: equal-exponent add is (ma+mb)/2 with a carry into
+    // offset+1. Runs wherever test blocks run (cargo-transcribed guards, icarus
+    // simulation), so it doubles as a mini differential sweep in hardware.
+    bench add_mantissa_sweep {
+        m0 = gft_add_mant(40, 40, 0, 0);
+        o0 = gft_add_offset(40, 40, 0, 0, 80);
+        m1 = gft_add_mant(40, 40, 32, 96);
+        m2 = gft_add_mant(40, 40, 64, 192);
+        m3 = gft_add_mant(40, 40, 96, 288);
+        m4 = gft_add_mant(40, 40, 128, 384);
+        m5 = gft_add_mant(40, 40, 160, 480);
+        m6 = gft_add_mant(40, 40, 192, 64);
+        m7 = gft_add_mant(40, 40, 224, 160);
+        m8 = gft_add_mant(40, 40, 256, 256);
+        m9 = gft_add_mant(40, 40, 288, 352);
+        m10 = gft_add_mant(40, 40, 320, 448);
+        m11 = gft_add_mant(40, 40, 352, 32);
+        m12 = gft_add_mant(40, 40, 384, 128);
+        m13 = gft_add_mant(40, 40, 416, 224);
+        m14 = gft_add_mant(40, 40, 448, 320);
+        m15 = gft_add_mant(40, 40, 480, 416);
+        assert(m0 == 0, "1.0+1.0 -> mantissa 0 with carry");
+        assert(o0 == 41, "1.0+1.0 -> offset 41");
+        assert(m1 == 64, "sweep step 1: (32+96)/2");
+        assert(m2 == 128, "sweep step 2: (64+192)/2");
+        assert(m3 == 192, "sweep step 3: (96+288)/2");
+        assert(m4 == 256, "sweep step 4: (128+384)/2");
+        assert(m5 == 320, "sweep step 5: (160+480)/2");
+        assert(m6 == 128, "sweep step 6: (192+64)/2");
+        assert(m7 == 192, "sweep step 7: (224+160)/2");
+        assert(m8 == 256, "sweep step 8: (256+256)/2");
+        assert(m9 == 320, "sweep step 9: (288+352)/2");
+        assert(m10 == 384, "sweep step 10: (320+448)/2");
+        assert(m11 == 192, "sweep step 11: (352+32)/2");
+        assert(m12 == 256, "sweep step 12: (384+128)/2");
+        assert(m13 == 320, "sweep step 13: (416+224)/2");
+        assert(m14 == 384, "sweep step 14: (448+320)/2");
+        assert(m15 == 448, "sweep step 15: (480+416)/2");
+    }
+}

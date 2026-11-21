@@ -1,0 +1,768 @@
+// SPDX-License-Identifier: Apache-2.0
+; gf64.t27 — GoldenFloat64 Encode/Decode
+; GF64: 64-bit floating point with 1 sign + 18 exponent + 45 mantissa
+; Bit layout: [S(1) E(18) M(45)] = [63:63][62:45][44:0]
+; φ² + 1/φ² = 3 | TRINITY
+
+module triformat-gf64;
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+pub const SIGN_SHIFT : u8 = 63;
+pub const EXP_SHIFT : u8 = 45;
+pub const MANT_SHIFT : u8 = 0;
+
+pub const SIGN_MASK : u64 = 0x8000000000000000;  // 1 << 63
+pub const EXP_MASK : u64 = 0x7FFF800000000000;   // 0b111111111111111111 << 45
+pub const MANT_MASK : u64 = 0x00007FFFFFFFFFFF; // 0b111111111111111111111111111111111111111111111
+
+pub const EXP_MAX : u16 = 0x3FFFF;      // 262143 (all ones in 18 bits)
+pub const EXP_MIN : u16 = 0x0000;
+
+pub const BIAS : i16 = 131071;          // Exponent bias for GF64: 2^(18-1) - 1
+pub const SPECIAL_EXP : u16 = 0x3FFFF;  // All ones = special (Inf/NaN)
+
+pub const MANT_DIVISOR : u64 = 35184372088832;  // 2^45
+pub const MANT_DIVISOR_SHIFT : u8 = 45;
+
+pub const PHI_BIAS : u32 = 245760;      // Phi-optimized rounding bias
+
+// GF64 special values
+pub const GF64_ZERO_POS : u64 = 0x0000000000000000;
+pub const GF64_ZERO_NEG : u64 = 0x8000000000000000;
+pub const GF64_INF_POS : u64 = 0x7FFF800000000000;
+pub const GF64_INF_NEG : u64 = 0xFFFF800000000000;
+pub const GF64_NAN : u64 = 0xFFFF800000000001; // Sign + all exp + mantissa != 0
+
+// ============================================================================
+// Types
+// ============================================================================
+
+pub const GF64 = u64;
+
+// ============================================================================
+// Functions
+// ============================================================================
+
+// gf64_extract_sign(gf64: GF64) -> i8
+// Extract sign bit (bit 63)
+// Returns: 0 for positive, -1 for negative
+pub fn gf64_extract_sign(gf64: GF64) i8 {
+    const bit = (gf64 >> SIGN_SHIFT) & 1;
+    return if (bit != 0) -1 else 0;
+}
+
+// gf64_extract_exponent(gf64: GF64) -> i16
+// Extract exponent bits (bits 62-45)
+// Returns: 0-262143
+pub fn gf64_extract_exponent(gf64: GF64) i16 {
+    return ((gf64 >> EXP_SHIFT) & (EXP_MAX)) as i16;
+}
+
+// gf64_extract_mantissa(gf64: GF64) -> u64
+// Extract mantissa bits (bits 44-0)
+// Returns: 0-2^45-1
+pub fn gf64_extract_mantissa(gf64: GF64) u64 {
+    return gf64 & MANT_MASK;
+}
+
+// gf64_from_components(sign: i8, exp: i16, mant: u64) -> GF64
+// Assemble GF64 from sign, exponent, mantissa
+pub fn gf64_from_components(sign: i8, exp: i16, mant: u64) GF64 {
+    const sign_bit = if (sign < 0) 1 else 0;
+    // `as` takes a builtin type name; GF64 is u64 (see Types).
+    return ((sign_bit as u64) << SIGN_SHIFT) |
+           (((exp & EXP_MAX) as u64) << EXP_SHIFT) |
+           (mant & MANT_MASK);
+}
+
+// gf64_is_zero(gf64: GF64) -> bool
+// Check if GF64 is zero (positive or negative)
+pub fn gf64_is_zero(gf64: GF64) bool {
+    return gf64 == GF64_ZERO_POS or gf64 == GF64_ZERO_NEG;
+}
+
+// gf64_is_special(gf64: GF64) -> bool
+// Check if GF64 is Inf or NaN (exp == 262143)
+pub fn gf64_is_special(gf64: GF64) bool {
+    return gf64_extract_exponent(gf64) == (EXP_MAX as i16);
+}
+
+// gf64_is_inf(gf64: GF64) -> bool
+// Check if GF64 is infinity (exp == max, mant == 0)
+pub fn gf64_is_inf(gf64: GF64) bool {
+    const exp = gf64_extract_exponent(gf64);
+    const mant = gf64_extract_mantissa(gf64);
+    return exp == (EXP_MAX as i16) and mant == 0;
+}
+
+// gf64_is_nan(gf64: GF64) -> bool
+// Check if GF64 is NaN (exp == max, mant != 0)
+pub fn gf64_is_nan(gf64: GF64) bool {
+    const exp = gf64_extract_exponent(gf64);
+    const mant = gf64_extract_mantissa(gf64);
+    return exp == (EXP_MAX as i16) and mant != 0;
+}
+
+// gf64_encode_f64(f64: f64) -> GF64
+// Encode IEEE 754 double precision to GF64
+// Round-to-nearest, ties to even
+pub fn gf64_encode_f64(value: f64) GF64 {
+    // Handle zero
+    if (value == 0.0) {
+        return if (std.math.signbit(value)) GF64_ZERO_NEG else GF64_ZERO_POS;
+    }
+
+    // Handle NaN
+    if (std.math.isNan(value)) {
+        return GF64_NAN;
+    }
+
+    // Handle Infinity
+    if (std.math.isInf(value)) {
+        return if (value < 0.0) GF64_INF_NEG else GF64_INF_POS;
+    }
+
+    // Extract sign
+    const sign = if (value < 0.0) -1 else 0;
+    const abs_value = if (value < 0.0) -value else value;
+
+    // Get f64 components
+    // @bitCast: reinterpret the f64 bits as u64 (no `as` form for this; the
+    // canonical numeric/gf16.t27 uses the same intrinsic).
+    const f64_bits: u64 = @bitCast(abs_value);
+    var f64_exp: i16 = (((f64_bits >> 52) & 0x7FF) as i16) - 1023;
+    var f64_mant: u64 = f64_bits & 0x000FFFFFFFFFFFFF;
+
+    // Convert exp from f64 bias (1023) to GF64 bias (131071)
+    var gf64_exp = f64_exp + BIAS;
+
+    // Clamp exponent
+    if (gf64_exp < 0) {
+        // Underflow - could return subnormal, but flushing to zero for simplicity
+        return if (sign < 0) GF64_ZERO_NEG else GF64_ZERO_POS;
+    } else if (gf64_exp > ((EXP_MAX - 1) as i16)) {
+        return if (sign < 0) GF64_INF_NEG else GF64_INF_POS;
+    }
+
+    // Extract mantissa and scale to 45 bits
+    // f64 mantissa is 52 bits, GF64 needs 45 bits
+    // Shift right by 7 bits (52 - 45 = 7)
+    var mant = f64_mant >> 7;
+
+    // Round-to-nearest with ties to even
+    const discarded = f64_mant & 0x7F;
+    if ((discarded & 0x40) != 0) {
+        // Round up
+        if ((discarded & 0x3F) != 0 or (mant & 1) != 0) {
+            mant += 1;
+            if (mant > MANT_MASK) {
+                mant = 0;
+                if (gf64_exp < ((EXP_MAX - 1) as i16)) {
+                    gf64_exp += 1;
+                }
+            }
+        }
+    }
+
+    return gf64_from_components(sign, gf64_exp, mant);
+}
+
+// gf64_decode_f64(gf64: GF64) -> f64
+// Decode GF64 to IEEE 754 double precision
+pub fn gf64_decode_f64(gf64: GF64) f64 {
+    // Handle zero
+    if (gf64_is_zero(gf64)) {
+        return if (gf64_extract_sign(gf64) < 0) -0.0 else 0.0;
+    }
+
+    // Handle NaN
+    if (gf64_is_nan(gf64)) {
+        return std.math.nan(f64);
+    }
+
+    // Handle Infinity
+    if (gf64_is_inf(gf64)) {
+        return if (gf64_extract_sign(gf64) < 0) -std.math.inf(f64) else std.math.inf(f64);
+    }
+
+    // Extract components
+    const sign = gf64_extract_sign(gf64);
+    const exp = gf64_extract_exponent(gf64);
+    const mant = gf64_extract_mantissa(gf64);
+
+    // Decode value: mantissa * 2^(exp - bias)
+    const bias_adjusted = (exp as i64) - (BIAS as i64);
+    const mant_f64 = (mant as f64) / (MANT_DIVISOR as f64);
+    const value = mant_f64 * std.math.pow(f64, 2.0, bias_adjusted as f64);
+
+    return if (sign < 0) -value else value;
+}
+
+// gf64_add(a: GF64, b: GF64) -> GF64
+// Add two GF64 values
+pub fn gf64_add(a: GF64, b: GF64) GF64 {
+    const fa = gf64_decode_f64(a);
+    const fb = gf64_decode_f64(b);
+    return gf64_encode_f64(fa + fb);
+}
+
+// gf64_sub(a: GF64, b: GF64) -> GF64
+// Subtract two GF64 values
+pub fn gf64_sub(a: GF64, b: GF64) GF64 {
+    const fa = gf64_decode_f64(a);
+    const fb = gf64_decode_f64(b);
+    return gf64_encode_f64(fa - fb);
+}
+
+// gf64_mul(a: GF64, b: GF64) -> GF64
+// Multiply two GF64 values
+pub fn gf64_mul(a: GF64, b: GF64) GF64 {
+    const fa = gf64_decode_f64(a);
+    const fb = gf64_decode_f64(b);
+    return gf64_encode_f64(fa * fb);
+}
+
+// gf64_div(a: GF64, b: GF64) -> GF64
+// Divide two GF64 values
+pub fn gf64_div(a: GF64, b: GF64) GF64 {
+    const fb = gf64_decode_f64(b);
+    if (fb == 0.0) {
+        const fa = gf64_decode_f64(a);
+        return if (fa < 0.0) GF64_INF_NEG else GF64_INF_POS;
+    }
+    const fa = gf64_decode_f64(a);
+    return gf64_encode_f64(fa / fb);
+}
+
+// gf64_abs(gf64: GF64) -> GF64
+// Absolute value of GF64
+pub fn gf64_abs(gf64: GF64) GF64 {
+    return gf64 & ~SIGN_MASK;
+}
+
+// gf64_neg(gf64: GF64) -> GF64
+// Negate GF64
+pub fn gf64_neg(gf64: GF64) GF64 {
+    return gf64 ^ SIGN_MASK;
+}
+
+// gf64_is_equal(a: GF64, b: GF64) -> bool
+// Check if two GF64 values are equal
+pub fn gf64_is_equal(a: GF64, b: GF64) bool {
+    // Handle NaN: NaN != NaN
+    if (gf64_is_nan(a) or gf64_is_nan(b)) {
+        return false;
+    }
+    // Handle zero: +0 == -0
+    if (gf64_is_zero(a) and gf64_is_zero(b)) {
+        return true;
+    }
+    return a == b;
+}
+
+// gf64_is_greater(a: GF64, b: GF64) -> bool
+// Check if a > b
+pub fn gf64_is_greater(a: GF64, b: GF64) bool {
+    if (gf64_is_nan(a) or gf64_is_nan(b)) {
+        return false;
+    }
+    // Extract signs for comparison
+    const sign_a = gf64_extract_sign(a);
+    const sign_b = gf64_extract_sign(b);
+    if (sign_a != sign_b) {
+        return sign_a > sign_b;  // negative < positive
+    }
+    // Same sign: compare as unsigned (positive case) or reversed (negative case)
+    if (sign_a < 0) {
+        return (gf64_neg(a) > gf64_neg(b));
+    }
+    return a > b;
+}
+
+// gf64_max(a: GF64, b: GF64) -> GF64
+// Return the larger of two GF64 values
+pub fn gf64_max(a: GF64, b: GF64) GF64 {
+    return if (gf64_is_greater(a, b)) a else b;
+}
+
+// gf64_min(a: GF64, b: GF64) -> GF64
+// Return the smaller of two GF64 values
+pub fn gf64_min(a: GF64, b: GF64) GF64 {
+    return if (gf64_is_greater(a, b)) b else a;
+}
+
+// gf64_clamp(value: GF64, min: GF64, max: GF64) -> GF64
+// Clamp value between min and max
+pub fn gf64_clamp(value: GF64, min: GF64, max: GF64) GF64 {
+    return gf64_min(gf64_max(value, min), max);
+}
+
+// gf64_lerp(a: GF64, b: GF64, t: GF64) -> GF64
+// Linear interpolation between a and b
+pub fn gf64_lerp(a: GF64, b: GF64, t: GF64) GF64 {
+    const ft = gf64_decode_f64(t);
+    const result = gf64_decode_f64(a) * (1.0 - ft) + gf64_decode_f64(b) * ft;
+    return gf64_encode_f64(result);
+}
+
+// gf64_from_u32(value: u32) -> GF64
+// Convert unsigned 32-bit integer to GF64
+pub fn gf64_from_u32(value: u32) GF64 {
+    return gf64_encode_f64(value as f64);
+}
+
+// gf64_to_u32(gf64: GF64) -> ?u32
+// Convert GF64 to unsigned 32-bit integer
+// Returns null if value is NaN, Infinity, or out of range
+pub fn gf64_to_u32(gf64: GF64) ?u32 {
+    if (gf64_is_nan(gf64) or gf64_is_inf(gf64)) {
+        return null;
+    }
+    // Typed f64 local so the Zig backend lowers `value as u32` to @intFromFloat.
+    const value: f64 = gf64_decode_f64(gf64);
+    if (value < 0.0 or value > (std.math.maxInt(u32) as f64)) {
+        return null;
+    }
+    return value as u32;
+}
+
+// gf64_from_i32(value: i32) -> GF64
+// Convert signed 32-bit integer to GF64
+pub fn gf64_from_i32(value: i32) GF64 {
+    return gf64_encode_f64(value as f64);
+}
+
+// gf64_to_i32(gf64: GF64) -> ?i32
+// Convert GF64 to signed 32-bit integer
+// Returns null if value is NaN, Infinity, or out of range
+pub fn gf64_to_i32(gf64: GF64) ?i32 {
+    if (gf64_is_nan(gf64) or gf64_is_inf(gf64)) {
+        return null;
+    }
+    // Typed f64 local so the Zig backend lowers `value as i32` to @intFromFloat.
+    const value: f64 = gf64_decode_f64(gf64);
+    if (value < (std.math.minInt(i32) as f64) or
+        value > (std.math.maxInt(i32) as f64)) {
+        return null;
+    }
+    return value as i32;
+}
+
+// ============================================================================
+// TDD Tests
+// ============================================================================
+
+test "gf64_extract_sign_positive" {
+    const value = 0x0000000000001234;
+    const sign = gf64_extract_sign(value);
+    assert(sign == 0);
+}
+
+test "gf64_extract_sign_negative" {
+    const value = 0x8000000000001234;
+    const sign = gf64_extract_sign(value);
+    assert(sign == -1);
+}
+
+test "gf64_extract_exponent_middle" {
+    const value = 0x0000800000000000;  // exp = 131072
+    const exp = gf64_extract_exponent(value);
+    assert(exp == 131072);
+}
+
+test "gf64_extract_mantissa_max" {
+    const value = 0x00007FFFFFFFFFFF;
+    const mant = gf64_extract_mantissa(value);
+    assert(mant == 0x00007FFFFFFFFFFF);
+}
+
+test "gf64_is_zero_positive" {
+    assert(gf64_is_zero(GF64_ZERO_POS) == true);
+}
+
+test "gf64_is_zero_negative" {
+    assert(gf64_is_zero(GF64_ZERO_NEG) == true);
+}
+
+test "gf64_is_zero_nonzero" {
+    assert(gf64_is_zero(0x0000000000000001) == false);
+}
+
+test "gf64_is_special_inf" {
+    assert(gf64_is_special(GF64_INF_POS) == true);
+}
+
+test "gf64_is_special_nan" {
+    assert(gf64_is_special(GF64_NAN) == true);
+}
+
+test "gf64_is_special_normal" {
+    assert(gf64_is_special(0x0000000000001234) == false);
+}
+
+test "gf64_is_inf_positive" {
+    assert(gf64_is_inf(GF64_INF_POS) == true);
+}
+
+test "gf64_is_inf_negative" {
+    assert(gf64_is_inf(GF64_INF_NEG) == true);
+}
+
+test "gf64_is_inf_not_nan" {
+    assert(gf64_is_inf(GF64_NAN) == false);
+}
+
+test "gf64_is_nan" {
+    assert(gf64_is_nan(GF64_NAN) == true);
+}
+
+test "gf64_is_nan_not_inf" {
+    assert(gf64_is_nan(GF64_INF_POS) == false);
+}
+
+test "gf64_encode_f64_zero" {
+    const gf = gf64_encode_f64(0.0);
+    assert(gf == GF64_ZERO_POS);
+}
+
+test "gf64_encode_f64_negative_zero" {
+    const gf = gf64_encode_f64(-0.0);
+    assert(gf == GF64_ZERO_NEG);
+}
+
+test "gf64_encode_f64_one" {
+    const gf = gf64_encode_f64(1.0);
+    const decoded = gf64_decode_f64(gf);
+    assert(abs(decoded - 1.0) < 0.0001);
+}
+
+test "gf64_encode_f64_negative_one" {
+    const gf = gf64_encode_f64(-1.0);
+    const decoded = gf64_decode_f64(gf);
+    assert(abs(decoded + 1.0) < 0.0001);
+}
+
+test "gf64_encode_f64_two_pow_ten" {
+    const gf = gf64_encode_f64(1024.0);
+    const decoded = gf64_decode_f64(gf);
+    assert(abs(decoded - 1024.0) < 1.0);
+}
+
+test "gf64_encode_f64_pi" {
+    const gf = gf64_encode_f64(std.math.pi);
+    const decoded = gf64_decode_f64(gf);
+    assert(abs(decoded - std.math.pi) < 0.001);
+}
+
+test "gf64_decode_f64_roundtrip_positive" {
+    const original = 42.5;
+    const gf = gf64_encode_f64(original);
+    const decoded = gf64_decode_f64(gf);
+    assert(abs(decoded - original) < 0.001);
+}
+
+test "gf64_decode_f64_roundtrip_negative" {
+    const original = -17.75;
+    const gf = gf64_encode_f64(original);
+    const decoded = gf64_decode_f64(gf);
+    assert(abs(decoded - original) < 0.001);
+}
+
+test "gf64_add_simple" {
+    const a = gf64_encode_f64(1.0);
+    const b = gf64_encode_f64(2.0);
+    const result = gf64_add(a, b);
+    const decoded = gf64_decode_f64(result);
+    assert(abs(decoded - 3.0) < 0.01);
+}
+
+test "gf64_sub_simple" {
+    const a = gf64_encode_f64(5.0);
+    const b = gf64_encode_f64(3.0);
+    const result = gf64_sub(a, b);
+    const decoded = gf64_decode_f64(result);
+    assert(abs(decoded - 2.0) < 0.01);
+}
+
+test "gf64_mul_simple" {
+    const a = gf64_encode_f64(3.0);
+    const b = gf64_encode_f64(4.0);
+    const result = gf64_mul(a, b);
+    const decoded = gf64_decode_f64(result);
+    assert(abs(decoded - 12.0) < 0.01);
+}
+
+test "gf64_div_simple" {
+    const a = gf64_encode_f64(12.0);
+    const b = gf64_encode_f64(4.0);
+    const result = gf64_div(a, b);
+    const decoded = gf64_decode_f64(result);
+    assert(abs(decoded - 3.0) < 0.01);
+}
+
+test "gf64_abs_positive" {
+    const value = gf64_encode_f64(5.0);
+    const abs_val = gf64_abs(value);
+    assert(abs_val == value);
+}
+
+test "gf64_abs_negative" {
+    const value = gf64_encode_f64(-5.0);
+    const abs_val = gf64_abs(value);
+    const decoded = gf64_decode_f64(abs_val);
+    assert(decoded > 0.0);
+}
+
+test "gf64_neg" {
+    const value = gf64_encode_f64(5.0);
+    const neg_val = gf64_neg(value);
+    const decoded = gf64_decode_f64(neg_val);
+    assert(abs(decoded + 5.0) < 0.01);
+}
+
+test "gf64_is_equal_same" {
+    const value = gf64_encode_f64(1.0);
+    assert(gf64_is_equal(value, value) == true);
+}
+
+test "gf64_is_equal_different" {
+    const a = gf64_encode_f64(1.0);
+    const b = gf64_encode_f64(2.0);
+    assert(gf64_is_equal(a, b) == false);
+}
+
+test "gf64_is_equal_nan" {
+    assert(gf64_is_equal(GF64_NAN, GF64_NAN) == false);
+}
+
+test "gf64_is_equal_zero" {
+    assert(gf64_is_equal(GF64_ZERO_POS, GF64_ZERO_NEG) == true);
+}
+
+test "gf64_is_greater_positive" {
+    const a = gf64_encode_f64(5.0);
+    const b = gf64_encode_f64(3.0);
+    assert(gf64_is_greater(a, b) == true);
+}
+
+test "gf64_is_greater_negative" {
+    const a = gf64_encode_f64(-3.0);
+    const b = gf64_encode_f64(-5.0);
+    assert(gf64_is_greater(a, b) == true);
+}
+
+test "gf64_is_greater_positive_vs_negative" {
+    const a = gf64_encode_f64(1.0);
+    const b = gf64_encode_f64(-1.0);
+    assert(gf64_is_greater(a, b) == true);
+}
+
+test "gf64_max_returns_larger" {
+    const a = gf64_encode_f64(3.0);
+    const b = gf64_encode_f64(5.0);
+    const result = gf64_max(a, b);
+    const decoded = gf64_decode_f64(result);
+    assert(decoded >= 4.0);
+}
+
+test "gf64_min_returns_smaller" {
+    const a = gf64_encode_f64(3.0);
+    const b = gf64_encode_f64(5.0);
+    const result = gf64_min(a, b);
+    const decoded = gf64_decode_f64(result);
+    assert(decoded <= 4.0);
+}
+
+test "gf64_clamp_within_range" {
+    const value = gf64_encode_f64(3.0);
+    const min = gf64_encode_f64(0.0);
+    const max = gf64_encode_f64(10.0);
+    const result = gf64_clamp(value, min, max);
+    assert(result == value);
+}
+
+test "gf64_clamp_below_min" {
+    const value = gf64_encode_f64(-5.0);
+    const min = gf64_encode_f64(0.0);
+    const max = gf64_encode_f64(10.0);
+    const result = gf64_clamp(value, min, max);
+    const decoded = gf64_decode_f64(result);
+    assert(decoded >= 0.0);
+}
+
+test "gf64_clamp_above_max" {
+    const value = gf64_encode_f64(15.0);
+    const min = gf64_encode_f64(0.0);
+    const max = gf64_encode_f64(10.0);
+    const result = gf64_clamp(value, min, max);
+    const decoded = gf64_decode_f64(result);
+    assert(decoded <= 10.0);
+}
+
+test "gf64_lerp_zero" {
+    const a = gf64_encode_f64(1.0);
+    const b = gf64_encode_f64(5.0);
+    const t = gf64_encode_f64(0.0);
+    const result = gf64_lerp(a, b, t);
+    assert(gf64_is_equal(result, a) == true);
+}
+
+test "gf64_lerp_one" {
+    const a = gf64_encode_f64(1.0);
+    const b = gf64_encode_f64(5.0);
+    const t = gf64_encode_f64(1.0);
+    const result = gf64_lerp(a, b, t);
+    assert(gf64_is_equal(result, b) == true);
+}
+
+test "gf64_lerp_half" {
+    const a = gf64_encode_f64(1.0);
+    const b = gf64_encode_f64(5.0);
+    const t = gf64_encode_f64(0.5);
+    const result = gf64_lerp(a, b, t);
+    const decoded = gf64_decode_f64(result);
+    assert(abs(decoded - 3.0) < 0.1);
+}
+
+test "gf64_from_u32_zero" {
+    const value = 0;
+    const gf = gf64_from_u32(value);
+    assert(gf == GF64_ZERO_POS);
+}
+
+test "gf64_from_u32_max" {
+    const value = std.math.maxInt(u32);
+    const gf = gf64_from_u32(value);
+    const decoded = gf64_to_u32(gf);
+    assert(decoded.? == value);
+}
+
+test "gf64_to_u32_success" {
+    const gf = gf64_encode_f64(123.0);
+    const result = gf64_to_u32(gf);
+    assert(result.? == 123);
+}
+
+test "gf64_to_u32_negative" {
+    const gf = gf64_encode_f64(-1.0);
+    const result = gf64_to_u32(gf);
+    assert(result == null);
+}
+
+test "gf64_to_u32_nan" {
+    const result = gf64_to_u32(GF64_NAN);
+    assert(result == null);
+}
+
+test "gf64_from_i32_zero" {
+    const value = 0;
+    const gf = gf64_from_i32(value);
+    assert(gf == GF64_ZERO_POS);
+}
+
+test "gf64_from_i32_negative" {
+    const value = -42;
+    const gf = gf64_from_i32(value);
+    const decoded = gf64_to_i32(gf);
+    assert(decoded.? == value);
+}
+
+test "gf64_to_i32_positive" {
+    const gf = gf64_encode_f64(123.0);
+    const result = gf64_to_i32(gf);
+    assert(result.? == 123);
+}
+
+test "gf64_to_i32_negative" {
+    const gf = gf64_encode_f64(-123.0);
+    const result = gf64_to_i32(gf);
+    assert(result.? == -123);
+}
+
+test "gf64_from_components_roundtrip" {
+    const sign = -1;
+    const exp = 131072;
+    const mant = 0x0000000000000800;
+    const gf = gf64_from_components(sign, exp, mant);
+    const extracted_sign = gf64_extract_sign(gf);
+    const extracted_exp = gf64_extract_exponent(gf);
+    const extracted_mant = gf64_extract_mantissa(gf);
+    assert(extracted_sign == sign and extracted_exp == exp and extracted_mant == mant);
+}
+
+// ============================================================================
+// Invariants
+// ============================================================================
+
+invariant gf64_sign_mask_single_bit
+    assert (SIGN_MASK & (SIGN_MASK - 1)) == 0
+
+invariant gf64_exp_mask_no_sign
+    assert (EXP_MASK & SIGN_MASK) == 0
+
+invariant gf64_mant_mask_no_sign_exp
+    assert (MANT_MASK & (SIGN_MASK | EXP_MASK)) == 0
+
+invariant gf64_masks_cover_all_bits
+    assert (SIGN_MASK | EXP_MASK | MANT_MASK) == 0xFFFFFFFFFFFFFFFF
+
+invariant gf64_bias_power_of_two_minus_one
+    assert BIAS + 1 == 131072  // 2^17
+
+invariant gf64_special_exp_all_ones
+    assert SPECIAL_EXP == EXP_MAX
+
+invariant gf64_zero_pos_no_sign
+    assert (GF64_ZERO_POS & SIGN_MASK) == 0
+
+invariant gf64_zero_neg_has_sign
+    assert (GF64_ZERO_NEG & SIGN_MASK) == SIGN_MASK
+
+invariant gf64_inf_pos_max_exp
+    assert (GF64_INF_POS & EXP_MASK) == EXP_MASK
+
+invariant gf64_nan_has_mantissa
+    assert (GF64_NAN & MANT_MASK) != 0
+
+invariant gf64_abs_removes_sign
+    assert gf64_abs(GF64_ZERO_NEG) == GF64_ZERO_POS
+
+invariant gf64_neg_toggles_sign
+    assert (gf64_neg(GF64_INF_POS) & SIGN_MASK) == SIGN_MASK
+
+invariant gf64_from_u32_zero
+    assert gf64_from_u32(0) == GF64_ZERO_POS
+
+invariant gf64_from_i32_zero
+    assert gf64_from_i32(0) == GF64_ZERO_POS
+
+// ============================================================================
+// Benchmarks
+// ============================================================================
+
+bench gf64_extract_sign_latency
+    measure: nanoseconds to gf64_extract_sign(0x123456789ABCDEF0)
+    target: < 10ns
+
+bench gf64_extract_exponent_latency
+    measure: nanoseconds to gf64_extract_exponent(0x123456789ABCDEF0)
+    target: < 10ns
+
+bench gf64_encode_f64_latency
+    measure: nanoseconds to gf64_encode_f64(123.456)
+    target: < 100ns
+
+bench gf64_decode_f64_latency
+    measure: nanoseconds to gf64_decode_f64(0x3F80000000000000)
+    target: < 100ns
+
+bench gf64_add_latency
+    measure: nanoseconds to gf64_add(0x3F80000000000000, 0x4000000000000000)
+    target: < 200ns
+
+bench gf64_mul_latency
+    measure: nanoseconds to gf64_mul(0x3F80000000000000, 0x4000000000000000)
+    target: < 200ns

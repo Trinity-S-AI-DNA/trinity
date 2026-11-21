@@ -1,0 +1,140 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/automation/crm-client-ownership.t27 -- WHO owns a client profile, and money in the stage
+// the client workspace shows. Closes the two gaps crm-client-workspace.t27 (#3604) left open and
+// that were seen live on 2026-09-13.
+// Host: 999-multibots-telegraf apps/vibee-editor/render -- crm-client-setup-tool.ts (table
+//       crm_client_profiles, ensureProfileTable, setupClient, clientProfileFor, tool
+//       crm_client_profile), crm-client-workspace-tools.ts (tool crm_clients), crm-touch-tools.ts
+//       (tool crm_history), chat.ts (clientContextBlock), crm-tools.ts (whoPaid, visibleScope),
+//       crm-stages.ts (stageOf).
+// WHAT was measured before this spec (code read 2026-09-13): crm_client_profiles had PRIMARY KEY
+//       (telegram_id) and no owner column -- one profile per person on the whole installation, so
+//       a second seller would read and overwrite the first seller's profile; crm_clients and
+//       crm_history called stageOf with paid = false hard-coded, so a person with a COMPLETED
+//       MONEY_INCOME row in payments_v2 showed the stage of their last touch ('written', 'new')
+//       instead of 'client' or 'winback' as crm_leads and crm_summary already showed.
+// WHY a nullable column and a unique index, not a new primary key: the table has live rows with
+//       no owner; a NOT NULL key would either refuse the migration or invent an owner. Legacy rows
+//       are backfilled from crm_people (the ingest already knows which owner met whom); a row
+//       still unowned after that is readable by any seller and is CLAIMED by the next
+//       crm_client_setup, which always writes owner_id.
+// WHY money first: crm-stages.ts already says it -- somebody who paid is a client even if the last
+//       touch says 'refused'; the workspace must not contradict the list next to it. Payments are
+//       read once per call through the same owner-scoped whoPaid the other tools use (only the
+//       owner's own bots count, CRM audit 2026-09-12 P1 #2); a Supabase failure costs the money
+//       column, never the answer -- the stage then falls back to touches and says so.
+// Claim status: contract and pure functions written and unit-tested with doubles on the host; the
+//       migration having run on the production Postgres and a paying client showing 'client' on
+//       the live dashboard are shown by the host after deploy, not by this file.
+// phi^2 + 1/phi^2 = 3 | TRINITY
+
+module automation::crm_client_ownership {
+
+    pub const KIND : str = "automation";
+    pub const ID : str = "crm-client-ownership";
+    pub const REPO : str = "999-multibots-telegraf";
+    pub const VERSION : u8 = 1;
+    pub const EXTENDS : str = "crm-client-workspace";
+
+    // ---- Ownership of a profile ---------------------------------------------------------------
+    pub const TABLE_PROFILES : str = "crm_client_profiles";
+    pub const OWNER_COLUMN : str = "owner_id";  // text, nullable: legacy rows carry NULL until claimed
+    pub const OWNER_IS : str = "seller-telegram-id";  // the caller of crm_client_setup, never the client
+    pub const UNIQUE_KEY : str = "owner_id,telegram_id";  // one profile per (seller, client); legacy pkey dropped
+    pub const MIGRATION_IDEMPOTENT : bool = true;  // ADD COLUMN IF NOT EXISTS, DROP pkey only if present
+    pub const BACKFILL_FROM : str = "crm_people";  // owner_id of the newest ingest row for that lead
+    pub const UNOWNED_READABLE_BY_ANY_SELLER : bool = true;  // until the next setup claims the row
+    pub const SETUP_ALWAYS_WRITES_OWNER : bool = true;
+    pub const READS_SCOPED_BY_OWNER : u8 = 4;  // crm_client_profile, crm_clients, clientContextBlock, duet sellerBrief
+
+    // ---- Money in the workspace stage -------------------------------------------------------
+    pub const PAYMENTS_TABLE : str = "payments_v2";
+    pub const PAYMENT_COUNTS_WHEN : str = "COMPLETED+MONEY_INCOME";
+    pub const PAYMENTS_SCOPED_TO : str = "owner-bots";  // visibleScope -> whoPaid; another owner's bot is not our money
+    pub const STAGE_TOOLS_READING_MONEY : u8 = 2;  // crm_clients, crm_history
+    pub const MONEY_BEFORE_TOUCHES : bool = true;  // stageOf: paid outranks every touch, refused included
+    pub const WINBACK_AFTER_QUIET_DAYS : u8 = 60;
+    pub const PAID_FLAG_IN_ROWS : bool = true;  // crm_clients rows and crm_history carry paid: bool
+    pub const MONEY_UNREACHABLE_FALLS_BACK_TO_TOUCHES : bool = true;  // and says paid_known: false
+
+    // ---- The read-only schema witness (#3611) ---------------------------------------------
+    pub const SCHEMA_CHECK_TOOL : str = "crm_schema_check";  // owner-only; reads pg_constraint, pg_indexes, information_schema and one count
+    pub const SCHEMA_CHECK_WRITES : bool = false;  // it never calls ensureProfileTable; a witness that migrates is not a witness
+    pub const SCHEMA_CHECK_REPORTS : str = "owner_column,legacy_pkey,unique_index,rows_total,rows_owned,rows_unowned,owners";
+
+    // ---- Claimed live -----------------------------------------------------------------------
+    pub const PAYING_CLIENT_SEEN_LIVE : bool = true;  // 2026-09-13 ~21:25 +07: crm_history 435572800 -> stage client, paid true, paid_known true, after the #2390 deploy
+    pub const MIGRATION_RAN_ON_PROD : bool = true;  // 2026-09-13 ~21:37 +07: crm_schema_check on prod -> owner_column true, legacy_pkey false, unique_index true, rows 1/1 owned/0 unowned (#2392)
+
+    struct ProfileRow {
+        has_owner: bool,
+        owner_is_caller: bool,
+    }
+
+    // A profile is visible to a seller when it is theirs, or when nobody has claimed it yet.
+    fn profile_visible(row: ProfileRow) -> bool {
+        return !row.has_owner || row.owner_is_caller;
+    }
+
+    // Two sellers may hold two profiles of one person; one seller holds one.
+    fn conflicts(same_owner: bool, same_client: bool) -> bool {
+        return same_owner && same_client;
+    }
+
+    // The stage the workspace shows: money first, then the touches, then quiet.
+    // 0 new, 1 written, 2 talking, 3 later, 4 refused, 5 client, 6 winback.
+    fn stage_code(paid: bool, quiet_days: u8, touch_code: u8) -> u8 {
+        if paid {
+            if quiet_days > WINBACK_AFTER_QUIET_DAYS { return 6; }
+            return 5;
+        }
+        return touch_code;
+    }
+
+    fn paid_known(money_reachable: bool) -> bool {
+        return money_reachable;
+    }
+
+    test "a profile belongs to the seller who set it up and is invisible to another seller"
+        assert(OWNER_COLUMN == "owner_id");
+        assert(OWNER_IS == "seller-telegram-id");
+        assert(SETUP_ALWAYS_WRITES_OWNER);
+        assert(profile_visible(ProfileRow { has_owner: true, owner_is_caller: true }));
+        assert(!profile_visible(ProfileRow { has_owner: true, owner_is_caller: false }));
+        assert(READS_SCOPED_BY_OWNER == 4);
+
+    test "a legacy row without an owner stays readable until the next setup claims it"
+        assert(profile_visible(ProfileRow { has_owner: false, owner_is_caller: false }));
+        assert(UNOWNED_READABLE_BY_ANY_SELLER);
+        assert(BACKFILL_FROM == "crm_people");
+        assert(MIGRATION_IDEMPOTENT);
+        assert(UNIQUE_KEY == "owner_id,telegram_id");
+        assert(conflicts(true, true));
+        assert(!conflicts(false, true));
+
+    test "money outranks every touch in the stage the workspace shows"
+        assert(MONEY_BEFORE_TOUCHES);
+        assert(stage_code(true, 0, 4) == 5);
+        assert(stage_code(true, 61, 0) == 6);
+        assert(stage_code(true, 60, 0) == 5);
+        assert(stage_code(false, 200, 1) == 1);
+        assert(STAGE_TOOLS_READING_MONEY == 2);
+
+    test "payments are only the owner's own completed income and a dead Supabase costs the money column, not the answer"
+        assert(PAYMENTS_TABLE == "payments_v2");
+        assert(PAYMENT_COUNTS_WHEN == "COMPLETED+MONEY_INCOME");
+        assert(PAYMENTS_SCOPED_TO == "owner-bots");
+        assert(MONEY_UNREACHABLE_FALLS_BACK_TO_TOUCHES);
+        assert(!paid_known(false));
+        assert(paid_known(true));
+        assert(PAID_FLAG_IN_ROWS);
+
+    test "this spec extends the client workspace; a paying client and the migration were both witnessed live"
+        assert(EXTENDS == "crm-client-workspace");
+        assert(KIND == "automation");
+        assert(WINBACK_AFTER_QUIET_DAYS == 60);
+        assert(PAYING_CLIENT_SEEN_LIVE);
+        assert(MIGRATION_RAN_ON_PROD);
+        assert(SCHEMA_CHECK_TOOL == "crm_schema_check");
+        assert(!SCHEMA_CHECK_WRITES);
+}

@@ -1,0 +1,325 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/tri/mutate/lab.t27 -- what `tri mutate spec --lab` decides about a run on the Railway lab (#7050)
+; `tri mutate spec` (cli/tri/src/mutate.rs) runs every mutant's `zig test` on the machine it is called on.
+; `--lab` will start that run on the lab, where zig and the cores are, and read it back over `railway ssh`.
+; This spec was slice 1 of #7050: the rules came first, in t27. Slice 2 copies its eight functions and
+; its constants into `mod lab` in cli/tri/src/mutate.rs; the test there,
+; `the_lab_rules_agree_with_every_assert_row_of_their_spec`, reads this file and evaluates every `assert`
+; row of the tests below against that copy, so a row changed here fails the Rust test until the copy
+; follows. Slice 3 adds the `--lab` flag and its `railway ssh` plumbing, which call the copy. It also
+; passes zig_j to each mutant's `zig test` as -j, and `--lab` passes job_pids to lab_jobs.
+; The lab run is a nohup'd job in its own directory: a pid file written by the launch, an exit file
+; written when the tool returns, and the tool's output. Any later ssh can read those three back, so a
+; dropped ssh does not lose the run.
+; ASCII only (L3)
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module TriMutateLab;
+
+// State of one lab run, read from its directory: NONE = 0 (no directory), RUNNING = 1 (no exit file,
+// runner alive), DONE = 2 (exit file written), LOST = 3 (directory, no exit file, runner dead: the lab
+// restarted or the job was killed).
+pub const RUN_NONE : u8 = 0;
+pub const RUN_RUNNING : u8 = 1;
+pub const RUN_DONE : u8 = 2;
+pub const RUN_LOST : u8 = 3;
+
+// Exit code of `tri mutate spec --lab`. 0..2 are the remote tool's own codes, passed through, so a
+// caller reads `--lab` as it reads a local run: OK = 0; TOOL_FAILED = 1 (the tool exited 1 or any code it
+// does not define: the unmutated spec is red, or some mutants could not be run); SURVIVED = 2 (the
+// survivor gate failed, specs/tri/mutate/survivors.t27). 3..5 are the lab's own: NO_RESULT = 3 (no run,
+// or a lost one); ORPHANS = 4 (the run finished but left processes in its directory, trap T9: a killed
+// `zig test` leaves its test binary spinning); STILL_RUNNING = 5 (the run is alive: call again to read it).
+pub const EXIT_OK : u8 = 0;
+pub const EXIT_TOOL_FAILED : u8 = 1;
+pub const EXIT_SURVIVED : u8 = 2;
+pub const EXIT_NO_RESULT : u8 = 3;
+pub const EXIT_ORPHANS : u8 = 4;
+pub const EXIT_STILL_RUNNING : u8 = 5;
+
+// The remote tool's exit code for a failed survivor gate: survivors.t27 EXIT_SURVIVED (a literal, not a
+// `use`: a drift between the two is caught by the test that names both).
+pub const TOOL_RC_SURVIVED : u32 = 2;
+
+// Reads over ssh are tried at most this many times; writes once (a launch that is retried blindly
+// can start a second run).
+pub const SSH_MAX_ATTEMPTS : u32 = 3;
+
+// Polling a running job: 5 s, then doubling, never above 60 s.
+pub const POLL_BASE_SECONDS : u32 = 5;
+pub const POLL_CAP_SECONDS : u32 = 60;
+
+// Pids left for the lab's other lanes: one batch of 8 jobs at zig's default thread count on the lab's
+// 48 cores, 8 * (48 + JOB_OVERHEAD_PIDS). So a lane whose zig is not bounded can still start one batch.
+// Measured 2026-10-07 on the lab after its tini redeploy (48 cores, pids.max 1000), sampled every 5 ms:
+// `tri mutate spec --jobs 8` over this spec's 54 mutants raised pids.current by 394 and 394 at zig's
+// default (4.94 s, 5.15 s), 110 with -j12 (5.06 s), 58 with -j6 (4.74 s), 34 with -j3 (5.50 s) and 18
+// with -j1 (8.11 s). Every run killed the same 50 of 54. Slice 1's probe (104 at the default, 20 with
+// -j6) read pids.current too seldom and missed the peaks: zig starts a thread per -j, and a thread is a pid.
+pub const PID_RESERVE : u32 = 408;
+
+// Pids one job holds besides its compile's -j threads: one job alone peaked at 9 tasks with -j6 and at
+// 51 with -j48, counted in the run's directory every 5 ms.
+pub const JOB_OVERHEAD_PIDS : u32 = 3;
+
+/// The run's state from what its directory shows. An exit file wins over a runner still closing.
+pub fn run_state(dir_exists: bool, exit_written: bool, runner_alive: bool) -> u8 {
+    if (dir_exists == false) { return RUN_NONE; }
+    if (exit_written) { return RUN_DONE; }
+    if (runner_alive) { return RUN_RUNNING; }
+    return RUN_LOST;
+}
+
+/// A run is started only where none is: never over a running one, never over an unread result,
+/// never over a lost one that has not been cleaned up.
+pub fn launch_allowed(state: u8) -> bool {
+    return state == RUN_NONE;
+}
+
+/// The directory goes only when nothing will write to it again and nothing runs in it. Orphans are
+/// killed and counted again first: a test binary still running in a deleted directory keeps spinning.
+pub fn may_remove(state: u8, orphans: u32) -> bool {
+    if (orphans > 0) { return false; }
+    return state == RUN_DONE || state == RUN_LOST;
+}
+
+/// The exit code of `--lab`. Orphans outrank the tool's verdict: the tool's verdict is in its own
+/// output, the orphans are visible nowhere else. The gate's 2 passes through; any other non-zero code
+/// is a failed tool, so a code the tool never defined cannot pass as a verdict.
+pub fn lab_exit(state: u8, tool_rc: u32, orphans: u32) -> u8 {
+    if (state == RUN_RUNNING) { return EXIT_STILL_RUNNING; }
+    if (state != RUN_DONE) { return EXIT_NO_RESULT; }
+    if (orphans > 0) { return EXIT_ORPHANS; }
+    if (tool_rc == 0) { return EXIT_OK; }
+    if (tool_rc == TOOL_RC_SURVIVED) { return EXIT_SURVIVED; }
+    return EXIT_TOOL_FAILED;
+}
+
+/// After `attempts` failed tries of one ssh call: try again? Only a read, only on a transient failure,
+/// at most SSH_MAX_ATTEMPTS tries in all. A write's outcome is read back through run_state instead.
+pub fn ssh_should_retry(attempts: u32, transient: bool, is_write: bool) -> bool {
+    if (is_write) { return false; }
+    return transient && attempts < SSH_MAX_ATTEMPTS;
+}
+
+/// Seconds to wait before poll number `polls` (from 0) of a running job.
+pub fn poll_wait_seconds(polls: u32) -> u32 {
+    var wait : u32 = POLL_BASE_SECONDS;
+    var n : u32 = 0;
+    while (n < polls && wait < POLL_CAP_SECONDS) {
+        wait = wait * 2;
+        n = n + 1;
+    }
+    if (wait > POLL_CAP_SECONDS) { return POLL_CAP_SECONDS; }
+    return wait;
+}
+
+/// zig's -j for each mutant's `zig test`: the cores shared by the parallel jobs, at least 1.
+/// The measurements at PID_RESERVE: -j6 for 8 jobs on 48 cores took the default's time with a seventh of its pids.
+pub fn zig_j(nproc: u32, jobs: u32) -> u32 {
+    if (jobs == 0) { return 1; }
+    var j : u32 = nproc / jobs;
+    if (j == 0) { return 1; }
+    return j;
+}
+
+/// The pids one job holds: its compile's -j threads and JOB_OVERHEAD_PIDS more. `--lab` passes it to
+/// lab_jobs as per_job. zig_threads is at most 4096 (the flag's cap) or the lab's core count, so the sum
+/// cannot overflow.
+pub fn job_pids(zig_threads: u32) -> u32 {
+    return zig_threads + JOB_OVERHEAD_PIDS;
+}
+
+/// How many mutants may run at once: the request, cut to what fits in the pids left after the reserve.
+/// per_job is job_pids of the run's -j; 0 is no measurement and refuses. 0 = do not start.
+/// pids_used + PID_RESERVE cannot overflow: Linux caps pid_max at 2^22.
+pub fn lab_jobs(requested: u32, pids_max: u32, pids_used: u32, per_job: u32) -> u32 {
+    if (per_job == 0) { return 0; }
+    if (pids_used + PID_RESERVE >= pids_max) { return 0; }
+    var fit : u32 = (pids_max - pids_used - PID_RESERVE) / per_job;
+    if (fit < requested) { return fit; }
+    return requested;
+}
+
+/// The run states are 0..3 and nothing else.
+invariant the_run_states_are_contiguous { assert RUN_NONE == 0 and RUN_RUNNING == 1 and RUN_DONE == 2 and RUN_LOST == 3; }
+/// 0 is success and every failure has its own code: the tool's 0..2 as the tool gives them, the lab's 3..5.
+invariant the_exit_codes_are_contiguous { assert EXIT_OK == 0 and EXIT_TOOL_FAILED == 1 and EXIT_SURVIVED == 2 and EXIT_NO_RESULT == 3 and EXIT_ORPHANS == 4 and EXIT_STILL_RUNNING == 5; }
+/// The tool's gate code passes through unchanged.
+invariant the_gate_code_passes_through { assert TOOL_RC_SURVIVED == 2 and EXIT_SURVIVED == 2; }
+/// A read gets at least one try, and the poll wait grows before it caps.
+invariant a_read_is_tried_and_the_poll_wait_grows { assert SSH_MAX_ATTEMPTS >= 1 and POLL_BASE_SECONDS > 0 and POLL_BASE_SECONDS < POLL_CAP_SECONDS; }
+/// The reserve leaves the lab room for a run of its own: 1000 is the measured pids.max.
+invariant the_reserve_leaves_room_on_the_lab { assert PID_RESERVE > 0 and PID_RESERVE < 1000; }
+/// The reserve is one batch of 8 jobs at zig's default thread count on the lab's 48 cores.
+invariant the_reserve_is_one_unbounded_batch { assert PID_RESERVE == 8 * (48 + JOB_OVERHEAD_PIDS); }
+
+// Scenario: no directory. Nothing to read, nothing to remove; a launch may start one.
+test no_directory_is_no_run {
+    var s : u8 = run_state(false, false, false);
+    assert s == RUN_NONE;
+    assert run_state(false, true, true) == RUN_NONE;
+    assert launch_allowed(s) == true;
+    assert may_remove(s, 0) == false;
+    assert lab_exit(s, 0, 0) == EXIT_NO_RESULT;
+}
+
+// Scenario: the ssh that waited on the run dropped. The run goes on under nohup; the next call reads
+// the same directory back and must neither start a second run nor delete this one.
+test a_run_cut_by_a_dropped_ssh_is_read_again {
+    var s : u8 = run_state(true, false, true);
+    assert s == RUN_RUNNING;
+    assert launch_allowed(s) == false;
+    assert may_remove(s, 0) == false;
+    assert lab_exit(s, 0, 0) == EXIT_STILL_RUNNING;
+    assert lab_exit(s, 1, 2) == EXIT_STILL_RUNNING;
+}
+
+// Scenario: the tool returned and wrote its exit file while the wrapper is still closing.
+test an_exit_file_wins_over_a_runner_still_closing {
+    assert run_state(true, true, true) == RUN_DONE;
+    assert run_state(true, true, false) == RUN_DONE;
+}
+
+// Scenario: acceptance of #7050 -- the run finished, every mutant was killed, nothing was left behind.
+test a_clean_finished_run_exits_0_and_is_removed {
+    var s : u8 = run_state(true, true, false);
+    assert lab_exit(s, 0, 0) == EXIT_OK;
+    assert may_remove(s, 0) == true;
+    assert launch_allowed(s) == false;
+}
+
+// Scenario: the remote tool failed (red unmutated spec, or mutants not run), or exited with a code it
+// does not define (101 is a Rust panic): both are a failed tool, never a verdict.
+test a_failed_tool_exits_1 {
+    var s : u8 = run_state(true, true, false);
+    assert lab_exit(s, 1, 0) == EXIT_TOOL_FAILED;
+    assert lab_exit(s, 3, 0) == EXIT_TOOL_FAILED;
+    assert lab_exit(s, 101, 0) == EXIT_TOOL_FAILED;
+    assert may_remove(s, 0) == true;
+}
+
+// Scenario: #7303 -- the survivor gate failed on the lab. `--lab` exits 2, as the local run would,
+// and the directory still goes: the verdict is read.
+test a_failed_survivor_gate_passes_through_as_2 {
+    var s : u8 = run_state(true, true, false);
+    assert lab_exit(s, 2, 0) == EXIT_SURVIVED;
+    assert lab_exit(s, 2, 1) == EXIT_ORPHANS;
+    assert lab_exit(RUN_RUNNING, 2, 0) == EXIT_STILL_RUNNING;
+    assert lab_exit(RUN_LOST, 2, 0) == EXIT_NO_RESULT;
+    assert may_remove(s, 0) == true;
+}
+
+// Scenario: trap T9 -- a test binary outlived its run. It is killed before the directory goes, and
+// the exit code says so even when the tool also failed.
+test orphans_are_killed_before_the_directory_goes {
+    var s : u8 = run_state(true, true, false);
+    assert may_remove(s, 1) == false;
+    assert may_remove(RUN_LOST, 1) == false;
+    assert lab_exit(s, 0, 1) == EXIT_ORPHANS;
+    assert lab_exit(s, 1, 2) == EXIT_ORPHANS;
+}
+
+// Scenario: the lab restarted mid-run. No exit file, no runner: no result, and the directory may go.
+test a_lost_run_has_no_result_and_may_be_removed {
+    var s : u8 = run_state(true, false, false);
+    assert s == RUN_LOST;
+    assert lab_exit(s, 0, 0) == EXIT_NO_RESULT;
+    assert lab_exit(s, 0, 3) == EXIT_NO_RESULT;
+    assert may_remove(s, 0) == true;
+    assert launch_allowed(s) == false;
+}
+
+// Scenario: a state code outside 0..3 is no result, never success, and is never removed.
+test an_unknown_state_is_no_result {
+    assert lab_exit(7, 0, 0) == EXIT_NO_RESULT;
+    assert may_remove(7, 0) == false;
+    assert launch_allowed(7) == false;
+}
+
+// Scenario: a read over ssh fails transiently. Tried 3 times in all, then given up.
+test a_read_is_tried_three_times {
+    assert ssh_should_retry(1, true, false) == true;
+    assert ssh_should_retry(2, true, false) == true;
+    assert ssh_should_retry(3, true, false) == false;
+    assert ssh_should_retry(4, true, false) == false;
+}
+
+// Scenario: the launch ssh dropped. It is never resent; run_state says whether it landed.
+test a_write_is_never_retried_blindly {
+    assert ssh_should_retry(1, true, true) == false;
+    assert ssh_should_retry(0, true, true) == false;
+}
+
+// Scenario: a permanent failure (no such service, refused key) is not retried.
+test a_permanent_failure_is_not_retried {
+    assert ssh_should_retry(1, false, false) == false;
+    assert ssh_should_retry(0, false, false) == false;
+}
+
+test polls_wait_5_10_20_40_then_60 {
+    assert poll_wait_seconds(0) == 5;
+    assert poll_wait_seconds(1) == 10;
+    assert poll_wait_seconds(2) == 20;
+    assert poll_wait_seconds(3) == 40;
+    assert poll_wait_seconds(4) == 60;
+    assert poll_wait_seconds(5) == 60;
+    assert poll_wait_seconds(1000000) == 60;
+}
+
+// Scenario: the probe's own numbers -- 8 jobs on 48 cores run with -j6.
+test zig_j_shares_the_cores_between_the_jobs {
+    assert zig_j(48, 8) == 6;
+    assert zig_j(48, 1) == 48;
+    assert zig_j(48, 7) == 6;
+    assert zig_j(48, 48) == 1;
+    assert zig_j(48, 64) == 1;
+    assert zig_j(4, 3) == 1;
+}
+
+test zig_j_with_no_jobs_is_1 {
+    assert zig_j(48, 0) == 1;
+    assert zig_j(0, 0) == 1;
+}
+
+// Scenario: one job alone, as measured: 9 tasks with -j6, 51 with -j48.
+test a_job_holds_its_zig_threads_and_3_more {
+    assert job_pids(zig_j(48, 8)) == 9;
+    assert job_pids(zig_j(48, 1)) == 51;
+    assert job_pids(1) == 4;
+}
+
+// Scenario: the lab after its tini redeploy, 36 of 1000 pids in use. 8 jobs at -j6 cost 72 and fit.
+// With 713 in use (slice 1's probe, before the redeploy) the reserve takes what is left.
+test eight_jobs_fit_the_lab_as_measured {
+    assert lab_jobs(8, 1000, 36, job_pids(zig_j(48, 8))) == 8;
+    assert lab_jobs(100, 1000, 36, job_pids(zig_j(48, 8))) == 61;
+    assert lab_jobs(8, 1000, 713, job_pids(zig_j(48, 8))) == 0;
+}
+
+// Scenario: the lab nearly full. Jobs are cut to what fits, and none start inside the reserve.
+test a_full_lab_cuts_or_refuses_the_jobs {
+    assert lab_jobs(8, 1000, 521, 9) == 7;
+    assert lab_jobs(8, 1000, 583, 9) == 1;
+    assert lab_jobs(8, 1000, 584, 9) == 0;
+    assert lab_jobs(8, 1000, 591, 1) == 1;
+    assert lab_jobs(8, 1000, 592, 1) == 0;
+    assert lab_jobs(8, 1000, 950, 1) == 0;
+    assert lab_jobs(8, 1000, 1000, 1) == 0;
+    assert lab_jobs(8, 1000, 1200, 1) == 0;
+}
+
+// Scenario: the edge of the default batch: 8 jobs at -j6 need 72 pids above the reserve.
+test the_measured_cost_cuts_the_default_batch {
+    assert lab_jobs(8, 1000, 520, job_pids(zig_j(48, 8))) == 8;
+    assert lab_jobs(8, 1000, 521, job_pids(zig_j(48, 8))) == 7;
+}
+
+test lab_jobs_with_no_measurement_refuses {
+    assert lab_jobs(8, 1000, 0, 0) == 0;
+}
+
+test lab_jobs_never_exceeds_the_request {
+    assert lab_jobs(1, 1000, 0, 1) == 1;
+    assert lab_jobs(0, 1000, 0, 1) == 0;
+}

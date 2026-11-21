@@ -1,0 +1,385 @@
+module TrinityBramTritRomT27;
+
+// Read-only store of the block-RAM trit packing bench (fpga/ax7203/tms_bram_bench.v):
+// the words of a fixed tensor are array initializers, which yosys maps to the
+// RAMB36E1 INIT and INITP contents, so configuration loads them and a run only
+// reads. tools/generate-bram-bench.py --rom-trits writes one copy per format with
+// the tensor's words (encoded by the rules of t27/rtl/bram_trit_codec.t27) and
+// renames it to the engine module of that format, so the adapter wires it like
+// t27/rtl/bram_trit_engine.t27: same ports, enc_word unused, enc_lanes and
+// write_ticks zero.
+//
+// A run reads every word once, one read per enabled clock, decodes it and
+// reports what the engine reports: read ticks, invalid groups, the count of +1
+// and -1 trits, the dot product with the activations (index mod 8) + 1 and the
+// rotate-xor checksum of the stored words. There is no regenerated stream to
+// compare with, so the store checks itself: the rotate-xor checksum of the
+// decoded lanes must equal LANES_CHECK, the host's checksum of the tensor's trits
+// in lane code, and bad_words is 1 when it does not. The host compares every
+// other field with its model (tools/bram_trit_model.py, rom_results).
+//
+// The store is the engine's: four banks of up to 16384 words (see
+// bram_trit_engine.t27 for why), each read straight into a read register.
+// PIPE 0 decodes, sums and accumulates a word in the tick after its read, as the
+// engine does (read_ticks = WORDS + 1). PIPE 1 splits that into four ticks: a
+// register after the decoder (d_*), one after the sums over each half of the
+// lanes (h_*), one after the per-word sums (s_*), then the accumulators, so the
+// longest path is one of those steps instead of all of them (read_ticks =
+// WORDS + 4). Both report the same fields and values.
+// PAIR 1 (the d5p layout) stores 45 trits in a pair of words: each word's bits 31:0
+// are four dense5 bytes, decoded by the adapter's d5 decoder, and the two parity
+// nibbles are one more dense5 byte (low nibble in the first word, high nibble in the
+// second), decoded here into lanes 20-24 of the second word. The words carry 20 and
+// 25 lanes; LANES is the larger, LANES_OUT the trits per pair that the report shows.
+// Every statement of on_clock reads a variable before the same tick writes it.
+const FORMAT: u32 = 2;
+const LANES: u32 = 22;
+const WORDS: u32 = 4;
+const BANK_BITS: u32 = 14;
+const BANK_MASK: u32 = 16383;
+const B0_WORDS: u32 = 4;
+const B1_WORDS: u32 = 1;
+const B2_WORDS: u32 = 1;
+const B3_WORDS: u32 = 1;
+const LANES_CHECK: u64 = 0;
+const PIPE: u32 = 0;
+const PAIR: u32 = 0;
+const BYTE_LANES: u32 = 22;
+const LANES_OUT: u32 = 22;
+const WORD_MASK: u64 = 68719476735;
+const PH_IDLE: u32 = 0;
+const PH_READ: u32 = 2;
+const PH_DONE: u32 = 3;
+
+var mem_b0: [B0_WORDS]u64 = [B0_WORDS]u64{ 0, 0, 0, 0 };
+var mem_b1: [B1_WORDS]u64 = [B1_WORDS]u64{ 0 };
+var mem_b2: [B2_WORDS]u64 = [B2_WORDS]u64{ 0 };
+var mem_b3: [B3_WORDS]u64 = [B3_WORDS]u64{ 0 };
+var rdata_b0: u64;
+var rdata_b1: u64;
+var rdata_b2: u64;
+var rdata_b3: u64;
+var r_bank: u32 = 0;
+var phase: u32 = 0;
+var r_addr: u32 = 0;
+var r_issue: bool = false;
+var r_valid: bool = false;
+var checked: u32 = 0;
+var act_base: u32 = 0;
+var read_ticks: u32 = 0;
+var bad_words: u32 = 0;
+var invalid_groups: u32 = 0;
+var pos: u32 = 0;
+var neg: u32 = 0;
+var dot: i64 = 0;
+var chk: u64 = 0;
+var lchk: u64 = 0;
+var done: bool = false;
+var accumulated: u32 = 0;
+var d_valid: bool = false;
+var d_lanes: u64 = 0;
+var d_word: u64 = 0;
+var d_inv: u32 = 0;
+var d_base: u32 = 0;
+var h_valid: bool = false;
+var h_pos_lo: u32 = 0;
+var h_pos_hi: u32 = 0;
+var h_neg_lo: u32 = 0;
+var h_neg_hi: u32 = 0;
+var h_dot_lo: i64 = 0;
+var h_dot_hi: i64 = 0;
+var h_word: u64 = 0;
+var h_lanes: u64 = 0;
+var h_inv: u32 = 0;
+var s_valid: bool = false;
+var w_odd: bool = false;
+var nib_saved: u32 = 0;
+var s_pos: u32 = 0;
+var s_neg: u32 = 0;
+var s_dot: i64 = 0;
+var s_word: u64 = 0;
+var s_lanes: u64 = 0;
+var s_inv: u32 = 0;
+
+fn lane_mask(lanes: u32) -> u64 {
+    var one: u64 = 1;
+    return (one << (lanes << 1)) - 1;
+}
+
+fn count_code(lanes: u64, want: u64) -> u32 {
+    var n: u32 = 0;
+    var j: u32 = 0;
+    while (j < 25) {
+        if (j < LANES) {
+            if (((lanes >> (j << 1)) & 3) == want) { n = n + 1; }
+        }
+        j = j + 1;
+    }
+    return n;
+}
+
+// Sum of trit * activation over the word's lanes; the activation of global trit
+// index i is (i mod 8) + 1 and base = (index of lane 0) mod 8.
+fn weighted(lanes: u64, base: u32) -> i64 {
+    var sum: i64 = 0;
+    var j: u32 = 0;
+    while (j < 25) {
+        if (j < LANES) {
+            var code: u64 = (lanes >> (j << 1)) & 3;
+            var act: i64 = (((base + j) & 7) + 1) as i64;
+            if (code == 1) { sum = sum + act; }
+            if (code == 2) { sum = sum - act; }
+        }
+        j = j + 1;
+    }
+    return sum;
+}
+
+// count_code and weighted over the lanes first..last-1 only (the halves of PIPE 1).
+fn count_range(lanes: u64, want: u64, first: u32, last: u32) -> u32 {
+    var n: u32 = 0;
+    var j: u32 = 0;
+    while (j < 25) {
+        if (j >= first && j < last && j < LANES) {
+            if (((lanes >> (j << 1)) & 3) == want) { n = n + 1; }
+        }
+        j = j + 1;
+    }
+    return n;
+}
+
+fn weighted_range(lanes: u64, base: u32, first: u32, last: u32) -> i64 {
+    var sum: i64 = 0;
+    var j: u32 = 0;
+    while (j < 25) {
+        if (j >= first && j < last && j < LANES) {
+            var code: u64 = (lanes >> (j << 1)) & 3;
+            var act: i64 = (((base + j) & 7) + 1) as i64;
+            if (code == 1) { sum = sum + act; }
+            if (code == 2) { sum = sum - act; }
+        }
+        j = j + 1;
+    }
+    return sum;
+}
+
+fn rotl1(x: u64) -> u64 {
+    return (x << 1) | (x >> 63);
+}
+
+// The parity byte of a d5p pair, as the codec's dense5 decoder reads a byte.
+fn lane_of_digit(digit: u16) -> u64 {
+    if (digit == 0) { return 2; }
+    if (digit == 1) { return 0; }
+    return 1;
+}
+
+fn group5_lanes(code: u16) -> u64 {
+    if (code < 243) {
+        return lane_of_digit(code % 3) | (lane_of_digit((code / 3) % 3) << 2)
+            | (lane_of_digit((code / 9) % 3) << 4) | (lane_of_digit((code / 27) % 3) << 6)
+            | (lane_of_digit((code / 81) % 3) << 8);
+    }
+    return 0;
+}
+
+// Lanes 20-24 of a pair's second word (0 for any other word) and its invalid count.
+fn pair_lanes_of(pair: u32, odd: bool, code: u16) -> u64 {
+    if (pair == 1 && odd) { return group5_lanes(code) << 40; }
+    return 0;
+}
+
+fn pair_invalid_of(pair: u32, odd: bool, code: u16) -> u32 {
+    if (pair == 1 && odd && code >= 243) { return 1; }
+    return 0;
+}
+
+// Global trits consumed by one word: 20 then 25 in a pair, LANES otherwise.
+fn lanes_step(pair: u32, odd: bool) -> u32 {
+    if (pair == 1) {
+        if (odd) { return 25; }
+        return 20;
+    }
+    return LANES;
+}
+
+fn pick_lanes(pipe: u32, staged: u64, direct: u64) -> u64 {
+    if (pipe == 1) { return staged; }
+    return direct;
+}
+
+fn select_bank(bank: u32, w0: u64, w1: u64, w2: u64, w3: u64) -> u64 {
+    if (bank == 0) { return w0; }
+    if (bank == 1) { return w1; }
+    if (bank == 2) { return w2; }
+    return w3;
+}
+
+// Module-level (combinational), as in the engine.
+var enc_lanes: u64;
+var rdata: u64;
+var nib_now: u32;
+var pair_code: u16;
+var pair_lanes: u64;
+var inv_now: u32;
+var step: u32;
+var got: u64;
+var lchk_next: u64;
+var write_ticks: u32;
+var words_out: u32;
+var format_out: u32;
+var lanes_out: u32;
+rdata = select_bank(r_bank, rdata_b0, rdata_b1, rdata_b2, rdata_b3);
+nib_now = ((rdata >> 32) & 15) as u32;
+pair_code = ((nib_now << 4) | nib_saved) as u16;
+pair_lanes = pair_lanes_of(PAIR, w_odd, pair_code);
+inv_now = (((dec_out >> 48) & 255) as u32) + pair_invalid_of(PAIR, w_odd, pair_code);
+step = lanes_step(PAIR, w_odd);
+got = (dec_out & lane_mask(BYTE_LANES)) | pair_lanes;
+lchk_next = rotl1(lchk) ^ pick_lanes(PIPE, s_lanes, got);
+enc_lanes = 0;
+write_ticks = 0;
+words_out = WORDS;
+format_out = FORMAT;
+lanes_out = LANES_OUT;
+
+// dec_out = decode(FORMAT, rdata) comes from the adapter's decoder instance;
+// enc_word (the encoder instance) is not used.
+fn on_clock(start: bool, enc_word: u64, dec_out: u64) {
+    if (phase == PH_IDLE || phase == PH_DONE) {
+        if (start) {
+            phase = PH_READ;
+            r_addr = 0;
+            r_issue = true;
+            r_valid = false;
+            checked = 0;
+            act_base = 0;
+            read_ticks = 0;
+            bad_words = 0;
+            invalid_groups = 0;
+            pos = 0;
+            neg = 0;
+            dot = 0;
+            chk = 0;
+            lchk = 0;
+            done = false;
+            accumulated = 0;
+            d_valid = false;
+            h_valid = false;
+            s_valid = false;
+            w_odd = false;
+            nib_saved = 0;
+        }
+    } else if (phase == PH_READ && PIPE == 1) {
+        read_ticks = read_ticks + 1;
+        // Accumulate the sums that the previous tick registered.
+        if (s_valid) {
+            invalid_groups = invalid_groups + s_inv;
+            pos = pos + s_pos;
+            neg = neg + s_neg;
+            dot = dot + s_dot;
+            chk = rotl1(chk) ^ s_word;
+            lchk = lchk_next;
+            if (accumulated == WORDS - 1) {
+                if (lchk_next != LANES_CHECK) { bad_words = 1; }
+                phase = PH_DONE;
+                done = true;
+            }
+            accumulated = accumulated + 1;
+        }
+        // Per-word sums from the two halves registered in the previous tick.
+        s_valid = h_valid;
+        s_inv = h_inv;
+        s_pos = h_pos_lo + h_pos_hi;
+        s_neg = h_neg_lo + h_neg_hi;
+        s_dot = h_dot_lo + h_dot_hi;
+        s_word = h_word;
+        s_lanes = h_lanes;
+        // Sums over each half of the lanes that the decoder stage registered.
+        h_valid = d_valid;
+        h_inv = d_inv;
+        h_pos_lo = count_range(d_lanes, 1, 0, 11);
+        h_pos_hi = count_range(d_lanes, 1, 11, 25);
+        h_neg_lo = count_range(d_lanes, 2, 0, 11);
+        h_neg_hi = count_range(d_lanes, 2, 11, 25);
+        h_dot_lo = weighted_range(d_lanes, d_base, 0, 11);
+        h_dot_hi = weighted_range(d_lanes, d_base, 11, 25);
+        h_word = d_word;
+        h_lanes = d_lanes;
+        // Decoder stage: the word read in the previous tick.
+        d_valid = r_valid;
+        d_inv = inv_now;
+        d_lanes = got;
+        d_word = rdata & WORD_MASK;
+        d_base = act_base;
+        if (r_valid) {
+            act_base = (act_base + step) & 7;
+            if (!w_odd) { nib_saved = nib_now; }
+            w_odd = !w_odd;
+        }
+        if (r_issue) {
+            rdata_b0 = mem_b0[r_addr & BANK_MASK];
+            rdata_b1 = mem_b1[r_addr & BANK_MASK];
+            rdata_b2 = mem_b2[r_addr & BANK_MASK];
+            rdata_b3 = mem_b3[r_addr & BANK_MASK];
+            r_bank = r_addr >> BANK_BITS;
+            r_valid = true;
+            if (r_addr == WORDS - 1) { r_issue = false; } else { r_addr = r_addr + 1; }
+        } else {
+            r_valid = false;
+        }
+    } else if (phase == PH_READ) {
+        read_ticks = read_ticks + 1;
+        if (r_valid) {
+            invalid_groups = invalid_groups + inv_now;
+            pos = pos + count_code(got, 1);
+            neg = neg + count_code(got, 2);
+            dot = dot + weighted(got, act_base);
+            chk = rotl1(chk) ^ (rdata & WORD_MASK);
+            lchk = lchk_next;
+            act_base = (act_base + step) & 7;
+            if (!w_odd) { nib_saved = nib_now; }
+            w_odd = !w_odd;
+            if (checked == WORDS - 1) {
+                if (lchk_next != LANES_CHECK) { bad_words = 1; }
+                phase = PH_DONE;
+                done = true;
+            }
+            checked = checked + 1;
+        }
+        if (r_issue) {
+            rdata_b0 = mem_b0[r_addr & BANK_MASK];
+            rdata_b1 = mem_b1[r_addr & BANK_MASK];
+            rdata_b2 = mem_b2[r_addr & BANK_MASK];
+            rdata_b3 = mem_b3[r_addr & BANK_MASK];
+            r_bank = r_addr >> BANK_BITS;
+            r_valid = true;
+            if (r_addr == WORDS - 1) { r_issue = false; } else { r_addr = r_addr + 1; }
+        } else {
+            r_valid = false;
+        }
+    }
+}
+
+test lane_mask_widths { assert_eq(lane_mask(18), 68719476735); assert_eq(lane_mask(22), 17592186044415); }
+test counts_and_weights {
+    assert_eq(count_code(1 | (2 << 2) | (1 << 4), 1), 2);
+    assert_eq(weighted(1 | (2 << 2) | (1 << 4), 0), 1 - 2 + 3);
+    assert_eq(weighted(1, 7), 8);
+}
+test rotate_left { assert_eq(rotl1(9223372036854775808), 1); }
+test halves_add_up {
+    assert_eq(count_range(1 | (1 << 30), 1, 0, 11) + count_range(1 | (1 << 30), 1, 11, 25), 2);
+    assert_eq(weighted_range(1 | (2 << 30), 3, 0, 11) + weighted_range(1 | (2 << 30), 3, 11, 25), weighted(1 | (2 << 30), 3));
+}
+test pair_parity_byte {
+    assert_eq(group5_lanes(121), 0);
+    assert_eq(pair_lanes_of(1, true, 242), 341 << 40);
+    assert_eq(pair_lanes_of(1, false, 242), 0);
+    assert_eq(pair_invalid_of(1, true, 250), 1);
+    assert_eq(lanes_step(1, true), 25);
+    assert_eq(lanes_step(1, false), 20);
+}
+test pick_lanes_by_pipe { assert_eq(pick_lanes(1, 5, 6), 5); assert_eq(pick_lanes(0, 5, 6), 6); }
+test bank_select { assert_eq(select_bank(0, 5, 6, 7, 8), 5); assert_eq(select_bank(3, 5, 6, 7, 8), 8); }
+endmodule

@@ -1,0 +1,943 @@
+// SPDX-License-Identifier: Apache-2.0
+// t27/specs/nn/attention.t27
+// Sacred Attention Specification
+// Multi-head attention with φ-RoPE and sacred scaling (d_k^(-φ³))
+// φ² + 1/φ² = 3 | TRINITY
+
+module SacredAttention {
+    // Import base types, operations, and math constants
+    use base::types;
+    use base::ops;
+    use math::constants;
+
+    // ═════════════════════════════════════════════════════════════════
+    // 1. Constants
+    // ═════════════════════════════════════════════════════════════════════════
+
+    // TRINITY-based configuration
+    const NUM_HEADS : usize = 3;           // 3 heads (TRINITY)
+    const HEAD_DIM : usize = 81;            // 81 dim per head (3⁴)
+    const EMBED_DIM : usize = 243;          // Total embedding (3 × 81)
+    const CONTEXT_LEN : usize = 81;         // Max sequence length
+    const ROPE_PAIRS : usize = 40;          // 81/2 = 40 pairs (1 unrotated)
+
+    // Sacred scaling: φ⁻³ and d_k^(-φ³)
+    const SACRED_GAMMA : f64 = constants::PHI_CUBED_INV;  // φ⁻³ ≈ 0.236
+    const SACRED_SCALE : f64 = pow(81.0, -SACRED_GAMMA); // 81^(-φ⁻³) ≈ 0.354
+
+    // Attention types
+    const ATTN_CAUSAL : u8 = 0;     // Causal (autoregressive) attention
+    const ATTN_BIDIR : u8 = 1;      // Bidirectional attention
+    const ATTN_SPARSE : u8 = 2;     // Sparse (local) attention
+
+    // Attention phase states
+    const PHASE_QUERY : u8 = 0;     // Compute Q projections
+    const PHASE_KEY : u8 = 1;       // Compute K projections
+    const PHASE_VALUE : u8 = 2;     // Compute V projections
+    const PHASE_SCORE : u8 = 3;     // Compute attention scores
+    const PHASE_SOFTMAX : u8 = 4;   // Apply softmax
+    const PHASE_WEIGHT : u8 = 5;    // Apply to values
+
+    // ═════════════════════════════════════════════════════════════════
+    // 2. RoPE Tables
+    // ═════════════════════════════════════════════════════════════════════════
+
+    // φ-RoPE tables: [CONTEXT_LEN × ROPE_PAIRS]
+    // Each entry is precomputed cos(p * θ_i) and sin(p * θ_i)
+    // where θ_i = φ^(-2i/HEAD_DIM) for i=0..ROPE_PAIRS-1
+    struct RoPETables {
+        cos : [CONTEXT_LEN * ROPE_PAIRS]f64,
+        sin : [CONTEXT_LEN * ROPE_PAIRS]f64,
+    }
+
+    var rope_tables : RoPETables;
+
+    // ═════════════════════════════════════════════════════════════════
+    // 3. Attention State
+    // ═════════════════════════════════════════════════════════════════════════
+
+    // Attention buffers (allocated per forward pass)
+    struct AttentionBuffers {
+        q_buffer : [EMBED_DIM]f64,     // Query projections
+        k_buffer : [EMBED_DIM]f64,     // Key projections
+        v_buffer : [EMBED_DIM]f64,     // Value projections
+        scores : [NUM_HEADS * CONTEXT_LEN]f64,  // Attention scores
+        concat : [EMBED_DIM]f64,       // Concatenated head outputs
+    }
+
+    // ═════════════════════════════════════════════════════════════════
+    // 4. Initialization
+    // ═════════════════════════════════════════════════════════════════════════
+
+    // sacred_attention_init() → void
+    // Initialize φ-RoPE tables
+    // θ_i = φ^(-2i/HEAD_DIM) for i=0..ROPE_PAIRS-1
+    // For each position p: cos(p*θ_i), sin(p*θ_i)
+    fn sacred_attention_init() -> void {
+        var p : usize = 0;
+
+        while (p < CONTEXT_LEN) {
+            var i : usize = 0;
+
+            while (i < ROPE_PAIRS) {
+                // Compute freq = φ^(-2i/HEAD_DIM)
+                const freq_exponent = -2.0 * (i as f64) / (HEAD_DIM as f64);
+                const freq = pow(constants::PHI, freq_exponent);
+
+                // angle = position * freq
+                const angle = (p as f64) * freq;
+
+                // cos and sin
+                const cos_val = cos(angle);
+                const sin_val = sin(angle);
+
+                // Store in tables
+                const table_offset = p * ROPE_PAIRS + i;
+                rope_tables.cos[table_offset] = cos_val;
+                rope_tables.sin[table_offset] = sin_val;
+
+                i = i + 1;
+            }
+
+            p = p + 1;
+        }
+    }
+
+    // ═════════════════════════════════════════════════════════════════
+    // 5. Main Attention Kernel
+    // ═════════════════════════════════════════════════════════════════════════
+
+    // sacred_attention_kernel(
+    //   input: []f32,              // [EMBED_DIM] input embeddings
+    //   w_q: []Trit, w_k: []Trit, w_v: []Trit, w_o: []Trit, // Ternary weights
+    //   position: usize,
+    //   seq_len: usize,
+    //   output: []f32,             // [EMBED_DIM] output
+    //   cache_k: []f32, cache_v: []f32,  // [CONTEXT_LEN][EMBED_DIM]
+    // ) → void
+    // Single position forward pass with sacred scaling
+    fn sacred_attention_kernel(
+        input: []f64,
+        w_q: []Trit, w_k: []Trit, w_v: []Trit, w_o: []Trit,
+        position: usize,
+        seq_len: usize,
+        output: []f64,
+        cache_k: []f64, cache_v: []f64,
+    ) -> void {
+        var buffers = AttentionBuffers{
+            .q_buffer = [0.0; EMBED_DIM],
+            .k_buffer = [0.0; EMBED_DIM],
+            .v_buffer = [0.0; EMBED_DIM],
+            .scores = [0.0; NUM_HEADS * CONTEXT_LEN],
+            .concat = [0.0; EMBED_DIM],
+        };
+
+        // Step 1: Project Q, K, V via ternary matmul
+        project_qkv(&buffers, input, w_q, w_k, w_v);
+
+        // Step 2: Apply φ-RoPE to Q and K
+        apply_rope_qk(&buffers, position);
+
+        // Step 3: Cache K and V
+        cache_kv(&buffers, position, cache_k, cache_v);
+
+        // Step 4: Compute attention scores (Q @ K^T * SACRED_SCALE)
+        compute_scores(&buffers, position, seq_len, cache_k);
+
+        // Step 5: Apply softmax to scores
+        apply_softmax(&buffers, seq_len);
+
+        // Step 6: Weighted sum of values
+        weighted_values(&buffers, seq_len, cache_v);
+
+        // Step 7: Output projection via W_o
+        project_output(&buffers, w_o, output);
+
+        // Step 8: Add residual connection
+        add_residual(output, input);
+    }
+
+    // ═════════════════════════════════════════════════════════════════
+    // 6. Q/K/V Projection
+    // ═════════════════════════════════════════════════════════════════════════
+
+    // project_qkv(buffers, input, w_q, w_k, w_v) → void
+    // Compute Q, K, V projections using ternary matrix multiplication
+    // Q[i] = Σ_j input[j] * W_q[j][i]
+    // Using ternary weights: W_q[j][i] ∈ {-1, 0, +1}
+    fn project_qkv(
+        buffers: *AttentionBuffers,
+        input: []f64,
+        w_q: []Trit, w_k: []Trit, w_v: []Trit,
+    ) -> void {
+        // Compute Q
+        ternary_matmul(input, w_q, &buffers.q_buffer, EMBED_DIM, EMBED_DIM);
+
+        // Compute K
+        ternary_matmul(input, w_k, &buffers.k_buffer, EMBED_DIM, EMBED_DIM);
+
+        // Compute V
+        ternary_matmul(input, w_v, &buffers.v_buffer, EMBED_DIM, EMBED_DIM);
+    }
+
+    // ternary_matmul(input, weights, output, in_dim, out_dim) → void
+    // Matrix multiplication with ternary weights
+    fn ternary_matmul(
+        input: []f64,
+        weights: []Trit,
+        output: []f64,
+        in_dim: usize,
+        out_dim: usize,
+    ) -> void {
+        var i : usize = 0;
+
+        while (i < out_dim) {
+            var acc : f64 = 0.0;
+            var j : usize = 0;
+
+            while (j < in_dim) {
+                const weight_val = weights[j * out_dim + i] as i8;
+
+                if (weight_val == 1) {
+                    acc = acc + input[j];
+                } else if (weight_val == -1) {
+                    acc = acc - input[j];
+                }
+
+                j = j + 1;
+            }
+
+            output[i] = acc;
+            i = i + 1;
+        }
+    }
+
+    // ═════════════════════════════════════════════════════════════════
+    // 7. φ-RoPE Application
+    // ═════════════════════════════════════════════════════════════════════════
+
+    // apply_rope_qk(buffers, position) → void
+    // Apply φ-RoPE rotation to Q and K
+    // Rotates pairs of dimensions using precomputed tables
+    fn apply_rope_qk(buffers: *AttentionBuffers, position: usize) -> void {
+        // `rope_tables.cos` is [CONTEXT_LEN * ROPE_PAIRS] and this reads
+        // `position * ROPE_PAIRS + pair_idx`. Nothing bounded `position`, so a
+        // caller past the end read off the end of the table -- a panic in the
+        // generated Rust, and a silent read in C, where a []T is a bare pointer.
+        if (position >= CONTEXT_LEN) {
+            return;
+        }
+        var h : usize = 0;
+
+        while (h < NUM_HEADS) {
+            const head_offset = h * HEAD_DIM;
+            var pair_idx : usize = 0;
+
+            while (pair_idx < ROPE_PAIRS) {
+                const idx0 = head_offset + pair_idx;
+                const idx1 = head_offset + pair_idx + ROPE_PAIRS;
+
+                const table_offset = position * ROPE_PAIRS + pair_idx;
+                const cos_val = rope_tables.cos[table_offset];
+                const sin_val = rope_tables.sin[table_offset];
+
+                // Rotate Q
+                const q0 = buffers.q_buffer[idx0];
+                const q1 = buffers.q_buffer[idx1];
+                buffers.q_buffer[idx0] = q0 * cos_val - q1 * sin_val;
+                buffers.q_buffer[idx1] = q0 * sin_val + q1 * cos_val;
+
+                // Rotate K
+                const k0 = buffers.k_buffer[idx0];
+                const k1 = buffers.k_buffer[idx1];
+                buffers.k_buffer[idx0] = k0 * cos_val - k1 * sin_val;
+                buffers.k_buffer[idx1] = k0 * sin_val + k1 * cos_val;
+
+                pair_idx = pair_idx + 1;
+            }
+
+            h = h + 1;
+        }
+    }
+
+    // ═════════════════════════════════════════════════════════════════
+    // 8. KV Caching
+    // ═════════════════════════════════════════════════════════════════════════
+
+    // cache_kv(buffers, position, cache_k, cache_v) → void
+    // Cache K and V at the current position
+    fn cache_kv(
+        buffers: *AttentionBuffers,
+        position: usize,
+        cache_k: []f64, cache_v: []f64,
+    ) -> void {
+        // The shape is stated in a comment on the declaration --
+        // `cache_k: []f64, cache_v: []f64,  // [CONTEXT_LEN][EMBED_DIM]` -- and
+        // was enforced nowhere. `position` indexes into that, so an unbounded
+        // one writes past the end.
+        if (position >= CONTEXT_LEN) {
+            return;
+        }
+        const offset = position * EMBED_DIM;
+        var i : usize = 0;
+
+        while (i < EMBED_DIM) {
+            cache_k[offset + i] = buffers.k_buffer[i];
+            cache_v[offset + i] = buffers.v_buffer[i];
+            i = i + 1;
+        }
+    }
+
+    // ═════════════════════════════════════════════════════════════════
+    // 9. Score Computation
+    // ═════════════════════════════════════════════════════════════════════════
+
+    // compute_scores(buffers, position, seq_len, cache_k) → void
+    // Compute attention scores: Q @ K^T * SACRED_SCALE
+    // For causal attention: only positions <= current position
+    fn compute_scores(
+        buffers: *AttentionBuffers,
+        position: usize,
+        seq_len: usize,
+        cache_k: []f64,
+    ) -> void {
+        // `buffers.scores` is [NUM_HEADS * CONTEXT_LEN] and the write index is
+        // `h * CONTEXT_LEN + j` with `j < seq_len`. A `seq_len` above
+        // CONTEXT_LEN therefore runs off the end of every head's row.
+        var bounded_len : usize = seq_len;
+        if (bounded_len > CONTEXT_LEN) {
+            bounded_len = CONTEXT_LEN;
+        }
+        var h : usize = 0;
+
+        while (h < NUM_HEADS) {
+            const head_offset = h * HEAD_DIM;
+            var j : usize = 0;
+
+            while (j < bounded_len) {
+                // Skip if j > position (causal mask)
+                if (j > position) {
+                    buffers.scores[h * CONTEXT_LEN + j] = 0.0;
+                    j = j + 1;
+                    continue;
+                }
+
+                // Compute dot product: Q_head · K_head[j]
+                var score : f64 = 0.0;
+                var d : usize = 0;
+
+                while (d < HEAD_DIM) {
+                    const q_val = buffers.q_buffer[head_offset + d];
+                    const k_val = cache_k[j * EMBED_DIM + head_offset + d];
+                    score = score + q_val * k_val;
+                    d = d + 1;
+                }
+
+                // Apply sacred scale
+                buffers.scores[h * CONTEXT_LEN + j] = score * SACRED_SCALE;
+                j = j + 1;
+            }
+
+            h = h + 1;
+        }
+    }
+
+    // ═════════════════════════════════════════════════════════════════
+    // 10. Softmax
+    // ═════════════════════════════════════════════════════════════════════════
+
+    // apply_softmax(buffers, seq_len) → void
+    // Apply softmax to attention scores for each head
+    // softmax(x) = exp(x - max) / Σ exp(x - max)
+    fn apply_softmax(buffers: *AttentionBuffers, seq_len: usize) -> void {
+        var h : usize = 0;
+
+        while (h < NUM_HEADS) {
+            // Find max
+            var max_score : f64 = -1.0e30;
+            var j : usize = 0;
+
+            while (j < seq_len) {
+                const s = buffers.scores[h * CONTEXT_LEN + j];
+                if (s > max_score) {
+                    max_score = s;
+                }
+                j = j + 1;
+            }
+
+            // Compute exp and sum
+            var sum_exp : f64 = 0.0;
+            j = 0;
+
+            while (j < seq_len) {
+                const s = exp(buffers.scores[h * CONTEXT_LEN + j] - max_score);
+                buffers.scores[h * CONTEXT_LEN + j] = s;
+                sum_exp = sum_exp + s;
+                j = j + 1;
+            }
+
+            // Normalize
+            j = 0;
+            while (j < seq_len) {
+                buffers.scores[h * CONTEXT_LEN + j] =
+                    buffers.scores[h * CONTEXT_LEN + j] / sum_exp;
+                j = j + 1;
+            }
+
+            h = h + 1;
+        }
+    }
+
+    // ═════════════════════════════════════════════════════════════════
+    // 11. Weighted Value Sum
+    // ═════════════════════════════════════════════════════════════════════════
+
+    // weighted_values(buffers, seq_len, cache_v) → void
+    // Compute weighted sum of values: output = Σ attention[j] * V[j]
+    fn weighted_values(
+        buffers: *AttentionBuffers,
+        seq_len: usize,
+        cache_v: []f64,
+    ) -> void {
+        var h : usize = 0;
+
+        while (h < NUM_HEADS) {
+            const head_offset = h * HEAD_DIM;
+            var d : usize = 0;
+
+            while (d < HEAD_DIM) {
+                var weighted_sum : f64 = 0.0;
+                var j : usize = 0;
+
+                while (j < seq_len) {
+                    const weight = buffers.scores[h * CONTEXT_LEN + j];
+                    const v_val = cache_v[j * EMBED_DIM + head_offset + d];
+                    weighted_sum = weighted_sum + weight * v_val;
+                    j = j + 1;
+                }
+
+                buffers.concat[head_offset + d] = weighted_sum;
+                d = d + 1;
+            }
+
+            h = h + 1;
+        }
+    }
+
+    // ═════════════════════════════════════════════════════════════════
+    // 12. Output Projection
+    // ═════════════════════════════════════════════════════════════════════════
+
+    // project_output(buffers, w_o, output) → void
+    // Apply output projection: output = concat @ W_o
+    // Using ternary weights
+    fn project_output(
+        buffers: *AttentionBuffers,
+        w_o: []Trit,
+        output: []f64,
+    ) -> void {
+        ternary_matmul(buffers.concat, w_o, output, EMBED_DIM, EMBED_DIM);
+    }
+
+    // ═════════════════════════════════════════════════════════════════
+    // 13. Residual Connection
+    // ═════════════════════════════════════════════════════════════════════════
+
+    // add_residual(output, input) → void
+    // Add residual connection: output = output + input
+    fn add_residual(output: []f64, input: []f64) -> void {
+        var i : usize = 0;
+
+        while (i < output.len()) {
+            output[i] = output[i] + input[i];
+            i = i + 1;
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════════════════════════════════
+    // TDD-Inside-Spec: Tests and Invariants for SacredAttention
+    // ═══════════════════════════════════════════════════════════════════════════════════════════════════════
+
+    test attn_sacred_scaling_constant
+        given scale = SACRED_SCALE
+        and expected = pow(81.0, -0.2360679)
+        then abs(scale - expected) < 0.001
+
+    test attn_sacred_gamma_is_phi_cubed_inv
+        given gamma = SACRED_GAMMA
+        and phi_inv_cubed = pow(constants::PHI_INV, 3.0)
+        then abs(gamma - phi_inv_cubed) < 0.00001
+
+    test attn_num_heads_is_trinity
+        given heads = NUM_HEADS
+        then heads == 3
+
+    test attn_head_dim_is_three_pow_four
+        given dim = HEAD_DIM
+        then dim == 81  // 3^4
+
+    test attn_embed_dim_is_heads_times_head_dim
+        given embed = EMBED_DIM
+        and computed = NUM_HEADS * HEAD_DIM
+        then embed == computed
+
+    test attn_rope_pairs_is_context_len_div_two
+        given pairs = ROPE_PAIRS
+        and computed = CONTEXT_LEN / 2
+        then pairs == computed
+
+    test attn_ternary_matmul_identity
+        given input = [1.0, 2.0, 3.0, 4.0]
+        and weights = [Trit.pos, Trit.zero, Trit.zero, Trit.zero,
+                       Trit.zero, Trit.pos, Trit.zero, Trit.zero,
+                       Trit.zero, Trit.zero, Trit.pos, Trit.zero,
+                       Trit.zero, Trit.zero, Trit.zero, Trit.pos]
+        and output = [0.0; 4]
+        when ternary_matmul(input, weights, output, 4, 4)
+        then output[0] == 1.0 and output[1] == 2.0 and output[2] == 3.0 and output[3] == 4.0
+
+    test attn_ternary_matmul_negation
+        given input = [1.0, 2.0, 3.0, 4.0]
+        and weights = [Trit.neg, Trit.neg, Trit.neg, Trit.neg,
+                       Trit.neg, Trit.neg, Trit.neg, Trit.neg,
+                       Trit.neg, Trit.neg, Trit.neg, Trit.neg,
+                       Trit.neg, Trit.neg, Trit.neg, Trit.neg]
+        and output = [0.0; 4]
+        when ternary_matmul(input, weights, output, 4, 4)
+        then output[0] == -10.0 and output[1] == -10.0 and output[2] == -10.0 and output[3] == -10.0
+
+    test attn_add_residual_identity
+        given output = [5.0, 10.0, 15.0, 20.0]
+        and input = [2.0, 4.0, 6.0, 8.0]
+        when add_residual(output, input)
+        then output[0] == 7.0 and output[1] == 14.0 and output[2] == 21.0 and output[3] == 28.0
+
+    test attn_softmax_normalization
+        given scores = [1.0, 2.0, 3.0, 4.0]
+        and buffers = AttentionBuffers{...}
+        when buffers.scores[0..4] = scores
+        and apply_softmax(&buffers, 4)
+        and sum = buffers.scores[0] + buffers.scores[1] + buffers.scores[2] + buffers.scores[3]
+        then abs(sum - 1.0) < 0.0001
+
+    test attn_softmax_positive
+        given scores = [1.0, -1.0, 2.0, -2.0]
+        and buffers = AttentionBuffers{...}
+        when buffers.scores[0..4] = scores
+        and apply_softmax(&buffers, 4)
+        and all_positive = (buffers.scores[0] >= 0.0) and
+                          (buffers.scores[1] >= 0.0) and
+                          (buffers.scores[2] >= 0.0) and
+                          (buffers.scores[3] >= 0.0)
+        then all_positive == true
+
+    test attn_sacred_scale_range
+        given scale = SACRED_SCALE
+        then scale > 0.3 and scale < 0.4
+
+    test attn_rope_tables_initialized
+        given tables = rope_tables
+        and sacred_attention_init()
+        then tables.cos[0] > 0.0 and tables.cos.len() == CONTEXT_LEN * ROPE_PAIRS
+
+    test attn_cache_kv_stores_values
+        given buffers = AttentionBuffers{...}
+        and cache_k = [0.0; EMBED_DIM * CONTEXT_LEN]
+        and cache_v = [0.0; EMBED_DIM * CONTEXT_LEN]
+        and buffers.k_buffer = [1.0, 2.0, 3.0]
+        and buffers.v_buffer = [4.0, 5.0, 6.0]
+        when cache_kv(&buffers, 0, cache_k, cache_v)
+        then cache_k[0] == 1.0 and cache_k[1] == 2.0 and cache_v[0] == 4.0 and cache_v[1] == 5.0
+
+    test attn_compute_scores_applies_scale
+        given buffers = AttentionBuffers{...}
+        and cache_k = [0.0; EMBED_DIM * CONTEXT_LEN]
+        and buffers.q_buffer = [1.0, 1.0, 1.0]
+        and buffers.k_buffer = [1.0, 1.0, 1.0]
+        and sacred_attention_init()
+        when cache_kv(&buffers, 0, cache_k, [0.0; EMBED_DIM * CONTEXT_LEN])
+        and compute_scores(&buffers, 0, 1, cache_k)
+        then buffers.scores[0] == 3.0 * SACRED_SCALE
+
+    invariant attn_sacred_gamma_positive
+        assert SACRED_GAMMA > 0.0
+
+    invariant attn_sacred_gamma_less_than_one
+        assert SACRED_GAMMA < 1.0
+
+    invariant attn_sacred_scale_positive
+        assert SACRED_SCALE > 0.0
+
+    invariant attn_sacred_scale_reasonable
+        assert SACRED_SCALE > 0.3 and SACRED_SCALE < 0.4
+
+    invariant attn_num_heads_constant
+        assert NUM_HEADS == 3
+
+    invariant attn_head_dim_constant
+        assert HEAD_DIM == 81
+
+    invariant attn_embed_dim_constant
+        assert EMBED_DIM == 243
+
+    invariant attn_context_len_constant
+        assert CONTEXT_LEN == 81
+
+    invariant attn_rope_pairs_constant
+        assert ROPE_PAIRS == 40
+
+    invariant attn_embed_dim_equals_heads_times_head_dim
+        assert EMBED_DIM == NUM_HEADS * HEAD_DIM
+
+    invariant attn_rope_pairs_is_half_context_len
+        assert ROPE_PAIRS == CONTEXT_LEN / 2
+
+    invariant attn_ternary_matmul_output_dim
+        given input = [0.0; 10]
+        and weights = [Trit.zero; 100]
+        and output = [0.0; 10]
+        and ternary_matmul(input, weights, output, 10, 10)
+        assert output.len() == 10
+
+    invariant attn_add_residual_preserves_dim
+        given output = [0.0; 100]
+        and input = [0.0; 100]
+        and add_residual(output, input)
+        assert output.len() == 100
+
+    invariant attn_softmax_output_probability_distribution
+        given buffers = AttentionBuffers{...}
+        and buffers.scores = [1.0, 2.0, 3.0, 4.0]
+        and apply_softmax(&buffers, 4)
+        and sum = buffers.scores[0] + buffers.scores[1] + buffers.scores[2] + buffers.scores[3]
+        and all_non_neg = (buffers.scores[0] >= 0.0) and
+                         (buffers.scores[1] >= 0.0) and
+                         (buffers.scores[2] >= 0.0) and
+                         (buffers.scores[3] >= 0.0)
+        assert abs(sum - 1.0) < 0.001 and all_non_neg
+
+    invariant attn_rope_cos_in_valid_range
+        given tables = rope_tables
+        and sacred_attention_init()
+        and idx = tables.cos.len() / 2
+        then assert tables.cos[idx] >= -1.0 and tables.cos[idx] <= 1.0
+
+    invariant attn_rope_sin_in_valid_range
+        given tables = rope_tables
+        and sacred_attention_init()
+        and idx = tables.sin.len() / 2
+        then assert tables.sin[idx] >= -1.0 and tables.sin[idx] <= 1.0
+
+    bench attn_ternary_matmul_latency
+        measure: nanoseconds to ternary_matmul([1.0; 243], [Trit.pos; 243*243], [0.0; 243], 243, 243)
+        target: < 5000ns
+
+    bench attn_apply_rope_latency
+        measure: nanoseconds to apply_rope_qk(&buffers, 40)
+        target: < 2000ns
+
+    bench attn_softmax_latency
+        measure: nanoseconds to apply_softmax(&buffers, 81)
+        target: < 3000ns
+
+    bench attn_compute_scores_latency
+        measure: nanoseconds to compute_scores(&buffers, 40, 41, cache_k)
+        target: < 10000ns
+
+    bench attn_weighted_values_latency
+        measure: nanoseconds to weighted_values(&buffers, 41, cache_v)
+        target: < 8000ns
+
+    bench attn_sacred_attention_kernel_latency
+        measure: nanoseconds for sacred_attention_kernel on single position
+        target: < 30000ns
+}
+
+// =====================================================================
+// Phase B2 (epic #181) -- QK-Gain control ablation (appended, separate module)
+// gain=phi^2 vs gain=1.0 vs learned. phi^2 [Open conjecture]; phi^2=phi+1 [Verified].
+// =====================================================================
+
+module AttentionQKGainAblation;
+    use base::types;
+    use math::constants;
+    use numeric::gf16;
+    use nn::attention;
+
+    // =========================================================
+    // 1. Constants
+    // =========================================================
+
+    const PHI : gf16::GF16 = 1.618033988749895;
+    const PHI_SQ : gf16::GF16 = 2.618033988749895;  // phi^2 = phi + 1; [Verified arithmetic]
+    const PHI_SQ_INV : gf16::GF16 = 0.381966011250105; // phi^(-2); [Verified arithmetic]
+
+    // B2 gain variants
+    const GAIN_PHI_SQ : gf16::GF16 = PHI_SQ;      // phi^2 ~ 2.618 [Open conjecture]
+    const GAIN_STANDARD : gf16::GF16 = 1.0;        // Standard (no extra gain)
+    const GAIN_SQRT_PHI : gf16::GF16 = 1.272019649514069; // sqrt(phi) ~ 1.272 [Open conjecture]
+    const GAIN_LEARNED_INIT : gf16::GF16 = 1.0;    // Learned gain initialized at 1.0
+
+    // Attention scaling (kept separate from QK-Gain; standard 1/sqrt(d_k))
+    // Sacred scaling from attention.t27: SACRED_SCALE = 81^(-PHI^(-3)) ~ 0.354
+    // These are combined: effective_scale = SACRED_SCALE * qk_gain^2
+    // (qk_gain is applied to Q and K before dot product -- doubles in the score)
+
+    // =========================================================
+    // 2. Types
+    // =========================================================
+
+    pub const QKGainVariant = enum {
+        PhiSquared,  // gain = phi^2 ~ 2.618  [Open conjecture]
+        Standard,    // gain = 1.0 (baseline)
+        Learned,     // gain starts at 1.0, optimized by AdamW
+        SqrtPhi,     // gain = sqrt(phi) ~ 1.272  [Open conjecture]
+    };
+
+    pub const QKGainConfig = struct {
+        variant : QKGainVariant,
+        head_dim : u32,
+        initial_gain : gf16::GF16,
+        learnable : bool,          // If true, gain is a trained scalar
+        lr_gain : gf16::GF16,      // LR for gain parameter (if learnable)
+    };
+
+    pub const QKGainResult = struct {
+        gain_value : gf16::GF16,   // Effective gain applied
+        score_scale : gf16::GF16,  // Combined score scale (gain^2 / sqrt(head_dim))
+    };
+
+    // =========================================================
+    // 3. Core Functions
+    // =========================================================
+
+    // get_qk_gain(config: QKGainConfig) -> gf16::GF16
+    // Returns the effective QK gain scalar for the given variant.
+    fn get_qk_gain(config: QKGainConfig) -> gf16::GF16 {
+        // PhiSquared: return GAIN_PHI_SQ
+        // Standard:   return GAIN_STANDARD
+        // Learned:    return config.initial_gain (will be trained)
+        // SqrtPhi:    return GAIN_SQRT_PHI
+    }
+
+    // effective_score_scale(gain: gf16::GF16, head_dim: u32) -> gf16::GF16
+    // Computes the combined score scale = gain^2 / sqrt(head_dim).
+    // Standard formula uses gain=1: scale = 1/sqrt(head_dim).
+    // phi^2 formula: scale = phi^4 / sqrt(head_dim).
+    // Note: igla-peek applies gain to both Q and K, so dot product
+    // picks up gain^2 vs the standard 1 factor.
+    fn effective_score_scale(gain: gf16::GF16, head_dim: u32) -> gf16::GF16 {
+        // return gain * gain / sqrt(head_dim as gf16::GF16)
+    }
+
+    // =========================================================
+    // PHASE B2: Constant-identity tests
+    // =========================================================
+
+    // B2-CONST-1: phi^2 = phi + 1 -- [Verified] (L5 corollary)
+    test b2_phi_sq_equals_phi_plus_one
+        given phi = 1.618033988749895
+        when lhs = phi * phi
+        and  rhs = phi + 1.0
+        then approximately_equal(lhs, rhs) // tolerance 1e-12
+
+    // B2-CONST-2: GAIN_PHI_SQ matches igla-peek PHI_SQ
+    test b2_gain_phi_sq_matches_trainer_constant
+        given expected = 1.618033988749895 + 1.0  // phi + 1 = phi^2
+        when val = GAIN_PHI_SQ
+        then approximately_equal(val, expected)   // tolerance 1e-9
+
+    // B2-CONST-3: phi^2 + phi^(-2) = 3 -- [Verified] (Law L5)
+    test b2_trinity_identity_l5
+        given phi = 1.618033988749895
+        when lhs = phi * phi + 1.0 / (phi * phi)
+        then approximately_equal(lhs, 3.0) // tolerance 1e-12
+        // [Verified]: the ONLY phi-fact that is Verified in this codebase.
+
+    // B2-CONST-4: Standard gain is distinct from phi^2
+    test b2_standard_gain_distinct_from_phi_sq
+        then GAIN_PHI_SQ != GAIN_STANDARD
+        and  GAIN_PHI_SQ > 2.0
+        and  GAIN_PHI_SQ < 3.0
+
+    // B2-CONST-5: sqrt(phi) is in valid range
+    test b2_sqrt_phi_in_range
+        given phi = 1.618033988749895
+        when expected = sqrt(phi)
+        then approximately_equal(GAIN_SQRT_PHI, expected) // tolerance 1e-9
+
+    // =========================================================
+    // PHASE B2: Control-test design (QK-Gain ablation)
+    //
+    // FALSIFICATION CRITERION:
+    //   If gain=1.0 (standard) or learned gain reaches BPB within
+    //   Monte-Carlo error of gain=phi^2 on equal budget, phi-specificity
+    //   of the QK-gain design is FALSIFIED.
+    //
+    // Experimental protocol:
+    //   - Metric: BPB on held-out validation set
+    //   - Budget: equal gradient steps; equal HP tuning for lr_gain
+    //   - Baseline: standard attention (Vaswani 2017, 1/sqrt(d_k))
+    //   - Three cells: (a) phi^2, (b) 1.0, (c) learned
+    //   - Optional fourth cell: sqrt(phi) to test sqrt-phi hypothesis
+    //   - All cells use identical architecture; only gain differs
+    //   - muP QK scaling (Yang 2022, 2203.03466) is phi-independent:
+    //     use standard 1/sqrt(d_k) after muP transfer (see B3)
+    // =========================================================
+
+    // B2a: phi^2 gain  [Open conjecture]
+    test b2_variant_a_phi_sq_config
+        given config = QKGainConfig{
+            .variant = QKGainVariant.PhiSquared,
+            .head_dim = 96,
+            .initial_gain = GAIN_PHI_SQ,
+            .learnable = false,
+            .lr_gain = 0.0
+        }
+        when gain = get_qk_gain(config)
+        then approximately_equal(gain, PHI_SQ) // ~ 2.618
+
+    // B2b: standard gain = 1.0 (baseline; Vaswani 2017)
+    test b2_variant_b_standard_config
+        given config = QKGainConfig{
+            .variant = QKGainVariant.Standard,
+            .head_dim = 96,
+            .initial_gain = GAIN_STANDARD,
+            .learnable = false,
+            .lr_gain = 0.0
+        }
+        when gain = get_qk_gain(config)
+        then approximately_equal(gain, 1.0)
+
+    // B2c: learned gain (starts at 1.0, optimized jointly with model)
+    //   Represents: "let the data decide the gain"
+    test b2_variant_c_learned_init
+        given config = QKGainConfig{
+            .variant = QKGainVariant.Learned,
+            .head_dim = 96,
+            .initial_gain = GAIN_LEARNED_INIT,
+            .learnable = true,
+            .lr_gain = 1e-3
+        }
+        when gain_init = get_qk_gain(config)
+        then approximately_equal(gain_init, 1.0)  // starts at 1.0
+        // after training, gain may converge toward phi^2 or elsewhere --
+        // that outcome would be informative but is not asserted here
+
+    // B2d: Score scale is correctly computed per variant
+    test b2_score_scale_phi_sq
+        given gain = GAIN_PHI_SQ
+        and   head_dim = 96
+        when scale = effective_score_scale(gain, head_dim)
+        // phi^4 / sqrt(96) ~ 6.854 / 9.798 ~ 0.7
+        then scale > 0.5 and scale < 1.5
+
+    test b2_score_scale_standard
+        given gain = GAIN_STANDARD
+        and   head_dim = 96
+        when scale = effective_score_scale(gain, head_dim)
+        // 1 / sqrt(96) ~ 0.102
+        then approximately_equal(scale, 1.0 / sqrt(96.0)) // tolerance 1e-6
+
+    // B2e: Ablation scaffold produces finite BPB for all variants
+    test b2_control_ablation_all_variants_finite
+        given n_steps = 500     // mini-run for CI; full run uses 81000
+        and   seed = 43
+        and   bpb_a = run_attention_with_gain(QKGainVariant.PhiSquared, n_steps, seed)
+        and   bpb_b = run_attention_with_gain(QKGainVariant.Standard, n_steps, seed)
+        and   bpb_c = run_attention_with_gain(QKGainVariant.Learned, n_steps, seed)
+        then all_finite([bpb_a, bpb_b, bpb_c])
+        and  all_positive([bpb_a, bpb_b, bpb_c])
+        // NOT asserting bpb_a < bpb_b or bpb_a < bpb_c.
+        // phi-specificity is FALSIFIED if any non-phi variant
+        // matches variant (a) within Monte-Carlo error.
+
+    // =========================================================
+    // PHASE B2: Invariants
+    // =========================================================
+
+    // B2-INV-1: phi^2 gain is in (1, 4) -- plausible range for a score amplifier
+    invariant b2_phi_sq_gain_valid_range
+        then GAIN_PHI_SQ > 1.0
+        and  GAIN_PHI_SQ < 4.0
+
+    // B2-INV-2: standard gain is exactly 1.0
+    invariant b2_standard_gain_is_one
+        then GAIN_STANDARD == 1.0
+
+    // B2-INV-3: effective score scale is positive for any positive gain and head_dim
+    invariant b2_score_scale_positive
+        given gain = random_gf16_in_range(0.01, 10.0)
+        and   head_dim = 96
+        when scale = effective_score_scale(gain, head_dim)
+        then scale > 0.0
+
+    // B2-INV-4: phi^2 gain variant gives strictly higher score scale than gain=1
+    //   (This is a structural invariant -- not a performance claim)
+    invariant b2_phi_sq_scale_greater_than_standard
+        given head_dim = 96
+        when scale_a = effective_score_scale(GAIN_PHI_SQ, head_dim)
+        and  scale_b = effective_score_scale(GAIN_STANDARD, head_dim)
+        then scale_a > scale_b
+
+    // B2-INV-5: Trinity identity preserved -- [Verified] (Law L5)
+    invariant b2_trinity_l5_verified
+        given phi = 1.618033988749895
+        when lhs = phi * phi + 1.0 / (phi * phi)
+        then approximately_equal(lhs, 3.0)
+
+    // B2-INV-6: Gain variants are numerically distinct
+    invariant b2_all_gain_variants_distinct
+        then GAIN_PHI_SQ != GAIN_STANDARD
+        and  GAIN_PHI_SQ != GAIN_SQRT_PHI
+        and  GAIN_STANDARD != GAIN_SQRT_PHI
+
+    // =========================================================
+    // PHASE B2: Benchmarks
+    // =========================================================
+
+    bench b2_forward_pass_phi_sq_gain
+        given config = QKGainConfig{.variant = QKGainVariant.PhiSquared, .head_dim = 96, .initial_gain = GAIN_PHI_SQ, .learnable = false, .lr_gain = 0.0}
+        and   seq_len = 64
+        when result = attention_forward(config, seq_len)
+        then elapsed_time_ms < 5
+
+    bench b2_forward_pass_standard_gain
+        given config = QKGainConfig{.variant = QKGainVariant.Standard, .head_dim = 96, .initial_gain = GAIN_STANDARD, .learnable = false, .lr_gain = 0.0}
+        and   seq_len = 64
+        when result = attention_forward(config, seq_len)
+        then elapsed_time_ms < 5
+        // Both variants must have equal latency (same algorithm, different scalar)
+
+    bench b2_forward_pass_learned_gain
+        given config = QKGainConfig{.variant = QKGainVariant.Learned, .head_dim = 96, .initial_gain = GAIN_LEARNED_INIT, .learnable = true, .lr_gain = 1e-3}
+        and   seq_len = 64
+        when result = attention_forward(config, seq_len)
+        then elapsed_time_ms < 5
+
+    // =========================================================
+    // Mathematical Notes
+    // =========================================================
+    //
+    // QK scoring: score(q, k) = (q @ k^T) * scale
+    //   Standard scale: 1 / sqrt(head_dim)  (Vaswani 2017)
+    //   igla-peek uses: qk_gain applied to Q and K before dot product,
+    //     then 1/sqrt(head_dim) on the dot product.
+    //     Net score = (gain * q) @ (gain * k)^T / sqrt(head_dim)
+    //              = gain^2 * (q @ k^T) / sqrt(head_dim)
+    //   So QK-Gain = phi^2 is equivalent to scaling by phi^4 / sqrt(head_dim).
+    //
+    // Why [Open conjecture] and not [Verified]:
+    //   - phi^2 = phi + 1 is [Verified arithmetic] (L5).
+    //   - That phi^2 is the *optimal* gain for LLM attention is NOT derived
+    //     from any theorem. It is a hypothesis to be tested empirically.
+    //   - muP (Yang 2022, 2203.03466) provides a principled alternative:
+    //     QK scale = 1/sqrt(d_head) after muP initialization. This scale
+    //     is phi-independent (see B3 audit).
+    //
+    // Literature:
+    //   Vaswani et al. 2017: standard 1/sqrt(d_k) scaling rationale.
+    //   Yang et al. 2022 (2203.03466): muP LR transfer; QK scale is 1/d_head.
+    //   igla-peek INV-9: current codebase anchors gain to phi^2 as a hypothesis.
+    //
+    // =========================================================

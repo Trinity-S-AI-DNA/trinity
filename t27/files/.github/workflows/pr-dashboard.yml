@@ -1,0 +1,116 @@
+name: PR Dashboard
+
+on:
+  workflow_dispatch:
+  # No schedule: block. The Queen (Inngest app t27-queen) dispatches this workflow
+  # on '0 * * * *' UTC from the card specs/crons/t27-pr-dashboard.t27.
+  pull_request:
+    types: [opened, synchronize]
+    branches: [master, main]
+
+permissions:
+  pull-requests: write
+  issues: write
+
+jobs:
+  pr-dashboard:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Get PR status
+        id: pr-status
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          echo "# PR Dashboard" > /tmp/pr_dashboard.md
+          echo "" >> /tmp/pr_dashboard.md
+          echo "Generated at: $(date -u '+%Y-%m-%d %H:%M:%S %Z')" >> /tmp/pr_dashboard.md
+          echo "" >> /tmp/pr_dashboard.md
+
+          # Get all open PRs (capture once for reuse)
+          PR_DATA=$(gh pr list --state open --limit 50 --json number,title,headRefName,statusCheckRollup,createdAt,updatedAt)
+
+          # Per-PR one-liner. Use string concatenation in jq instead of broken
+          # \(Created: ...) interpolation that crashed the previous version.
+          echo "$PR_DATA" | jq -r '.[] | "- #\(.number) [\(.title)](\(.headRefName)) | Created: \(.createdAt | split("T")[0]) | Updated: \(.updatedAt | split("T")[0]) | \((.statusCheckRollup // []) | map(select(.conclusion != "SUCCESS" and .conclusion != "SKIPPED" and .conclusion != null)) | length) failing / \((.statusCheckRollup // []) | length) total"' \
+            >> /tmp/pr_dashboard.md
+
+          echo "" >> /tmp/pr_dashboard.md
+
+          # Compute summary counts BEFORE rendering the table.
+          # Prior version referenced $TOTAL / $FAILING before they were assigned,
+          # which crashed under `set -u` with "unbound variable" on every PR.
+          TOTAL=$(echo "$PR_DATA"   | jq -r 'length')
+          FAILING=$(echo "$PR_DATA" | jq -r '[.[] | select((.statusCheckRollup // []) | any(.conclusion == "FAILURE" or .conclusion == "CANCELLED" or .conclusion == "TIMED_OUT"))] | length')
+          # READY used to be `all(SUCCESS or SKIPPED or null)`, which is true of a PR
+          # on which NOTHING has run (`all` over an empty array) and of one still
+          # running (the `null` arm). The same PR was then counted in both READY
+          # and PENDING, so the three columns did not partition TOTAL and a reader
+          # taking them as a breakdown was reading an overlap.
+          #
+          # READY now means what it says: at least one check has posted, and every
+          # one of them concluded. "Nothing has run yet" gets its own column
+          # rather than being folded into ready.
+          READY=$(echo "$PR_DATA"   | jq -r '[.[] | select(((.statusCheckRollup // []) | length) > 0 and ((.statusCheckRollup // []) | all(.conclusion == "SUCCESS" or .conclusion == "SKIPPED")))] | length')
+          NOCHECKS=$(echo "$PR_DATA" | jq -r '[.[] | select(((.statusCheckRollup // []) | length) == 0)] | length')
+          PENDING=$(echo "$PR_DATA" | jq -r '[.[] | select((.statusCheckRollup // []) | any(.conclusion == null))] | length')
+
+          # Summary table
+          echo "## Summary" >> /tmp/pr_dashboard.md
+          echo "" >> /tmp/pr_dashboard.md
+          echo "| Status | Count |" >> /tmp/pr_dashboard.md
+          echo "| --- | --- |" >> /tmp/pr_dashboard.md
+          echo "| Total Open PRs | $TOTAL |" >> /tmp/pr_dashboard.md
+          echo "| PRs with Failing Checks | $FAILING |" >> /tmp/pr_dashboard.md
+          echo "| PRs with All Checks Green | $((TOTAL - FAILING)) |" >> /tmp/pr_dashboard.md
+
+          echo "| READY    | $READY |"    >> /tmp/pr_dashboard.md
+          echo "| FAILING  | $FAILING |"  >> /tmp/pr_dashboard.md
+          echo "| PENDING  | $PENDING |"  >> /tmp/pr_dashboard.md
+          echo "| NO CHECKS YET | $NOCHECKS |" >> /tmp/pr_dashboard.md
+
+          # The four columns must account for every open PR. They are printed as
+          # a breakdown, so if they stop partitioning, say so in the table rather
+          # than letting a reader add them up and get a different number.
+          SUM=$((READY + FAILING + PENDING + NOCHECKS))
+          if [ "$SUM" != "$TOTAL" ]; then
+            echo "" >> /tmp/pr_dashboard.md
+            echo "> **These columns do not partition:** $READY + $FAILING + $PENDING + $NOCHECKS = $SUM, and there are $TOTAL open PRs. A PR is being counted twice or not at all." >> /tmp/pr_dashboard.md
+          fi
+
+          # Seal Status (advisory, non-blocking). The certifying NMSE manifest is
+          # sealed against sha256(bootstrap/src/compiler.rs); when the compiler
+          # changes the committed numbers were certified against an older compiler.
+          # This mirrors scripts/reseal-check.sh and seal-staleness-warn.yml so the
+          # dashboard surfaces staleness without ever gating a merge.
+          echo "" >> /tmp/pr_dashboard.md
+          echo "## Seal Status" >> /tmp/pr_dashboard.md
+          echo "" >> /tmp/pr_dashboard.md
+          MANIFEST="repro/numerics/nmse_manifest.json"
+          SRC="bootstrap/src/compiler.rs"
+          if [ ! -f "$SRC" ]; then
+            echo "- :grey_question: seal source missing ($SRC); cannot verify." >> /tmp/pr_dashboard.md
+          else
+            LIVE=$(sha256sum "$SRC" | awk '{print $1}')
+            SEAL=$(python3 -c "import json; print(json.load(open('$MANIFEST')).get('seal',''))" 2>/dev/null || echo "")
+            if [ -z "$SEAL" ] || [ "$SEAL" = "unsealed" ]; then
+              echo "- :grey_question: **UNSEALED** -- manifest carries no seal; nothing to compare." >> /tmp/pr_dashboard.md
+            elif [ "$LIVE" = "$SEAL" ]; then
+              echo "- :white_check_mark: **fresh** -- sha256(compiler.rs)=\`${LIVE:0:12}\` matches the manifest seal. Certification is current." >> /tmp/pr_dashboard.md
+            else
+              echo "- :warning: **STALE** -- sha256(compiler.rs)=\`${LIVE:0:12}\` != manifest seal=\`${SEAL:0:12}\`." >> /tmp/pr_dashboard.md
+              echo "  The committed NMSE numbers were certified against an older compiler.rs." >> /tmp/pr_dashboard.md
+              echo "  Run \`scripts/reseal-check.sh\` locally for the two-step reseal command (advisory; not a merge gate)." >> /tmp/pr_dashboard.md
+            fi
+          fi
+
+      - name: Post PR Comment
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          gh pr comment "$PR_NUMBER" --body-file /tmp/pr_dashboard.md || echo "PR comment skipped"

@@ -1,0 +1,240 @@
+// SPDX-License-Identifier: Apache-2.0
+// t27/specs/igla/race/ternary_lut_table.t27
+// The mu-deep LUT: partial sums computed ONCE, selected by K output neurons.
+//
+// WHY THIS EXISTS.  W806 built `ternary_mac_group.t27` -- eight ternary lanes
+// sharing one 32-bit accumulator -- and it went the wrong way: CARRY4 per
+// multiply fell from 10.0 to 3.0 exactly as forecast, and LUT per multiply rose
+// from 33.00 to 63.25, because eight independent per-lane selects built 172
+// MUXF7 and 59 MUXF8 that the single MAC does not have (T503).
+//
+// T503 named the mistake: arXiv:2604.25183's `mu` is a LUT indexed by the
+// group's WHOLE CODE WORD, not mu selects sharing an adder. W806 implemented the
+// sharing and skipped the tabulation. This file builds the tabulation.
+//
+// THE ARCHITECTURE, which is theirs and not ours.
+//
+//   mu = 2 activations enter. Every partial sum they can produce under ternary
+//   weights is computed ONCE:
+//
+//       0,  +a0,  -a0,  +a1,  -a1,  a0+a1,  -(a0+a1),  a0-a1,  -(a0-a1)
+//
+//   Nine values, and only TWO adders build them -- `a0+a1` and `a0-a1`; every
+//   other entry is a negation or a wire. That is the whole economy of the
+//   method: the adders are paid once and read many times.
+//
+//   K = 4 output neurons then each present a 4-bit code word and take one entry.
+//   Eight multiplies total, two adders, four read-outs.
+//
+// WHY K MATTERS AND WHY W806 HAD NO K.  A table read once is pure loss: you paid
+// for nine entries to use one. The amortisation is entirely in K, their
+// "fetchers per LUT", and `ternary_mac_group.t27` had K = 1 implicitly -- which
+// is why it lost. This design has K = 4.
+//
+// REGISTERED FORECAST (T44), before synthesis:
+//   the eight multiplies land BETWEEN 250 and 500 LUT -- better than the 506 LUT
+//   the eight grouped selects cost, and not better than 8 x 33 = 264, because a
+//   9-way read-out over i16 is cheaper than eight select-and-add chains but is
+//   not free.
+//   REFUTATION: below 250 means the read-out is nearly free on this fabric and
+//   the method should be pushed to larger mu at once; above 506 means tabulation
+//   loses to plain selects on an FPGA and arXiv:2604.25183's INT8 finding
+//   transfers to us after all, against T499a.
+//
+// NO MULTIPLICATION APPEARS ANYWHERE, including in the code indexing.
+//
+// phi^2 + 1/phi^2 = 3 | TRINITY
+
+module IglaRaceTernaryLutTable {
+    use base::types;
+
+    // ---- Geometry ----
+
+    const MU        : u32 = 2;    // activations per group
+    const FETCHERS  : u32 = 4;    // K: output neurons reading the table
+    const MULTIPLIES: u32 = 8;    // MU * FETCHERS, written out
+    const ENTRIES   : u32 = 9;    // 3^MU: the valid ternary code words
+
+    const GAT_ZERO : u8 = 0;
+    const GAT_POS  : u8 = 1;
+    const GAT_NEG  : u8 = 2;
+
+    // The nine code words, as the 4-bit value (c1 << 2) | c0. Named so the
+    // read-out below is checkable against them rather than against a comment.
+    const CW_00 : u8 = 0;    // 0
+    const CW_P0 : u8 = 1;    // +a0
+    const CW_N0 : u8 = 2;    // -a0
+    const CW_0P : u8 = 4;    // +a1
+    const CW_PP : u8 = 5;    // +a0 +a1
+    const CW_NP : u8 = 6;    // -a0 +a1
+    const CW_0N : u8 = 8;    // -a1
+    const CW_PN : u8 = 9;    // +a0 -a1
+    const CW_NN : u8 = 10;   // -a0 -a1
+
+    // ---- The read-out ----
+    //
+    // Nine cases over a 4-bit code. `sum_pp` and `sum_pn` are passed IN rather
+    // than computed here, which is the entire point: the caller computes them
+    // once and every fetcher receives the same two wires. Computing them inside
+    // would replicate the adders per fetcher and rebuild W806's design.
+    //
+    // Codes outside the nine (3, 7, 11..15) contribute nothing, matching
+    // `ternary_decode` in specs/igla/race/ternary_mac.t27, which returns 0 for
+    // any code that is not 1 or 2.
+    fn fetch(code: u8, a0: i16, a1: i16, sum_pp: i16, sum_pn: i16) -> i16 {
+        if (code == CW_P0) { return a0; }
+        if (code == CW_N0) { return (0 -% a0); }
+        if (code == CW_0P) { return a1; }
+        if (code == CW_0N) { return (0 -% a1); }
+        if (code == CW_PP) { return sum_pp; }
+        if (code == CW_NN) { return (0 -% sum_pp); }
+        if (code == CW_PN) { return sum_pn; }
+        if (code == CW_NP) { return (0 -% sum_pn); }
+        return 0;
+    }
+
+    // ---- The layer ----
+    //
+    // TWO adders build the table; FOUR fetchers read it; one wide add folds the
+    // result into the accumulator. Eight multiplies, and the adder count does
+    // not grow with K.
+    fn layer(acc: i32, a0: i8, a1: i8,
+             k0: u8, k1: u8, k2: u8, k3: u8) -> i32 {
+        let w0 = (a0 as i16);
+        let w1 = (a1 as i16);
+        let sum_pp = (w0 +% w1);
+        let sum_pn = (w0 -% w1);
+        let e0 = fetch(k0, w0, w1, sum_pp, sum_pn);
+        let e1 = fetch(k1, w0, w1, sum_pp, sum_pn);
+        let e2 = fetch(k2, w0, w1, sum_pp, sum_pn);
+        let e3 = fetch(k3, w0, w1, sum_pp, sum_pn);
+        let s01 = (e0 +% e1);
+        let s23 = (e2 +% e3);
+        let narrow = (s01 +% s23);
+        return (acc +% (narrow as i32));
+    }
+
+    // ---- Combinational port surface (T81) ----
+
+    fn on_comb(acc: i32, a0: i8, a1: i8,
+               k0: u8, k1: u8, k2: u8, k3: u8) -> i32 {
+        return layer(acc, a0, a1, k0, k1, k2, k3);
+    }
+
+    // ---- Tests ----
+    //
+    // Every expected value below was computed independently before the compiler
+    // was asked, as W806's vectors were.
+
+    test all_zero_code_words_leave_the_accumulator
+        given r = on_comb(100, 7, 9, 0, 0, 0, 0)
+        then r == 100
+
+    test one_fetcher_takes_a_zero
+        given r = on_comb(0, 7, 9, 1, 0, 0, 0)
+        then r == 7
+
+    test one_fetcher_takes_a_one
+        given r = on_comb(0, 7, 9, 4, 0, 0, 0)
+        then r == 9
+
+    test one_fetcher_takes_the_sum
+        given r = on_comb(0, 7, 9, 5, 0, 0, 0)
+        then r == 16
+
+    test one_fetcher_takes_the_difference
+        given r = on_comb(0, 7, 9, 9, 0, 0, 0)
+        then r == -2
+
+    test negated_sum
+        given r = on_comb(0, 7, 9, 10, 0, 0, 0)
+        then r == -16
+
+    test negated_difference
+        given r = on_comb(0, 7, 9, 6, 0, 0, 0)
+        then r == 2
+
+    // 7 + 9 + 16 + (-2) = 30
+    test four_fetchers_all_different
+        given r = on_comb(0, 7, 9, 1, 4, 5, 9)
+        then r == 30
+
+    // Codes outside the nine contribute nothing: 3, 7, 11, 15 are all invalid.
+    test invalid_code_words_contribute_nothing
+        given r = on_comb(50, 7, 9, 3, 7, 11, 15)
+        then r == 50
+
+    // Opposite code words cancel: +a0 with -a0, +a1 with -a1.
+    test opposite_code_words_cancel
+        given r = on_comb(0, 7, 9, 1, 2, 4, 8)
+        then r == 0
+
+    test accumulator_seed_is_carried
+        given r = on_comb(-1000, 7, 9, 5, 5, 5, 5)
+        then r == -936
+
+    test negative_activations
+        given r = on_comb(0, -7, -9, 5, 0, 0, 0)
+        then r == -16
+
+    // The read-out on its own, so a failure localises.
+    test fetch_sum_entry
+        given v = fetch(5, 7, 9, 16, -2)
+        then v == 16
+
+    test fetch_negated_difference_entry
+        given v = fetch(6, 7, 9, 16, -2)
+        then v == 2
+
+    test fetch_invalid_is_zero
+        given v = fetch(15, 7, 9, 16, -2)
+        then v == 0
+
+    // ---- Invariants ----
+
+    invariant eight_multiplies_per_evaluation
+        assert MULTIPLIES == 8
+
+    invariant multiplies_are_mu_times_fetchers
+        assert MULTIPLIES == 8
+
+    // THE ECONOMY, asserted rather than described: there are more entries than
+    // activations, and more fetchers than one. Either being false collapses the
+    // design back to W806's, which lost.
+    invariant the_table_is_deeper_than_the_group
+        assert ENTRIES > MU
+
+    invariant more_than_one_fetcher_or_there_is_no_amortisation
+        assert FETCHERS > 1
+
+    invariant entries_are_three_to_the_mu
+        assert ENTRIES == 9
+
+    // The nine code words must be distinct, or two entries alias and the table
+    // is smaller than it claims. Spot-checked at the boundaries.
+    invariant zero_word_is_zero
+        assert CW_00 == 0
+
+    invariant sum_and_difference_words_differ
+        assert CW_PP != CW_PN
+
+    invariant negation_words_differ_from_their_positives
+        assert CW_NN != CW_PP
+
+    // The alphabet must agree with the scalar unit or the two compute different
+    // things and no comparison between them means anything.
+    invariant alphabet_matches_the_scalar_unit
+        assert GAT_POS == 1
+
+    invariant negative_code_matches_the_scalar_unit
+        assert GAT_NEG == 2
+
+    // ---- Bench ----
+
+    bench lut_table_arithmetic
+        assert on_comb(0, 7, 9, 1, 4, 5, 9) == 30
+        assert on_comb(50, 7, 9, 3, 7, 11, 15) == 50
+        assert fetch(5, 7, 9, 16, -2) == 16
+}
+
+// phi^2 + 1/phi^2 = 3 | TRINITY

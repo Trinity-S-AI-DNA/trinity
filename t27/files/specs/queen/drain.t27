@@ -1,0 +1,321 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/queen/drain.t27 -- when a draining Queen process may exit: what it waits for, what it stops, what it leaves
+; Owner's night loop, 2026-10-10 (gHashTag/trios#1729 item 2): "every deploy still freezes the swarm for
+; 1800 s; with durable jobs and waits and stoppable turns, a spec can bound the drain by in-flight turns".
+; Measured before this card (gHashTag/trios trios/agent-server, branch queen):
+; - the drain is not a fixed wait. On SIGTERM the server drains its own bee runner (queen-runner.ts
+;   drainBeeRunner): it takes no new order and waits while any bee it carries still runs, up to
+;   TRIOS_BEE_RUNNER_DRAIN_SECONDS = 1800, then salvages the branch of each bee still running and exits
+;   about 2 s later. Rounds, the reviewer and the wait scheduler run on through that wait
+;   (roundsThroughDrain, BrowserOS#546) and are cut by the exit. Railway's
+;   RAILWAY_DEPLOYMENT_DRAINING_SECONDS = 1830 is only the SIGKILL that follows; the service has a
+;   volume, so the next container starts when this one ends.
+; - so the Queen's own bees are what the drain waits for, and they usually outlive it. GitHub's
+;   deployment statuses for the Queen's service, 2026-10-08 23:14Z to 2026-10-10 12:01Z: 7 of 8 deploys
+;   took 30.4 to 33.7 min from start to live, and one took 2.8 min (00:44Z, a quiet night).
+; - the 1800 s protects a bee that ends within 30 min of SIGTERM. A bee still running then is cut
+;   anyway (salvaged, its conversation lost), and its row stays claimed until its task lease lapses.
+; Owner rules this card keeps (2026-10-08): a deploy must not cut a bee short, and must not idle the
+; swarm; never shorten the drain without asking (a 120 s drain was tried and reverted in 5 min).
+; How others stop for a deploy: OTP stops children in reverse order with a shutdown time each, then
+; kills; Akka Cluster Sharding hands a shard off within 60 s and warns that Kubernetes' 30 s grace can
+; be shorter; Kubernetes sends SIGTERM, waits terminationGracePeriodSeconds, then SIGKILL; DBOS,
+; Temporal and Restate keep a workflow's progress in the store, so a stopped process loses only the
+; step it was on.
+; What is reused, not restated:
+; - actors.t27 turn_signal (a turn's own bound, 0 meaning TURN_MAX_SECONDS) and stop_signal
+;   (X_SHUTDOWN, then X_KILL past a timeout);
+; - turn_stop.t27: a stopped turn gets its abort, TURN_STOP_GRACE_MS, then its escalation, and its lane
+;   is free within LANE_FREE_MS;
+; - waits.t27 section 7: a deploy writes nothing to a wait; the next process takes it up
+;   (pickup_after_seconds);
+; - jobs.t27: a job holds no lane, and an effect runs through the effects journal, so a process that
+;   stops mid-step never repeats it;
+; - control.t27 section 2: a runner's task lease lapses TASK_LEASE_TTL_SECONDS after its last renewal,
+;   and only then is its task reclaimable.
+; Not here: the store, the signals, the salvage (the runtime, gHashTag/trios).
+; ASCII only (L3).
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module QueenDrain;
+
+use queen::actors::turn_signal;
+use queen::actors::stop_signal;
+use queen::control::reclaimable;
+use queen::waits::pickup_after_seconds;
+
+; --- 1. What a draining process holds ---------------------------------------------------------------
+
+/// The kinds of work a Queen process can hold when SIGTERM arrives.
+/// WK_BEE: a bee this process runs for its runner (queen-runner.ts), a turn of up to an hour.
+/// WK_REVIEW: one review (reviewer.t27), a turn bounded by REVIEW_ROW_SECONDS.
+/// WK_ROUND: a Queen round, a reconcile: it re-reads the store and decides again.
+/// WK_JOB: a step of a job (jobs.t27).
+/// WK_WAIT: a wait row this process claimed (waits.t27).
+pub const WK_BEE : u8 = 0;
+pub const WK_REVIEW : u8 = 1;
+pub const WK_ROUND : u8 = 2;
+pub const WK_JOB : u8 = 3;
+pub const WK_WAIT : u8 = 4;
+pub const WORK_KINDS : u8 = 5;
+
+/// actors.t27 X_KILL and X_NONE, written as literals here (stop_signal and turn_signal answer them).
+pub const X_KILL_LIT : u8 = 2;
+pub const X_NONE_LIT : u8 = 99;
+
+/// Whether the store keeps this work as it stands, so another process continues it from there and
+/// a stop throws nothing away. A wait is a row a deploy never writes (waits.t27 section 7). A job is
+/// a row and its effects are journaled (jobs.t27). A round is a reconcile: everything it decided is
+/// decided again from the store by the next round, and every effect it made is journaled. A review
+/// and a bee are turns: their row stays, but what the turn has done so far is in its process.
+pub fn row_keeps(kind: u8) -> bool {
+    if (kind == WK_WAIT) { return true; }
+    if (kind == WK_JOB) { return true; }
+    if (kind == WK_ROUND) { return true; }
+    return false;
+}
+
+/// A turn's own bound in seconds, as actors.t27 turn_signal reads it (0 is TURN_MAX_SECONDS, 3600).
+/// A review is reviewer.t27 REVIEW_ROW_SECONDS (300, a literal here). A bee names none.
+pub const REVIEW_BOUND_SECONDS : u32 = 300;
+
+pub fn bound_of(kind: u8) -> u32 {
+    if (kind == WK_REVIEW) { return REVIEW_BOUND_SECONDS; }
+    return 0;
+}
+
+/// The most work a drain may throw away to end sooner: one review. A turn whose own timer kills it
+/// within this many seconds (turn_signal says X_KILL at this age) loses at most that much to a stop,
+/// and the next process redoes it from its row. A bee's turn does not qualify: its bound is an hour,
+/// and what it has done lives in its conversation, which no row keeps. Chosen, not measured.
+pub const STOP_LOSS_SECONDS : u32 = 300;
+
+pub fn redo_is_cheap(bound_seconds: u32) -> bool {
+    return turn_signal(STOP_LOSS_SECONDS, bound_seconds) == X_KILL_LIT;
+}
+
+; --- 2. What the drain owes each piece of work --------------------------------------------------------
+
+/// DV_DONE: its work ended; nothing is owed.
+/// DV_LEAVE: the store keeps it (row_keeps); the process exits without it and the next one takes it up.
+/// DV_STOP: the drain does not wait for it. It runs on while something else holds the process, and is
+/// stopped when the process exits, through turn_stop.t27 (its abort, the grace, the escalation).
+/// DV_HOLD: the drain waits for it to end on its own.
+/// DV_HAND_BACK: held to the cap and still running: it is stopped as DV_STOP is, what it wrote is
+/// salvaged into its branch and stored, and its row is ended now, so its issue is free at once.
+pub const DV_DONE : u8 = 0;
+pub const DV_LEAVE : u8 = 1;
+pub const DV_STOP : u8 = 2;
+pub const DV_HOLD : u8 = 3;
+pub const DV_HAND_BACK : u8 = 4;
+
+/// A bee is held until it ends or the cap passes: the owner's rule that a deploy does not cut a bee
+/// short, kept to the same cap as before this card. A review is not held: a stop loses at most one
+/// review, which the next process redoes. Rows are left.
+pub fn drain_verdict(kind: u8, ended: bool, waited_seconds: u32, cap_seconds: u32) -> u8 {
+    if (ended) { return DV_DONE; }
+    if (row_keeps(kind)) { return DV_LEAVE; }
+    if (redo_is_cheap(bound_of(kind))) { return DV_STOP; }
+    if (waited_seconds >= cap_seconds) { return DV_HAND_BACK; }
+    return DV_HOLD;
+}
+
+; --- 3. What keeps working while something holds ------------------------------------------------------
+
+/// Whether a source of work starts anything new during the drain. Nothing that would start a bee in
+/// this process: that bee would hold the drain for up to its hour. Everything else keeps going while
+/// a held bee keeps the process alive, because the next process cannot start before this one ends
+/// (one instance, one volume), and stopping the rounds then idled the swarm for the whole drain
+/// (measured 2026-10-08, BrowserOS#546). Once nothing holds, the process is leaving: nothing starts.
+pub fn takes_new_work(starts_a_bee_here: bool, holding: u32) -> bool {
+    if (starts_a_bee_here) { return false; }
+    return holding > 0;
+}
+
+; --- 4. The hard cap ----------------------------------------------------------------------------------
+
+/// What must still fit after the cap, before the platform's SIGKILL: the hand-back of every held bee
+/// (its abort and grace, the salvage into its branch, the bundle, the row), run side by side under one
+/// deadline, then the server's own close (main.ts gives it 2 s). Chosen, not measured.
+pub const HAND_BACK_SECONDS : u32 = 20;
+pub const EXIT_SECONDS : u32 = 5;
+
+/// The cap: the runner's drain (TRIOS_BEE_RUNNER_DRAIN_SECONDS), never so late that the hand-back and
+/// the exit cannot finish before the platform kills the process (RAILWAY_DEPLOYMENT_DRAINING_SECONDS).
+/// A platform drain of 0 is one this process cannot read: the runner's drain stands, as before.
+/// With today's 1800 and 1830 the cap is 1800: this card cuts no bee sooner than the drain it replaces.
+pub fn drain_cap_seconds(runner_drain_seconds: u32, platform_seconds: u32) -> u32 {
+    if (platform_seconds == 0) { return runner_drain_seconds; }
+    if (platform_seconds <= HAND_BACK_SECONDS + EXIT_SECONDS) { return 0; }
+    let latest : u32 = platform_seconds - HAND_BACK_SECONDS - EXIT_SECONDS;
+    if (runner_drain_seconds < latest) { return runner_drain_seconds; }
+    return latest;
+}
+
+; --- 5. The exit --------------------------------------------------------------------------------------
+
+/// turn_stop.t27's promises, written as literals here: the grace after the abort, and the time by
+/// which a stopped turn's lane is free.
+pub const TURN_STOP_GRACE_MS : u32 = 3000;
+pub const LANE_FREE_MS : u32 = 5000;
+
+pub const EXIT_NOW : u8 = 0;
+pub const EXIT_WAIT : u8 = 1;
+
+/// The process exits once nothing holds it and every turn it stopped has had its stop land: its abort
+/// at once, the grace, the escalation (stop_signal with the grace says X_KILL by LANE_FREE_MS). A
+/// process that stopped nothing exits at once.
+pub fn exit_step(holding: u32, stopping: u32, since_stop_ms: u32) -> u8 {
+    if (holding > 0) { return EXIT_WAIT; }
+    if (stopping == 0) { return EXIT_NOW; }
+    if (since_stop_ms >= LANE_FREE_MS) { return EXIT_NOW; }
+    return EXIT_WAIT;
+}
+
+; --- 6. When the work is free for another process -----------------------------------------------------
+
+/// control.t27 TASK_LEASE_TTL_SECONDS, written as a literal here (pinned by the invariant below).
+pub const TASK_LEASE_TTL_LIT : u32 = 180;
+
+/// Seconds after the exit before another process may take the issue of a bee the drain stopped.
+/// Handed back, its row is ended at the cap: free at once. Left claimed, as before this card, it waits
+/// until its task lease lapses (control.t27 reclaimable), counted from the last renewal, which stopped
+/// with the process.
+pub fn bee_free_after_seconds(handed_back: bool, since_renewal: u32) -> u32 {
+    if (handed_back) { return 0; }
+    if (reclaimable(false, since_renewal)) { return 0; }
+    return TASK_LEASE_TTL_LIT - since_renewal;
+}
+
+/// Seconds after the exit before another process may take a wait row this process had claimed: the
+/// rest of its claim (waits.t27 pickup_after_seconds). The drain writes nothing to it.
+pub fn wait_free_after_seconds(claimed: bool, since_claim: u32) -> u32 {
+    return pickup_after_seconds(claimed, since_claim);
+}
+
+; --- tests --------------------------------------------------------------------------------------------
+
+test rows_are_left_to_the_next_process {
+    assert row_keeps(WK_WAIT) == true;
+    assert row_keeps(WK_JOB) == true;
+    assert row_keeps(WK_ROUND) == true;
+    assert row_keeps(WK_REVIEW) == false;
+    assert row_keeps(WK_BEE) == false;
+    assert drain_verdict(WK_WAIT, false, 0, 1800) == DV_LEAVE;
+    assert drain_verdict(WK_JOB, false, 0, 1800) == DV_LEAVE;
+    assert drain_verdict(WK_ROUND, false, 0, 1800) == DV_LEAVE;
+    // past the cap too: a row is never handed back, it is simply there
+    assert drain_verdict(WK_WAIT, false, 1800, 1800) == DV_LEAVE;
+}
+
+test a_review_is_stopped_at_the_exit_not_waited_for {
+    assert bound_of(WK_REVIEW) == 300;
+    assert redo_is_cheap(300) == true;
+    assert redo_is_cheap(301) == false;
+    assert drain_verdict(WK_REVIEW, false, 0, 1800) == DV_STOP;
+    assert drain_verdict(WK_REVIEW, false, 1800, 1800) == DV_STOP;
+}
+
+test a_bee_is_held_until_it_ends_or_the_cap {
+    assert bound_of(WK_BEE) == 0;
+    // its bound is TURN_MAX_SECONDS: a stop could throw away an hour
+    assert redo_is_cheap(0) == false;
+    assert redo_is_cheap(3600) == false;
+    assert drain_verdict(WK_BEE, false, 0, 1800) == DV_HOLD;
+    assert drain_verdict(WK_BEE, false, 1799, 1800) == DV_HOLD;
+    assert drain_verdict(WK_BEE, false, 1800, 1800) == DV_HAND_BACK;
+    assert drain_verdict(WK_BEE, false, 4000, 1800) == DV_HAND_BACK;
+    // a bee that ended is owed nothing, at any time
+    assert drain_verdict(WK_BEE, true, 0, 1800) == DV_DONE;
+    assert drain_verdict(WK_BEE, true, 1800, 1800) == DV_DONE;
+    assert drain_verdict(WK_REVIEW, true, 0, 1800) == DV_DONE;
+    assert drain_verdict(WK_WAIT, true, 0, 1800) == DV_DONE;
+}
+
+test a_cap_of_zero_hands_every_bee_back_at_once {
+    assert drain_verdict(WK_BEE, false, 0, 0) == DV_HAND_BACK;
+}
+
+test nothing_starts_a_bee_here_and_the_rest_runs_only_while_held {
+    assert takes_new_work(true, 3) == false;
+    assert takes_new_work(true, 0) == false;
+    assert takes_new_work(false, 1) == true;
+    assert takes_new_work(false, 0) == false;
+}
+
+test the_cap_is_todays_drain_and_fits_the_platform {
+    // today: runner 1800, Railway 1830 -> 1800, no bee cut sooner than before
+    assert drain_cap_seconds(1800, 1830) == 1800;
+    // a platform drain too short for the hand-back moves the cap earlier
+    assert drain_cap_seconds(1800, 1800) == 1775;
+    assert drain_cap_seconds(1800, 26) == 1;
+    assert drain_cap_seconds(1800, 25) == 0;
+    assert drain_cap_seconds(1800, 10) == 0;
+    // a shorter runner drain is the owner's to choose, and it stands
+    assert drain_cap_seconds(600, 1830) == 600;
+    assert drain_cap_seconds(0, 1830) == 0;
+    // a platform drain this process cannot read leaves the runner's drain alone
+    assert drain_cap_seconds(1800, 0) == 1800;
+}
+
+test the_exit_waits_for_held_work_and_for_stops_to_land {
+    assert exit_step(1, 0, 0) == EXIT_WAIT;
+    assert exit_step(2, 3, 9000) == EXIT_WAIT;
+    assert exit_step(0, 0, 0) == EXIT_NOW;
+    assert exit_step(0, 2, 0) == EXIT_WAIT;
+    assert exit_step(0, 2, 4999) == EXIT_WAIT;
+    assert exit_step(0, 2, 5000) == EXIT_NOW;
+}
+
+test a_handed_back_bee_is_free_at_once_and_a_left_one_waits_out_its_lease {
+    assert bee_free_after_seconds(true, 0) == 0;
+    assert bee_free_after_seconds(true, 100) == 0;
+    assert bee_free_after_seconds(false, 0) == 180;
+    assert bee_free_after_seconds(false, 45) == 135;
+    assert bee_free_after_seconds(false, 179) == 1;
+    assert bee_free_after_seconds(false, 180) == 0;
+    assert bee_free_after_seconds(false, 4294967295) == 0;
+}
+
+test a_wait_row_is_free_after_the_rest_of_its_claim {
+    assert wait_free_after_seconds(false, 0) == 0;
+    assert wait_free_after_seconds(true, 0) == 60;
+    assert wait_free_after_seconds(true, 45) == 15;
+    assert wait_free_after_seconds(true, 60) == 0;
+}
+
+invariant the_verdicts_and_kinds_are_pinned {
+    assert DV_DONE == 0;
+    assert DV_LEAVE == 1;
+    assert DV_STOP == 2;
+    assert DV_HOLD == 3;
+    assert DV_HAND_BACK == 4;
+    assert WK_BEE == 0;
+    assert WK_WAIT == 4;
+    assert WORK_KINDS == 5;
+    assert EXIT_NOW == 0;
+    assert EXIT_WAIT == 1;
+}
+
+invariant the_literals_match_the_cards_they_come_from {
+    // actors.t27: turn_signal answers X_KILL at the bound and X_NONE before it
+    assert turn_signal(300, 300) == X_KILL_LIT;
+    assert turn_signal(299, 300) == X_NONE_LIT;
+    // control.t27: the task lease lapses at TASK_LEASE_TTL_SECONDS
+    assert reclaimable(false, TASK_LEASE_TTL_LIT) == true;
+    assert reclaimable(false, TASK_LEASE_TTL_LIT - 1) == false;
+    // turn_stop.t27: by LANE_FREE_MS a stopped turn's grace has passed (stop_signal says X_KILL)
+    assert stop_signal(LANE_FREE_MS, TURN_STOP_GRACE_MS) == X_KILL_LIT;
+    assert stop_signal(TURN_STOP_GRACE_MS - 1, TURN_STOP_GRACE_MS) == X_NONE_LIT;
+}
+
+invariant a_review_is_cheap_to_redo_and_a_bee_is_not {
+    assert STOP_LOSS_SECONDS == REVIEW_BOUND_SECONDS;
+    assert redo_is_cheap(REVIEW_BOUND_SECONDS) == true;
+    assert redo_is_cheap(0) == false;
+}
+
+invariant the_hand_back_fits_between_todays_drain_and_the_platform_kill {
+    assert HAND_BACK_SECONDS + EXIT_SECONDS <= 30;
+    assert drain_cap_seconds(1800, 1830) == 1800;
+}

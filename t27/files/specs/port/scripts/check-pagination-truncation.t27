@@ -1,0 +1,174 @@
+module port::scripts::check-pagination-truncation;
+
+// Port of scripts/check-pagination-truncation.sh (80 lines of bash) to .t27,
+// so the check's decision is generated instead of hand-written.
+//
+// T90/T91: a paginated query that returns EXACTLY its limit has not answered
+// the question -- it has reported the limit. The two are indistinguishable in
+// the response body, and the only way to separate them is to ask again with a
+// larger limit and see whether the number moves.
+//
+// The plumbing stays out of the port. The gh subprocess, the gh api
+// cross-checks (account type, public_repos) and every echo are the caller's
+// side; what is ported is the decision -- which exit the script takes for the
+// counts it observes. The caller runs at most MAX_PROBES probes, records each
+// returned count (NO_COUNT when a query failed, nothing at all when gh is
+// missing or unauthenticated) and hands the list over with the flags.
+
+const EXIT_OK: i32 = 0;
+const EXIT_TRUNCATED: i32 = 1;
+const EXIT_ENV: i32 = 2;
+const MAX_PROBES: usize = 8;
+const DEFAULT_START_LIMIT: i64 = 100;
+// What the caller records when a probe produced no count at all: the original
+// prints "query failed at --limit L" and exits 2.
+const NO_COUNT: i64 = -1;
+
+// Decision inside the argv handling (`if [ -z "$OWNER" ]`): a missing owner is
+// the usage error. argc counts argv entries, so the script plus its owner
+// argument is 2.
+fn args_exit_code(argc: u32, owner: []const u8) -> i32 {
+    if (argc < 2) {
+        return EXIT_ENV;
+    }
+    if (owner.len == 0) {
+        return EXIT_ENV;
+    }
+    return EXIT_OK;
+}
+
+// Decision inside the probe comparison (`if [ "$n" -lt "$limit" ]`): only when
+// the count is strictly less than the limit is it a property of the population
+// rather than of the request.
+fn is_population(n: i64, limit: i64) -> bool {
+    return n < limit;
+}
+
+// Decision inside the loop tail (`limit=$(( limit * 2 ))`): a truncated probe
+// doubles the limit for the next one.
+fn next_limit(limit: i64) -> i64 {
+    return limit * 2;
+}
+
+// The script's top level, as a verdict. Returns the original's exit codes:
+// 0 a non-truncating limit was found, 1 every probed limit truncated (the
+// population exceeds the largest probe), 2 gh unavailable, unauthenticated,
+// a usage error, or a failed query.
+pub fn main(argc: u32, owner: []const u8, start_limit: i64, counts: []const i64) -> i32 {
+    const args_code: i32 = args_exit_code(argc, owner);
+    if (args_code != EXIT_OK) {
+        return args_code;
+    }
+    var limit: i64 = start_limit;
+    var probed: usize = 0;
+    for c in counts {
+        // The original's loop head runs exactly eight times, no more.
+        if (probed >= MAX_PROBES) {
+            break;
+        }
+        if (c == NO_COUNT) {
+            // "query failed at --limit $limit" -- exit 2.
+            return EXIT_ENV;
+        }
+        if (is_population(c, limit)) {
+            // "OK --limit $limit -> $n  (n < limit, so this is the
+            // population)" -- exit 0. The caller prints the account type and
+            // public_repos cross-check around this verdict.
+            return EXIT_OK;
+        }
+        // "TRUNCATED --limit $limit -> $n  (n == limit; this is the limit,
+        // not the answer)".
+        probed += 1;
+        limit = next_limit(limit);
+    }
+    if (probed == 0) {
+        // No probe ever ran: gh was missing or unauthenticated, which the
+        // original reports as exit 2 before the loop starts.
+        return EXIT_ENV;
+    }
+    // "still truncating at --limit $(( limit / 2 )) -> $prev; population
+    // exceeds every probe" -- exit 1.
+    return EXIT_TRUNCATED;
+}
+
+test args_exit_code_usage {
+    // "usage: $0 <owner> [start-limit]" -- exit 2 when the owner is missing,
+    // exit 0 when it is present.
+    assert(args_exit_code(1, "") == EXIT_ENV);
+    assert(args_exit_code(0, "") == EXIT_ENV);
+    assert(args_exit_code(2, "gHashTag") == EXIT_OK);
+    assert(args_exit_code(2, "") == EXIT_ENV);
+}
+
+test is_population_edges {
+    // The story from the original's comments: 100 -> 200 -> 219.
+    assert(is_population(219, 1000));
+    assert(is_population(0, 100));
+    // n == limit is the truncation that fooled the session three times.
+    assert(!is_population(100, 100));
+    assert(!is_population(200, 200));
+    // A count above the limit is not a population either: the original's
+    // -lt test sends it to the truncation branch.
+    assert(!is_population(219, 200));
+}
+
+test next_limit_doubles {
+    assert(next_limit(100) == 200);
+    assert(next_limit(200) == 400);
+    assert(next_limit(1600) == 3200);
+}
+
+test main_finds_population_after_doubling {
+    // gh repo list gHashTag --limit 100 -> 100, --limit 200 -> 200, then the
+    // answer: two truncations and 219 under the doubled limit. Exit 0.
+    var counts: [3]i64 = [100, 200, 219];
+    assert(main(2, "gHashTag", DEFAULT_START_LIMIT, &counts) == EXIT_OK);
+}
+
+test main_reports_truncation_after_eight_probes {
+    // A population above every probe: all eight limits return exactly the
+    // limit, and the script exits 1.
+    var counts: [8]i64 = [100, 200, 400, 800, 1600, 3200, 6400, 12800];
+    assert(main(2, "gHashTag", DEFAULT_START_LIMIT, &counts) == EXIT_TRUNCATED);
+}
+
+test main_caps_probes_at_eight {
+    // Eight truncated replies followed by a ninth that would succeed.
+    // The original never makes that ninth query, so its result cannot matter.
+    var counts: [9]i64 = [100, 200, 400, 800, 1600, 3200, 6400, 12800, 0];
+    assert(main(2, "gHashTag", DEFAULT_START_LIMIT, &counts) == EXIT_TRUNCATED);
+}
+
+test main_query_failure_exits_two {
+    // "query failed at --limit 200" -- NO_COUNT anywhere ends the run with 2.
+    var counts: [2]i64 = [100, NO_COUNT];
+    assert(main(2, "gHashTag", DEFAULT_START_LIMIT, &counts) == EXIT_ENV);
+}
+
+test main_gh_unavailable_exits_two {
+    // gh missing or unauthenticated: no probe ever runs, exit 2.
+    var none: [0]i64 = [];
+    assert(main(2, "gHashTag", DEFAULT_START_LIMIT, &none) == EXIT_ENV);
+}
+
+test main_usage_error_exits_two {
+    // "usage: $0 <owner> [start-limit]" through the top level: exit 2.
+    var counts: [1]i64 = [0];
+    assert(main(1, "", DEFAULT_START_LIMIT, &counts) == EXIT_ENV);
+}
+
+
+test main_accepts_population_on_eighth_probe {
+    var counts: [8]i64 = [100, 200, 400, 800, 1600, 3200, 6400, 12799];
+    assert(main(2, "gHashTag", DEFAULT_START_LIMIT, &counts) == EXIT_OK);
+}
+
+test main_ignores_query_failure_beyond_cap {
+    var counts: [9]i64 = [100, 200, 400, 800, 1600, 3200, 6400, 12800, NO_COUNT];
+    assert(main(2, "gHashTag", DEFAULT_START_LIMIT, &counts) == EXIT_TRUNCATED);
+}
+
+test main_respects_custom_start_limit {
+    var counts: [8]i64 = [3, 6, 12, 24, 48, 96, 192, 384];
+    assert(main(2, "gHashTag", 3, &counts) == EXIT_TRUNCATED);
+}

@@ -1,0 +1,147 @@
+// Native JSON-RPC client domain. Include json.h and json_writer.h first.
+// Caller-owned live, nonoverlapping buffers; no allocation or network here.
+// Scratch tokens/arena and partial output may change on failure. Reply is
+// committed only after validation. IDs are 32 lowercase hexadecimal bytes.
+module TrinityMemoryRPCClient {
+    const TM_RPC_ERR_TRANSPORT: i32 = -32000;
+    const TM_RPC_ERR_LIMIT: i32 = -32010;
+    const TM_RPC_ERR_PARAMS: i32 = -32602;
+    struct TMRPCWorkspace {
+        tokens: []TMJsonToken, token_capacity: usize,
+        arena: []u8, arena_capacity: usize,
+        root: i64, token_count: usize,
+    }
+    struct TMRPCReply { result_index: i64, error_index: i64, remote_error: bool, }
+
+    fn tm_rpc_id_valid(id: []u8) -> bool {
+        var i: usize = 0;
+        while (i < 32) {
+            var c: u8 = id[i];
+            if (!((c >= 48 && c <= 57) || (c >= 97 && c <= 102))) { return false; }
+            i = i + 1;
+        }
+        return true;
+    }
+    fn tm_rpc_random_id(out: []u8) -> i32 {
+        var scratch: [16]u8 = [0];
+        if (tm_os_random(scratch, 16) != 0) { return TM_RPC_ERR_TRANSPORT; }
+        scratch[6] = (scratch[6] & 15) | 64;
+        scratch[8] = (scratch[8] & 63) | 128;
+        var i: usize = 0;
+        while (i < 16) {
+            var high: u8 = scratch[i] / 16; var low: u8 = scratch[i] % 16;
+            if (high < 10) { out[i * 2] = 48 + high; } else { out[i * 2] = 87 + high; }
+            if (low < 10) { out[i * 2 + 1] = 48 + low; } else { out[i * 2 + 1] = 87 + low; }
+            i = i + 1;
+        }
+        return 0;
+    }
+    fn tm_rpc_literal(w: *TMJsonWriter, value: str, size: usize) -> i32 {
+        var i: usize = 0;
+        while (i < size && w.error == 0) { tm_json_write_byte(w, value[i] as u8); i = i + 1; }
+        return w.error;
+    }
+    fn tm_rpc_text(token: *TMJsonToken, value: str, size: usize) -> bool {
+        if (token[0].kind != TM_JSON_STRING || token[0].text_size != size) { return false; }
+        var i: usize = 0;
+        while (i < size) { if (token[0].text[i] != (value[i] as u8)) { return false; } i = i + 1; }
+        return true;
+    }
+    // Internal helper for already parsed objects. Still guards corrupted loops.
+    fn tm_rpc_field(work: *TMRPCWorkspace, index: i64, key: str, size: usize) -> i64 {
+        if (index < 0 || (index as u64) >= (work.token_count as u64) ||
+            work.tokens[index as usize].kind != TM_JSON_OBJECT) { return -1; }
+        var child: i64 = work.tokens[index as usize].first; var visits: usize = 0;
+        while (child >= 0 && visits < work.token_count) {
+            if ((child as u64) >= (work.token_count as u64)) { return -1; }
+            var token: *TMJsonToken = &work.tokens[child as usize];
+            if (tm_rpc_text(token, key, size)) {
+                if (token[0].first < 0 || (token[0].first as u64) >= (work.token_count as u64)) { return -1; }
+                return token[0].first;
+            }
+            child = token[0].next; visits = visits + 1;
+        }
+        return -1;
+    }
+    fn tm_rpc_parse_depth(data: []u8, size: usize, depth: usize, work: *TMRPCWorkspace) -> i32 {
+        work.root = -1; work.token_count = 0;
+        var result: TMJsonResult = TMJsonResult{ .root = -1, .token_count = 0, .arena_used = 0 };
+        var status: i32 = tm_json_parse(data, size, work.tokens, work.token_capacity,
+            work.arena, work.arena_capacity, depth, &result);
+        if (status == 0) { work.root = result.root; work.token_count = result.token_count; }
+        return status;
+    }
+    fn tm_rpc_parse(data: []u8, size: usize, work: *TMRPCWorkspace) -> i32 {
+        return tm_rpc_parse_depth(data, size, 64, work);
+    }
+    fn tm_rpc_prepare(method: []u8, method_size: usize, params: []u8, params_size: usize,
+                      id: []u8, out: []u8, capacity: usize, work: *TMRPCWorkspace) -> i64 {
+        work.root = -1; work.token_count = 0;
+        if (!tm_rpc_id_valid(id)) { return TM_RPC_ERR_PARAMS as i64; }
+        var offset: usize = 0;
+        while (offset < method_size) {
+            var width: usize = tm_json_utf8_width(method, method_size, offset);
+            if (width == 0) { return TM_RPC_ERR_PARAMS as i64; }
+            offset = offset + width;
+        }
+        if (params_size > 0) {
+            // Reserve one container level for the surrounding RPC envelope.
+            var parsed: i32 = tm_rpc_parse_depth(params, params_size, 63, work);
+            if (parsed == TM_JSON_ERR_CAPACITY || parsed == TM_JSON_ERR_DEPTH) { return TM_RPC_ERR_LIMIT as i64; }
+            if (parsed != 0) { return TM_RPC_ERR_PARAMS as i64; }
+        }
+        var w: TMJsonWriter = TMJsonWriter{ .data = out, .capacity = capacity, .used = 0, .error = 0 };
+        tm_rpc_literal(&w, "{\"jsonrpc\":\"2.0\",\"id\":", 22);
+        tm_json_write_quoted(&w, id, 32);
+        tm_rpc_literal(&w, ",\"method\":", 10);
+        tm_json_write_quoted(&w, method, method_size);
+        tm_rpc_literal(&w, ",\"params\":", 10);
+        if (params_size == 0) { tm_rpc_literal(&w, "{}", 2); }
+        else { tm_json_write_tree(&w, work.tokens, work.token_count, work.root); }
+        tm_json_write_byte(&w, 125);
+        if (w.error == TM_JSON_ERR_CAPACITY || w.error == TM_JSON_ERR_DEPTH) { return TM_RPC_ERR_LIMIT as i64; }
+        if (w.error != 0) { return TM_RPC_ERR_PARAMS as i64; }
+        if ((w.used as u64) > 9223372036854775807) { return TM_RPC_ERR_LIMIT as i64; }
+        return w.used as i64;
+    }
+    fn tm_rpc_id_matches(token: *TMJsonToken, id: []u8) -> bool {
+        if (token[0].kind != TM_JSON_STRING || token[0].text_size != 32) { return false; }
+        var i: usize = 0;
+        while (i < 32) { if (token[0].text[i] != id[i]) { return false; } i = i + 1; }
+        return true;
+    }
+    // 0 valid result; 1 valid remote error; negative local BridgeError code.
+    // Remote code remains an exact INTEGER token (signed i64 or unsigned u64).
+    // Extra fields allowed, matching BridgeClient.call. Missing/null id is
+    // accepted only for a valid error response, as Python dict.get does.
+    fn tm_rpc_validate(body: []u8, size: usize, id: []u8,
+                       work: *TMRPCWorkspace, reply: *TMRPCReply) -> i32 {
+        work.root = -1; work.token_count = 0;
+        if (!tm_rpc_id_valid(id)) { return TM_RPC_ERR_PARAMS; }
+        var parsed: i32 = tm_rpc_parse(body, size, work);
+        if (parsed == TM_JSON_ERR_CAPACITY || parsed == TM_JSON_ERR_DEPTH) { return TM_RPC_ERR_LIMIT; }
+        if (parsed != 0) { return TM_RPC_ERR_TRANSPORT; }
+        if (work.tokens[work.root as usize].kind != TM_JSON_OBJECT) { return TM_RPC_ERR_TRANSPORT; }
+        var version: i64 = tm_rpc_field(work, work.root, "jsonrpc", 7);
+        if (version < 0 || !tm_rpc_text(&work.tokens[version as usize], "2.0", 3)) { return TM_RPC_ERR_TRANSPORT; }
+        var error: i64 = tm_rpc_field(work, work.root, "error", 5);
+        var result: i64 = tm_rpc_field(work, work.root, "result", 6);
+        if ((error >= 0) == (result >= 0)) { return TM_RPC_ERR_TRANSPORT; }
+        var response_id: i64 = tm_rpc_field(work, work.root, "id", 2);
+        var matched: bool = false; var null_id: bool = response_id < 0;
+        if (response_id >= 0) {
+            var id_token: *TMJsonToken = &work.tokens[response_id as usize];
+            matched = tm_rpc_id_matches(id_token, id); null_id = id_token[0].kind == TM_JSON_NULL;
+        }
+        if (!matched && !(error >= 0 && null_id)) { return TM_RPC_ERR_TRANSPORT; }
+        if (error >= 0) {
+            if (work.tokens[error as usize].kind != TM_JSON_OBJECT) { return TM_RPC_ERR_TRANSPORT; }
+            var code: i64 = tm_rpc_field(work, error, "code", 4);
+            var message: i64 = tm_rpc_field(work, error, "message", 7);
+            if (code < 0 || message < 0 || work.tokens[code as usize].kind != TM_JSON_INTEGER ||
+                work.tokens[message as usize].kind != TM_JSON_STRING) { return TM_RPC_ERR_TRANSPORT; }
+            reply.result_index = -1; reply.error_index = error; reply.remote_error = true; return 1;
+        }
+        reply.result_index = result; reply.error_index = -1; reply.remote_error = false; return 0;
+    }
+}

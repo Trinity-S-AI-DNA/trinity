@@ -1,0 +1,478 @@
+// SPDX-License-Identifier: Apache-2.0
+; subth_clk.t27 — Sacred Opcode 0xE5: Sub-threshold Clock Gating
+; Hardware for sub-threshold clock gating for power reduction
+; φ² + 1/φ² = 3 | TRINITY
+
+module sacred-subth_clk;
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+pub const OP_SUBTH_CLK : u8 = 0xE5;
+
+pub const NUM_CLK_DOMAINS : u8 = 8;
+pub const SUBTH_THRESHOLD_MV : u16 = 400;  // 400mV threshold
+pub const NORMAL_VOLTAGE_MV : u16 = 1100;  // 1.1V normal
+
+pub const CLK_GATE_OFF : u8 = 0;
+pub const CLK_GATE_ON : u8 = 1;
+pub const CLK_GATE_AUTO : u8 = 2;
+
+pub const POWER_STATE_ACTIVE : u8 = 0;
+pub const POWER_STATE_IDLE : u8 = 1;
+pub const POWER_STATE_SLEEP : u8 = 2;
+pub const POWER_STATE_DEEP_SLEEP : u8 = 3;
+
+// ============================================================================
+// Types
+// ============================================================================
+
+pub const ClkGateMode = enum(u8) {
+    off = CLK_GATE_OFF,
+    on = CLK_GATE_ON,
+    auto = CLK_GATE_AUTO,
+}
+
+pub const PowerState = enum(u8) {
+    active = POWER_STATE_ACTIVE,
+    idle = POWER_STATE_IDLE,
+    sleep = POWER_STATE_SLEEP,
+    deep_sleep = POWER_STATE_DEEP_SLEEP,
+}
+
+pub const ClkDomain = struct {
+    id : u8,
+    enabled : bool,
+    gate_mode : ClkGateMode,
+    activity_count : u16,
+    last_active_cycle : u32,
+}
+
+pub const SubthConfig = struct {
+    threshold_mv : u16,
+    hysteresis_mv : u16,
+    enable_subth : bool,
+    transition_cycles : u8,  // Cycles for voltage transition
+}
+
+pub const PowerMetrics = struct {
+    current_voltage_mv : u16,
+    current_power_mw : u16,
+    activity_ratio : u8,  // 0-100%
+    clock_gated_domains : u8,
+}
+
+// ============================================================================
+// Clk Domain Functions
+// ============================================================================
+
+// clk_domain_enabled(domain: ClkDomain) -> bool
+// Check if clock domain is enabled
+pub fn clk_domain_enabled(domain: ClkDomain) bool {
+    return domain.enabled and domain.gate_mode != ClkGateMode.off;
+}
+
+// clk_domain_gate_active(domain: ClkDomain) -> bool
+// Check if clock gating is active
+pub fn clk_domain_gate_active(domain: ClkDomain) bool {
+    return domain.gate_mode == ClkGateMode.off or
+           (domain.gate_mode == ClkGateMode.auto and domain.activity_count == 0);
+}
+
+// clk_domain_is_idle(domain: ClkDomain, current_cycle: u32, idle_threshold: u32) -> bool
+// Check if domain is idle
+pub fn clk_domain_is_idle(domain: ClkDomain, current_cycle: u32, idle_threshold: u32) bool {
+    return domain.activity_count == 0 and
+           (current_cycle - domain.last_active_cycle) > idle_threshold;
+}
+
+// clk_domain_pulse(domain: ClkDomain, current_cycle: u32) -> ClkDomain
+// Record activity pulse on domain
+pub fn clk_domain_pulse(domain: ClkDomain, current_cycle: u32) ClkDomain {
+    return ClkDomain {
+        .id = domain.id,
+        .enabled = domain.enabled,
+        .gate_mode = domain.gate_mode,
+        .activity_count = domain.activity_count + 1,
+        .last_active_cycle = current_cycle,
+    };
+}
+
+// clk_domain_decay(domain: ClkDomain) -> ClkDomain
+// Decay activity count
+pub fn clk_domain_decay(domain: ClkDomain) ClkDomain {
+    const new_count = if (domain.activity_count > 0) domain.activity_count - 1 else 0;
+    return ClkDomain {
+        .id = domain.id,
+        .enabled = domain.enabled,
+        .gate_mode = domain.gate_mode,
+        .activity_count = new_count,
+        .last_active_cycle = domain.last_active_cycle,
+    };
+}
+
+// ============================================================================
+// Sub-threshold Functions
+// ============================================================================
+
+// is_subthreshold(voltage_mv: u16, config: SubthConfig) -> bool
+// Check if voltage is in sub-threshold region
+pub fn is_subthreshold(voltage_mv: u16, config: SubthConfig) bool {
+    if (!config.enable_subth) {
+        return false;
+    }
+    return voltage_mv < config.threshold_mv;
+}
+
+// voltage_within_range(voltage_mv: u16, target_mv: u16, tolerance_mv: u16) -> bool
+// Check if voltage is within tolerance of target
+pub fn voltage_within_range(voltage_mv: u16, target_mv: u16, tolerance_mv: u16) bool {
+    if (voltage_mv >= target_mv) {
+        return (voltage_mv - target_mv) <= tolerance_mv;
+    }
+    return (target_mv - voltage_mv) <= tolerance_mv;
+}
+
+// subth_power_estimate(voltage_mv: u16) -> u16
+// Estimate power at given voltage (quadratic scaling)
+pub fn subth_power_estimate(voltage_mv: u16) -> u16 {
+    // Power scales with V^2, normalize to 1.1V = 100mW (arbitrary baseline)
+    const ratio = @as(f32, @floatFromInt(voltage_mv)) / 1100.0;
+    const power_baseline : f32 = 100.0;
+    const estimated : f32 = power_baseline * ratio * ratio;
+    return @as(u16, @intFromFloat(@floor(estimated)));
+}
+
+// power_savings_ratio(normal_mv: u16, subth_mv: u16) -> u8
+// Calculate power savings ratio (0-100%)
+pub fn power_savings_ratio(normal_mv: u16, subth_mv: u16) -> u8 {
+    const normal_power = subth_power_estimate(normal_mv);
+    const subth_power = subth_power_estimate(subth_mv);
+
+    if (normal_power == 0) {
+        return 0;
+    }
+
+    const saved = normal_power - subth_power;
+    const ratio = (saved * 100) / normal_power;
+
+    return @as(u8, @truncate(ratio));
+}
+
+// ============================================================================
+// Power State Functions
+// ============================================================================
+
+// power_state_can_gate(state: PowerState) -> bool
+// Check if power state allows clock gating
+pub fn power_state_can_gate(state: PowerState) bool {
+    return state != PowerState.active;
+}
+
+// power_state_deeper(a: PowerState, b: PowerState) -> PowerState
+// Return deeper power state
+pub fn power_state_deeper(a: PowerState, b: PowerState) PowerState {
+    if (@intFromEnum(a) > @intFromEnum(b)) {
+        return a;
+    }
+    return b;
+}
+
+// power_state_sleep_ok(domains: [NUM_CLK_DOMAINS]ClkDomain, current_cycle: u32) -> bool
+// Check if all domains can go to sleep
+pub fn power_state_sleep_ok(domains: [NUM_CLK_DOMAINS]ClkDomain, current_cycle: u32) bool {
+    for i in 0..NUM_CLK_DOMAINS {
+        const domain = domains[i];
+        if (!clk_domain_is_idle(domain, current_cycle, 100)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// ============================================================================
+// Opcode Encoding/Decoding
+// ============================================================================
+
+// encode_subth_clk(domain_id: u8, mode: u8) -> u16
+// Encode sub-threshold clock instruction
+pub fn encode_subth_clk(domain_id: u8, mode: u8) u16 {
+    // Format: [OP:8][DOMAIN:3][MODE:2][RES:3]
+    const op : u16 = @as(u16, OP_SUBTH_CLK) << 8;
+    const domain_field : u16 = @as(u16, domain_id & 0x07) << 5;
+    const mode_field : u16 = @as(u16, mode & 0x03) << 3;
+    return op | domain_field | mode_field;
+}
+
+// decode_subth_clk(encoded: u16) -> struct { domain_id: u8, mode: u8 }
+// Decode sub-threshold clock instruction
+pub fn decode_subth_clk(encoded: u16) struct { domain_id: u8, mode: u8 } {
+    const domain_id : u8 = @as(u8, @truncate((encoded >> 5) & 0x07));
+    const mode : u8 = @as(u8, @truncate((encoded >> 3) & 0x03));
+    return .{ .domain_id = domain_id, .mode = mode };
+}
+
+// ============================================================================
+// TDD Tests
+// ============================================================================
+
+test "num_clk_domains_eight" {
+    assert(NUM_CLK_DOMAINS == 8);
+}
+
+test "subth_threshold_four_hundred" {
+    assert(SUBTH_THRESHOLD_MV == 400);
+}
+
+test "normal_voltage_eleven_hundred" {
+    assert(NORMAL_VOLTAGE_MV == 1100);
+}
+
+test "clk_gate_mode_off" {
+    assert(@intFromEnum(ClkGateMode.off) == 0);
+}
+
+test "clk_gate_mode_on" {
+    assert(@intFromEnum(ClkGateMode.on) == 1);
+}
+
+test "clk_gate_mode_auto" {
+    assert(@intFromEnum(ClkGateMode.auto) == 2);
+}
+
+test "power_state_active" {
+    assert(@intFromEnum(PowerState.active) == 0);
+}
+
+test "power_state_deep_sleep" {
+    assert(@intFromEnum(PowerState.deep_sleep) == 3);
+}
+
+test "clk_domain_enabled_true" {
+    const domain = ClkDomain{.id = 0, .enabled = true, .gate_mode = ClkGateMode.on, .activity_count = 0, .last_active_cycle = 0};
+    assert(clk_domain_enabled(domain) == true);
+}
+
+test "clk_domain_enabled_false_gate_off" {
+    const domain = ClkDomain{.id = 0, .enabled = true, .gate_mode = ClkGateMode.off, .activity_count = 0, .last_active_cycle = 0};
+    assert(clk_domain_enabled(domain) == false);
+}
+
+test "clk_domain_enabled_false_disabled" {
+    const domain = ClkDomain{.id = 0, .enabled = false, .gate_mode = ClkGateMode.on, .activity_count = 0, .last_active_cycle = 0};
+    assert(clk_domain_enabled(domain) == false);
+}
+
+test "clk_domain_gate_active_off" {
+    const domain = ClkDomain{.id = 0, .enabled = true, .gate_mode = ClkGateMode.off, .activity_count = 10, .last_active_cycle = 0};
+    assert(clk_domain_gate_active(domain) == true);
+}
+
+test "clk_domain_gate_active_auto_idle" {
+    const domain = ClkDomain{.id = 0, .enabled = true, .gate_mode = ClkGateMode.auto, .activity_count = 0, .last_active_cycle = 0};
+    assert(clk_domain_gate_active(domain) == true);
+}
+
+test "clk_domain_gate_active_auto_active" {
+    const domain = ClkDomain{.id = 0, .enabled = true, .gate_mode = ClkGateMode.auto, .activity_count = 10, .last_active_cycle = 0};
+    assert(clk_domain_gate_active(domain) == false);
+}
+
+test "clk_domain_is_idle_true" {
+    const domain = ClkDomain{.id = 0, .enabled = true, .gate_mode = ClkGateMode.on, .activity_count = 0, .last_active_cycle = 0};
+    assert(clk_domain_is_idle(domain, 200, 100) == true);
+}
+
+test "clk_domain_is_idle_false_active" {
+    const domain = ClkDomain{.id = 0, .enabled = true, .gate_mode = ClkGateMode.on, .activity_count = 10, .last_active_cycle = 0};
+    assert(clk_domain_is_idle(domain, 200, 100) == false);
+}
+
+test "clk_domain_is_idle_false_recent" {
+    const domain = ClkDomain{.id = 0, .enabled = true, .gate_mode = ClkGateMode.on, .activity_count = 0, .last_active_cycle = 150};
+    assert(clk_domain_is_idle(domain, 200, 100) == false);
+}
+
+test "clk_domain_pulse" {
+    const domain = ClkDomain{.id = 0, .enabled = true, .gate_mode = ClkGateMode.on, .activity_count = 0, .last_active_cycle = 0};
+    const result = clk_domain_pulse(domain, 100);
+    assert(result.activity_count == 1);
+    assert(result.last_active_cycle == 100);
+}
+
+test "clk_domain_decay" {
+    const domain = ClkDomain{.id = 0, .enabled = true, .gate_mode = ClkGateMode.on, .activity_count = 5, .last_active_cycle = 0};
+    const result = clk_domain_decay(domain);
+    assert(result.activity_count == 4);
+}
+
+test "clk_domain_decay_zero" {
+    const domain = ClkDomain{.id = 0, .enabled = true, .gate_mode = ClkGateMode.on, .activity_count = 0, .last_active_cycle = 0};
+    const result = clk_domain_decay(domain);
+    assert(result.activity_count == 0);
+}
+
+test "is_subthreshold_true" {
+    const config = SubthConfig{.threshold_mv = 400, .hysteresis_mv = 20, .enable_subth = true, .transition_cycles = 10};
+    assert(is_subthreshold(300, config) == true);
+}
+
+test "is_subthreshold_false_disabled" {
+    const config = SubthConfig{.threshold_mv = 400, .hysteresis_mv = 20, .enable_subth = false, .transition_cycles = 10};
+    assert(is_subthreshold(300, config) == false);
+}
+
+test "is_subthreshold_false_high_voltage" {
+    const config = SubthConfig{.threshold_mv = 400, .hysteresis_mv = 20, .enable_subth = true, .transition_cycles = 10};
+    assert(is_subthreshold(500, config) == false);
+}
+
+test "voltage_within_range_true" {
+    assert(voltage_within_range(1100, 1100, 50) == true);
+}
+
+test "voltage_within_range_low" {
+    assert(voltage_within_range(1060, 1100, 50) == true);
+}
+
+test "voltage_within_range_high" {
+    assert(voltage_within_range(1140, 1100, 50) == true);
+}
+
+test "voltage_within_range_false" {
+    assert(voltage_within_range(1000, 1100, 50) == false);
+}
+
+test "subth_power_estimate_normal" {
+    assert(subth_power_estimate(1100) == 100);
+}
+
+test "subth_power_estimate_half" {
+    assert(subth_power_estimate(550) == 25);
+}
+
+test "subth_power_estimate_quarter" {
+    assert(subth_power_estimate(275) == 6);
+}
+
+test "power_savings_ratio_fifty_percent" {
+    const result = power_savings_ratio(1100, 777);
+    assert(result == 50);
+}
+
+test "power_savings_ratio_seventy_five_percent" {
+    const result = power_savings_ratio(1100, 550);
+    assert(result == 75);
+}
+
+test "power_state_can_gate_active" {
+    assert(power_state_can_gate(PowerState.active) == false);
+}
+
+test "power_state_can_gate_idle" {
+    assert(power_state_can_gate(PowerState.idle) == true);
+}
+
+test "power_state_can_gate_sleep" {
+    assert(power_state_can_gate(PowerState.sleep) == true);
+}
+
+test "power_state_deeper" {
+    assert(power_state_deeper(PowerState.idle, PowerState.deep_sleep) == PowerState.deep_sleep);
+    assert(power_state_deeper(PowerState.deep_sleep, PowerState.idle) == PowerState.deep_sleep);
+}
+
+test "power_state_sleep_ok_true" {
+    const domains = [_]ClkDomain{
+        .{.id = 0, .enabled = true, .gate_mode = ClkGateMode.on, .activity_count = 0, .last_active_cycle = 0},
+        .{.id = 1, .enabled = true, .gate_mode = ClkGateMode.on, .activity_count = 0, .last_active_cycle = 0},
+    } ** 8;
+    assert(power_state_sleep_ok(domains, 200) == true);
+}
+
+test "power_state_sleep_ok_false" {
+    const domains = [_]ClkDomain{
+        .{.id = 0, .enabled = true, .gate_mode = ClkGateMode.on, .activity_count = 10, .last_active_cycle = 0},
+        .{.id = 1, .enabled = true, .gate_mode = ClkGateMode.on, .activity_count = 0, .last_active_cycle = 0},
+    } ** 8;
+    assert(power_state_sleep_ok(domains, 200) == false);
+}
+
+test "encode_subth_clk" {
+    const encoded = encode_subth_clk(0x05, 0x02);
+    assert((encoded >> 8) == OP_SUBTH_CLK);
+}
+
+test "decode_subth_clk" {
+    const decoded = decode_subth_clk(0xE5A8);
+    assert(decoded.domain_id == 0x05);
+    assert(decoded.mode == 0x02);
+}
+
+test "opcode_constant" {
+    assert(OP_SUBTH_CLK == 0xE5);
+}
+
+// ============================================================================
+// Invariants
+// ============================================================================
+
+invariant num_clk_domains_eight
+    assert NUM_CLK_DOMAINS == 8
+
+invariant subth_threshold_bound
+    assert SUBTH_THRESHOLD_MV < NORMAL_VOLTAGE_MV
+
+invariant power_estimate_positive
+    assert subth_power_estimate(100) >= 0
+
+invariant power_savings_bound
+    assert power_savings_ratio(1100, 550) <= 100
+
+invariant power_state_enum_range
+    assert @intFromEnum(PowerState.active) >= 0 and @intFromEnum(PowerState.deep_sleep) <= 3
+
+invariant clk_gate_mode_enum_range
+    assert @intFromEnum(ClkGateMode.off) >= 0 and @intFromEnum(ClkGateMode.auto) <= 2
+
+invariant clk_domain_pulse_increases_activity
+    given domain = ClkDomain{.id = 0, .enabled = true, .gate_mode = ClkGateMode.on, .activity_count = 0, .last_active_cycle = 0}
+    and result = clk_domain_pulse(domain, 100)
+    assert result.activity_count > domain.activity_count
+
+invariant clk_domain_decay_decreases_or_same
+    given domain = ClkDomain{.id = 0, .enabled = true, .gate_mode = ClkGateMode.on, .activity_count = 5, .last_active_cycle = 0}
+    and result = clk_domain_decay(domain)
+    assert result.activity_count <= domain.activity_count
+
+invariant power_savings_symmetric
+    assert power_savings_ratio(1100, 550) == power_savings_ratio(550, 1100)
+
+// ============================================================================
+// Benchmarks
+// ============================================================================
+
+bench clk_domain_is_idle_latency
+    measure: nanoseconds to clk_domain_is_idle(.{.id = 0, .enabled = true, .gate_mode = ClkGateMode.on, .activity_count = 0, .last_active_cycle = 0}, 200, 100)
+    target: < 50ns
+
+bench is_subthreshold_latency
+    measure: nanoseconds to is_subthreshold(350, .{.threshold_mv = 400, .hysteresis_mv = 20, .enable_subth = true, .transition_cycles = 10})
+    target: < 50ns
+
+bench subth_power_estimate_latency
+    measure: nanoseconds to subth_power_estimate(550)
+    target: < 50ns
+
+bench power_state_sleep_ok_latency
+    measure: nanoseconds to power_state_sleep_ok([_]ClkDomain{.{.id = 0, .enabled = true, .gate_mode = ClkGateMode.on, .activity_count = 0, .last_active_cycle = 0}} ** 8, 200)
+    target: < 100ns
+
+bench encode_subth_clk_latency
+    measure: nanoseconds to encode_subth_clk(0x05, 0x02)
+    target: < 20ns
+
+bench decode_subth_clk_latency
+    measure: nanoseconds to decode_subth_clk(0xE5A8)
+    target: < 20ns

@@ -1,0 +1,107 @@
+module GftNeuronFull;
+// #1764 + GF-T: a COMPLETE BitNet neuron with GF-T-precision accumulation.
+// Ternary weights {-1,0,+1} times real-valued GF-T16 activations, summed in
+// signed GF-T (round-to-nearest-even), then a sign activation quantizes the sum
+// back to a TRIT output {N,Z,P}. So the neuron is layer-composable: trit weights
+// x GF-T activations -> GF-T dot product -> trit activation, feeding the next
+// layer. This is the full BitNet-x-GF-T inference unit (weighted sum + nonlinearity).
+//
+// Weights: trit u8 {N=0->-1, Z=1->0, P=2->+1}. Activations: signed GF-T16 in u32.
+// Output: trit u8 {N=0, Z=1, P=2} = sign(sum).
+
+fn magadd(a: i32, b: i32) -> i32 {
+    var ao : i32 = a >> 9; var am : i32 = a & 511;
+    var bo : i32 = b >> 9; var bm : i32 = b & 511;
+    var ho : i32 = bo; var hm : i32 = bm; var lo : i32 = ao; var lm : i32 = am;
+    if (ao >= bo) { ho = ao; hm = am; lo = bo; lm = bm; }
+    var hs : i32 = 512 + hm; var ls : i32 = 512 + lm;
+    var d : i32 = ho - lo; if (d > 11) { d = 11; }
+    var losh : i32 = ls >> d; var rem : i32 = ls - (losh << d);
+    var s : i32 = hs + losh; var off : i32 = ho; var mant : i32 = s - 512;
+    if (s >= 1024) {
+        var g : i32 = s & 1; var pre : i32 = s >> 1; mant = pre - 512;
+        if (g == 1) { if (rem > 0) { mant = mant + 1; } else { if ((pre & 1) == 1) { mant = mant + 1; } } }
+        off = ho + 1; if (off >= 80) { off = 80; }
+    } else {
+        var t : i32 = rem << 1; var hf : i32 = 1 << d;
+        if (t > hf) { mant = mant + 1; } else { if (t == hf) { if ((s & 1) == 1) { mant = mant + 1; } } }
+    }
+    if (mant >= 512) { mant = 0; off = off + 1; if (off >= 80) { off = 80; } }
+    return (off << 9) | mant;
+}
+fn magsub(hi: i32, lo: i32) -> i32 {
+    if (hi == lo) { return 0; }
+    var ho : i32 = hi >> 9; var hm : i32 = hi & 511;
+    var lo_o : i32 = lo >> 9; var lm : i32 = lo & 511;
+    var d : i32 = ho - lo_o; var hs : i32 = (512 + hm) << 14;
+    var la : i32 = 0; var sticky : i32 = 0;
+    if (d >= 26) { la = 0; sticky = 1; }
+    else { var ls : i32 = (512 + lm) << 14; la = ls >> d; if ((ls - (la << d)) > 0) { sticky = 1; } }
+    var diff : i32 = hs - la; var off : i32 = ho;
+    var cap : i32 = 12; if (off - 1 < cap) { cap = off - 1; } if (cap < 0) { cap = 0; }
+    var sh : i32 = 0;
+    if (diff != 0) {
+        var t : i32 = diff;
+        if (t < 65536) { if (sh + 8 <= cap) { t = t << 8; sh = sh + 8; } }
+        if (t < 1048576) { if (sh + 4 <= cap) { t = t << 4; sh = sh + 4; } }
+        if (t < 4194304) { if (sh + 2 <= cap) { t = t << 2; sh = sh + 2; } }
+        if (t < 8388608) { if (sh + 1 <= cap) { t = t << 1; sh = sh + 1; } }
+    }
+    diff = diff << sh; off = off - sh;
+    var q : i32 = diff >> 14; var rem : i32 = diff - (q << 14); var half : i32 = 8192; var mant : i32 = q - 512;
+    if (rem > half) { mant = mant + 1; }
+    else { if (rem == half) { if (sticky == 1) { mant = mant + 1; } else { if ((q & 1) == 1) { mant = mant + 1; } } } }
+    if (mant >= 512) { mant = 0; off = off + 1; if (off >= 80) { off = 80; } }
+    // #5506: below the smallest binade the normalisation stops at its floor and
+    // q stays under 512, so mant goes negative and (off << 9) | mant is no
+    // GF-T16 encoding at all (sadd(256, 66047) gave 0xFFFFFEFF). There are no
+    // subnormals: such a difference is zero, exactly as enc() makes any
+    // value below 2^-40 zero.
+    if (mant < 0) { return 0; }
+    return (off << 9) | mant;
+}
+fn sadd(a: u32, b: u32) -> u32 {
+    if (a == 0) { return b; }
+    if (b == 0) { return a; }
+    var sa : i32 = (a >> 16) as i32; var ma : i32 = (a & 65535) as i32;
+    var sb : i32 = (b >> 16) as i32; var mb : i32 = (b & 65535) as i32;
+    if (sa == sb) { return ((sa << 16) | magadd(ma, mb)) as u32; }
+    // different signs: a top-level r==0 guard (NOT nested inside the ma>=mb
+    // branch -- gen-verilog does not lower that as an early return, so it fell
+    // through to (sign<<16)|0 = a wrong negative zero on exact cancellation).
+    // #5506: order the operands BEFORE subtracting. magsub(hi, lo) shifts by
+    // hi_off - lo_off, so calling it unordered shifts by a negative count:
+    // undefined in C, unchecked in Rust -O, a trap in Zig ReleaseSafe.
+    var bsign : i32 = sa;
+    var r : i32 = 0;
+    if (ma < mb) { r = magsub(mb, ma); bsign = sb; } else { r = magsub(ma, mb); }
+    if (r == 0) { return 0; }
+    return ((bsign << 16) | r) as u32;
+}
+fn contrib(w: u8, a: u32) -> u32 {
+    if (w == 2) { return a; }
+    if (a == 0) { return 0; }
+    if (w == 0) { return a ^ 65536; }
+    return 0;
+}
+// sign activation: quantize the signed GF-T sum to a trit {N=0, Z=1, P=2}.
+fn activate(s: u32) -> u8 {
+    if (s == 0) { return 1; }              // exactly zero -> Z
+    if ((s >> 16) == 1) { return 0; }      // sign bit set -> N
+    return 2;                              // positive -> P
+}
+
+// The full neuron: sum_i w_i * a_i in signed GF-T, then sign -> trit.
+fn on_comb(w1: u8, a1: u32, w2: u8, a2: u32, w3: u8, a3: u32, w4: u8, a4: u32) -> u8 {
+    var acc : u32 = sadd(sadd(contrib(w1, a1), contrib(w2, a2)),
+                         sadd(contrib(w3, a3), contrib(w4, a4)));
+    return activate(acc);
+}
+
+// weights +1,+1,-1,+1 on 1.0s -> 1+1-1+1 = +2 -> P (2).
+test pos { assert_eq(on_comb(2,20480, 2,20480, 0,20480, 2,20480), 2); }
+// weights +1,-1 on 1.0s (rest 0) -> exact cancel -> Z (1).
+test zero { assert_eq(on_comb(2,20480, 0,20480, 1,20480, 1,20480), 1); }
+// weights -1,-1,-1,-1 on 1.0s -> -4 -> N (0).
+test neg { assert_eq(on_comb(0,20480, 0,20480, 0,20480, 0,20480), 0); }
+endmodule

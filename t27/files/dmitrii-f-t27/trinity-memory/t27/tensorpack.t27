@@ -1,0 +1,247 @@
+// Native TensorPack v1 framing and caller-supplied descriptor validation.
+// This is NOT a JSON parser or a full TensorPack decoder. In particular, this
+// module cannot establish that descriptors equal the JSON metadata in a file.
+// Include generated codecs.h, container.h, then tensorpack.h. All nonempty
+// pointer ranges must be valid and output records must not alias input data.
+module TrinityMemoryTensorPack {
+    const TM_TP_ERR_DESCRIPTOR: i32 = -20;
+    const TM_TP_ERR_TEXT: i32 = -21;
+    const TM_TP_ERR_SHAPE: i32 = -22;
+    const TM_TP_ERR_SCALE: i32 = -23;
+    const TM_TP_ERR_AXES: i32 = -24;
+    const TM_TP_ERR_OFFSET: i32 = -25;
+
+    struct TMTPText { data: []u8, size: usize, }
+    struct TMTensorDescriptor {
+        name: []u8,
+        name_size: usize,
+        shape: []u64,
+        rank: usize,
+        scales: []f64,
+        scale_count: usize,
+        scale_axis: i32,
+        axes: []TMTPText,
+        axes_count: usize,
+        codec: i32,
+        offset: u64,
+        length: u64,
+    }
+    struct TMTPHeader {
+        metadata_bytes: usize,
+        tensor_count: usize,
+        payload_bytes: usize,
+        payload_offset: usize,
+        container_bytes: usize,
+    }
+    struct TMTPValidation {
+        tensor_count: usize,
+        total_trits: u64,
+        payload_bytes: usize,
+        framing_valid: bool,
+        descriptors_valid: bool,
+        json_binding_valid: bool,
+    }
+
+    fn tm_tp_utf8(data: []u8, size: usize, forbid_controls: bool) -> bool {
+        var i: usize = 0;
+        while (i < size) {
+            var a: u8 = data[i];
+            if (a < 128) {
+                if (forbid_controls && (a < 32 || a == 127)) { return false; }
+                i = i + 1;
+            } else {
+                var width: usize = 0;
+                if (a >= 194 && a <= 223) { width = 2; }
+                if (a >= 224 && a <= 239) { width = 3; }
+                if (a >= 240 && a <= 244) { width = 4; }
+                if (width == 0 || width > size - i) { return false; }
+                var j: usize = 1;
+                while (j < width) {
+                    if (data[i + j] < 128 || data[i + j] > 191) { return false; }
+                    j = j + 1;
+                }
+                // Reject overlong forms, UTF-16 surrogates, >U+10FFFF.
+                if (a == 224 && data[i + 1] < 160) { return false; }
+                if (a == 237 && data[i + 1] > 159) { return false; }
+                if (a == 240 && data[i + 1] < 144) { return false; }
+                if (a == 244 && data[i + 1] > 143) { return false; }
+                i = i + width;
+            }
+        }
+        return true;
+    }
+
+    fn tm_tp_text_equal(a: []u8, a_size: usize, b: []u8, b_size: usize) -> bool {
+        if (a_size != b_size) { return false; }
+        var i: usize = 0;
+        while (i < a_size) { if (a[i] != b[i]) { return false; } i = i + 1; }
+        return true;
+    }
+
+    fn tm_tp_validate_header(data: []u8, size: usize, header: *TMTPHeader) -> i32 {
+        if (size < 32) { return TM_ERR_LENGTH; }
+        if (data[0] != 84 || data[1] != 84 || data[2] != 80 || data[3] != 75) { return TM_ERR_HEADER; }
+        if (data[4] != 1 || data[5] != 0 || data[6] != 0 || data[7] != 0) { return TM_ERR_HEADER; }
+        var metadata: u32 = tm_read_u32(data, 8);
+        var tensors: u32 = tm_read_u32(data, 12);
+        var payload: u64 = tm_read_u64(data, 16);
+        if (metadata > 1048576 || tensors > 1024 || payload > 67108864) { return TM_ERR_LIMIT; }
+        var payload_offset: usize = 32 + (metadata as usize);
+        if ((size as u64) != ((payload_offset as u64) + payload)) { return TM_ERR_LENGTH; }
+        var meta_crc: u32 = tm_crc32_update(data, 24, 0xffffffff);
+        meta_crc = tm_crc32_update(&data[32], metadata as usize, meta_crc) ^ 0xffffffff;
+        if (meta_crc != tm_read_u32(data, 24)) { return TM_ERR_CHECKSUM; }
+        if (tm_crc32(&data[payload_offset], payload as usize) != tm_read_u32(data, 28)) { return TM_ERR_CHECKSUM; }
+        if (!tm_tp_utf8(&data[32], metadata as usize, false)) { return TM_TP_ERR_TEXT; }
+        // Reject a UTF-8 BOM, but do not pretend this checks JSON grammar.
+        if (metadata >= 3 && data[32] == 239 && data[33] == 187 && data[34] == 191) { return TM_TP_ERR_TEXT; }
+        header.metadata_bytes = metadata as usize;
+        header.tensor_count = tensors as usize;
+        header.payload_bytes = payload as usize;
+        header.payload_offset = payload_offset;
+        header.container_bytes = size;
+        return 0;
+    }
+
+    fn tm_tp_descriptor_count(d: *TMTensorDescriptor) -> i64 {
+        if (d.name_size == 0 || d.name_size > 256 || !tm_tp_utf8(d.name, d.name_size, true)) {
+            return TM_TP_ERR_TEXT as i64;
+        }
+        if (d.rank > 16) { return TM_TP_ERR_SHAPE as i64; }
+        var count: u64 = 1;
+        var i: usize = 0;
+        while (i < d.rank) {
+            var dimension: u64 = d.shape[i];
+            if (dimension == 0 || dimension > 2147483647 || dimension > 4194304 / count) {
+                return TM_TP_ERR_SHAPE as i64;
+            }
+            count = count * dimension;
+            i = i + 1;
+        }
+        if (tm_group_size(d.codec) == 0) { return TM_ERR_CODEC as i64; }
+        if (d.axes_count != 0 && d.axes_count != d.rank) { return TM_TP_ERR_AXES as i64; }
+        i = 0;
+        while (i < d.axes_count) {
+            if (d.axes[i].size == 0 || d.axes[i].size > 64 || !tm_tp_utf8(d.axes[i].data, d.axes[i].size, true)) {
+                return TM_TP_ERR_AXES as i64;
+            }
+            var j: usize = 0;
+            while (j < i) {
+                if (tm_tp_text_equal(d.axes[i].data, d.axes[i].size, d.axes[j].data, d.axes[j].size)) {
+                    return TM_TP_ERR_AXES as i64;
+                }
+                j = j + 1;
+            }
+            i = i + 1;
+        }
+        var scales: u64 = 1;
+        if (d.scale_axis != -1) {
+            if (d.scale_axis < 0 || (d.scale_axis as usize) >= d.rank) { return TM_TP_ERR_SCALE as i64; }
+            scales = d.shape[d.scale_axis as usize];
+        }
+        if ((d.scale_count as u64) != scales) { return TM_TP_ERR_SCALE as i64; }
+        i = 0;
+        while (i < d.scale_count) {
+            // Both comparisons must succeed: NaN and infinities are rejected.
+            if (!(d.scales[i] > 0.0 && d.scales[i] <= 1.7976931348623157e308)) {
+                return TM_TP_ERR_SCALE as i64;
+            }
+            i = i + 1;
+        }
+        return count as i64;
+    }
+
+    fn tm_tp_validate_tmem(data: []u8, size: usize, codec: i32, count: usize) -> i32 {
+        if (size < 24) { return TM_ERR_LENGTH; }
+        if (data[0] != 84 || data[1] != 77 || data[2] != 69 || data[3] != 77 ||
+            data[4] != 1 || data[6] != 0 || data[7] != 0) { return TM_ERR_HEADER; }
+        if ((data[5] as i32) != codec || tm_read_u64(data, 8) != (count as u64)) { return TM_TP_ERR_DESCRIPTOR; }
+        var needed: i64 = tm_payload_size(codec, count as u64);
+        if (needed < 0) { return needed as i32; }
+        if ((needed as u64) != (tm_read_u32(data, 16) as u64) || ((size - 24) as u64) != (needed as u64)) {
+            return TM_ERR_LENGTH;
+        }
+        var crc: u32 = tm_crc32_update(data, 20, 0xffffffff);
+        crc = tm_crc32_update(&data[24], size - 24, crc) ^ 0xffffffff;
+        if (crc != tm_read_u32(data, 20)) { return TM_ERR_CHECKSUM; }
+        // Validate canonical words without allocating or writing decoded trits.
+        var group: usize = tm_group_size(codec);
+        var group_bits: u32 = tm_group_bits(codec);
+        var mask: u64 = ((1 as u64) << group_bits) - 1;
+        var buffered: u64 = 0;
+        var buffered_bits: u32 = 0;
+        var offset: usize = 24;
+        var checked: usize = 0;
+        while (checked < count) {
+            while (buffered_bits < group_bits) {
+                buffered = buffered | ((data[offset] as u64) << buffered_bits);
+                offset = offset + 1;
+                buffered_bits = buffered_bits + 8;
+            }
+            var word: u64 = buffered & mask;
+            buffered = buffered >> group_bits;
+            buffered_bits = buffered_bits - group_bits;
+            if (!tm_word_valid(codec, word)) { return TM_ERR_CODE; }
+            if (count - checked < group) {
+                var lane: usize = count - checked;
+                while (lane < group) {
+                    if (tm_word_trit(codec, word, lane) != 0) { return TM_ERR_PADDING; }
+                    lane = lane + 1;
+                }
+                checked = count;
+            } else { checked = checked + group; }
+        }
+        if (buffered != 0) { return TM_ERR_PADDING; }
+        return 0;
+    }
+
+    fn tm_tp_validate_descriptors(data: []u8, size: usize, items: []TMTensorDescriptor,
+                                  item_count: usize, max_total_trits: u64, result: *TMTPValidation) -> i32 {
+        if (max_total_trits == 0) { return TM_ERR_LIMIT; }
+        var limit: u64 = max_total_trits;
+        if (limit > 4194304) { limit = 4194304; }
+        var header: TMTPHeader = TMTPHeader{ .metadata_bytes = 0, .tensor_count = 0,
+            .payload_bytes = 0, .payload_offset = 0, .container_bytes = 0 };
+        var status: i32 = tm_tp_validate_header(data, size, &header);
+        if (status != 0) { return status; }
+        if (item_count != header.tensor_count) { return TM_TP_ERR_DESCRIPTOR; }
+        var total: u64 = 0;
+        var offset: u64 = 0;
+        var i: usize = 0;
+        // Bound every descriptor and total trit count before scanning nested data.
+        while (i < item_count) {
+            var count: i64 = tm_tp_descriptor_count(&items[i]);
+            if (count < 0) { return count as i32; }
+            if ((count as u64) > limit - total) { return TM_ERR_LIMIT; }
+            total = total + (count as u64);
+            var j: usize = 0;
+            while (j < i) {
+                if (tm_tp_text_equal(items[i].name, items[i].name_size, items[j].name, items[j].name_size)) {
+                    return TM_TP_ERR_DESCRIPTOR;
+                }
+                j = j + 1;
+            }
+            var length: u64 = 24 + (tm_payload_size(items[i].codec, count as u64) as u64);
+            if (items[i].offset != offset || items[i].length != length ||
+                length > (header.payload_bytes as u64) - offset) { return TM_TP_ERR_OFFSET; }
+            offset = offset + length;
+            i = i + 1;
+        }
+        if (offset != (header.payload_bytes as u64)) { return TM_TP_ERR_OFFSET; }
+        i = 0;
+        while (i < item_count) {
+            var count: i64 = tm_tp_descriptor_count(&items[i]);
+            var start: usize = header.payload_offset + (items[i].offset as usize);
+            status = tm_tp_validate_tmem(&data[start], items[i].length as usize, items[i].codec, count as usize);
+            if (status != 0) { return status; }
+            i = i + 1;
+        }
+        result.tensor_count = item_count;
+        result.total_trits = total;
+        result.payload_bytes = header.payload_bytes;
+        result.framing_valid = true;
+        result.descriptors_valid = true;
+        result.json_binding_valid = false;
+        return 0;
+    }
+}

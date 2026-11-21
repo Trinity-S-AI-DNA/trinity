@@ -1,0 +1,742 @@
+// SPDX-License-Identifier: Apache-2.0
+; avs_controller_96.t27 — 96-pin AVS Controller
+; Adaptive voltage scaling controller for 96-pin configuration
+; φ² + 1/φ² = 3 | TRINITY
+
+module avs-controller-96;
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+pub const PINS_96 : u8 = 96;
+pub const VOLTAGE_MIN_MV : u16 = 700;   // 0.7V minimum
+pub const VOLTAGE_MAX_MV : u16 = 1300;  // 1.3V maximum
+pub const VOLTAGE_STEP_MV : u16 = 5;     // 5mV step size
+pub const VOLTAGE_LEVELS : u8 = 121;     // (1300-700)/5 + 1
+
+pub const TARGET_MV : u16 = 1000;       // 1.0V target
+pub const HYSTERESIS_MV : u16 = 15;     // 15mV hysteresis
+pub const SETTLING_US : u16 = 80;       // 80us settling time
+
+pub const CONTROL_PIN_OFFSET : u8 = 64;  // AVS control pins start at 64
+pub const CONTROL_PIN_COUNT : u8 = 7;    // 7 control pins for 96-pin config
+
+pub const FREQ_MIN_KHZ : u32 = 10000;   // 10 MHz minimum
+pub const FREQ_MAX_KHZ : u32 = 200000;  // 200 MHz maximum
+
+pub const DUAL_CHANNEL : bool = true;   // 96-pin supports dual channels
+pub const CHANNEL_PIN_GROUPS : u8 = 2;   // 2 groups of control pins
+
+// ============================================================================
+// Types
+// ============================================================================
+
+pub const AvsChannel = enum(u8) {
+    channel0 = 0,
+    channel1 = 1,
+    both = 2,
+}
+
+pub const AvsState = enum(u8) {
+    disabled = 0,
+    enabled = 1,
+    adjusting = 2,
+    settled = 3,
+    fault = 4,
+    calibrating = 5,  // 96-pin supports calibration
+}
+
+pub const AvsMode = enum(u8) {
+    manual = 0,
+    automatic = 1,
+    adaptive = 2,
+    dual_independent = 3,  // 96-pin exclusive mode
+}
+
+pub const AvsChannelConfig = struct {
+    channel : AvsChannel,
+    enabled : bool,
+    target_mv : u16,
+    current_mv : u16,
+    level : u8,
+}
+
+pub const AvsPinConfig = struct {
+    pin_index : u8,
+    is_output : bool,
+    function : u8,  // 0=control, 1=feedback, 2=enable, 3=calibration
+}
+
+pub const AvsVoltageLevel = struct {
+    level : u8,          // 0 to 120
+    voltage_mv : u16,
+    control_code : u8,   // 7-bit code for control pins
+}
+
+pub const AvsStatus = struct {
+    state : AvsState,
+    mode : AvsMode,
+    channel0 : AvsChannelConfig,
+    channel1 : AvsChannelConfig,
+    fault_code : u8,
+    calibration_complete : bool,
+}
+
+// Named form of the anonymous `struct { opcode, level, channel }` that
+// decode_avs_96_cmd returns (same fields, same types).
+pub const Avs96Cmd = struct {
+    opcode : u8,
+    level : u8,
+    channel : u8,
+}
+
+pub const AvsConfig = struct {
+    mode : AvsMode,
+    min_mv : u16,
+    max_mv : u16,
+    target_mv : u16,
+    hysteresis_mv : u16,
+    settling_us : u16,
+    enable_dual_channel : bool,
+}
+
+// ============================================================================
+// Voltage Level Functions
+// ============================================================================
+
+// avs_voltage_from_level(level: u8) -> u16
+// Convert voltage level to millivolts
+pub fn avs_voltage_from_level(level: u8) -> u16 {
+    return VOLTAGE_MIN_MV + @as(u16, level) * VOLTAGE_STEP_MV;
+}
+
+// avs_level_from_voltage(voltage_mv: u16) -> u8
+// Convert voltage to level
+pub fn avs_level_from_voltage(voltage_mv: u16) -> u8 {
+    var mv = voltage_mv;
+    if (mv < VOLTAGE_MIN_MV) {
+        mv = VOLTAGE_MIN_MV;
+    } else if (mv > VOLTAGE_MAX_MV) {
+        mv = VOLTAGE_MAX_MV;
+    }
+    return @as(u8, (mv - VOLTAGE_MIN_MV) / VOLTAGE_STEP_MV);
+}
+
+// avs_control_code_from_level(level: u8) -> u8
+// Generate 7-bit control code for voltage level
+pub fn avs_control_code_from_level(level: u8) -> u8 {
+    return level & 0x7F;
+}
+
+// avs_level_from_control_code(code: u8) -> u8
+// Decode level from 7-bit control code
+pub fn avs_level_from_control_code(code: u8) -> u8 {
+    return code & 0x7F;
+}
+
+// ============================================================================
+// Voltage Validation
+// ============================================================================
+
+// avs_voltage_valid(voltage_mv: u16) -> bool
+// Check if voltage is within valid range
+pub fn avs_voltage_valid(voltage_mv: u16) -> bool {
+    return voltage_mv >= VOLTAGE_MIN_MV and voltage_mv <= VOLTAGE_MAX_MV;
+}
+
+// avs_voltage_in_hysteresis(current_mv: u16, target_mv: u16, hysteresis_mv: u16) -> bool
+// Check if current voltage is within hysteresis band of target
+pub fn avs_voltage_in_hysteresis(current_mv: u16, target_mv: u16, hysteresis_mv: u16) -> bool {
+    if (current_mv > target_mv) {
+        return (current_mv - target_mv) <= hysteresis_mv;
+    } else {
+        return (target_mv - current_mv) <= hysteresis_mv;
+    }
+}
+
+// avs_should_adjust(current_mv: u16, target_mv: u16, hysteresis_mv: u16) -> bool
+// Check if voltage should be adjusted
+pub fn avs_should_adjust(current_mv: u16, target_mv: u16, hysteresis_mv: u16) -> bool {
+    return !avs_voltage_in_hysteresis(current_mv, target_mv, hysteresis_mv);
+}
+
+// ============================================================================
+// Config Functions
+// ============================================================================
+
+// avs_config_init() -> AvsConfig
+// Initialize AVS configuration
+pub fn avs_config_init() -> AvsConfig {
+    return AvsConfig {
+        .mode = AvsMode.automatic,
+        .min_mv = VOLTAGE_MIN_MV,
+        .max_mv = VOLTAGE_MAX_MV,
+        .target_mv = TARGET_MV,
+        .hysteresis_mv = HYSTERESIS_MV,
+        .settling_us = SETTLING_US,
+        .enable_dual_channel = false,
+    };
+}
+
+// avs_config_dual(target0_mv: u16, target1_mv: u16) -> AvsConfig
+// Create dual-channel AVS configuration
+pub fn avs_config_dual(target0_mv: u16, target1_mv: u16) -> AvsConfig {
+    return AvsConfig {
+        .mode = AvsMode.dual_independent,
+        .min_mv = VOLTAGE_MIN_MV,
+        .max_mv = VOLTAGE_MAX_MV,
+        .target_mv = (target0_mv + target1_mv) / 2,  // Average target
+        .hysteresis_mv = HYSTERESIS_MV,
+        .settling_us = SETTLING_US,
+        .enable_dual_channel = true,
+    };
+}
+
+// avs_config_adaptive(min_mv: u16, max_mv: u16) -> AvsConfig
+// Create adaptive AVS configuration
+pub fn avs_config_adaptive(min_mv: u16, max_mv: u16) -> AvsConfig {
+    return AvsConfig {
+        .mode = AvsMode.adaptive,
+        .min_mv = min_mv,
+        .max_mv = max_mv,
+        .target_mv = (min_mv + max_mv) / 2,
+        .hysteresis_mv = HYSTERESIS_MV,
+        .settling_us = SETTLING_US,
+        .enable_dual_channel = false,
+    };
+}
+
+// ============================================================================
+// Channel Functions
+// ============================================================================
+
+// avs_channel_init(channel: AvsChannel) -> AvsChannelConfig
+// Initialize channel configuration
+pub fn avs_channel_init(channel: AvsChannel) -> AvsChannelConfig {
+    return AvsChannelConfig {
+        .channel = channel,
+        .enabled = false,
+        .target_mv = TARGET_MV,
+        .current_mv = VOLTAGE_MIN_MV,
+        .level = 0,
+    };
+}
+
+// avs_channel_enable(channel: AvsChannelConfig, target_mv: u16) -> AvsChannelConfig
+// Enable channel
+pub fn avs_channel_enable(channel: AvsChannelConfig, target_mv: u16) -> AvsChannelConfig {
+    return AvsChannelConfig {
+        .channel = channel.channel,
+        .enabled = true,
+        .target_mv = target_mv,
+        .current_mv = channel.current_mv,
+        .level = channel.level,
+    };
+}
+
+// avs_channel_adjust(channel: AvsChannelConfig, new_level: u8) -> AvsChannelConfig
+// Adjust channel to new level
+pub fn avs_channel_adjust(channel: AvsChannelConfig, new_level: u8) -> AvsChannelConfig {
+    const new_mv = avs_voltage_from_level(new_level);
+    return AvsChannelConfig {
+        .channel = channel.channel,
+        .enabled = channel.enabled,
+        .target_mv = channel.target_mv,
+        .current_mv = new_mv,
+        .level = new_level,
+    };
+}
+
+// ============================================================================
+// Status Functions
+// ============================================================================
+
+// avs_status_init() -> AvsStatus
+// Initialize AVS status
+pub fn avs_status_init() -> AvsStatus {
+    return AvsStatus {
+        .state = AvsState.disabled,
+        .mode = AvsMode.manual,
+        .channel0 = avs_channel_init(AvsChannel.channel0),
+        .channel1 = avs_channel_init(AvsChannel.channel1),
+        .fault_code = 0,
+        .calibration_complete = false,
+    };
+}
+
+// avs_status_enable(status: AvsStatus, config: AvsConfig) -> AvsStatus
+// Enable AVS controller
+pub fn avs_status_enable(status: AvsStatus, config: AvsConfig) -> AvsStatus {
+    var ch0 = status.channel0;
+    var ch1 = status.channel1;
+
+    if (config.enable_dual_channel) {
+        ch0 = avs_channel_enable(ch0, config.target_mv);
+        ch1 = avs_channel_enable(ch1, config.target_mv);
+    } else {
+        ch0 = avs_channel_enable(ch0, config.target_mv);
+    }
+
+    return AvsStatus {
+        .state = AvsState.enabled,
+        .mode = config.mode,
+        .channel0 = ch0,
+        .channel1 = ch1,
+        .fault_code = 0,
+        .calibration_complete = status.calibration_complete,
+    };
+}
+
+// avs_status_calibrate(status: AvsStatus) -> AvsStatus
+// Enter calibration mode
+pub fn avs_status_calibrate(status: AvsStatus) -> AvsStatus {
+    return AvsStatus {
+        .state = AvsState.calibrating,
+        .mode = status.mode,
+        .channel0 = status.channel0,
+        .channel1 = status.channel1,
+        .fault_code = status.fault_code,
+        .calibration_complete = false,
+    };
+}
+
+// avs_status_calibration_complete(status: AvsStatus) -> AvsStatus
+// Mark calibration complete
+pub fn avs_status_calibration_complete(status: AvsStatus) -> AvsStatus {
+    return AvsStatus {
+        .state = AvsState.enabled,
+        .mode = status.mode,
+        .channel0 = status.channel0,
+        .channel1 = status.channel1,
+        .fault_code = status.fault_code,
+        .calibration_complete = true,
+    };
+}
+
+// avs_status_fault(status: AvsStatus, fault_code: u8) -> AvsStatus
+// Mark fault condition
+pub fn avs_status_fault(status: AvsStatus, fault_code: u8) -> AvsStatus {
+    return AvsStatus {
+        .state = AvsState.fault,
+        .mode = status.mode,
+        .channel0 = status.channel0,
+        .channel1 = status.channel1,
+        .fault_code = fault_code,
+        .calibration_complete = status.calibration_complete,
+    };
+}
+
+// ============================================================================
+// Pin Functions
+// ============================================================================
+
+// avs_control_pins_start() -> u8
+// Get starting pin index for control pins
+pub fn avs_control_pins_start() -> u8 {
+    return CONTROL_PIN_OFFSET;
+}
+
+// avs_control_pins_end() -> u8
+// Get ending pin index for control pins (primary)
+pub fn avs_control_pins_end() -> u8 {
+    return CONTROL_PIN_OFFSET + CONTROL_PIN_COUNT - 1;
+}
+
+// avs_control_pins_secondary_start() -> u8
+// Get starting pin index for secondary channel
+pub fn avs_control_pins_secondary_start() -> u8 {
+    return CONTROL_PIN_OFFSET + CONTROL_PIN_COUNT;
+}
+
+// avs_control_pins_secondary_end() -> u8
+// Get ending pin index for secondary channel
+pub fn avs_control_pins_secondary_end() -> u8 {
+    return avs_control_pins_secondary_start() + CONTROL_PIN_COUNT - 1;
+}
+
+// avs_is_control_pin(pin_index: u8) -> bool
+// Check if pin is a control pin (either channel)
+pub fn avs_is_control_pin(pin_index: u8) -> bool {
+    return avs_is_control_pin_primary(pin_index) or avs_is_control_pin_secondary(pin_index);
+}
+
+// avs_is_control_pin_primary(pin_index: u8) -> bool
+// Check if pin is a primary control pin
+pub fn avs_is_control_pin_primary(pin_index: u8) -> bool {
+    return pin_index >= avs_control_pins_start() and pin_index <= avs_control_pins_end();
+}
+
+// avs_is_control_pin_secondary(pin_index: u8) -> bool
+// Check if pin is a secondary control pin
+pub fn avs_is_control_pin_secondary(pin_index: u8) -> bool {
+    return pin_index >= avs_control_pins_secondary_start() and pin_index <= avs_control_pins_secondary_end();
+}
+
+// avs_control_pin_for_bit(bit_index: u8, channel: AvsChannel) -> u8
+// Get control pin for a bit index and channel
+pub fn avs_control_pin_for_bit(bit_index: u8, channel: AvsChannel) -> u8 {
+    if (bit_index >= CONTROL_PIN_COUNT) {
+        bit_index = 0;
+    }
+
+    if (channel == AvsChannel.channel1) {
+        return avs_control_pins_secondary_start() + bit_index;
+    } else {
+        return avs_control_pins_start() + bit_index;
+    }
+}
+
+// ============================================================================
+// Opcode Encoding/Decoding
+// ============================================================================
+
+// encode_avs_96_cmd(opcode: u8, level: u8, channel: u8) -> u16
+// Encode AVS 96-pin command
+pub fn encode_avs_96_cmd(opcode: u8, level: u8, channel: u8) -> u16 {
+    // Format: [OP:8][LEVEL:7][CHANNEL:1]
+    const op_field : u16 = @as(u16, opcode) << 8;
+    const level_field : u16 = @as(u16, level & 0x7F) << 1;
+    const channel_field : u16 = @as(u16, channel & 0x01);
+    return op_field | level_field | channel_field;
+}
+
+// decode_avs_96_cmd(encoded: u16) -> struct { opcode: u8, level: u8, channel: u8 }
+// Decode AVS 96-pin command
+pub fn decode_avs_96_cmd(encoded: u16) -> Avs96Cmd {
+    const opcode : u8 = @as(u8, @truncate((encoded >> 8) & 0xFF));
+    const level : u8 = @as(u8, @truncate((encoded >> 1) & 0x7F));
+    const channel : u8 = @as(u8, @truncate(encoded & 0x01));
+    return Avs96Cmd{ .opcode = opcode, .level = level, .channel = channel };
+}
+
+// ============================================================================
+// TDD Tests
+// ============================================================================
+
+test "pins_96_constant" {
+    assert(PINS_96 == 96);
+}
+
+test "voltage_constants" {
+    assert(VOLTAGE_MIN_MV == 700);
+    assert(VOLTAGE_MAX_MV == 1300);
+    assert(VOLTAGE_STEP_MV == 5);
+    assert(VOLTAGE_LEVELS == 121);
+}
+
+test "target_voltage_constant" {
+    assert(TARGET_MV == 1000);
+}
+
+test "control_pin_constants" {
+    assert(CONTROL_PIN_OFFSET == 64);
+    assert(CONTROL_PIN_COUNT == 7);
+}
+
+test "dual_channel_constant" {
+    assert DUAL_CHANNEL == true
+}
+
+test "avs_voltage_from_level_zero" {
+    assert(avs_voltage_from_level(0) == VOLTAGE_MIN_MV);
+}
+
+test "avs_voltage_from_level_max" {
+    const max_level = VOLTAGE_LEVELS - 1;
+    assert(avs_voltage_from_level(max_level) == VOLTAGE_MAX_MV);
+}
+
+test "avs_level_from_voltage_target" {
+    const level = avs_level_from_voltage(TARGET_MV);
+    assert(avs_voltage_from_level(level) == TARGET_MV);
+}
+
+test "avs_level_from_voltage_clamp_low" {
+    assert(avs_level_from_voltage(600) == 0);
+}
+
+test "avs_level_from_voltage_clamp_high" {
+    assert(avs_level_from_voltage(1500) == VOLTAGE_LEVELS - 1);
+}
+
+test "avs_control_code_from_level_max" {
+    const code = avs_control_code_from_level(127);
+    assert(code == 127);
+}
+
+test "avs_control_code_from_level_clamp" {
+    const code = avs_control_code_from_level(200);
+    assert(code == 72); // 200 & 0x7F
+}
+
+test "avs_level_from_control_code_roundtrip" {
+    const level = 50;
+    const code = avs_control_code_from_level(level);
+    const decoded = avs_level_from_control_code(code);
+    assert(decoded == level);
+}
+
+test "avs_voltage_valid_in_range" {
+    assert(avs_voltage_valid(750) == true);
+    assert(avs_voltage_valid(1000) == true);
+    assert(avs_voltage_valid(1250) == true);
+}
+
+test "avs_voltage_valid_out_of_range" {
+    assert(avs_voltage_valid(600) == false);
+    assert(avs_voltage_valid(1400) == false);
+}
+
+test "avs_voltage_in_hysteresis_true" {
+    assert(avs_voltage_in_hysteresis(1000, 1000, 15) == true);
+    assert(avs_voltage_in_hysteresis(1010, 1000, 15) == true);
+    assert(avs_voltage_in_hysteresis(990, 1000, 15) == true);
+}
+
+test "avs_voltage_in_hysteresis_false" {
+    assert(avs_voltage_in_hysteresis(1030, 1000, 15) == false);
+    assert(avs_voltage_in_hysteresis(970, 1000, 15) == false);
+}
+
+test "avs_config_init_structure" {
+    const config = avs_config_init();
+    assert(config.mode == AvsMode.automatic);
+    assert(config.target_mv == TARGET_MV);
+    assert(config.enable_dual_channel == false);
+}
+
+test "avs_config_dual_structure" {
+    const config = avs_config_dual(950, 1050);
+    assert(config.mode == AvsMode.dual_independent);
+    assert(config.enable_dual_channel == true);
+}
+
+test "avs_channel_init_structure" {
+    const channel = avs_channel_init(AvsChannel.channel0);
+    assert(channel.channel == AvsChannel.channel0);
+    assert(channel.enabled == false);
+}
+
+test "avs_channel_enable" {
+    const channel = avs_channel_init(AvsChannel.channel0);
+    const result = avs_channel_enable(channel, 950);
+    assert(result.enabled == true);
+    assert(result.target_mv == 950);
+}
+
+test "avs_channel_adjust" {
+    const channel = avs_channel_init(AvsChannel.channel0);
+    const result = avs_channel_adjust(channel, 30);
+    assert(result.level == 30);
+}
+
+test "avs_status_init_structure" {
+    const status = avs_status_init();
+    assert(status.state == AvsState.disabled);
+    assert(status.calibration_complete == false);
+}
+
+test "avs_status_enable" {
+    const status = avs_status_init();
+    const config = avs_config_init();
+    const result = avs_status_enable(status, config);
+    assert(result.state == AvsState.enabled);
+    assert(result.channel0.enabled == true);
+}
+
+test "avs_status_enable_dual" {
+    const status = avs_status_init();
+    const config = avs_config_dual(950, 1050);
+    const result = avs_status_enable(status, config);
+    assert(result.channel0.enabled == true);
+    assert(result.channel1.enabled == true);
+}
+
+test "avs_status_calibrate" {
+    const status = avs_status_init();
+    const result = avs_status_calibrate(status);
+    assert(result.state == AvsState.calibrating);
+    assert(result.calibration_complete == false);
+}
+
+test "avs_status_calibration_complete" {
+    const status = avs_status_init();
+    const result = avs_status_calibration_complete(status);
+    assert(result.calibration_complete == true);
+}
+
+test "avs_control_pins_start" {
+    assert(avs_control_pins_start() == CONTROL_PIN_OFFSET);
+}
+
+test "avs_control_pins_end" {
+    assert(avs_control_pins_end() == CONTROL_PIN_OFFSET + CONTROL_PIN_COUNT - 1);
+}
+
+test "avs_control_pins_secondary_start" {
+    assert(avs_control_pins_secondary_start() == CONTROL_PIN_OFFSET + CONTROL_PIN_COUNT);
+}
+
+test "avs_is_control_pin_primary_true" {
+    assert(avs_is_control_pin_primary(64) == true);
+    assert(avs_is_control_pin_primary(70) == true);
+}
+
+test "avs_is_control_pin_primary_false" {
+    assert(avs_is_control_pin_primary(63) == false);
+    assert(avs_is_control_pin_primary(71) == false);
+}
+
+test "avs_is_control_pin_secondary_true" {
+    assert(avs_is_control_pin_secondary(71) == true);
+    assert(avs_is_control_pin_secondary(77) == true);
+}
+
+test "avs_is_control_pin_secondary_false" {
+    assert(avs_is_control_pin_secondary(70) == false);
+    assert(avs_is_control_pin_secondary(78) == false);
+}
+
+test "avs_is_control_pin_true" {
+    assert(avs_is_control_pin(64) == true);
+    assert(avs_is_control_pin(75) == true);
+}
+
+test "avs_is_control_pin_false" {
+    assert(avs_is_control_pin(63) == false);
+    assert(avs_is_control_pin(78) == false);
+}
+
+test "avs_control_pin_for_bit_primary" {
+    assert(avs_control_pin_for_bit(0, AvsChannel.channel0) == CONTROL_PIN_OFFSET);
+    assert(avs_control_pin_for_bit(6, AvsChannel.channel0) == CONTROL_PIN_OFFSET + 6);
+}
+
+test "avs_control_pin_for_bit_secondary" {
+    assert(avs_control_pin_for_bit(0, AvsChannel.channel1) == avs_control_pins_secondary_start());
+    assert(avs_control_pin_for_bit(6, AvsChannel.channel1) == avs_control_pins_secondary_start() + 6);
+}
+
+test "encode_avs_96_cmd" {
+    const encoded = encode_avs_96_cmd(0x20, 30, 1);
+    assert((encoded >> 8) == 0x20);
+}
+
+test "decode_avs_96_cmd" {
+    const decoded = decode_avs_96_cmd(0x203D);
+    assert(decoded.opcode == 0x20);
+    assert(decoded.level == 30);
+    assert(decoded.channel == 1);
+}
+
+// ============================================================================
+// Invariants
+// ============================================================================
+
+invariant voltage_range_positive
+    assert VOLTAGE_MIN_MV > 0 and VOLTAGE_MAX_MV > VOLTAGE_MIN_MV
+
+invariant voltage_step_positive
+    assert VOLTAGE_STEP_MV > 0
+
+invariant voltage_levels_calculated
+    assert VOLTAGE_LEVELS == ((VOLTAGE_MAX_MV - VOLTAGE_MIN_MV) / VOLTAGE_STEP_MV) + 1
+
+invariant target_voltage_in_range
+    assert avs_voltage_valid(TARGET_MV)
+
+invariant control_pin_count_seven
+    assert CONTROL_PIN_COUNT == 7
+
+invariant control_pins_valid_range
+    assert avs_control_pins_secondary_end() < PINS_96
+
+invariant dual_channel_enabled
+    assert DUAL_CHANNEL == true
+
+invariant avs_status_init_disabled
+    given status = avs_status_init()
+    then status.state == AvsState.disabled
+
+invariant avs_status_calibrate_sets_state
+    given status = avs_status_init()
+    and   result = avs_status_calibrate(status)
+    then result.state == AvsState.calibrating
+
+invariant avs_is_control_pin_primary_excludes_secondary
+    given pin = 70  // Last primary pin
+    assert avs_is_control_pin_primary(pin) == true
+    then avs_is_control_pin_secondary(pin) == false
+
+invariant avs_is_control_pin_secondary_excludes_primary
+    given pin = 71  // First secondary pin
+    assert avs_is_control_pin_secondary(pin) == true
+    then avs_is_control_pin_primary(pin) == false
+
+invariant avs_control_pin_for_bit_monotonic
+    assert avs_control_pin_for_bit(3, AvsChannel.channel0) < avs_control_pin_for_bit(4, AvsChannel.channel0)
+
+invariant avs_config_dual_enables_both_channels
+    given config = avs_config_dual(950, 1050)
+    assert config.enable_dual_channel == true
+
+invariant avs_config_init_single_channel
+    given config = avs_config_init()
+    assert config.enable_dual_channel == false
+
+// ============================================================================
+// Benchmarks
+// ============================================================================
+
+bench avs_voltage_from_level_latency
+    measure: nanoseconds to avs_voltage_from_level(40)
+    target: < 20ns
+
+bench avs_level_from_voltage_latency
+    measure: nanoseconds to avs_level_from_voltage(1000)
+    target: < 20ns
+
+bench avs_control_code_from_level_latency
+    measure: nanoseconds to avs_control_code_from_level(40)
+    target: < 15ns
+
+bench avs_voltage_valid_latency
+    measure: nanoseconds to avs_voltage_valid(1000)
+    target: < 15ns
+
+bench avs_config_init_latency
+    measure: nanoseconds to avs_config_init()
+    target: < 30ns
+
+bench avs_channel_init_latency
+    measure: nanoseconds to avs_channel_init(AvsChannel.channel0)
+    target: < 20ns
+
+bench avs_status_init_latency
+    measure: nanoseconds to avs_status_init()
+    target: < 30ns
+
+bench avs_status_enable_latency
+    measure: nanoseconds to avs_status_enable(avs_status_init(), avs_config_init())
+    target: < 40ns
+
+bench avs_status_calibrate_latency
+    measure: nanoseconds to avs_status_calibrate(avs_status_init())
+    target: < 20ns
+
+bench avs_is_control_pin_latency
+    measure: nanoseconds to avs_is_control_pin(70)
+    target: < 15ns
+
+bench avs_control_pin_for_bit_latency
+    measure: nanoseconds to avs_control_pin_for_bit(3, AvsChannel.channel0)
+    target: < 20ns
+
+bench encode_avs_96_cmd_latency
+    measure: nanoseconds to encode_avs_96_cmd(0x20, 30, 1)
+    target: < 20ns
+
+bench decode_avs_96_cmd_latency
+    measure: nanoseconds to decode_avs_96_cmd(0x203D)
+    target: < 20ns

@@ -1,0 +1,693 @@
+// SPDX-License-Identifier: Apache-2.0
+module TypeChecking {
+    use compiler::parser;
+    use compiler::lexer;
+
+    enum TypeInfo {
+        Void,
+        Bool,
+        I8, I16, I32, I64,
+        U8, U16, U32, U64,
+        F32, F64,
+        Str,
+        Array,
+        Pointer,
+        Optional,
+        Function,
+        Custom,
+        Unknown,
+        Error,
+    }
+
+    struct TypeEntry {
+        name: str;
+        type_info: TypeInfo;
+        is_mutable: bool;
+        is_pub: bool;
+        line: u32;
+        col: u32;
+    }
+
+    const MAX_SYMBOLS: u32 = 1024;
+    const MAX_SCOPES: u32 = 64;
+
+    struct ScopeStack {
+        scope_starts: [MAX_SCOPES]u32;
+        scope_count: u32;
+    }
+
+    struct SymbolTable {
+        entries: [MAX_SYMBOLS]TypeEntry;
+        count: u32;
+        scopes: ScopeStack;
+    }
+
+    struct TypeCheckResult {
+        ok: bool;
+        error_count: u32;
+        first_error_line: u32;
+        first_error_col: u32;
+        first_error_msg: str;
+    }
+
+    struct FnSignature {
+        name: str;
+        params: [16]TypeInfo;
+        param_count: u32;
+        return_type: TypeInfo;
+    }
+
+    const MAX_FNS: u32 = 256;
+
+    struct FnRegistry {
+        fns: [MAX_FNS]FnSignature;
+        count: u32;
+    }
+
+    fn symbol_table_init() -> SymbolTable {
+        return SymbolTable{
+            entries = [TypeEntry{ name = "", type_info = TypeInfo::Unknown, is_mutable = false, is_pub = false, line = 0, col = 0 }; MAX_SYMBOLS],
+            count = 0,
+            scopes = ScopeStack{ scope_starts = [0; MAX_SCOPES], scope_count = 0 },
+        };
+    }
+
+    fn fn_registry_init() -> FnRegistry {
+        return FnRegistry{
+            fns = [FnSignature{ name = "", params = [TypeInfo::Unknown; 16], param_count = 0, return_type = TypeInfo::Void }; MAX_FNS],
+            count = 0,
+        };
+    }
+
+    fn ok_result() -> TypeCheckResult {
+        return TypeCheckResult{
+            ok = true,
+            error_count = 0,
+            first_error_line = 0,
+            first_error_col = 0,
+            first_error_msg = "",
+        };
+    }
+
+    fn error_result(line: u32, col: u32, msg: str) -> TypeCheckResult {
+        return TypeCheckResult{
+            ok = false,
+            error_count = 1,
+            first_error_line = line,
+            first_error_col = col,
+            first_error_msg = msg,
+        };
+    }
+
+    fn push_scope(table: *SymbolTable) {
+        if (table.scopes.scope_count < MAX_SCOPES) {
+            table.scopes.scope_starts[table.scopes.scope_count] = table.count;
+            table.scopes.scope_count = table.scopes.scope_count + 1;
+        }
+    }
+
+    fn pop_scope(table: *SymbolTable) {
+        if (table.scopes.scope_count > 0) {
+            table.scopes.scope_count = table.scopes.scope_count - 1;
+            table.count = table.scopes.scope_starts[table.scopes.scope_count];
+        }
+    }
+
+    fn lookup(table: SymbolTable, name: str) -> TypeInfo {
+        var i: u32 = table.count;
+        while (i > 0) {
+            i = i - 1;
+            if (table.entries[i].name == name) {
+                return table.entries[i].type_info;
+            }
+        }
+        return TypeInfo::Unknown;
+    }
+
+    fn lookup_mutable(table: SymbolTable, name: str) -> bool {
+        var i: u32 = table.count;
+        while (i > 0) {
+            i = i - 1;
+            if (table.entries[i].name == name) {
+                return table.entries[i].is_mutable;
+            }
+        }
+        return false;
+    }
+
+    fn insert(table: *SymbolTable, name: str, info: TypeInfo, mutable: bool, pub_val: bool, line: u32, col: u32) -> bool {
+        if (table.count >= MAX_SYMBOLS) {
+            return false;
+        }
+        table.entries[table.count] = TypeEntry{
+            name = name,
+            type_info = info,
+            is_mutable = mutable,
+            is_pub = pub_val,
+            line = line,
+            col = col,
+        };
+        table.count = table.count + 1;
+        return true;
+    }
+
+    fn register_fn(reg: *FnRegistry, name: str, ret: TypeInfo) {
+        if (reg.count < MAX_FNS) {
+            reg.fns[reg.count] = FnSignature{
+                name = name,
+                params = [TypeInfo::Unknown; 16],
+                param_count = 0,
+                return_type = ret,
+            };
+            reg.count = reg.count + 1;
+        }
+    }
+
+    fn set_fn_param(reg: *FnRegistry, fn_idx: u32, param_idx: u32, ptype: TypeInfo) {
+        if (fn_idx < reg.count and param_idx < 16) {
+            reg.fns[fn_idx].params[param_idx] = ptype;
+            if (param_idx >= reg.fns[fn_idx].param_count) {
+                reg.fns[fn_idx].param_count = param_idx + 1;
+            }
+        }
+    }
+
+    fn lookup_fn(reg: FnRegistry, name: str) -> TypeInfo {
+        var i: u32 = reg.count;
+        while (i > 0) {
+            i = i - 1;
+            if (reg.fns[i].name == name) {
+                return reg.fns[i].return_type;
+            }
+        }
+        return TypeInfo::Unknown;
+    }
+
+    fn lookup_fn_sig(reg: FnRegistry, name: str) -> FnSignature {
+        var i: u32 = reg.count;
+        while (i > 0) {
+            i = i - 1;
+            if (reg.fns[i].name == name) {
+                return reg.fns[i];
+            }
+        }
+        return FnSignature{ name = "", params = [TypeInfo::Unknown; 16], param_count = 0, return_type = TypeInfo::Unknown };
+    }
+
+    fn resolve_type(annotation: str) -> TypeInfo {
+        if (annotation == "void") { return TypeInfo::Void; }
+        if (annotation == "bool") { return TypeInfo::Bool; }
+        if (annotation == "i8") { return TypeInfo::I8; }
+        if (annotation == "i16") { return TypeInfo::I16; }
+        if (annotation == "i32") { return TypeInfo::I32; }
+        if (annotation == "i64") { return TypeInfo::I64; }
+        if (annotation == "u8") { return TypeInfo::U8; }
+        if (annotation == "u16") { return TypeInfo::U16; }
+        if (annotation == "u32") { return TypeInfo::U32; }
+        if (annotation == "u64") { return TypeInfo::U64; }
+        if (annotation == "f32") { return TypeInfo::F32; }
+        if (annotation == "f64") { return TypeInfo::F64; }
+        if (annotation == "str") { return TypeInfo::Str; }
+        if (annotation == "") { return TypeInfo::Unknown; }
+        return TypeInfo::Custom;
+    }
+
+    fn is_numeric(t: TypeInfo) -> bool {
+        return t == TypeInfo::I8 or t == TypeInfo::I16 or t == TypeInfo::I32 or t == TypeInfo::I64
+            or t == TypeInfo::U8 or t == TypeInfo::U16 or t == TypeInfo::U32 or t == TypeInfo::U64
+            or t == TypeInfo::F32 or t == TypeInfo::F64;
+    }
+
+    fn is_integer(t: TypeInfo) -> bool {
+        return t == TypeInfo::I8 or t == TypeInfo::I16 or t == TypeInfo::I32 or t == TypeInfo::I64
+            or t == TypeInfo::U8 or t == TypeInfo::U16 or t == TypeInfo::U32 or t == TypeInfo::U64;
+    }
+
+    fn is_float(t: TypeInfo) -> bool {
+        return t == TypeInfo::F32 or t == TypeInfo::F64;
+    }
+
+    fn is_signed(t: TypeInfo) -> bool {
+        return t == TypeInfo::I8 or t == TypeInfo::I16 or t == TypeInfo::I32 or t == TypeInfo::I64;
+    }
+
+    fn type_name(t: TypeInfo) -> str {
+        if (t == TypeInfo::Void) { return "void"; }
+        if (t == TypeInfo::Bool) { return "bool"; }
+        if (t == TypeInfo::I32) { return "i32"; }
+        if (t == TypeInfo::I64) { return "i64"; }
+        if (t == TypeInfo::U8) { return "u8"; }
+        if (t == TypeInfo::U32) { return "u32"; }
+        if (t == TypeInfo::U64) { return "u64"; }
+        if (t == TypeInfo::F32) { return "f32"; }
+        if (t == TypeInfo::F64) { return "f64"; }
+        if (t == TypeInfo::Str) { return "str"; }
+        if (t == TypeInfo::Array) { return "array"; }
+        if (t == TypeInfo::Bool) { return "bool"; }
+        if (t == TypeInfo::Error) { return "error"; }
+        return "unknown";
+    }
+
+    fn numeric_promotion(a: TypeInfo, b: TypeInfo) -> TypeInfo {
+        if (a == TypeInfo::F64 or b == TypeInfo::F64) { return TypeInfo::F64; }
+        if (a == TypeInfo::F32 or b == TypeInfo::F32) { return TypeInfo::F64; }
+        if (a == TypeInfo::I64 or b == TypeInfo::I64) { return TypeInfo::I64; }
+        if (a == TypeInfo::U64 or b == TypeInfo::U64) { return TypeInfo::U64; }
+        return TypeInfo::I32;
+    }
+
+    fn is_comparison_op(op: str) -> bool {
+        return op == "==" or op == "!=" or op == "<" or op == ">" or op == "<=" or op == ">=";
+    }
+
+    fn is_logical_op(op: str) -> bool {
+        return op == "and" or op == "or";
+    }
+
+    fn is_arithmetic_op(op: str) -> bool {
+        return op == "+" or op == "-" or op == "*" or op == "/" or op == "%"
+            or op == "**" or op == "<<" or op == ">>";
+    }
+
+    fn check_assign(lhs: TypeInfo, rhs: TypeInfo) -> bool {
+        if (lhs == rhs) { return true; }
+        if (is_numeric(lhs) and is_numeric(rhs)) { return true; }
+        if (lhs == TypeInfo::Unknown or rhs == TypeInfo::Unknown) { return true; }
+        if (lhs == TypeInfo::Custom or rhs == TypeInfo::Custom) { return true; }
+        if (lhs == TypeInfo::Optional) { return true; }
+        return false;
+    }
+
+    fn can_implicitly_cast(from: TypeInfo, to: TypeInfo) -> bool {
+        if (from == to) { return true; }
+        if (is_integer(from) and is_integer(to)) { return true; }
+        if (is_integer(from) and is_float(to)) { return true; }
+        if (is_float(from) and is_float(to)) { return true; }
+        return false;
+    }
+
+    fn infer_literal(value: str) -> TypeInfo {
+        if (value == "true" or value == "false") { return TypeInfo::Bool; }
+        if (value == "null") { return TypeInfo::Optional; }
+        if (value == "") { return TypeInfo::Void; }
+        if (value == "0") { return TypeInfo::I32; }
+        return TypeInfo::I32;
+    }
+
+    fn infer_binary_result(op: str, left: TypeInfo, right: TypeInfo) -> TypeInfo {
+        if (is_comparison_op(op)) { return TypeInfo::Bool; }
+        if (is_logical_op(op)) { return TypeInfo::Bool; }
+        if (op == "++") { return TypeInfo::Str; }
+        if (is_arithmetic_op(op)) {
+            if (is_numeric(left) and is_numeric(right)) {
+                return numeric_promotion(left, right);
+            }
+            return TypeInfo::Unknown;
+        }
+        return TypeInfo::Unknown;
+    }
+
+    fn infer_expr(expr: parser::Node, table: SymbolTable, reg: FnRegistry) -> TypeInfo {
+        if (expr.kind == parser::NodeKind::ExprLiteral) {
+            return infer_literal(expr.value);
+        }
+        if (expr.kind == parser::NodeKind::ExprIdentifier) {
+            return lookup(table, expr.name);
+        }
+        if (expr.kind == parser::NodeKind::ExprBinary) {
+            if (expr.children_count >= 2) {
+                var left = infer_expr(expr.children[0], table, reg);
+                var right = infer_expr(expr.children[1], table, reg);
+                return infer_binary_result(expr.extra_op, left, right);
+            }
+            return TypeInfo::Unknown;
+        }
+        if (expr.kind == parser::NodeKind::ExprUnary) {
+            if (expr.children_count >= 1) {
+                var inner = infer_expr(expr.children[0], table, reg);
+                if (expr.extra_op == "!") { return TypeInfo::Bool; }
+                if (expr.extra_op == "-") {
+                    if (is_numeric(inner)) { return inner; }
+                }
+                if (is_numeric(inner)) { return inner; }
+                if (inner == TypeInfo::Bool) { return TypeInfo::Bool; }
+            }
+            return TypeInfo::Unknown;
+        }
+        if (expr.kind == parser::NodeKind::ExprCall) {
+            return lookup_fn(reg, expr.name);
+        }
+        if (expr.kind == parser::NodeKind::ExprArrayLiteral) {
+            return TypeInfo::Array;
+        }
+        if (expr.kind == parser::NodeKind::ExprStructLit) {
+            return TypeInfo::Custom;
+        }
+        if (expr.kind == parser::NodeKind::ExprEnumValue) {
+            return TypeInfo::Custom;
+        }
+        if (expr.kind == parser::NodeKind::ExprIf) {
+            if (expr.children_count >= 2) {
+                return infer_expr(expr.children[1], table, reg);
+            }
+            return TypeInfo::Unknown;
+        }
+        if (expr.kind == parser::NodeKind::ExprFieldAccess) {
+            return TypeInfo::Unknown;
+        }
+        if (expr.kind == parser::NodeKind::ExprIndex) {
+            return TypeInfo::Unknown;
+        }
+        if (expr.kind == parser::NodeKind::ExprSwitch) {
+            if (expr.children_count >= 2) {
+                return infer_expr(expr.children[1], table, reg);
+            }
+            return TypeInfo::Unknown;
+        }
+        return TypeInfo::Unknown;
+    }
+
+    fn check_stmt(stmt: parser::Node, table: *SymbolTable, reg: FnRegistry, expected_ret: TypeInfo) -> TypeCheckResult {
+        if (stmt.kind == parser::NodeKind::ExprReturn) {
+            if (stmt.children_count >= 1) {
+                var ret_type = infer_expr(stmt.children[0], table, reg);
+                if (expected_ret != TypeInfo::Unknown and expected_ret != TypeInfo::Void) {
+                    if (check_assign(expected_ret, ret_type) == false) {
+                        return error_result(0, 0, "return type mismatch");
+                    }
+                }
+            }
+            return ok_result();
+        }
+        if (stmt.kind == parser::NodeKind::StmtLocal) {
+            var var_type = resolve_type(stmt.extra_type);
+            if (stmt.children_count >= 1) {
+                var init_type = infer_expr(stmt.children[0], table, reg);
+                if (var_type == TypeInfo::Unknown) {
+                    var_type = init_type;
+                } else if (check_assign(var_type, init_type) == false) {
+                    return error_result(0, 0, "type mismatch in local declaration");
+                }
+            }
+            insert(table, stmt.name, var_type, stmt.extra_mutable, false, 0, 0);
+            return ok_result();
+        }
+        if (stmt.kind == parser::NodeKind::StmtAssign) {
+            if (stmt.children_count >= 2) {
+                var target_type = infer_expr(stmt.children[0], table, reg);
+                var val_type = infer_expr(stmt.children[1], table, reg);
+                if (check_assign(target_type, val_type) == false) {
+                    return error_result(0, 0, "assignment type mismatch");
+                }
+            }
+            return ok_result();
+        }
+        if (stmt.kind == parser::NodeKind::StmtIf) {
+            push_scope(table);
+            if (stmt.children_count >= 2) {
+                var i: u32 = 0;
+                while (i < stmt.children[1].children_count) {
+                    var r = check_stmt(stmt.children[1].children[i], table, reg, expected_ret);
+                    if (r.ok == false) { pop_scope(table); return r; }
+                    i = i + 1;
+                }
+            }
+            if (stmt.children_count >= 3) {
+                var j: u32 = 0;
+                while (j < stmt.children[2].children_count) {
+                    var r = check_stmt(stmt.children[2].children[j], table, reg, expected_ret);
+                    if (r.ok == false) { pop_scope(table); return r; }
+                    j = j + 1;
+                }
+            }
+            pop_scope(table);
+            return ok_result();
+        }
+        if (stmt.kind == parser::NodeKind::StmtWhile) {
+            push_scope(table);
+            if (stmt.children_count >= 2) {
+                var i: u32 = 0;
+                while (i < stmt.children[1].children_count) {
+                    var r = check_stmt(stmt.children[1].children[i], table, reg, expected_ret);
+                    if (r.ok == false) { pop_scope(table); return r; }
+                    i = i + 1;
+                }
+            }
+            pop_scope(table);
+            return ok_result();
+        }
+        if (stmt.kind == parser::NodeKind::StmtFor) {
+            push_scope(table);
+            if (stmt.children_count >= 3) {
+                var i: u32 = 0;
+                while (i < stmt.children[2].children_count) {
+                    var r = check_stmt(stmt.children[2].children[i], table, reg, expected_ret);
+                    if (r.ok == false) { pop_scope(table); return r; }
+                    i = i + 1;
+                }
+            }
+            pop_scope(table);
+            return ok_result();
+        }
+        if (stmt.kind == parser::NodeKind::StmtExpr) {
+            return ok_result();
+        }
+        if (stmt.kind == parser::NodeKind::StmtBreak) {
+            return ok_result();
+        }
+        if (stmt.kind == parser::NodeKind::StmtContinue) {
+            return ok_result();
+        }
+        return ok_result();
+    }
+
+    fn typecheck_fn_body(fn_node: parser::Node, table: *SymbolTable, reg: FnRegistry) -> TypeCheckResult {
+        var ret_type = resolve_type(fn_node.extra_return_type);
+        var i: u32 = 0;
+        while (i < fn_node.children_count) {
+            var r = check_stmt(fn_node.children[i], table, reg, ret_type);
+            if (r.ok == false) { return r; }
+            i = i + 1;
+        }
+        return ok_result();
+    }
+
+    fn typecheck_module(module: parser::Node, table: *SymbolTable, reg: *FnRegistry) -> TypeCheckResult {
+        var i: u32 = 0;
+        while (i < module.children_count) {
+            var child = module.children[i];
+            if (child.kind == parser::NodeKind::ConstDecl) {
+                var const_type = resolve_type(child.extra_type);
+                if (const_type == TypeInfo::Unknown and child.children_count > 0) {
+                    const_type = infer_expr(child.children[0], table, reg);
+                }
+                insert(table, child.name, const_type, false, child.extra_pub, 0, 0);
+            } else if (child.kind == parser::NodeKind::StructDecl) {
+                insert(table, child.name, TypeInfo::Custom, false, child.extra_pub, 0, 0);
+            } else if (child.kind == parser::NodeKind::EnumDecl) {
+                insert(table, child.name, TypeInfo::Custom, false, child.extra_pub, 0, 0);
+            } else if (child.kind == parser::NodeKind::FnDecl) {
+                var ret_type = resolve_type(child.extra_return_type);
+                insert(table, child.name, TypeInfo::Function, false, child.extra_pub, 0, 0);
+                register_fn(reg, child.name, ret_type);
+            }
+            i = i + 1;
+        }
+        var j: u32 = 0;
+        while (j < module.children_count) {
+            var child = module.children[j];
+            if (child.kind == parser::NodeKind::FnDecl) {
+                push_scope(table);
+                var p: u32 = 0;
+                while (p < child.params_count) {
+                    var param_type = resolve_type(child.params[p].type_str);
+                    insert(table, child.params[p].name, param_type, false, false, 0, 0);
+                    p = p + 1;
+                }
+                var r = typecheck_fn_body(child, table, reg);
+                pop_scope(table);
+                if (r.ok == false) { return r; }
+            }
+            j = j + 1;
+        }
+        return ok_result();
+    }
+
+    fn typecheck(ast: parser::Node) -> TypeCheckResult {
+        var table = symbol_table_init();
+        var reg = fn_registry_init();
+        if (ast.kind == parser::NodeKind::Module) {
+            return typecheck_module(ast, &table, &reg);
+        }
+        var i: u32 = 0;
+        while (i < ast.children_count) {
+            var child = ast.children[i];
+            if (child.kind == parser::NodeKind::Module) {
+                var result = typecheck_module(child, &table, &reg);
+                if (result.ok == false) {
+                    return result;
+                }
+            }
+            i = i + 1;
+        }
+        return ok_result();
+    }
+
+    test resolve_type_i32
+        given result = resolve_type("i32")
+        then result == TypeInfo::I32
+
+    test resolve_type_bool
+        given result = resolve_type("bool")
+        then result == TypeInfo::Bool
+
+    test resolve_type_f64
+        given result = resolve_type("f64")
+        then result == TypeInfo::F64
+
+    test resolve_type_unknown
+        given result = resolve_type("")
+        then result == TypeInfo::Unknown
+
+    test resolve_type_custom
+        given result = resolve_type("MyStruct")
+        then result == TypeInfo::Custom
+
+    test is_numeric_i32
+        given result = is_numeric(TypeInfo::I32)
+        then result == true
+
+    test is_numeric_bool
+        given result = is_numeric(TypeInfo::Bool)
+        then result == false
+
+    test is_integer_u32
+        given result = is_integer(TypeInfo::U32)
+        then result == true
+
+    test is_integer_f64
+        given result = is_integer(TypeInfo::F64)
+        then result == false
+
+    test is_float_f32
+        given result = is_float(TypeInfo::F32)
+        then result == true
+
+    test is_float_i32
+        given result = is_float(TypeInfo::I32)
+        then result == false
+
+    test is_signed_i32
+        given result = is_signed(TypeInfo::I32)
+        then result == true
+
+    test is_signed_u32
+        given result = is_signed(TypeInfo::U32)
+        then result == false
+
+    test check_assign_same_type
+        given result = check_assign(TypeInfo::I32, TypeInfo::I32)
+        then result == true
+
+    test check_assign_numeric_compat
+        given result = check_assign(TypeInfo::I32, TypeInfo::F64)
+        then result == true
+
+    test check_assign_incompatible
+        given result = check_assign(TypeInfo::Bool, TypeInfo::Str)
+        then result == false
+
+    test check_assign_optional
+        given result = check_assign(TypeInfo::Optional, TypeInfo::I32)
+        then result == true
+
+    test numeric_promotion_f64
+        given result = numeric_promotion(TypeInfo::I32, TypeInfo::F64)
+        then result == TypeInfo::F64
+
+    test numeric_promotion_i32
+        given result = numeric_promotion(TypeInfo::I32, TypeInfo::I32)
+        then result == TypeInfo::I32
+
+    test infer_literal_int
+        given result = infer_literal("42")
+        then result == TypeInfo::I32
+
+    test infer_literal_bool
+        given result = infer_literal("true")
+        then result == TypeInfo::Bool
+
+    test infer_literal_false
+        given result = infer_literal("false")
+        then result == TypeInfo::Bool
+
+    test infer_literal_null
+        given result = infer_literal("null")
+        then result == TypeInfo::Optional
+
+    test is_comparison_eq
+        given result = is_comparison_op("==")
+        then result == true
+
+    test is_comparison_plus
+        given result = is_comparison_op("+")
+        then result == false
+
+    test is_logical_and
+        given result = is_logical_op("and")
+        then result == true
+
+    test is_arithmetic_plus
+        given result = is_arithmetic_op("+")
+        then result == true
+
+    test is_arithmetic_eq
+        given result = is_arithmetic_op("==")
+        then result == false
+
+    test can_cast_i32_to_f64
+        given result = can_implicitly_cast(TypeInfo::I32, TypeInfo::F64)
+        then result == true
+
+    test can_cast_bool_to_i32
+        given result = can_implicitly_cast(TypeInfo::Bool, TypeInfo::I32)
+        then result == false
+
+    test infer_binary_add_i32
+        given result = infer_binary_result("+", TypeInfo::I32, TypeInfo::I32)
+        then result == TypeInfo::I32
+
+    test infer_binary_compare
+        given result = infer_binary_result("==", TypeInfo::I32, TypeInfo::I32)
+        then result == TypeInfo::Bool
+
+    test infer_binary_logical
+        given result = infer_binary_result("and", TypeInfo::Bool, TypeInfo::Bool)
+        then result == TypeInfo::Bool
+
+    test infer_binary_concat
+        given result = infer_binary_result("++", TypeInfo::Str, TypeInfo::Str)
+        then result == TypeInfo::Str
+
+    test infer_binary_mixed
+        given result = infer_binary_result("+", TypeInfo::I32, TypeInfo::F64)
+        then result == TypeInfo::F64
+
+    invariant void_not_numeric
+        assert is_numeric(TypeInfo::Void) == false
+
+    invariant bool_not_numeric
+        assert is_numeric(TypeInfo::Bool) == false
+
+    invariant promotion_symmetric_f64
+        assert numeric_promotion(TypeInfo::F64, TypeInfo::I32) == TypeInfo::F64
+
+    invariant self_assign_ok
+        assert check_assign(TypeInfo::I32, TypeInfo::I32) == true
+
+    invariant comparison_returns_bool
+        assert infer_binary_result("==", TypeInfo::I32, TypeInfo::I32) == TypeInfo::Bool
+
+    invariant logical_returns_bool
+        assert infer_binary_result("or", TypeInfo::Bool, TypeInfo::Bool) == TypeInfo::Bool
+}

@@ -1,0 +1,197 @@
+// SPDX-License-Identifier: Apache-2.0
+// t27/specs/
+// Probability ratio between policies | φ² + 1/φ² = 3 | TRINITY
+
+// #8980: written with `let x = if ... {}` and `for i in 0..n`, so it never compiled.
+// Three formulas were wrong, and their tests pinned the wrong values:
+// - compute_ratio returned log pi_new - log pi_old; the ratio is exp of that.
+// - clipped_surrogate returned clip(r) A; PPO's term is min(r A, clip(r) A), so
+//   r = 1.1 inside the clip range gives 2.2, not 2.4.
+// - policy_loss returned the surrogate itself, a quantity to MAXIMISE; as a loss
+//   added to the value and entropy losses it is minus the mean surrogate.
+// Each test now states the value PPO defines (Schulman et al., 2017).
+
+module PpoClipLoss;
+    use base::types;
+    use math::constants;
+
+    // ═══════════════════════════════════════════════════════════
+    // 1. Constants
+    // ═══════════════════════════════════════════════════════════
+
+    const DEFAULT_CLIP_EPSILON : f32 = 0.2;
+    const DEFAULT_ENTROPY_COEF : f32 = 0.01;
+
+    // ═══════════════════════════════════════════════════════════
+    // 2. Types
+    // ═══════════════════════════════════════════════════════════
+
+    pub const PPOClipConfig = struct {
+        clip_epsilon : f32,
+        entropy_coef : f32,
+        value_clip_coef : f32,
+    };
+
+    pub const PPOBatch = struct {
+        states : [][]f32,
+        actions : [][]f32,
+        old_log_probs : []f32,
+        advantages : []f32,
+        returns : []f32,
+        values : []f32,
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    // 3. Core Functions
+    // ═══════════════════════════════════════════════════════════
+
+    // r = pi_new / pi_old = exp(log pi_new - log pi_old)
+    fn compute_ratio(new_log_prob: f32, old_log_prob: f32) -> f32 {
+        return exp(new_log_prob - old_log_prob);
+    }
+
+    // min(r A, clip(r, 1 - eps, 1 + eps) A)
+    fn clipped_surrogate(ratio: f32, advantage: f32, clip_epsilon: f32) -> f32 {
+        const clipped_ratio = @min(@max(ratio, 1.0 - clip_epsilon), 1.0 + clip_epsilon);
+        return @min(ratio * advantage, clipped_ratio * advantage);
+    }
+
+    // -mean_t min(r_t A_t, clip(r_t) A_t): the loss gradient descent minimises
+    fn policy_loss(ratios: []const f32, advantages: []const f32, clip_epsilon: f32) -> f32 {
+        var total : f32 = 0.0;
+        var i : usize = 0;
+        while (i < ratios.len) {
+            total = total + clipped_surrogate(ratios[i], advantages[i], clip_epsilon);
+            i = i + 1;
+        }
+        return -total / @as(f32, @floatFromInt(ratios.len));
+    }
+
+    // -coef * mean entropy: lower loss for a more exploratory policy
+    fn entropy_loss(entropies: []const f32, entropy_coef: f32) -> f32 {
+        var total : f32 = 0.0;
+        var i : usize = 0;
+        while (i < entropies.len) {
+            total = total + entropies[i];
+            i = i + 1;
+        }
+        return -entropy_coef * (total / @as(f32, @floatFromInt(entropies.len)));
+    }
+
+    // mean 0.5 (target - (old + clip(pred - old, -c, c)))^2
+    fn value_loss(predicted_values: []const f32, target_values: []const f32, old_values: []const f32, clip_coef: f32) -> f32 {
+        var total : f32 = 0.0;
+        var i : usize = 0;
+        while (i < predicted_values.len) {
+            const diff = @min(@max(predicted_values[i] - old_values[i], -clip_coef), clip_coef);
+            const err = target_values[i] - (old_values[i] + diff);
+            total = total + 0.5 * err * err;
+            i = i + 1;
+        }
+        return total / @as(f32, @floatFromInt(predicted_values.len));
+    }
+
+    fn policy_loss_of(r0: f32, r1: f32, r2: f32) -> f32 {
+        const ratios : [3]f32 = [r0, r1, r2];
+        const advantages : [3]f32 = [2.0, 1.5, 3.0];
+        return policy_loss(&ratios, &advantages, DEFAULT_CLIP_EPSILON);
+    }
+
+    fn entropy_loss_of() -> f32 {
+        const entropies : [3]f32 = [0.5, 0.6, 0.4];
+        return entropy_loss(&entropies, DEFAULT_ENTROPY_COEF);
+    }
+
+    fn value_loss_of(p0: f32) -> f32 {
+        const predicted : [3]f32 = [p0, 2.0, 1.5];
+        const target : [3]f32 = [1.1, 2.1, 1.6];
+        const old : [3]f32 = [0.9, 1.9, 1.4];
+        return value_loss(&predicted, &target, &old, 0.2);
+    }
+
+    fn valid_input() -> f32 {
+        return DEFAULT_CLIP_EPSILON;
+    }
+
+    // total_loss(policy_loss_value: f32, value_loss_value: f32, entropy_loss_value: f32, value_loss_coef: f32) → f32
+    fn total_loss(policy_loss_value: f32, value_loss_value: f32, entropy_loss_value: f32, value_loss_coef: f32) -> f32 {
+        // Combine all loss components
+        return policy_loss_value + value_loss_coef * value_loss_value + entropy_loss_value;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // TDD: Tests (from .tri behaviors)
+    // ═══════════════════════════════════════════════════════════
+
+    test compute_ratio_basic_case
+        given 
+            new_log_prob = 0.5
+            old_log_prob = 0.3
+        when result = compute_ratio(new_log_prob, old_log_prob)
+        then @abs(result - 1.2214028) < 0.000001  // exp(0.2); the old `== 0.2` was the log ratio
+
+    test clipped_surrogate_basic_case
+        given 
+            ratio = 1.1
+            advantage = 2.0
+            clip_epsilon = 0.2
+        when result = clipped_surrogate(ratio, advantage, clip_epsilon)
+        then @abs(result - 1.1 * 2.0) < 0.000001  // inside [0.8, 1.2] the clip does nothing
+
+    test clipped_surrogate_clipping_case
+        given 
+            ratio = 1.5  // Above clip threshold of 1.2
+            advantage = 2.0
+            clip_epsilon = 0.2
+        when result = clipped_surrogate(ratio, advantage, clip_epsilon)
+        then @abs(result - 1.2 * 2.0) < 0.000001 and clipped_surrogate(0.5, -1.0, 0.2) == -0.8
+
+    // min(r A, clip(r) A) = (2.0, 1.65, 2.7): the loss is -mean = -2.1166667. The old `> 0` was
+    // the surrogate's sign; a ratio pushed past the clip earns nothing more.
+    test policy_loss_basic_case
+        given result = policy_loss_of(1.0, 1.1, 0.9)
+        when pushed = policy_loss_of(1.0, 1.1, 3.0)
+        then result < 0.0 and @abs(result + 2.1166667) < 0.000001 and @abs(pushed - policy_loss_of(1.0, 1.1, 1.2)) < 0.000001
+
+    test entropy_loss_basic_case
+        given result = entropy_loss_of()
+        then result < 0.0 and @abs(result + 0.005) < 0.0000001
+
+    test value_loss_basic_case
+        given result = value_loss_of(1.0)
+        when clipped = value_loss_of(5.0)
+        then result > 0.0 and @abs(result - 0.005) < 0.0000001 and @abs(clipped - value_loss_of(1.1)) < 0.0000001
+
+    test total_loss_basic_case
+        given 
+            policy_loss_value = 1.0
+            value_loss_value = 0.5
+            entropy_loss_value = -0.01
+            value_loss_coef = 0.5
+        when result = total_loss(policy_loss_value, value_loss_value, entropy_loss_value, value_loss_coef)
+        then @abs(result - (1.0 + 0.5 * 0.5 + (-0.01))) < 0.0000001
+
+    // ═══════════════════════════════════════════════════════════
+    // TDD: Invariants (from .tri constraints)
+    // ═══════════════════════════════════════════════════════════
+
+    // 0 < clip_epsilon <= 1 (typically 0.1-0.3)
+    invariant ppo_clip_loss_constraint_0
+        assert valid_input() > 0.0 and valid_input() <= 1.0
+
+    // entropy_coef >= 0
+    invariant ppo_clip_loss_constraint_1
+        assert DEFAULT_ENTROPY_COEF >= 0.0
+
+    // name: ppo_objective -- for A > 0 the surrogate stops growing at r = 1 + eps
+    invariant ppo_clip_loss_constraint_2
+        assert clipped_surrogate(5.0, 1.0, 0.2) == 1.2
+
+    // name: probability_ratio -- equal log-probabilities give r = 1
+    invariant ppo_clip_loss_constraint_3
+        assert compute_ratio(0.3, 0.3) == 1.0
+
+    // "Schulman et al. (2017) - Proximal Policy Optimization Algorithms, arXiv:1707.06347":
+    // for A < 0 the surrogate stops falling at r = 1 - eps
+    invariant ppo_clip_loss_constraint_4
+        assert clipped_surrogate(0.1, -1.0, 0.2) == -0.8

@@ -1,0 +1,264 @@
+// TRI-NET executor reputation: weight the pool split (tri_compute_pool) by a
+// node's track record, so a repeatedly-honest node earns a larger share for the
+// same raw work and a slashed node earns less. Reputation rises on honest
+// settlement (capped) and is halved on every slash -- a strong, memory-bearing
+// penalty that a single fresh receipt cannot immediately undo.
+
+module TriComputeReputation {
+    use base::types;
+
+    const REP_INIT: u32 = 100;    // a new node starts here
+    const REP_MAX: u32 = 1000;    // cap, so reputation cannot run away
+
+    // Outcome codes from tri_compute_challenge.resolve_full. Reputation moves ONLY
+    // on a PROVEN terminal outcome; the non-terminal guards are no-ops (below).
+    const RESOLVE_HONEST: u32 = 0;   // executor proven correct
+    const RESOLVE_SLASH: u32 = 1;    // executor proven wrong
+    // (RESOLVE_MALFORMED=2, RESOLVE_STALE=3, RESOLVE_FAMILY_MISMATCH=4 prove
+    //  neither fraud nor honesty -> reputation must not move.)
+
+    // Reputation after an honest settlement: +gain, capped at REP_MAX.
+    // SATURATE BEFORE COMPARE: gain is a caller-supplied u32 (threaded from
+    // rep_after_resolution / rep_after_verifier, not a bounded constant, and plausibly
+    // scaled to work magnitude). A u32 `rep + gain` OVERFLOWS for a large gain and the
+    // wrapped sum can land BELOW REP_MAX -- e.g. rep=1000, gain=0xFFFFFC18 wraps to 0,
+    // so the `> REP_MAX` guard passes and honest work ZEROES reputation instead of
+    // capping it (the cap is defeated by the very overflow it must survive). Widen the
+    // sum to u64 (two u32s never overflow u64) so the comparison sees the true value
+    // and the cap holds for every gain.
+    fn rep_after_honest(rep: u32, gain: u32) -> u32 {
+        let r: u64 = (rep as u64) + (gain as u64);
+        if (r > REP_MAX as u64) {
+            return REP_MAX;
+        } else {
+            return r as u32;
+        }
+    }
+
+    // Reputation after a proven wrong result: halved (strong penalty with memory).
+    fn rep_after_slash(rep: u32) -> u32 {
+        return rep >> 1;
+    }
+
+    // The wiring the penalty was missing: DRIVE reputation from the challenge
+    // outcome. rep_after_slash/rep_after_honest existed but nothing invoked them,
+    // so a fraudster's reputation never actually fell -- it kept full pool weight
+    // after a slash. Bind them here: halve on a proven SLASH, gain on a proven
+    // HONEST result. Every non-terminal outcome (MALFORMED/STALE/FAMILY_MISMATCH)
+    // is a NO-OP -- they prove nothing, so a griefer cannot tank an honest node's
+    // reputation (nor farm its own) by spamming malformed or replayed disputes.
+    fn rep_after_resolution(rep: u32, outcome: u32, gain: u32) -> u32 {
+        if (outcome == RESOLVE_SLASH) {
+            return rep_after_slash(rep);
+        } else {
+            if (outcome == RESOLVE_HONEST) {
+                return rep_after_honest(rep, gain);
+            } else {
+                return rep;
+            }
+        }
+    }
+
+    // Honest-work trust accrual scaled by the RUNG. Correctly completing expensive,
+    // high-precision work is stronger evidence of capability than cheap low-precision
+    // work, so it should build reputation faster. base_gain applies at/below GF-T16
+    // (Et4); +REP_GAIN_PER_TRIT per exponent trit above it. This is a DIFFERENT axis
+    // from weighted_work: that scales a node's pool SHARE by width, this scales its
+    // TRUST SCORE by rung -- so a node proving itself on GF-T64 climbs to admissible
+    // reputation faster than one only ever doing GF-T8. gf_et is the ladder Et
+    // (tri_a2a.skill_et); mirrors the rung-aware window/bond premiums.
+    const GFT16_ET: u32 = 4;
+    const REP_GAIN_PER_TRIT: u32 = 3;  // extra honest-gain per exponent trit above GF-T16
+
+    fn rung_honest_gain(base_gain: u32, gf_et: u32) -> u32 {
+        if (gf_et <= GFT16_ET) {
+            return base_gain;
+        } else {
+            return base_gain + (gf_et - GFT16_ET) * REP_GAIN_PER_TRIT;
+        }
+    }
+
+    // rep_after_resolution with the rung-scaled honest gain. A proven SLASH still halves
+    // regardless of rung -- fraud is fraud -- and the u64 saturation in rep_after_honest
+    // still caps the result at REP_MAX for any gain.
+    fn rep_after_resolution_rung(rep: u32, outcome: u32, base_gain: u32, gf_et: u32) -> u32 {
+        return rep_after_resolution(rep, outcome, rung_honest_gain(base_gain, gf_et));
+    }
+
+    // Symmetric driver for VERIFIERS (tri_compute_challenge.verifier_dissented):
+    // the same fraud proof that judges the executor also judges the verifiers who
+    // recomputed it. A verifier that dissented from a FORMED quorum is provably
+    // wrong (GF is deterministic) -> halve; one that agreed did honest work ->
+    // gain (capped). When no quorum formed (has_quorum == 0) nothing is proven, so
+    // reputation does not move -- the verifier analogue of the non-terminal no-op.
+    // Composed with can_admit, a verifier with a bad track record is locked out
+    // just like a fraudulent executor: both sides of a dispute are accountable.
+    fn rep_after_verifier(rep: u32, has_quorum: u32, dissented: u32, gain: u32) -> u32 {
+        if (has_quorum == 1) {
+            if (dissented == 1) {
+                return rep_after_slash(rep);
+            } else {
+                return rep_after_honest(rep, gain);
+            }
+        } else {
+            return rep;
+        }
+    }
+
+    // Effective work for the pool split = raw work scaled by reputation. Feeds
+    // tri_compute_pool.pool_share as (my_weighted, sum_weighted).
+    // SATURATING: raw_work * rep overflows u32 for a busy node (raw_work = summed
+    // GF widths across many receipts, an untrusted input; rep up to REP_MAX=1000),
+    // wrapping the pool weight to garbage. Widen to u64 and cap at u32 max -- the
+    // same overflow fix tri_compute_payout.weighted carries (balance_add discipline).
+    fn weighted_work(raw_work: u32, rep: u32) -> u32 {
+        let prod: u64 = (raw_work as u64) * (rep as u64);
+        if (prod > 4294967295) {
+            return 4294967295;
+        } else {
+            return prod as u32;
+        }
+    }
+
+    // Admission gate: a node may be ASSIGNED new work only if its reputation
+    // clears a floor. Reputation weighting (weighted_work) only shrinks a bad
+    // node's SHARE -- a repeatedly-slashed node still occupies the assignment and
+    // challenge machinery and can grief. Bind admission to reputation: each proven
+    // fraud halves rep (rep_after_resolution), so after enough frauds the node
+    // falls below min_rep and is excluded from new tasks entirely. min_rep is a
+    // policy parameter and must sit at or below REP_INIT so fresh honest nodes are
+    // admissible. This is the entry-side counterpart to the pool-side weighting.
+    fn can_admit(rep: u32, min_rep: u32) -> bool {
+        return rep >= min_rep;
+    }
+
+    // ---- Tests / invariants ----
+
+    // Honest settlement raises reputation; it never exceeds the cap.
+    test honest_raises_capped {
+        assert(rep_after_honest(100, 20) == 120, "honest work gains reputation");
+        assert(rep_after_honest(990, 50) == REP_MAX, "reputation is capped at REP_MAX");
+    }
+
+    // Honest work at a higher rung builds trust faster (rung-scaled gain), while a
+    // proven slash still halves regardless of rung and the REP_MAX cap still holds.
+    test rung_scales_honest_trust {
+        assert(rung_honest_gain(5, 4) == 5, "GF-T16 base gain");
+        assert(rung_honest_gain(5, 6) == 11, "GF-T32 gains more (+2 trits * 3)");
+        assert(rung_honest_gain(5, 9) == 20, "GF-T64 gains more still (+5 trits)");
+        assert(rung_honest_gain(5, 14) == 35, "GF-T128 gains most (+10 trits)");
+        assert(rung_honest_gain(5, 3) == 5, "sub-flagship uses the base (never shrinks)");
+        assert(rep_after_resolution_rung(100, RESOLVE_HONEST, 5, 9) == 120, "honest GF-T64: +20 trust");
+        assert(rep_after_resolution_rung(100, RESOLVE_HONEST, 5, 4) == 105, "honest GF-T16: +5 trust");
+        assert(rep_after_resolution_rung(100, RESOLVE_SLASH, 5, 9) == 50, "a GF-T64 slash still halves (fraud is fraud)");
+        assert(rep_after_resolution_rung(999, RESOLVE_HONEST, 100, 14) == REP_MAX, "cap holds even at a high rung + big gain");
+    }
+
+    // The cap survives an overflowing gain: a u32 rep + gain would wrap and slip past
+    // the REP_MAX guard (gain 0xFFFFFC18 makes rep=1000 wrap to exactly 0), zeroing an
+    // honest node's reputation. The u64-widened sum caps correctly instead.
+    test gain_overflow_cannot_defeat_the_cap {
+        assert(rep_after_honest(1000, 4294966296) == REP_MAX, "gain wrapping rep+gain to 0 still caps at REP_MAX, not 0");
+        assert(rep_after_honest(0, 4294967295) == REP_MAX, "a u32-max gain caps at REP_MAX, no wrap");
+        // Composes through the outcome driver: an honest resolution with a huge gain
+        // caps, never zeroes.
+        assert(rep_after_resolution(1000, RESOLVE_HONEST, 4294966296) == REP_MAX, "driver: overflowing honest gain caps at REP_MAX");
+    }
+
+    // The challenge outcome now DRIVES reputation: a proven slash halves it, a
+    // proven honest result gains (capped). This is the transition that was defined
+    // but never invoked.
+    test outcome_drives_reputation {
+        assert(rep_after_resolution(1000, RESOLVE_SLASH, 20) == 500, "proven fraud halves reputation");
+        assert(rep_after_resolution(100, RESOLVE_HONEST, 20) == 120, "proven honest gains reputation");
+        assert(rep_after_resolution(990, RESOLVE_HONEST, 50) == REP_MAX, "gain still respects the cap");
+    }
+
+    // Non-terminal outcomes prove nothing and must NOT move reputation, or a
+    // griefer could tank an honest node (malformed/family) or dodge a penalty via
+    // replay (stale). 2=MALFORMED, 3=STALE, 4=FAMILY_MISMATCH.
+    test non_terminal_outcomes_are_noops {
+        assert(rep_after_resolution(800, 2, 20) == 800, "MALFORMED does not move reputation");
+        assert(rep_after_resolution(800, 3, 20) == 800, "STALE (replay) does not move reputation");
+        assert(rep_after_resolution(800, 4, 20) == 800, "FAMILY_MISMATCH does not move reputation");
+    }
+
+    // Verifiers are accountable too: dissent from a formed quorum halves, agreement
+    // gains, and no quorum is a no-op. Symmetric with the executor driver.
+    test verifier_reputation_driver {
+        assert(rep_after_verifier(1000, 1, 1, 20) == 500, "dissenting verifier is halved");
+        assert(rep_after_verifier(100, 1, 0, 20) == 120, "agreeing verifier gains");
+        assert(rep_after_verifier(800, 0, 0, 20) == 800, "no quorum -> verifier reputation unchanged");
+        assert(rep_after_verifier(800, 0, 1, 20) == 800, "no quorum: even a 'dissent' flag is ignored");
+    }
+
+    // A repeatedly-dissenting verifier is locked out by can_admit, exactly like a
+    // fraudulent executor: five dissents (1000 -> 31) fall below floor 50.
+    test bad_verifier_is_locked_out {
+        d1 = rep_after_verifier(1000, 1, 1, 0);
+        d2 = rep_after_verifier(d1, 1, 1, 0);
+        d3 = rep_after_verifier(d2, 1, 1, 0);
+        d4 = rep_after_verifier(d3, 1, 1, 0);
+        d5 = rep_after_verifier(d4, 1, 1, 0);
+        assert(can_admit(d4, 50) == true, "after 4 dissents (62) still admissible");
+        assert(can_admit(d5, 50) == false, "the fifth dissent (31) locks the verifier out");
+    }
+
+    // Memory: a slash cannot be undone by one honest job -- 1000 -> slash 500 ->
+    // honest +20 = 520, still far below the pre-fraud 1000.
+    test slash_has_memory_through_the_driver {
+        r = rep_after_resolution(1000, RESOLVE_SLASH, 20);
+        assert(rep_after_resolution(r, RESOLVE_HONEST, 20) == 520, "one honest job only partly repairs a proven slash");
+    }
+
+    // A slash halves reputation -- one honest job cannot fully repair it.
+    test slash_halves {
+        assert(rep_after_slash(1000) == 500, "a slash halves reputation");
+        r = rep_after_slash(1000);
+        assert(rep_after_honest(r, 20) == 520, "one honest job only partly repairs a slash");
+    }
+
+    // For equal raw work, a higher-reputation node carries more weight in the pool.
+    test reputation_weights_the_split {
+        honest = weighted_work(16, 1000);
+        slashed = weighted_work(16, 500);
+        assert(honest > slashed, "same work, higher reputation => bigger pool weight");
+        assert(honest == 16000, "weight = raw_work * reputation");
+    }
+
+    // A node with zero reputation earns zero weight regardless of raw work.
+    test zero_reputation_zero_weight {
+        assert(weighted_work(48, 0) == 0, "no reputation => no share");
+    }
+
+    // Admission floor: a fresh node clears a sane floor, a slashed-to-zero node is
+    // excluded, and the boundary is inclusive.
+    test admission_floor {
+        assert(can_admit(REP_INIT, 50) == true, "a fresh node (REP_INIT) is admissible");
+        assert(can_admit(50, 50) == true, "exactly at the floor is admitted");
+        assert(can_admit(49, 50) == false, "one below the floor is excluded");
+        assert(can_admit(0, 50) == false, "a slashed-to-zero node cannot take work");
+    }
+
+    // Fraud eventually locks a node out: a top-reputation node proven fraudulent
+    // enough times halves below the floor and stops being admitted -- the entry-
+    // side teeth the pool-side weighting alone did not have. 1000 -> 500 -> 250 ->
+    // 125 -> 62 -> 31; at floor 50 the fifth proven fraud excludes it.
+    test repeated_fraud_locks_out {
+        r1 = rep_after_resolution(1000, RESOLVE_SLASH, 0);
+        r2 = rep_after_resolution(r1, RESOLVE_SLASH, 0);
+        r3 = rep_after_resolution(r2, RESOLVE_SLASH, 0);
+        r4 = rep_after_resolution(r3, RESOLVE_SLASH, 0);
+        r5 = rep_after_resolution(r4, RESOLVE_SLASH, 0);
+        assert(can_admit(r4, 50) == true, "after 4 frauds (rep 62) still just admissible");
+        assert(can_admit(r5, 50) == false, "the fifth proven fraud (rep 31) locks the node out");
+    }
+
+    // weighted_work is saturating: raw_work * rep past u32 caps at max, not wraps.
+    test weighted_work_saturates {
+        assert(weighted_work(16, 1000) == 16000, "normal weight is exact");
+        assert(weighted_work(48, 0) == 0, "zero reputation -> zero weight (regression)");
+        assert(weighted_work(100000, 1000) == 100000000, "1e5 * 1e3 = 1e8 fits, exact");
+        assert(weighted_work(5000000, 1000) == 4294967295, "overflowing weight saturates to u32 max, no wrap");
+    }
+}

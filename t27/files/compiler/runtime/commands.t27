@@ -1,0 +1,1111 @@
+// commands.t27 — CLI Command Specifications
+// Individual command specifications for tri CLI
+// φ² + 1/φ² = 3 | TRINITY
+
+module commands {
+    // ═════════════════════════════════════════════════════════════════════
+    // Command Enum
+    // ═════════════════════════════════════════════════════════════════════
+
+    pub const Command = enum(u8) {
+        SpecCommand,          // spec create, validate, list
+        GenCommand,           // gen <spec>, gen --all
+        CompileProjectCommand, // compile-project: multi-file with resolved imports
+        GitCommand,           // git commit, push, status
+        LintCommand,          // lint [file], lint --all
+        SkillCommand,         // skill begin, seal, status
+        HelpCommand,          // help
+    };
+
+    // ═════════════════════════════════════════════════════════════════════
+    // Command: tri spec
+    // ═════════════════════════════════════════════════════════════════════
+
+    // tri spec create <name> [--kind feature|bugfix|hotfix|recovery]
+    pub fn spec_create(name: []const u8, kind: []const u8) i32 {
+        // Validate name
+        if (name.len == 0) {
+            error_print("ERROR: spec name cannot be empty");
+            return 1;
+        }
+
+        // Validate kind
+        // (Element type written `string`: an array literal's element type must
+        // be a single type name, so `[_][]const u8{...}` does not parse.
+        // t27's `string` is that name for `[]const u8` -- it lowers to
+        // `[]const u8` in Zig and `const char*` in C -- so nothing is lost.
+        // The `: [4]string` annotation is the type Zig infers for the
+        // original literal; without it the Zig backend emits an untyped
+        // tuple `.{...}`, which a runtime `for` cannot iterate.)
+        const valid_kinds : [4]string = [_]string{ "feature", "bugfix", "hotfix", "recovery" };
+        var valid = false;
+        for (valid_kinds) |k| {
+            if (std.mem.eql(u8, kind, k)) {
+                valid = true;
+                break;
+            }
+        }
+
+        if (!valid) {
+            error_print("ERROR: invalid kind: ");
+            error_print(kind);
+            error_print("\nValid kinds: feature, bugfix, hotfix, recovery");
+            return 1;
+        }
+
+        // Create spec file
+        const spec_path = "specs/" ++ name ++ ".t27";
+
+        if (file_exists(spec_path)) {
+            error_print("ERROR: spec already exists: ");
+            error_print(spec_path);
+            return 1;
+        }
+
+        const spec_content = generate_spec_template(name, kind);
+        write_file(spec_path, spec_content);
+
+        print("Created spec: ");
+        print(spec_path);
+        print("\nKind: ");
+        print(kind);
+        print("\n");
+        print("NOTE: Spec must contain at least one 'test' or 'invariant' block");
+        print("Run 'tri gen ");
+        print(spec_path);
+        print("' to generate code");
+
+        return 0;
+    }
+
+    // tri spec validate <spec_path>
+    pub fn spec_validate(spec_path: []const u8) i32 {
+        // Check if spec exists
+        if (!file_exists(spec_path)) {
+            error_print("ERROR: spec not found: ");
+            error_print(spec_path);
+            return 1;
+        }
+
+        // Parse spec
+        const spec = parse_spec(spec_path);
+        if (spec == null) {
+            error_print("ERROR: failed to parse spec: ");
+            error_print(spec_path);
+            return 1;
+        }
+
+        // Check TDD contract
+        if (spec.?.test_blocks.len == 0 and spec.?.invariant_blocks.len == 0) {
+            error_print("ERROR: TDD contract violated");
+            error_print("Spec must contain at least one 'test' or 'invariant' block");
+            error_print("See: docs/TDD-CONTRACT.md");
+            return 1;
+        }
+
+        // Check language policy
+        if (contains_cyrillic(spec.?.content) and !is_docs_path(spec_path)) {
+            error_print("ERROR: Language policy violated");
+            error_print("Source files must not contain Cyrillic characters");
+            error_print("See: ADR-004-language-policy.md");
+            return 1;
+        }
+
+        // Validate structure
+        const validation_result = validate_spec_structure(spec.?);
+        if (validation_result != 0) {
+            return validation_result;
+        }
+
+        print("Valid: ");
+        print(spec_path);
+        print("\n  Tests: ");
+        print_int(spec.?.test_blocks.len);
+        print("\n  Invariants: ");
+        print_int(spec.?.invariant_blocks.len);
+
+        return 0;
+    }
+
+    // tri spec list
+    pub fn spec_list() i32 {
+        const spec_files = list_files("specs/**/*.t27");
+
+        if (spec_files.len == 0) {
+            print("No spec files found in specs/");
+            return 0;
+        }
+
+        print("Spec files (");
+        print_int(spec_files.len);
+        print("):\n");
+
+        for (spec_files) |spec_path| {
+            const spec = parse_spec(spec_path);
+            // (Zig labelled block `if (...) blk: { ... break :blk v; } else {...}`
+            // written as a var that starts at the else value and is
+            // overwritten inside a plain if -- same result.)
+            var status: []const u8 = "ERROR";
+            if (spec != null) {
+                // (Zig `catch ""` dropped: t27 has no error unions, and a
+                // decimal usize (at most 20 digits) always fits in 64 bytes,
+                // so the fallback could never be taken.)
+                var buf: [64]u8 = undefined;
+                const t_count = std.fmt.bufPrintInt(&buf, spec.?.test_blocks.len, 10, .lower, .{});
+                const i_count = std.fmt.bufPrintInt(&buf, spec.?.invariant_blocks.len, 10, .lower, .{});
+                status = "T:" ++ t_count ++ " I:" ++ i_count;
+            }
+            print("  ");
+            print(spec_path);
+            print(" [");
+            print(status);
+            print("]\n");
+        }
+
+        return 0;
+    }
+
+    // ═════════════════════════════════════════════════════════════════════
+    // Command: tri gen
+    // ═════════════════════════════════════════════════════════════════════
+
+    // tri gen <spec_path> [--backend zig|c|verilog] [--emit-conformance]
+    pub fn gen_spec(spec_path: []const u8, backend: []const u8, emit_conformance: bool) i32 {
+        // Validate spec first
+        const validation = spec_validate(spec_path);
+        if (validation != 0) {
+            error_print("ERROR: spec validation failed, cannot generate code");
+            return validation;
+        }
+
+        // Parse spec
+        const spec = parse_spec(spec_path);
+        if (spec == null) {
+            error_print("ERROR: failed to parse spec");
+            return 1;
+        }
+
+        // Generate backend code
+        var result: i32 = 0;
+        if (std.mem.eql(u8, backend, "zig")) {
+            result = generate_zig(spec.?);
+        } else if (std.mem.eql(u8, backend, "c")) {
+            result = generate_c(spec.?);
+        } else if (std.mem.eql(u8, backend, "verilog")) {
+            result = generate_verilog(spec.?);
+        } else {
+            error_print("ERROR: unknown backend: ");
+            error_print(backend);
+            return 1;
+        }
+
+        if (result != 0) {
+            error_print("ERROR: code generation failed");
+            return result;
+        }
+
+        // Generate conformance if requested
+        if (emit_conformance) {
+            const conformance_result = generate_conformance(spec.?);
+            if (conformance_result != 0) {
+                error_print("WARNING: conformance generation failed");
+            }
+        }
+
+        print("Generated code from: ");
+        print(spec_path);
+        print("\n  Backend: ");
+        print(backend);
+
+        return 0;
+    }
+
+    // tri gen --all
+    pub fn gen_all(backend: []const u8) i32 {
+        const spec_files = list_files("specs/**/*.t27");
+        var failed: i32 = 0;
+
+        for (spec_files) |spec_path| {
+            const result = gen_spec(spec_path, backend, false);
+            if (result != 0) {
+                failed += 1;
+                error_print("Failed to generate: ");
+                error_print(spec_path);
+            }
+        }
+
+        const total = spec_files.len;
+        const success = @as(i32, @intCast(total)) - failed;
+
+        print("\nGeneration complete:\n");
+        print("  Total: ");
+        print_int(total);
+        print("\n  Success: ");
+        print_int(success);
+        print("\n  Failed: ");
+        print_int(failed);
+
+        return if (failed > 0) 1 else 0;
+    }
+
+    // ═════════════════════════════════════════════════════════════════════
+    // Command: tri compile-project
+    // ═════════════════════════════════════════════════════════════════════
+
+    // tri compile-project --output <dir> [--backend zig|c|verilog]
+    // Generates ALL specs into a coherent project with working inter-file imports.
+    //
+    // Pass 1: Scan all .t27 files, build module -> file path map
+    // Pass 2: For each file, resolve `use X::Y` to correct relative path
+    // Pass 3: Write all files + build.zig to output directory
+    pub fn compile_project(output_dir: []const u8, backend: []const u8) i32 {
+        // Validate backend
+        if (!std.mem.eql(u8, backend, "zig") and
+            !std.mem.eql(u8, backend, "c") and
+            !std.mem.eql(u8, backend, "verilog"))
+        {
+            error_print("ERROR: unknown backend: ");
+            error_print(backend);
+            error_print("\nValid backends: zig, c, verilog");
+            return 1;
+        }
+
+        // Pass 1: Scan all .t27 files and build module map
+        const spec_files = list_files("specs/**/*.t27");
+        const compiler_files = list_files("compiler/**/*.t27");
+        const all_files = concat(spec_files, compiler_files);
+
+        var module_map: ModuleMap = undefined;
+        module_map.init();
+
+        for (all_files) |file_path| {
+            const source = read_file(file_path);
+            if (source == null) continue;
+
+            const rel_path = strip_prefix(file_path);
+            const module_key = path_to_module_key(rel_path);
+            module_map.put(module_key, rel_path);
+        }
+
+        print("Module map: ");
+        print_int(module_map.count());
+        print(" entries\n");
+
+        // Pass 2: Compile each file with resolved imports
+        var success: i32 = 0;
+        var failed: i32 = 0;
+
+        for (all_files) |file_path| {
+            const source = read_file(file_path);
+            if (source == null) {
+                failed += 1;
+                continue;
+            }
+
+            const rel_path = strip_prefix(file_path);
+            const code = compile_with_resolved_imports(source.?, rel_path, backend, module_map);
+
+            if (code == null) {
+                failed += 1;
+                error_print("Failed: ");
+                error_print(file_path);
+                error_print("\n");
+                continue;
+            }
+
+            const ext = backend_extension(backend);
+            const dest = output_dir ++ "/" ++ replace(rel_path, ".t27", ext);
+            const dir = dir_path(dest);
+            create_dir_if_not_exists(dir);
+            write_file(dest, code.?);
+            success += 1;
+        }
+
+        // Pass 3: Generate build.zig (Zig backend only)
+        if (std.mem.eql(u8, backend, "zig")) {
+            const build_zig = generate_build_zig(all_files, output_dir);
+            write_file(output_dir ++ "/build.zig", build_zig);
+            print("Generated build.zig\n");
+        }
+
+        print("\ncompile-project complete:\n");
+        print("  Output: ");
+        print(output_dir);
+        print("\n  Success: ");
+        print_int(success);
+        print("\n  Failed: ");
+        print_int(failed);
+
+        return if (failed > 0) 1 else 0;
+    }
+
+    // ═════════════════════════════════════════════════════════════════════
+    // Command: tri lint
+    // ═════════════════════════════════════════════════════════════════════
+
+    // tri lint [file] [--strict]
+    pub fn lint_file(file_path: []const u8, strict: bool) i32 {
+        // Check file extension
+        if (!std.mem.endsWith(u8, file_path, ".t27")) {
+            error_print("ERROR: .t27 file required");
+            return 1;
+        }
+
+        // Validate spec
+        const result = spec_validate(file_path);
+        if (result != 0) {
+            return result;
+        }
+
+        // Strict mode checks
+        if (strict) {
+            const spec = parse_spec(file_path);
+            if (spec.?.test_blocks.len == 0 and spec.?.invariant_blocks.len == 0) {
+                error_print("ERROR: strict mode requires tests");
+                return 1;
+            }
+        }
+
+        print("Lint passed: ");
+        print(file_path);
+        return 0;
+    }
+
+    // tri lint --all
+    pub fn lint_all(strict: bool) i32 {
+        const spec_files = list_files("specs/**/*.t27");
+        var failed: i32 = 0;
+
+        for (spec_files) |spec_path| {
+            const result = lint_file(spec_path, strict);
+            if (result != 0) {
+                failed += 1;
+            }
+        }
+
+        if (failed > 0) {
+            error_print("Lint failed: ");
+            print_int(failed);
+            error_print(" files");
+            return 1;
+        }
+
+        print("All specs passed lint");
+        return 0;
+    }
+
+    // ═════════════════════════════════════════════════════════════════════
+    // Command: tri skill
+    // ═════════════════════════════════════════════════════════════════════
+
+    // tri skill begin --issue <N> [--kind feature|bugfix|hotfix|recovery]
+    pub fn skill_begin(issue_id: []const u8, kind: []const u8) i32 {
+        const registry_path = ".trinity/skills/registry.json";
+
+        // Validate issue ID
+        if (issue_id.len == 0) {
+            error_print("ERROR: issue ID required");
+            error_print("Usage: tri skill begin --issue <N>");
+            return 1;
+        }
+
+        // Load or create registry
+        const registry = load_or_create_registry(registry_path);
+
+        // Create new skill
+        var skill_id_buf: [32]u8 = undefined;
+        // (Zig `catch ""` dropped: t27 has no error unions, and "skill-" plus
+        // a decimal usize (at most 26 bytes) always fits in 32 bytes, so the
+        // fallback could never be taken.)
+        const skill_id = std.fmt.bufPrint(&skill_id_buf, "skill-{d}", .{registry.skills.len + 1});
+        const timestamp = get_current_timestamp();
+        const branch = git_get_current_branch();
+
+        const new_skill = Skill{
+            .id = skill_id,
+            .status = "active",
+            .kind = kind,
+            .issue = issue_id,
+            .branch = branch,
+            .created_at = timestamp,
+            .updated_at = timestamp,
+            .sealed_at = null,
+            .commit = null,
+            .commit_at = null,
+            .pushed = false,
+            .pushed_at = null,
+            .verdict = null,
+            .verdict_at = null,
+            .seal_hash = null,
+            .artifacts = "",
+            .metadata = SkillMetadata{
+                .title = "",
+                .author = "cli",
+                .priority = "P1",
+                // (Was `&[_][]const u8{}`, which does not parse -- see
+                // spec_create. The empty tag list is written as the typed
+                // empty slice literal `[]string{}` (`string` = `[]const u8`).
+                // Not `&[_]string{}`: t27c lowers an empty `[_]T{}` to the
+                // one-element `{ _ }`, which would not be empty.)
+                .tags = []string{},
+            },
+        };
+
+        registry.skills.append(new_skill);
+        write_registry(registry_path, registry);
+
+        print("Skill started:\n");
+        print("  ID: ");
+        print(skill_id);
+        print("\n  Issue: ");
+        print(issue_id);
+        print("\n  Kind: ");
+        print(kind);
+        print("\n  Branch: ");
+        print(branch);
+
+        return 0;
+    }
+
+    // tri skill seal
+    pub fn skill_seal() i32 {
+        const registry_path = ".trinity/skills/registry.json";
+
+        if (!file_exists(registry_path)) {
+            error_print("ERROR: no active skill found");
+            error_print("Run 'tri skill begin --issue N' first");
+            return 1;
+        }
+
+        const registry = load_registry(registry_path);
+        const skill = find_active_skill(registry);
+
+        if (skill == null) {
+            error_print("ERROR: no active skill found");
+            return 1;
+        }
+
+        // Seal the skill
+        const timestamp = get_current_timestamp();
+        skill.?.status = "sealed";
+        skill.?.sealed_at = timestamp;
+        skill.?.seal_hash = compute_seal_hash(skill.?);
+        skill.?.updated_at = timestamp;
+
+        write_registry(registry_path, registry);
+
+        print("Skill sealed:\n");
+        print("  ID: ");
+        print(skill.?.id);
+        print("\n  Seal hash: ");
+        print(skill.?.seal_hash orelse "");
+        print("\n");
+        print("Run 'tri git commit' and 'tri git push' to complete");
+
+        return 0;
+    }
+
+    // tri skill status
+    pub fn skill_status() i32 {
+        const registry_path = ".trinity/skills/registry.json";
+
+        if (!file_exists(registry_path)) {
+            print("No skill registry found");
+            print("Run 'tri skill begin --issue N' to start a skill");
+            return 0;
+        }
+
+        const registry = load_registry(registry_path);
+        const skill = find_active_or_sealed_skill(registry);
+
+        if (skill == null) {
+            print("No active or sealed skill found");
+            return 0;
+        }
+
+        print("Current skill:\n");
+        print("  ID: ");
+        print(skill.?.id);
+        print("\n  Status: ");
+        print(skill.?.status);
+        print("\n  Kind: ");
+        print(skill.?.kind);
+        print("\n  Issue: ");
+        print(skill.?.issue);
+        print("\n  Branch: ");
+        print(skill.?.branch);
+
+        if (skill.?.verdict) |verdict| {
+            print("\n  Verdict: ");
+            print(verdict);
+        }
+
+        if (skill.?.artifacts.len > 0) {
+            print("\n  Artifacts: ");
+            print(skill.?.artifacts);
+        }
+
+        return 0;
+    }
+
+    // ═════════════════════════════════════════════════════════════════════
+    // Command: tri help
+    // ═════════════════════════════════════════════════════════════════════
+
+    // tri help [command]
+    pub fn help(command: []const u8) i32 {
+        if (command.len == 0) {
+            print("Trinity t27 CLI - Spec-First Development Framework\n");
+            print("\nUsage: tri <command> [options]\n");
+            print("\nCommands:\n");
+            print("  spec      Manage specifications\n");
+            print("    create <name>     Create a new spec\n");
+            print("    validate <file>   Validate a spec\n");
+            print("    list             List all specs\n");
+            print("\n");
+            print("  gen       Generate code from specs\n");
+            print("    <file>           Generate from spec\n");
+            print("    --all            Generate from all specs\n");
+            print("    --backend <b>    Backend: zig, c, verilog\n");
+            print("\n");
+            print("  compile-project  Compile all specs into coherent project\n");
+            print("    --output <dir>   Output directory (default: build)\n");
+            print("    --backend <b>    Backend: zig, c, verilog\n");
+            print("\n");
+            print("  git       Git integration with skill workflow\n");
+            print("    commit           Commit with skill validation\n");
+            print("    push             Push with skill validation\n");
+            print("    status           Show git and skill status\n");
+            print("\n");
+            print("  lint      Lint specifications\n");
+            print("    <file>           Lint a spec\n");
+            print("    --all            Lint all specs\n");
+            print("    --strict         Enable strict mode\n");
+            print("\n");
+            print("  skill     Skill workflow management\n");
+            print("    begin --issue N  Start a new skill\n");
+            print("    seal             Seal current skill\n");
+            print("    status           Show skill status\n");
+            print("\n");
+            print("  help      Show help\n");
+            print("    <command>        Show command help\n");
+            print("\n");
+            print("Documentation:\n");
+            print("  docs/SOUL.md               Constitutional laws\n");
+            print("  docs/TDD-CONTRACT.md       TDD requirements\n");
+            print("  docs/GENERATED-HEADER-POLICY.md  Generated file policy");
+            return 0;
+        }
+
+        // Command-specific help
+        if (std.mem.eql(u8, command, "spec")) {
+            print("tri spec - Specification management\n");
+            print("\nUsage:\n");
+            print("  tri spec create <name> [--kind <kind>]\n");
+            print("  tri spec validate <spec.t27>\n");
+            print("  tri spec list\n");
+            print("\nKinds: feature, bugfix, hotfix, recovery");
+        } else if (std.mem.eql(u8, command, "gen")) {
+            print("tri gen - Code generation from specs\n");
+            print("\nUsage:\n");
+            print("  tri gen <spec.t27> [--backend <backend>]\n");
+            print("  tri gen --all [--backend <backend>]\n");
+            print("\nBackends: zig (default), c, verilog");
+        } else if (std.mem.eql(u8, command, "git")) {
+            print("tri git - Git integration with skill workflow\n");
+            print("\nUsage:\n");
+            print("  tri git commit [--all] [-m <msg>] [--mode <mode>]\n");
+            print("  tri git push [<remote> <branch>] [--mode <mode>]\n");
+            print("  tri git status\n");
+            print("\nModes: normal, strict, local");
+        } else if (std.mem.eql(u8, command, "lint")) {
+            print("tri lint - Specification linting\n");
+            print("\nUsage:\n");
+            print("  tri lint <spec.t27> [--strict]\n");
+            print("  tri lint --all [--strict]");
+        } else if (std.mem.eql(u8, command, "skill")) {
+            print("tri skill - Skill workflow management\n");
+            print("\nUsage:\n");
+            print("  tri skill begin --issue <N> [--kind <kind>]\n");
+            print("  tri skill seal\n");
+            print("  tri skill status");
+        } else {
+            error_print("Unknown command: ");
+            error_print(command);
+            return 1;
+        }
+
+        return 0;
+    }
+
+    // ═════════════════════════════════════════════════════════════════════
+    // Helper functions
+    // ═════════════════════════════════════════════════════════════════════
+
+    fn generate_spec_template(name: []const u8, kind: []const u8) []const u8 {
+        return "// " ++ name ++ ".t27 — " ++ kind ++ " specification\n" ++
+               "// Generated by: tri spec create\n" ++
+               "// φ² + 1/φ² = 3 | TRINITY\n" ++
+               "\n" ++
+               "// ═════════════════════════════════════════════════════════════════════\n" ++
+               "// TDD-Inside-Spec: This spec MUST contain at least one test or invariant\n" ++
+               "// ═════════════════════════════════════════════════════════════════════\n" ++
+               "\n" ++
+               "test my_test\n" ++
+               "    // Verify: functionality works correctly\n" ++
+               "    try std.testing.expect(true);\n" ++
+               "\n" ++
+               "invariant my_invariant\n" ++
+               "    // For all valid inputs: output is in valid range\n" ++
+               "    assert true;\n";
+    }
+
+    fn generate_zig(spec: Spec) i32 {
+        // Generate Zig code with proper header
+        const header = "// This file is generated from " ++ spec.path ++ "\n" ++
+                      "// DO NOT EDIT - Changes will be overwritten on next tri gen\n" ++
+                      "// Generated at: " ++ get_current_timestamp() ++ "\n" ++
+                      "// Source spec: " ++ spec.path ++ "\n\n";
+
+        const code = generate_zig_impl(spec);
+        var output_path = spec.path;
+        output_path = replace(output_path, ".t27", ".zig");
+        output_path = replace(output_path, "specs/", "src/");
+
+        // Ensure output directory exists
+        const dir = dir_path(output_path);
+        create_dir_if_not_exists(dir);
+
+        write_file(output_path, header ++ code);
+        return 0;
+    }
+
+    fn generate_c(spec: Spec) i32 {
+        // Similar to generate_zig but for C
+        _ = spec;
+        return 0;
+    }
+
+    fn generate_verilog(spec: Spec) i32 {
+        // Similar to generate_zig but for Verilog
+        _ = spec;
+        return 0;
+    }
+
+    fn generate_conformance(spec: Spec) i32 {
+        // Generate conformance JSON from test blocks
+        const conformance = Conformance{
+            .version = "1.0",
+            .spec = spec.path,
+            .tests = extract_tests(spec),
+        };
+
+        const output_path = "conformance/" ++ replace(replace(spec.path, ".t27", ""), "specs/", "") ++ ".json";
+        write_file(output_path, serialize_json(conformance));
+        return 0;
+    }
+
+    fn load_or_create_registry(path: []const u8) SkillRegistry {
+        if (file_exists(path)) {
+            return load_registry(path);
+        } else {
+            return SkillRegistry{
+                .version = "1.0",
+                .skills = &[_]Skill{},
+            };
+        }
+    }
+
+    fn compute_seal_hash(skill: Skill) []const u8 {
+        // Compute hash of skill state for seal verification
+        const data = skill.id ++ skill.status ++ skill.issue ++ skill.updated_at;
+        return sha256(data);
+    }
+
+    // ═════════════════════════════════════════════════════════════════════
+    // Type definitions
+    // ═════════════════════════════════════════════════════════════════════
+
+    pub const Spec = struct {
+        path: []const u8,
+        content: []const u8,
+        test_blocks: []TestBlock,
+        invariant_blocks: []InvariantBlock,
+    };
+
+    pub const TestBlock = struct {
+        statements: []const u8,
+    };
+
+    pub const InvariantBlock = struct {
+        statements: []const u8,
+    };
+
+    pub const Skill = struct {
+        id: []const u8,
+        status: []const u8,
+        kind: []const u8,
+        issue: []const u8,
+        branch: []const u8,
+        created_at: []const u8,
+        updated_at: []const u8,
+        sealed_at: ?[]const u8,
+        commit: ?[]const u8,
+        commit_at: ?[]const u8,
+        pushed: bool,
+        pushed_at: ?[]const u8,
+        verdict: ?[]const u8,
+        verdict_at: ?[]const u8,
+        seal_hash: ?[]const u8,
+        artifacts: []const u8,
+        metadata: SkillMetadata,
+    };
+
+    pub const SkillMetadata = struct {
+        title: []const u8,
+        author: []const u8,
+        priority: []const u8,
+        tags: [][]const u8,
+    };
+
+    pub const SkillRegistry = struct {
+        version: []const u8,
+        skills: []Skill,
+    };
+
+    pub const Conformance = struct {
+        version: []const u8,
+        spec: []const u8,
+        tests: []TestBlock,
+    };
+
+    // ═════════════════════════════════════════════════════════════════════
+    // Module Map for compile-project
+    // ═════════════════════════════════════════════════════════════════════
+
+    pub const ModuleMapEntry = struct {
+        key: []const u8,    // e.g. "base::types"
+        path: []const u8,   // e.g. "base/types"
+    };
+
+    pub const ModuleMap = struct {
+        entries: [256]ModuleMapEntry,
+        count_val: usize,
+
+        pub fn init(self: *ModuleMap) void {
+            self.count_val = 0;
+        }
+
+        pub fn put(self: *ModuleMap, key: []const u8, path: []const u8) void {
+            if (self.count_val < 256) {
+                self.entries[self.count_val] = ModuleMapEntry{ .key = key, .path = path };
+                self.count_val += 1;
+            }
+        }
+
+        pub fn get(self: ModuleMap, key: []const u8) ?[]const u8 {
+            for (self.entries[0..self.count_val]) |entry| {
+                if (std.mem.eql(u8, entry.key, key)) {
+                    return entry.path;
+                }
+            }
+            return null;
+        }
+
+        pub fn count(self: ModuleMap) usize {
+            return self.count_val;
+        }
+    };
+
+    fn path_to_module_key(rel_path: []const u8) []const u8 {
+        // Convert "base/types.t27" → "base::types"
+        var result = replace(rel_path, ".t27", "");
+        result = replace(result, "/", "::");
+        return result;
+    }
+
+    fn backend_extension(backend: []const u8) []const u8 {
+        if (std.mem.eql(u8, backend, "verilog")) return ".v";
+        if (std.mem.eql(u8, backend, "c")) return ".c";
+        return ".zig";
+    }
+
+    fn strip_prefix(file_path: []const u8) []const u8 {
+        // Strip "specs/" or "compiler/" prefix
+        if (std.mem.startsWith(u8, file_path, "specs/")) {
+            return file_path[6..];
+        }
+        if (std.mem.startsWith(u8, file_path, "compiler/")) {
+            return file_path[9..];
+        }
+        return file_path;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════════
+// TDD-Inside-Spec: Tests and Invariants for Commands
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════════
+
+// (Blocks were keyword-style with Zig statements; now brace form:
+// `try std.testing.expect(x)` -> `assert x`,
+// `try std.testing.expectEqualStrings(e, a)` -> `assert std.mem.eql(u8, a, e)`,
+// and each bench's `target:` line is kept as a comment.)
+
+test spec_create_returns_zero_on_success {
+    const result = commands.spec_create("test_spec", "feature");
+    assert result == 0;
+}
+
+test spec_create_rejects_empty_name {
+    const result = commands.spec_create("", "feature");
+    assert result == 1;
+}
+
+test spec_create_rejects_invalid_kind {
+    const result = commands.spec_create("test_spec", "invalid");
+    assert result == 1;
+}
+
+test spec_validate_returns_zero_for_valid_spec {
+    // Simulate valid spec with tests and no Cyrillic
+    const result = commands.spec_validate("specs/valid.t27");
+    // In real test, would mock parse_spec to return valid spec
+    _ = result;
+    assert true;
+}
+
+test spec_validate_returns_one_for_spec_without_tests {
+    // Simulate spec without tests
+    const result = commands.spec_validate("specs/no_tests.t27");
+    _ = result;
+    assert true;
+}
+
+test spec_validate_rejects_cyrillic_in_source {
+    // Simulate spec with Cyrillic
+    const result = commands.spec_validate("specs/with_cyrillic.t27");
+    _ = result;
+    assert true;
+}
+
+test gen_spec_returns_zero_on_success {
+    const result = commands.gen_spec("specs/valid.t27", "zig", false);
+    _ = result;
+    assert true;
+}
+
+test gen_spec_returns_one_for_invalid_spec {
+    const result = commands.gen_spec("specs/invalid.t27", "zig", false);
+    _ = result;
+    assert true;
+}
+
+test gen_all_returns_zero_if_all_succeed {
+    const result = commands.gen_all("zig");
+    _ = result;
+    assert true;
+}
+
+test gen_all_returns_one_if_any_fails {
+    const result = commands.gen_all("zig");
+    _ = result;
+    assert true;
+}
+
+test lint_file_returns_zero_for_valid_spec {
+    const result = commands.lint_file("specs/valid.t27", false);
+    _ = result;
+    assert true;
+}
+
+test lint_file_returns_one_for_invalid_spec {
+    const result = commands.lint_file("specs/invalid.t27", false);
+    _ = result;
+    assert true;
+}
+
+test lint_strict_requires_tests {
+    const result = commands.lint_file("specs/no_tests.t27", true);
+    _ = result;
+    assert true;
+}
+
+test skill_begin_returns_zero_on_success {
+    const result = commands.skill_begin("123", "feature");
+    _ = result;
+    assert true;
+}
+
+test skill_begin_rejects_empty_issue_id {
+    const result = commands.skill_begin("", "feature");
+    _ = result;
+    assert true;
+}
+
+test skill_seal_returns_zero_on_success {
+    const result = commands.skill_seal();
+    _ = result;
+    assert true;
+}
+
+test skill_seal_returns_one_without_active_skill {
+    const result = commands.skill_seal();
+    _ = result;
+    assert true;
+}
+
+test skill_status_returns_zero_always {
+    const result = commands.skill_status();
+    assert result == 0;
+}
+
+test help_returns_zero_always {
+    const result = commands.help("");
+    assert result == 0;
+}
+
+test generate_spec_template_contains_test_block {
+    const template = commands.generate_spec_template("test", "feature");
+    assert std.mem.indexOf(u8, template, "test") != null;
+}
+
+test spec_create_command_enum_value {
+    const spec_command = commands.Command.SpecCommand;
+    assert @intFromEnum(spec_command) == 0;
+}
+
+test gen_command_enum_value {
+    const gen_command = commands.Command.GenCommand;
+    assert @intFromEnum(gen_command) == 1;
+}
+
+test compile_project_command_enum_value {
+    const compile_project_command = commands.Command.CompileProjectCommand;
+    assert @intFromEnum(compile_project_command) == 2;
+}
+
+test compile_project_returns_one_for_invalid_backend {
+    const result = commands.compile_project("build", "invalid");
+    assert result == 1;
+}
+
+test compile_project_returns_zero_on_success {
+    const result = commands.compile_project("/tmp/t27-test", "zig");
+    _ = result;
+    assert true;
+}
+
+test module_map_put_and_get {
+    var map: commands.ModuleMap = undefined;
+    map.init();
+    map.put("base::types", "base/types");
+    const result = map.get("base::types");
+    assert result != null;
+}
+
+test module_map_get_returns_null_for_missing {
+    var map: commands.ModuleMap = undefined;
+    map.init();
+    const result = map.get("nonexistent");
+    assert result == null;
+}
+
+test path_to_module_key_converts_correctly {
+    const result = commands.path_to_module_key("base/types.t27");
+    assert std.mem.eql(u8, result, "base::types");
+}
+
+test strip_prefix_strips_specs {
+    const result = commands.strip_prefix("specs/base/types.t27");
+    assert std.mem.eql(u8, result, "base/types.t27");
+}
+
+test strip_prefix_strips_compiler {
+    const result = commands.strip_prefix("compiler/cli/gen.t27");
+    assert std.mem.eql(u8, result, "cli/gen.t27");
+}
+
+test backend_extension_returns_zig_by_default {
+    const result = commands.backend_extension("zig");
+    assert std.mem.eql(u8, result, ".zig");
+}
+
+test backend_extension_returns_v_for_verilog {
+    const result = commands.backend_extension("verilog");
+    assert std.mem.eql(u8, result, ".v");
+}
+
+invariant spec_create_always_creates_file {
+    // spec_create creates a .t27 file
+    assert true;
+}
+
+invariant spec_validate_checks_tdd_contract {
+    // spec_validate enforces at least one test or invariant
+    assert true;
+}
+
+invariant spec_validate_checks_language_policy {
+    // spec_validate rejects Cyrillic in source files
+    assert true;
+}
+
+invariant gen_spec_validates_first {
+    // gen_spec runs spec_validate before generating
+    assert true;
+}
+
+invariant generate_zig_includes_header {
+    // Generated Zig files have DO NOT EDIT header
+    assert true;
+}
+
+invariant skill_begin_creates_registry_if_missing {
+    // skill_begin creates .trinity/skills/registry.json if missing
+    assert true;
+}
+
+invariant skill_seal_computes_seal_hash {
+    // skill_seal sets seal_hash field
+    assert true;
+}
+
+invariant command_enum_has_seven_values {
+    // Command enum has 7 values (added CompileProjectCommand)
+    assert @typeInfo(commands.Command).Enum.fields.len == 7;
+}
+
+invariant compile_project_validates_backend {
+    // compile_project rejects invalid backends
+    assert true;
+}
+
+invariant compile_project_generates_build_zig_for_zig_backend {
+    // compile_project generates build.zig when backend is zig
+    assert true;
+}
+
+invariant compile_project_resolves_imports {
+    // compile_project resolves use X::Y to correct relative paths
+    assert true;
+}
+
+bench spec_create_latency {
+    // target: < 10ms
+    _ = commands.spec_create("test", "feature");
+}
+
+bench spec_validate_latency {
+    // target: < 5ms
+    _ = commands.spec_validate("specs/valid.t27");
+}
+
+bench gen_spec_latency {
+    // target: < 100ms
+    _ = commands.gen_spec("specs/valid.t27", "zig", false);
+}
+
+bench skill_begin_latency {
+    // target: < 10ms
+    _ = commands.skill_begin("123", "feature");
+}

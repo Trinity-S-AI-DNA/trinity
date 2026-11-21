@@ -1,0 +1,681 @@
+// SPDX-License-Identifier: Apache-2.0
+// t27/specs/numeric/ocp_mx.t27
+// OCP Microscaling (MX) v1.0 and OCP 8-bit floating point (OFP8): every element type,
+// the E8M0 block scale, and the conversion of a 32-value block -- every code exact, one
+// worked block bit for bit.
+//
+// WHY THIS EXISTS. `specs/numeric/formats_catalog.t27` lists mxfp8, mxfp6 and mxfp4 and
+// cites OCP MX v1.0, and `specs/numeric/e8m0.t27` specifies the scale byte, but no spec
+// decoded one element code or ran the conversion that puts element and scale together.
+// That conversion is where MX's one weakness lives: a single large value sets the scale
+// for all 32, and the small ones fall to zero. The worked block below measures it -- 23
+// of 31 non-zero weights vanish in MXFP4.
+//
+// SOURCES. Open Compute Project, "OCP Microscaling Formats (MX) Specification", version
+// 1.0, 7 Sep 2023: section 5.2 (Table 1, the concrete formats), 5.3.1 (Table 2, FP8),
+// 5.3.2-5.3.4 (Tables 4-6, FP6, FP4, INT8), 5.4.1 (Table 7, E8M0), 6.3 (conversion).
+// The same algorithm is Algorithm 1 of Rouhani et al., "Microscaling Data Formats for Deep Learning",
+// arXiv:2310.10537. The FP8 elements are the OCP 8-bit Floating Point Specification
+// (OFP8), revision 1.0 (2023), first described in Micikevicius et al., "FP8 Formats for
+// Deep Learning", arXiv:2209.05433.
+//
+// ELEMENTS (sign-magnitude except INT8):
+//     FP4 E2M1  bias 1   max 6.0    min subnormal 0.5      no Inf, no NaN
+//     FP6 E2M3  bias 1   max 7.5    min subnormal 0.125    no Inf, no NaN
+//     FP6 E3M2  bias 3   max 28.0   min subnormal 0.0625   no Inf, no NaN
+//     FP8 E4M3  bias 7   max 448    min subnormal 2^-9     no Inf; S.1111.111 is NaN
+//     FP8 E5M2  bias 15  max 57344  min subnormal 2^-16    IEEE-style: S.11111.00 is
+//                                                         Inf, S.11111.01-11 are NaN
+//     INT8      2's complement, implicit scale 2^-6: max 1 63/64; the code for -2 may be
+//               left unused for symmetry (Table 6), and this file never emits it
+// E4M3 trades range for one more mantissa bit than E5M2; that trade is the whole OFP8
+// design, and on the block below the same trade decides FP6 the other way.
+//
+// ONE FORMULA. Count magnitudes in units of the smallest subnormal and every magnitude is
+// an integer: e == 0 gives m, e > 0 gives (2^MANT + m) * 2^(e - 1). One function, `units`,
+// states it for all five float kinds; nothing below computes a float.
+//
+// ROUNDING. Nearest, ties to the even code, SATURATING: past the largest finite magnitude
+// the nearest code is the largest one (MX section 6.3 requires the clamp; OFP8 also
+// defines a non-saturating mode, overflow to NaN or Inf, which is not modelled here).
+//
+// CONVERSION, section 6.3. X = (largest power of two <= max|V|) / (largest power of two in
+// the element type), i.e. shared_exp = floor(log2 max|V|) - emax_elem. Each P = V / X,
+// rounded as above, normal values past the element's max clamped to it with the sign
+// kept. An all-zero block has no largest power of two; section 6.3 does not define it and
+// this file does not convert one.
+//
+// INPUTS are integers in units of 2^-12; outputs are compared in units of 2^-24, so every
+// number below is exact. The expected codes were computed by an independent rational
+// (Python `fractions`) implementation of section 6.3 and are checked here bit for bit.
+//
+// phi^2 + phi^-2 = 3 | TRINITY
+
+module OCP_MX {
+
+    // ---- Element kinds: E2M1, E2M3, E3M2, E4M3, E5M2, INT8 ----
+
+    const K_E2M1 : i64 = 0;
+    const K_E2M3 : i64 = 1;
+    const K_E3M2 : i64 = 2;
+    const K_E4M3 : i64 = 3;
+    const K_E5M2 : i64 = 4;
+    const K_INT8 : i64 = 5;
+    const KIND_COUNT : i64 = 6;
+
+    const KIND_BITS     : [6]i64 = [4, 6, 6, 8, 8, 8];
+    const KIND_MANT     : [6]i64 = [1, 3, 2, 3, 2, 0];
+    const KIND_BIAS     : [6]i64 = [1, 1, 3, 7, 15, 0];
+    // Largest finite magnitude code: E4M3 skips its NaN (127), E5M2 its Inf/NaN (124..127).
+    const KIND_TOP      : [6]i64 = [7, 31, 31, 126, 123, 127];
+    // log2 of the units in 1.0, BIAS + MANT - 1 for the floats; INT8 counts 64ths.
+    const KIND_UPO_LOG2 : [6]i64 = [1, 3, 4, 9, 16, 6];
+    // emax_elem: exponent of the largest power of two in the element type.
+    const KIND_EMAX     : [6]i64 = [2, 2, 4, 8, 15, 0];
+
+    // ---- Block, section 5.2 Table 1: k = 32, scale E8M0 (8 bits) ----
+
+    const BLOCK_K     : i64 = 32;
+    const SCALE_BITS  : i64 = 8;
+    const E8M0_BIAS   : i64 = 127;    // as in `e8m0.t27`
+    const E8M0_NAN    : i64 = 255;
+    const IN_SHIFT    : i64 = 12;     // inputs are integers in units of 2^-12
+    const OUT_SHIFT   : i64 = 24;     // errors are measured in units of 2^-24
+
+    const POW2 : [41]i64 = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096,
+        8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576, 2097152, 4194304,
+        8388608, 16777216, 33554432, 67108864, 134217728, 268435456, 536870912,
+        1073741824, 2147483648, 4294967296, 8589934592, 17179869184, 34359738368,
+        68719476736, 137438953472, 274877906944, 549755813888, 1099511627776];
+
+    // FP4 E2M1's eight magnitudes in halves: 0, 0.5, 1, 1.5, 2, 3, 4, 6.
+    const E2M1_HALVES : [8]i64 = [0, 1, 2, 3, 4, 6, 8, 12];
+
+    // ---- OFP8: the top exponent, where E4M3 and E5M2 differ ----
+
+    const FP8_CODES     : i64 = 256;
+    const FP8_SIGN_CODE : i64 = 128;   // the code where the sign bit turns on
+    const E4M3_NAN_MAG  : i64 = 127;   // S.1111.111, the only NaN pattern
+    const E5M2_INF_MAG  : i64 = 124;   // S.11111.00; 125..127 are NaN
+    const NOT_FINITE    : i64 = -1;    // finite magnitudes are never negative
+
+    // ---- Decode ----
+
+    fn units(e: i64, m: i64, mant_bits: i64) -> i64 {
+        if (e == 0) { return m; }
+        return (POW2[@intCast(mant_bits)] + m) * POW2[@intCast(e - 1)];
+    }
+
+    // Magnitude of a magnitude code (sign stripped), in the kind's units.
+    fn kind_magnitude(kind: i64, c: i64) -> i64 {
+        if (kind == K_INT8) { return c; }
+        const mant : i64 = KIND_MANT[@intCast(kind)];
+        return units(c / POW2[@intCast(mant)], c % POW2[@intCast(mant)], mant);
+    }
+
+    // Signed value of a full code, in the kind's units.
+    fn kind_value(kind: i64, code: i64) -> i64 {
+        if (kind == K_INT8) {
+            if (code >= 128) { return code - 256; }
+            return code;
+        }
+        const half : i64 = POW2[@intCast(KIND_BITS[@intCast(kind)] - 1)];
+        if (code >= half) { return 0 - kind_magnitude(kind, code - half); }
+        return kind_magnitude(kind, code);
+    }
+
+    // 1.0 in the kind's units.
+    fn kind_one(kind: i64) -> i64 {
+        return POW2[@intCast(KIND_UPO_LOG2[@intCast(kind)])];
+    }
+
+    // ---- OFP8 decode: all 256 codes, NaN and Inf included ----
+
+    fn sign_of(code: i64) -> i64 {
+        return code / FP8_SIGN_CODE;
+    }
+
+    fn mag_of(code: i64) -> i64 {
+        return code % FP8_SIGN_CODE;
+    }
+
+    fn e4m3_is_nan(code: i64) -> bool {
+        return (mag_of(code) == E4M3_NAN_MAG);
+    }
+
+    fn e4m3_magnitude(code: i64) -> i64 {
+        if (e4m3_is_nan(code)) { return NOT_FINITE; }
+        return kind_magnitude(K_E4M3, mag_of(code));
+    }
+
+    // Signed value in units of 2^-9.
+    fn e4m3_value(code: i64) -> i64 {
+        if (sign_of(code) == 1) { return 0 - e4m3_magnitude(code); }
+        return e4m3_magnitude(code);
+    }
+
+    fn e5m2_is_inf(code: i64) -> bool {
+        return (mag_of(code) == E5M2_INF_MAG);
+    }
+
+    fn e5m2_is_nan(code: i64) -> bool {
+        return (mag_of(code) > E5M2_INF_MAG);
+    }
+
+    fn e5m2_magnitude(code: i64) -> i64 {
+        if (mag_of(code) >= E5M2_INF_MAG) { return NOT_FINITE; }
+        return kind_magnitude(K_E5M2, mag_of(code));
+    }
+
+    // Signed value in units of 2^-16.
+    fn e5m2_value(code: i64) -> i64 {
+        if (sign_of(code) == 1) { return 0 - e5m2_magnitude(code); }
+        return e5m2_magnitude(code);
+    }
+
+    // ---- Encode: nearest, ties to even, saturating ----
+
+    fn abs_i64(x: i64) -> i64 {
+        if (x < 0) { return 0 - x; }
+        return x;
+    }
+
+    // Magnitude code nearest num/den (num >= 0, den > 0). Past the largest finite
+    // magnitude the nearest code is the largest one, so saturation needs no branch.
+    fn kind_encode_mag(kind: i64, num: i64, den: i64) -> i64 {
+        const target : i64 = num * POW2[@intCast(KIND_UPO_LOG2[@intCast(kind)])];
+        var best : i64 = 0;
+        var best_d : i64 = abs_i64(target);
+        var c : i64 = 1;
+        while (c <= KIND_TOP[@intCast(kind)]) {
+            const d : i64 = abs_i64(target - kind_magnitude(kind, c) * den);
+            if (d < best_d) { best = c; best_d = d; }
+            if (d == best_d) {
+                if (c % 2 == 0) { best = c; }
+            }
+            c = c + 1;
+        }
+        return best;
+    }
+
+    // Full code for (neg ? -1 : 1) * num/den. A value that rounds to zero is +0.
+    fn kind_encode(kind: i64, num: i64, den: i64, neg: i64) -> i64 {
+        const q : i64 = kind_encode_mag(kind, num, den);
+        if (neg == 0) { return q; }
+        if (q == 0) { return 0; }
+        if (kind == K_INT8) { return 256 - q; }
+        return q + POW2[@intCast(KIND_BITS[@intCast(kind)] - 1)];
+    }
+
+    // ---- Block conversion, section 6.3 ----
+
+    fn floor_log2(x: i64) -> i64 {
+        var e : i64 = 0;
+        var p : i64 = 1;
+        while (p * 2 <= x) { p = p * 2; e = e + 1; }
+        return e;
+    }
+
+    fn block_max_abs(vals: [32]i64) -> i64 {
+        var mx : i64 = 0;
+        var i : i64 = 0;
+        while (i < BLOCK_K) {
+            if (abs_i64(vals[@intCast(i)]) > mx) { mx = abs_i64(vals[@intCast(i)]); }
+            i = i + 1;
+        }
+        return mx;
+    }
+
+    // shared_exp = floor(log2 max|V|) - emax_elem; X = 2^shared_exp.
+    fn block_shared_exp(vals: [32]i64, kind: i64) -> i64 {
+        return floor_log2(block_max_abs(vals)) - IN_SHIFT - KIND_EMAX[@intCast(kind)];
+    }
+
+    fn e8m0_code(shared_exp: i64) -> i64 {
+        return shared_exp + E8M0_BIAS;
+    }
+
+    // P_i = V_i / X, quantized. V_i / X = vals[i] / 2^(IN_SHIFT + shared_exp).
+    fn block_code(vals: [32]i64, kind: i64, i: i64) -> i64 {
+        const s : i64 = IN_SHIFT + block_shared_exp(vals, kind);
+        var neg : i64 = 0;
+        if (vals[@intCast(i)] < 0) { neg = 1; }
+        const a : i64 = abs_i64(vals[@intCast(i)]);
+        if (s >= 0) { return kind_encode(kind, a, POW2[@intCast(s)], neg); }
+        return kind_encode(kind, a * POW2[@intCast(0 - s)], 1, neg);
+    }
+
+    // X * P_i in units of 2^-24. Exact while the shift is non-negative, which the
+    // block below asserts.
+    fn out_shift(kind: i64, shared_exp: i64) -> i64 {
+        return shared_exp + OUT_SHIFT - KIND_UPO_LOG2[@intCast(kind)];
+    }
+
+    fn block_decoded(vals: [32]i64, kind: i64, i: i64) -> i64 {
+        const sh : i64 = out_shift(kind, block_shared_exp(vals, kind));
+        return kind_value(kind, block_code(vals, kind, i)) * POW2[@intCast(sh)];
+    }
+
+    // Sum of |X * P_i - V_i| over the block, in units of 2^-24.
+    fn block_l1_error(vals: [32]i64, kind: i64) -> i64 {
+        var sum : i64 = 0;
+        var i : i64 = 0;
+        while (i < BLOCK_K) {
+            sum = sum + abs_i64(block_decoded(vals, kind, i) - vals[@intCast(i)] * POW2[OUT_SHIFT - IN_SHIFT]);
+            i = i + 1;
+        }
+        return sum;
+    }
+
+    // Non-zero inputs that came back as zero.
+    fn block_flushed(vals: [32]i64, kind: i64) -> i64 {
+        var n : i64 = 0;
+        var i : i64 = 0;
+        while (i < BLOCK_K) {
+            if (vals[@intCast(i)] != 0) {
+                if (kind_value(kind, block_code(vals, kind, i)) == 0) { n = n + 1; }
+            }
+            i = i + 1;
+        }
+        return n;
+    }
+
+    // Storage cost per element in hundredths of a bit: (k * bits + 8) / k.
+    fn centibits_per_element(kind: i64) -> i64 {
+        const block_bits_x100 : i64 = (BLOCK_K * KIND_BITS[@intCast(kind)] + SCALE_BITS) * 100;
+        return block_bits_x100 / BLOCK_K;
+    }
+
+    // ---- The worked block: 31 weights within +-0.17 and one outlier, 3.3 ----
+    // Inputs in units of 2^-12; entry 13 is the outlier (13517 / 4096 = 3.29999...).
+
+    const BLOCK_A : [32]i64 = [-690, 161, -391, 460, -92, -644, 207, -345, 506, -46,
+        -598, 253, -299, 13517, 0, -552, 299, -253, 598, 46, -506, 345, -207, 644, 92,
+        -460, 391, -161, 690, 138, -414, 437];
+
+    // A block whose maximum is exactly a power of two, 2.0, and whose every value is
+    // an FP4 value times the scale 2^-1, so MXFP4 carries it with no error at all.
+    const BLOCK_P2 : [32]i64 = [8192, 1024, -2048, 3072, -4096, 6144, 0, -1024,
+        8192, 1024, -2048, 3072, -4096, 6144, 0, -1024,
+        8192, 1024, -2048, 3072, -4096, 6144, 0, -1024,
+        8192, 1024, -2048, 3072, -4096, 6144, 0, -1024];
+
+    // Expected codes, from the independent rational implementation of section 6.3.
+    const A_E2M1 : [32]i64 = [9, 0, 0, 0, 0, 9, 0, 0, 0, 0, 9, 0, 0, 7, 0, 9, 0, 0,
+        1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0];
+    const A_E2M3 : [32]i64 = [35, 1, 34, 2, 0, 35, 1, 33, 2, 0, 34, 1, 33, 29, 0, 34,
+        1, 33, 2, 0, 34, 1, 33, 3, 0, 34, 2, 33, 3, 1, 34, 2];
+    const A_E3M2 : [32]i64 = [45, 5, 42, 11, 35, 45, 6, 41, 12, 33, 45, 8, 41, 31, 0,
+        44, 9, 40, 13, 1, 44, 9, 38, 13, 3, 43, 10, 37, 13, 4, 42, 11];
+    const A_E4M3 : [32]i64 = [219, 74, 212, 86, 196, 218, 77, 211, 88, 188, 217, 80,
+        209, 125, 0, 217, 81, 208, 89, 60, 216, 83, 205, 90, 68, 214, 84, 202, 91, 73,
+        213, 86];
+    const A_INT8 : [32]i64 = [251, 1, 253, 4, 255, 251, 2, 253, 4, 0, 251, 2, 254, 106,
+        0, 252, 2, 254, 5, 0, 252, 3, 254, 5, 1, 252, 3, 255, 5, 1, 253, 3];
+
+    fn codes_match(kind: i64, expected: [32]i64) -> bool {
+        var ok : bool = true;
+        var i : i64 = 0;
+        while (i < BLOCK_K) {
+            if (block_code(BLOCK_A, kind, i) != expected[@intCast(i)]) { ok = false; }
+            i = i + 1;
+        }
+        return ok;
+    }
+
+    // ---- Combinational port surface: one FP4 E2M1 code to signed halves ----
+
+    fn on_comb(code: i64) -> i64 {
+        return kind_value(K_E2M1, code);
+    }
+
+    // ---- Elements, section 5.3 ----
+
+    test e2m1_table_is_the_formula {
+        var ok : bool = true;
+        var c : i64 = 0;
+        while (c < 8) {
+            if (kind_magnitude(K_E2M1, c) != E2M1_HALVES[@intCast(c)]) { ok = false; }
+            c = c + 1;
+        }
+        assert ok;
+        assert kind_value(K_E2M1, 15) == 0 - 12;
+    }
+
+    test fp6_end_points_match_table_4 {
+        // E2M3: max S.11.111 = 7.5, min normal 1.0, min subnormal 0.125
+        assert kind_magnitude(K_E2M3, 31) * 2 == 15 * POW2[KIND_UPO_LOG2[K_E2M3]];
+        assert kind_magnitude(K_E2M3, 8) == POW2[KIND_UPO_LOG2[K_E2M3]];
+        assert kind_magnitude(K_E2M3, 1) == 1;
+        // E3M2: max S.111.11 = 28.0, min normal 0.25, min subnormal 0.0625
+        assert kind_magnitude(K_E3M2, 31) == 28 * POW2[KIND_UPO_LOG2[K_E3M2]];
+        assert kind_magnitude(K_E3M2, 4) * 4 == POW2[KIND_UPO_LOG2[K_E3M2]];
+        assert kind_magnitude(K_E3M2, 1) == 1;
+    }
+
+    test int8_matches_table_6 {
+        // max 1 63/64 = 127/64, min 1/64, implicit scale 2^-6
+        assert kind_value(K_INT8, 127) == 127;
+        assert kind_value(K_INT8, 1) == 1;
+        assert kind_value(K_INT8, 255) == 0 - 1;
+        assert KIND_UPO_LOG2[K_INT8] == 6;
+        // the -2 code exists in 2's complement, and the encoder never emits it
+        assert kind_value(K_INT8, 128) == 0 - 128;
+        assert kind_encode(K_INT8, 1000, 1, 1) == 129;
+    }
+
+    fn kind_is_ordered(kind: i64) -> bool {
+        var ok : bool = true;
+        var c : i64 = 1;
+        while (c <= KIND_TOP[@intCast(kind)]) {
+            if (kind_magnitude(kind, c) <= kind_magnitude(kind, c - 1)) { ok = false; }
+            c = c + 1;
+        }
+        return ok;
+    }
+
+    // Every finite magnitude code encodes back to itself.
+    fn kind_round_trips(kind: i64) -> bool {
+        var ok : bool = true;
+        var c : i64 = 0;
+        while (c <= KIND_TOP[@intCast(kind)]) {
+            if (kind_encode_mag(kind, kind_magnitude(kind, c), POW2[@intCast(KIND_UPO_LOG2[@intCast(kind)])]) != c) { ok = false; }
+            c = c + 1;
+        }
+        return ok;
+    }
+
+    test every_kind_increases_strictly {
+        var ok : bool = true;
+        var k : i64 = 0;
+        while (k < KIND_COUNT) {
+            if (!kind_is_ordered(k)) { ok = false; }
+            k = k + 1;
+        }
+        assert ok;
+    }
+
+    test round_trip_e2m1 { assert kind_round_trips(K_E2M1); }
+    test round_trip_e2m3 { assert kind_round_trips(K_E2M3); }
+    test round_trip_e3m2 { assert kind_round_trips(K_E3M2); }
+    test round_trip_e4m3 { assert kind_round_trips(K_E4M3); }
+    test round_trip_e5m2 { assert kind_round_trips(K_E5M2); }
+    test round_trip_int8 { assert kind_round_trips(K_INT8); }
+
+    test emax_is_the_top_binade_of_each_kind {
+        // the largest finite magnitude lies in [2^emax, 2^(emax+1))
+        var ok : bool = true;
+        var k : i64 = 0;
+        while (k < KIND_COUNT) {
+            const top : i64 = kind_magnitude(k, KIND_TOP[@intCast(k)]);
+            const one : i64 = POW2[@intCast(KIND_UPO_LOG2[@intCast(k)])];
+            if (top < one * POW2[@intCast(KIND_EMAX[@intCast(k)])]) { ok = false; }
+            if (top >= one * POW2[@intCast(KIND_EMAX[@intCast(k)] + 1)]) { ok = false; }
+            k = k + 1;
+        }
+        assert ok;
+    }
+
+    test bias_puts_the_min_normal_at_two_to_one_minus_bias {
+        // Tables 2, 4, 5: the smallest normal (e = 1, m = 0) is 2^(1 - BIAS)
+        var ok : bool = true;
+        var k : i64 = 0;
+        while (k < K_INT8) {
+            if (units(1, 0, KIND_MANT[@intCast(k)]) * POW2[@intCast(KIND_BIAS[@intCast(k)] - 1)] != kind_one(k)) { ok = false; }
+            k = k + 1;
+        }
+        assert ok;
+        assert KIND_BIAS[K_INT8] == 0;
+    }
+
+    test e8m0_nan_sits_above_every_finite_scale {
+        // Table 7: exponents -127..127 take codes 0..254, and the one NaN is 1111_1111
+        assert e8m0_code(0 - E8M0_BIAS) == 0;
+        assert e8m0_code(E8M0_BIAS) == E8M0_NAN - 1;
+        assert E8M0_NAN == POW2[SCALE_BITS] - 1;
+    }
+
+    test rounding_is_ties_to_even_and_saturating {
+        // FP4: 2.5 -> 2 (code 4), 5.0 -> 4 (code 6), 0.25 -> 0, 7.3 -> 6 (code 7)
+        assert kind_encode(K_E2M1, 5, 2, 0) == 4;
+        assert kind_encode(K_E2M1, 5, 1, 0) == 6;
+        assert kind_encode(K_E2M1, 1, 4, 0) == 0;
+        assert kind_encode(K_E2M1, 73, 10, 0) == 7;
+        // -7.3 keeps its sign: code 15
+        assert kind_encode(K_E2M1, 73, 10, 1) == 15;
+        // INT8: 0.5/64 is a tie between 0 and 1/64 -> 0; 1.5/64 -> 2/64
+        assert kind_encode(K_INT8, 1, 128, 0) == 0;
+        assert kind_encode(K_INT8, 3, 128, 0) == 2;
+    }
+
+    // ---- OFP8, the named points of its Table 2 (MX Table 2 reproduces it) ----
+
+    test fp8_kind_top_is_the_last_finite_code {
+        // KIND_TOP stops exactly where NaN (E4M3) and Inf (E5M2) begin
+        assert e4m3_magnitude(KIND_TOP[K_E4M3]) != NOT_FINITE;
+        assert e4m3_magnitude(KIND_TOP[K_E4M3] + 1) == NOT_FINITE;
+        assert e5m2_magnitude(KIND_TOP[K_E5M2]) != NOT_FINITE;
+        assert e5m2_is_inf(KIND_TOP[K_E5M2] + 1);
+    }
+
+    test e4m3_one_is_code_0x38 {
+        assert e4m3_value(56) == kind_one(K_E4M3);
+        assert kind_one(K_E4M3) == 512;
+    }
+
+    test e4m3_max_normal_is_448 {
+        // S.1111.110 = 1.75 * 2^8
+        assert e4m3_magnitude(126) == 448 * kind_one(K_E4M3);
+    }
+
+    test e4m3_min_normal_is_two_to_minus_6 {
+        // S.0001.000: 2^-6 is 8 units of 2^-9
+        assert e4m3_magnitude(8) == 8;
+    }
+
+    test e4m3_subnormals_are_one_to_seven_units {
+        assert e4m3_magnitude(1) == 1;
+        assert e4m3_magnitude(7) == 7;
+    }
+
+    test e4m3_negative_one_is_code_0xb8 {
+        assert e4m3_value(184) == 0 - kind_one(K_E4M3);
+    }
+
+    test e4m3_has_two_nans_and_no_infinity {
+        var nans : i64 = 0;
+        var c : i64 = 0;
+        while (c < FP8_CODES) {
+            if (e4m3_is_nan(c)) { nans = nans + 1; }
+            c = c + 1;
+        }
+        assert nans == 2;
+        assert e4m3_is_nan(127);
+        assert e4m3_is_nan(255);
+    }
+
+    test e4m3_sign_is_a_mirror {
+        var ok : bool = true;
+        var c : i64 = 0;
+        while (c <= KIND_TOP[K_E4M3]) {
+            if (e4m3_value(c + FP8_SIGN_CODE) != 0 - e4m3_value(c)) { ok = false; }
+            c = c + 1;
+        }
+        assert ok;
+    }
+
+    test e4m3_span_is_between_17_and_18_binades {
+        // largest / smallest = 229376, and 2^17 < 229376 < 2^18
+        assert e4m3_magnitude(126) > POW2[17];
+        assert e4m3_magnitude(126) < POW2[18];
+    }
+
+    test e4m3_tie_rounds_to_even_mantissa {
+        // 1.0625 sits halfway between 1.0 (m=0) and 1.125 (m=1): even wins, 0x38
+        assert kind_encode_mag(K_E4M3, 17, 16) == 56;
+        // 1.1875 sits halfway between 1.125 (m=1) and 1.25 (m=2): even wins, 0x3A
+        assert kind_encode_mag(K_E4M3, 19, 16) == 58;
+    }
+
+    test e4m3_half_the_smallest_subnormal_rounds_to_zero {
+        assert kind_encode_mag(K_E4M3, 1, 1024) == 0;
+        assert kind_encode_mag(K_E4M3, 3, 2048) == 1;
+    }
+
+    test e4m3_overflow_saturates_to_448 {
+        assert kind_encode_mag(K_E4M3, 448, 1) == 126;
+        assert kind_encode_mag(K_E4M3, 500, 1) == 126;
+        assert kind_encode_mag(K_E4M3, 100000, 1) == 126;
+    }
+
+    test e4m3_one_third_lands_on_0x2b {
+        // 1/3 = 170.67 units; neighbours 160 (0x2A = 0.3125) and 176 (0x2B = 0.34375)
+        assert kind_encode_mag(K_E4M3, 1, 3) == 43;
+        assert e4m3_magnitude(43) == 176;
+        assert e4m3_magnitude(42) == 160;
+    }
+
+    test e5m2_one_is_code_0x3c {
+        assert e5m2_value(60) == kind_one(K_E5M2);
+        assert kind_one(K_E5M2) == 65536;
+    }
+
+    test e5m2_max_normal_is_57344 {
+        // S.11110.11 = 1.75 * 2^15
+        assert e5m2_magnitude(123) == 57344 * kind_one(K_E5M2);
+    }
+
+    test e5m2_min_normal_is_two_to_minus_14 {
+        // S.00001.00: 2^-14 is 4 units of 2^-16
+        assert e5m2_magnitude(4) == 4;
+    }
+
+    test e5m2_subnormals_are_one_to_three_units {
+        assert e5m2_magnitude(1) == 1;
+        assert e5m2_magnitude(3) == 3;
+    }
+
+    test e5m2_has_two_infinities_and_six_nans {
+        var infs : i64 = 0;
+        var nans : i64 = 0;
+        var c : i64 = 0;
+        while (c < FP8_CODES) {
+            if (e5m2_is_inf(c)) { infs = infs + 1; }
+            if (e5m2_is_nan(c)) { nans = nans + 1; }
+            c = c + 1;
+        }
+        assert infs == 2;
+        assert nans == 6;
+    }
+
+    test e5m2_span_is_between_31_and_32_binades {
+        // largest / smallest = 3758096384, and 2^31 < it < 2^32
+        assert e5m2_magnitude(123) > POW2[31];
+        assert e5m2_magnitude(123) < POW2[32];
+    }
+
+    test e5m2_overflow_saturates_to_57344 {
+        assert kind_encode_mag(K_E5M2, 60000, 1) == 123;
+    }
+
+    test e4m3_and_e5m2_finite_code_counts {
+        // E4M3 keeps 254 finite codes (two NaNs); E5M2 keeps 248 (two Inf, six NaN)
+        var f4 : i64 = 0;
+        var f5 : i64 = 0;
+        var c : i64 = 0;
+        while (c < FP8_CODES) {
+            if (e4m3_magnitude(c) != NOT_FINITE) { f4 = f4 + 1; }
+            if (e5m2_magnitude(c) != NOT_FINITE) { f5 = f5 + 1; }
+            c = c + 1;
+        }
+        assert f4 == 254;
+        assert f5 == 248;
+    }
+
+    test e4m3_is_finer_near_one {
+        // the step just above 1.0: 1/8 in E4M3, 1/4 in E5M2
+        assert kind_one(K_E4M3) == (e4m3_magnitude(57) - e4m3_magnitude(56)) * 8;
+        assert kind_one(K_E5M2) == (e5m2_magnitude(61) - e5m2_magnitude(60)) * 4;
+    }
+
+    // ---- The block, sections 5.2 and 6.3 ----
+
+    test storage_is_8_25_6_25_4_25_bits_per_element {
+        assert centibits_per_element(K_E4M3) == 825;
+        assert centibits_per_element(K_INT8) == 825;
+        assert centibits_per_element(K_E2M3) == 625;
+        assert centibits_per_element(K_E2M1) == 425;
+    }
+
+    test the_outlier_sets_the_scale {
+        assert block_max_abs(BLOCK_A) == 13517;
+        assert floor_log2(13517) - IN_SHIFT == 1;
+        assert block_shared_exp(BLOCK_A, K_E2M1) == 0 - 1;
+        assert block_shared_exp(BLOCK_A, K_E2M3) == 0 - 1;
+        assert block_shared_exp(BLOCK_A, K_E3M2) == 0 - 3;
+        assert block_shared_exp(BLOCK_A, K_E4M3) == 0 - 7;
+        assert block_shared_exp(BLOCK_A, K_INT8) == 1;
+        assert e8m0_code(block_shared_exp(BLOCK_A, K_E2M1)) == 126;
+        assert e8m0_code(block_shared_exp(BLOCK_A, K_E4M3)) == 120;
+        assert e8m0_code(block_shared_exp(BLOCK_A, K_INT8)) == 128;
+    }
+
+    test every_shift_in_the_block_is_exact {
+        var ok : bool = true;
+        var k : i64 = 0;
+        while (k < KIND_COUNT) {
+            if (k != K_E5M2) {
+                if (out_shift(k, block_shared_exp(BLOCK_A, k)) < 0) { ok = false; }
+            }
+            k = k + 1;
+        }
+        assert ok;
+    }
+
+    test a_power_of_two_maximum_is_not_clamped {
+        // "largest power of two less than or equal to max|V|": 2.0 itself, not 1.0
+        assert floor_log2(4096) == 12;
+        assert floor_log2(4095) == 11;
+        assert floor_log2(1) == 0;
+        assert block_shared_exp(BLOCK_P2, K_E2M1) == 0 - 1;
+        assert block_code(BLOCK_P2, K_E2M1, 0) == 6;
+        assert block_l1_error(BLOCK_P2, K_E2M1) == 0;
+    }
+
+    test block_codes_mxfp4 { assert codes_match(K_E2M1, A_E2M1); }
+    test block_codes_mxfp6_e2m3 { assert codes_match(K_E2M3, A_E2M3); }
+    test block_codes_mxfp6_e3m2 { assert codes_match(K_E3M2, A_E3M2); }
+    test block_codes_mxfp8_e4m3 { assert codes_match(K_E4M3, A_E4M3); }
+    test block_codes_mxint8 { assert codes_match(K_INT8, A_INT8); }
+
+    test the_outlier_clamps_in_mxfp4 {
+        // 3.3 / 2^-1 = 6.6 is past FP4's max 6.0: clamped to code 7, decoded 3.0 exactly
+        assert block_code(BLOCK_A, K_E2M1, 13) == 7;
+        assert block_decoded(BLOCK_A, K_E2M1, 13) == 3 * POW2[OUT_SHIFT];
+    }
+
+    test small_weights_vanish_in_mxfp4 {
+        // 31 non-zero inputs; the outlier's scale flushes 23 of them in MXFP4
+        assert block_flushed(BLOCK_A, K_E2M1) == 23;
+        assert block_flushed(BLOCK_A, K_E2M3) == 4;
+        assert block_flushed(BLOCK_A, K_INT8) == 2;
+        assert block_flushed(BLOCK_A, K_E3M2) == 0;
+        assert block_flushed(BLOCK_A, K_E4M3) == 0;
+    }
+
+    test l1_error_of_the_block {
+        // in units of 2^-24, from the independent reference
+        assert block_l1_error(BLOCK_A, K_E2M1) == 42967040;
+        assert block_l1_error(BLOCK_A, K_E2M3) == 9437184;
+        assert block_l1_error(BLOCK_A, K_E3M2) == 5398528;
+        assert block_l1_error(BLOCK_A, K_INT8) == 4112384;
+        assert block_l1_error(BLOCK_A, K_E4M3) == 1785856;
+    }
+
+    test on_this_block_range_beats_precision_at_six_bits {
+        // E3M2 trades a mantissa bit for exponent range and wins here, because the
+        // outlier pushes the small weights down into E2M3's subnormals
+        assert block_l1_error(BLOCK_A, K_E3M2) < block_l1_error(BLOCK_A, K_E2M3);
+        assert block_l1_error(BLOCK_A, K_E4M3) < block_l1_error(BLOCK_A, K_INT8);
+    }
+}

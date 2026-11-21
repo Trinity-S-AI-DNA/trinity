@@ -1,0 +1,964 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/turbobaby/availability.t27 -- what "available" counts, and everything it refuses to count
+; Source of truth for the availability half of issue #4's `bike_units` table (the status set and
+; the derived per-family count), for the availability filter of the catalog API (#8), and for the
+; "unavailable rather than hidden" rule the detail screen (#9) renders. Every number below is read
+; from data/fleet_seed.json (measured_at 2026-09-12) or from DECISIONS.md, and each carries where
+; it comes from. Nothing here is computed from a price and nothing is parsed out of prose.
+; ASCII only (L3), English only (LANG-EN).
+; --
+; WHY (measured 2026-09-12): the fleet is 37 units, 11 rented and 26 at base, and 11 + 26 == 37
+; exactly. That equality is the reason this is a spec and not a comment. The internal register's
+; own HEADER claims 38 units, 11 rented, 27 at base -- and 11 + 27 == 38 closes just as neatly.
+; Two triples, both internally consistent, one unit apart; only the 37 rows that actually exist
+; choose between them, and the seed chose the rows (data/fleet_seed.json, "discrepancy"). So the
+; totality check alone cannot tell a correct fleet from a fleet seeded off the header: the count
+; has to be pinned to the measured rows, which is what the invariants below do. An availability
+; number wrong by one unit is a double-booked bike, and double-booking is the failure availability
+; exists to prevent.
+; --
+; WHERE THE ISSUE IS REFUTED: #19 asks for an invariant about a "reserved" unit. No source in this
+; repository has a reserved status. The shipped schema enumerates exactly four wire values --
+; available, rented, service, retired (migrations/078_bike_units.sql:32) -- and the register
+; measures two of them: 11 rented, 26 at base, leaving 37 - 11 - 26 = 0 units in any third class.
+; A booking hold cannot become a reserved UNIT either: D8 puts the cart line's catalog_id on the
+; FAMILY key, because a customer books a model and the shop assigns the unit, so no unit row
+; exists for a hold to sit on. RESERVED is therefore recorded as absent with a note -- the form
+; specs/agents/turbobaby.t27 already uses for the alphabet seat it cannot honestly claim -- and
+; the acceptance criterion is met by something stronger than the invariant asked for:
+; available_count matches the AVAILABLE discriminant and nothing else, so rented, service,
+; retired, and any status a later migration adds under any name are excluded by construction
+; instead of by a deny-list this file must maintain.
+; --
+; WHERE THE ISSUE IS REFUTED A SECOND TIME (D17): #4's brief specifies the column as
+; status ENUM('available','rented','service','sold'). The shipped migration declares
+; CHECK (status IN ('available','rented','service','retired')) -- migrations/078_bike_units.sql:32
+; -- and explains the choice at 078:16-19: service and retired exist so a unit can leave the
+; available pool without being deleted and orphaning its service history in 080. Every other
+; source in the tree agrees with the migration rather than with the brief. RE-MEASURED
+; 2026-09-21, and every address in this sentence had drifted except two: src/api/bikes.rs:794
+; declares UNIT_STATUS_RETIRED, src/api/bikes.rs:797-803 is the four-value UNIT_STATUSES array
+; and the test the_four_statuses_match_the_check_constraint pins it at src/api/bikes.rs:2493,
+; src/db/entities/bike_unit.rs:40 and src/db/bikes.rs:42 restate it (both still exact),
+; scripts/verify_fleet_seed.py:67 parses no other value, and src/ui/screens/admin_screen.rs:522
+; renders it as a label. The sixth witness this sentence used to call is WITHDRAWN rather than
+; re-addressed: it claimed the sibling spec bike_catalog.t27 already writes "retired", and that
+; spec contains the word nowhere at all -- the citation was not stale, the claim was false.
+; The one contract that does name the set is turbobaby/order-status, and it names it while
+; crediting THIS file as the owner, so it corroborates nothing on its own. The shipped sources
+; above carry the point without it. The string
+; "sold" appears nowhere in this repository as a unit status (the sole hit, src/promo.rs:330, is
+; a promotion column and not a unit). So this file follows the migration:
+; D17 makes an issue a brief and not a measurement, and the earlier revision of this spec took the
+; fourth value from #4's PROSE and then labelled it a measurement. The cost is not cosmetic -- a
+; backend writing STATUS_NAMES[3] into bike_units.status would hand Postgres a value the column
+; rejects with a 23514 CHECK violation. This is the twin of the engine_cc / displacement_cc trap
+; D17 already records for #18.
+; --
+; WHY AVAILABLE IS NOT ZERO: the discriminants start at 1 and 0 means unset. D9 records three
+; constructs in this tree that turn an unknown into a confident zero, one of them fail-open by
+; design. A fixed-length slot array is a fourth: xmax-300-new writes 7 of 10 slots and leaves 3
+; zeroed, and had AVAILABLE been the zero those 3 would have read as bookable bikes. The direction
+; of the residual error is deliberate: an unrecognised code counts as not available, which costs a
+; booking, rather than as available, which double-books one.
+; --
+; WHAT THIS FILE NEVER DOES: it holds no renter identity, and that absence is the model rather
+; than an omission -- D14 forbids names, handles, phone numbers, key codes, plate numbers and
+; free-text notes anywhere in this repository, fixtures included, so a slot is the NN of a
+; synthetic <family-key>-NN label and carries one status and nothing else. It holds no dates and
+; no calendar: a status is a fact about now, while the term lives on the cart line (D8) and in
+; rental_terms (#17). And it never prices anything. A family with zero available units still shows
+; its published rate rather than hiding it (#4) -- and a family with no published rate at all,
+; which is click-125 and only click-125, renders a dash rather than a zero, an average or a
+; "from" (the seed's field_notes on null) -- while the client-facing number is still the one the
+; door returns: never computed here, never a "from", never a range, never silence (D11).
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module availability;
+
+pub const KIND : str = "availability";
+pub const ID : str = "turbobaby/availability";
+pub const NAME : str = "Unit availability";
+pub const SOURCE : str = "data/fleet_seed.json";
+pub const MEASURED_AT : str = "2026-09-12";
+
+; --- The status set -------------------------------------------------------------------------
+; The four wire values are the CHECK constraint of migrations/078_bike_units.sql:32:
+; status TEXT CHECK (status IN ('available','rented','service','retired')). NOT #4's brief, which
+; spells the fourth value 'sold' -- see the second refutation in the header. The u8 codes here
+; are this spec's own ordinals and they start at ONE, because zero is what an unwritten slot in
+; a fixed-length array already holds (see the header).
+; The codes are written as plain constants rather than as an enum type on purpose: a discriminant
+; that spells differently in two backends is a discriminant that can drift.
+; THE EVIDENCE THIS PARAGRAPH CITED IS NOT IN THIS CORPUS (re-measured 2026-09-21). It named two
+; incompatible spellings of an enum member inside an assert -- `ErrorCode::Success` in
+; specs/enrichment/youtube_transcript.t27 against the leading-dot form used elsewhere. There is no
+; specs/enrichment/ directory: find specs -type f returns 43 files, specs/agents/turbobaby.t27 and
+; the 42 under specs/turbobaby/, and grep -rn "ErrorCode::Success" specs/ now matches only this
+; paragraph. The reason is kept because the reason is sound on its own -- two backends, one
+; discriminant -- and the borrowed example is withdrawn rather than re-addressed to a file that
+; would have to be invented to hold it.
+pub const STATUS_UNSET : u8 = 0;
+pub const STATUS_AVAILABLE : u8 = 1;
+pub const STATUS_RENTED : u8 = 2;
+pub const STATUS_SERVICE : u8 = 3;
+pub const STATUS_RETIRED : u8 = 4;
+; Indexed by code minus one; the string is what the database column stores.
+pub const STATUS_NAMES : [4]str = ["available", "rented", "service", "retired"];
+
+; #19's "reserved". Empty because no source names it, with the reason stated rather than implied.
+pub const RESERVED_STATUS : str = "";
+pub const RESERVED_STATUS_NOTE : str = "Issue #19 asks for a reserved status; nothing in this repository has one. migrations/078_bike_units.sql:32 enumerates four wire values and reserved is not among them, and D8 puts a booking hold on the family key rather than on a unit, so no unit row exists for a hold to occupy. available_count matches AVAILABLE exactly, which excludes a held unit whatever a later migration calls it.";
+
+; --- What gates this file's copies, measured and not assumed ----------------------------------
+; Two absences this file asserted had quietly stopped being true, so the live one is pinned as a
+; literal instead of as a sentence. Re-measured 2026-09-21.
+pub const SEED_GATE_SCRIPT : str = "scripts/verify_fleet_seed.py";
+pub const SEED_GATE_SPEC_READ : str = "turbobaby/market";
+pub const SEED_GATE_COVERS_THIS_FILE : bool = false;
+pub const SEED_GATE_NOTE : str = "scripts/verify_fleet_seed.py is no longer .t27-blind: line 34 binds MARKET_SPEC to specs/turbobaby/market_profile.t27 and check_market_profile at :98-140 compares the seed's market block against that contract's constants. It gates turbobaby/market and nothing else. The fleet table in THIS file stays ungated, and the checkable form of that is narrow: the word availability does not occur anywhere in that script, measured 2026-09-21. Closing the gap needs FAMILY_UNITS, FAMILY_RENTED and FAMILY_AVAILABLE compared against data/fleet_seed.json by the same script, in the shape it already uses for the market block.";
+
+; The sixth witness the fourth-value refutation used to call. Recorded as a withdrawal rather
+; than deleted, because a reader who remembers the old sentence must be able to find out what
+; happened to it: bike_catalog.t27 was cited as already writing "retired" and it writes the word
+; nowhere. turbobaby/order-status does name the set, and names this file as its owner, so it is
+; corroboration of ownership and not an independent source for the value.
+pub const RETIRED_SIBLING_WITNESS : str = "";
+pub const RETIRED_SIBLING_WITNESS_NOTE : str = "No sibling contract independently writes the fourth unit status. The withdrawn citation was bike_catalog.t27, which contains no occurrence of retired at all (measured 2026-09-21). The only contract that names the four-value set is turbobaby/order-status, and it names it while crediting turbobaby/availability as the owner, so it restates this file rather than confirming it. The shipped sources carry the refutation on their own: src/api/bikes.rs:794, src/api/bikes.rs:797-803, the test at src/api/bikes.rs:2493, src/db/entities/bike_unit.rs:40, src/db/bikes.rs:42, scripts/verify_fleet_seed.py:67 and src/ui/screens/admin_screen.rs:522.";
+
+; --- The measured fleet ---------------------------------------------------------------------
+; 14 in-stock families in the seed's own order, so a diff against data/fleet_seed.json reads
+; line for line. This table is a SECOND copy of the seed's counts and a copy is a drift risk
+; (D15). It is here because the arithmetic cannot be checked without it, and the copy is
+; STILL ungated -- but for a narrower reason than this paragraph used to give (re-verified
+; 2026-09-21). It used to say scripts/verify_fleet_seed.py pins migrations/082_bikes_seed.sql to
+; the JSON and knows nothing about .t27. The first half holds; the second is now FALSE. That
+; script reads exactly one spec: MARKET_SPEC at scripts/verify_fleet_seed.py:41 is
+; specs/turbobaby/market_profile.t27, and check_market_profile at :98-140 compares the seed's
+; market block against that contract's constants field by field. It is a spec gate, and it gates
+; a different spec. What keeps this table ungated is narrower and checkable: the word
+; availability does not occur in that script at all (grep -c availability -> 0 on 2026-09-21),
+; and no column below is read by anything it does. So comparing this table to the seed is still
+; the next gate to write -- and the precedent for writing it now exists in the same file.
+pub const FAMILY_KEYS : [14]str = [
+  "click-125", "nmax-155", "xsr-155", "cb-300r", "forza-300", "mt-03-300", "xmax-300",
+  "xmax-300-new", "adv-350", "ninja-400", "cb-650r", "cbr-650r", "vulcan-s-650", "xadv-750",
+];
+pub const FAMILY_UNITS : [14]u8 = [1, 10, 2, 1, 1, 1, 3, 7, 5, 1, 1, 1, 1, 2];
+pub const FAMILY_RENTED : [14]u8 = [1, 5, 1, 0, 1, 1, 0, 1, 0, 0, 0, 0, 0, 1];
+pub const FAMILY_AVAILABLE : [14]u8 = [0, 5, 1, 1, 0, 0, 3, 6, 5, 1, 1, 1, 1, 1];
+
+; seed "totals". These are the published figures the three columns above must reproduce.
+pub const FAMILIES_IN_STOCK : u8 = 14;
+pub const FAMILIES_OFFERED : u8 = 13;
+pub const FLEET_UNITS : u8 = 37;
+pub const FLEET_RENTED : u8 = 11;
+pub const FLEET_AVAILABLE : u8 = 26;
+; Derived from the family rows: eleven families are both offered and have at least one unit.
+pub const BOOKABLE_FAMILIES : u8 = 11;
+; FORZA 300 and MT-03 are in stock but all their units are out. The old root spec called this
+; "no stock"; that name was retired because total stock and current availability are different.
+pub const OFFERED_WITH_ZERO_AVAILABLE_FAMILIES : u8 = 2;
+pub const OFFERED_OUT_ON_CONTRACT_KEYS : [2]str = ["forza-300", "mt-03-300"];
+; 37 - 11 - 26 = 0. No unit in the register is in service or retired; both statuses are declared
+; because 078 declares them, and both have zero measured instances today.
+pub const MEASURED_SERVICE_OR_RETIRED_UNITS : u8 = 0;
+
+; seed "discrepancy": the register header against the rows that exist. Recorded, not resolved.
+pub const REGISTER_HEADER_UNITS : u8 = 38;
+pub const REGISTER_HEADER_RENTED : u8 = 11;
+pub const REGISTER_HEADER_AT_BASE : u8 = 27;
+
+; DECISIONS.md D6: two units read `overdue` on the operations sheet. Both are still counted in
+; the 37 as either rented or at base, so service-due is a second axis over a unit, not a status
+; on it -- and it is admin-only, because a public badge we cannot keep accurate is the kind of
+; number D9 forbids.
+pub const SERVICE_DUE_UNITS : u8 = 2;
+
+; seed "price_list_only": 7 families published in the tariff with ZERO units. With the 13 in-stock
+; families that carry a published rate they are the 13 + 7 = 20 families the tariff NAMES --
+; click-125 is the fourteenth in-stock family and the tariff does not name it, because its
+; base_rate_thb_day and deposit_thb are both null ("Rate and deposit are null because no rentable
+; tariff is published for it") and the seed's own totals.families_without_published_rate is 1. The
+; single CLICK 125 figure anywhere, 187/day on the seasonal grid, is recorded in the seed's
+; reconciliation.unresolved as "stale, not a tariff", so it is not one either. 21 is therefore the
+; number of families in the SEED (14 in stock + 7 price-list-only), not in the tariff; 7 of 21
+; seeded families is exactly a third, while 7 of the 20 the tariff names is 35%. They are the
+; reason the empty set must answer zero rather than raise: an empty unit set is the normal,
+; permanent state of a third of the seeded catalog, not an error condition.
+pub const PRICE_LIST_ONLY_FAMILIES : u8 = 7;
+pub const PRICE_LIST_ONLY_UNITS : u8 = 0;
+
+; D12 lifecycle. CLICK 125's only unit is still rented on a contract predating the closure; it
+; is not at the office and has zero units available. The seasonal-grid number is stale evidence,
+; not a tariff, and can never be quoted.
+pub const CLICK_125_CLOSED_ON : str = "2026-09-12";
+pub const CLICK_125_EXISTING_RENTAL_CONTINUES : bool = true;
+pub const CLICK_125_STALE_GRID_RATE_THB : u16 = 187;
+pub const CLICK_125_STALE_GRID_IS_QUOTABLE : bool = false;
+
+; What is offered instead: the owner's decision of 2026-09-25, provisional ("for now"), NMAX 155
+; alone. The three-name list it replaced is kept under a _BEFORE_2026_09_25 name further down.
+pub const CLICK_125_REDIRECTS : [1]str = ["nmax-155"];
+pub const CLICK_125_REDIRECT_UNITS_AVAILABLE : [1]u8 = [5];
+
+; A file snapshot may rule a family out, but only a live shop check may confirm availability.
+pub const FILE_MAY_RULE_OUT : bool = true;
+pub const FILE_MAY_CONFIRM : bool = false;
+pub const CONFIRMATION_AUTHORITY : str = "a live check with the shop";
+
+; The largest family in the seed is nmax-155 at 10 units, so 10 slots hold any family today.
+; The invariants below keep this honest, and they SCAN the whole table rather than quoting one
+; row: a family that grows past the capacity invalidates the signature of available_count, and
+; that must fail here rather than silently truncate a count. This constant is also the clamp
+; available_count applies and the width of the slot fixtures, and the invariants pin all three
+; together -- raising it without widening the [10]u8 arrays would clamp past the end of them.
+pub const MAX_UNITS_PER_FAMILY : u8 = 10;
+
+; --- The unit row ---------------------------------------------------------------------------
+; Two fields, and the interesting thing about them is the fields that are missing. `slot` is the
+; NN of the synthetic <family-key>-NN label; `status` is one field holding one code, which is why
+; "a unit occupies exactly one status" is structural here and not merely asserted. There is no
+; renter, no plate, no key code and no note (D14). One packed struct per module: a second breaks
+; the Verilog-from-HIR backend with an empty duplicate-signal name (t27#3283).
+pub const UnitSlot = packed struct {
+    slot : u8,
+    status : u8,
+};
+
+pub const SLOT_LABEL_EXAMPLE : str = "nmax-155-01";
+
+; --- Functions ------------------------------------------------------------------------------
+
+; A code inside the declared set. STATUS_UNSET is deliberately outside it.
+pub fn status_is_known(status: u8) bool {
+    return status >= STATUS_AVAILABLE and status <= STATUS_RETIRED;
+}
+
+; The one question the customer app asks a unit. Exact match, never a range, never a default.
+pub fn is_available(status: u8) bool {
+    return status == STATUS_AVAILABLE;
+}
+
+; How many of the four classes a single code falls into. Exactly one for a known status and zero
+; for anything else -- the "exactly one status" claim in the form a machine can check. A code
+; that hit two classes would be a unit that is both available and rented.
+pub fn status_class_hits(status: u8) u8 {
+    var hits : u8 = 0;
+    if (status == STATUS_AVAILABLE) {
+        hits += @as(u8, 1);
+    }
+    if (status == STATUS_RENTED) {
+        hits += @as(u8, 1);
+    }
+    if (status == STATUS_SERVICE) {
+        hits += @as(u8, 1);
+    }
+    if (status == STATUS_RETIRED) {
+        hits += @as(u8, 1);
+    }
+    return hits;
+}
+
+; Availability of a family, derived from its slots -- #4: count(units WHERE status='available').
+; `used` is the size of the set, so an empty family passes 0 and gets 0 back: no error, no
+; special case, no sentinel. The bound is clamped because a caller's count is not evidence about
+; the array, and the count is safe under either mistake -- a `used` that is too large reads
+; unwritten slots, and an unwritten slot is STATUS_UNSET, which is not available.
+pub fn available_count(slots: [10]u8, used: u8) u8 {
+    const n = if (used > MAX_UNITS_PER_FAMILY) MAX_UNITS_PER_FAMILY else used;
+    var found : u8 = 0;
+    var i : u8 = 0;
+    while (i < n) {
+        if (slots[i] == STATUS_AVAILABLE) {
+            found += @as(u8, 1);
+        }
+        i += @as(u8, 1);
+    }
+    return found;
+}
+
+; D12: CLICK 125 is closed to NEW rentals while one unit stays out on an older contract. Being
+; offered is a property of the family and being available is a property of a unit, so the offer
+; gate multiplies the count rather than replacing it. Today the two axes cannot disagree --
+; click-125 has 0 available units -- and this function is what keeps that from being load-bearing.
+pub fn offerable_count(available: u8, offered: bool) u8 {
+    if (!offered) {
+        return 0;
+    }
+    return available;
+}
+
+; Boolean form shared by pricing and catalog consumers. Both conjuncts live here so no caller
+; reconstructs only half of the rule.
+pub fn has_an_available_unit(units_available: u8) bool {
+    return units_available >= 1;
+}
+
+pub fn is_bookable(offered: bool, units_available: u8) bool {
+    return offered and has_an_available_unit(units_available);
+}
+
+pub const REASON_BOOKABLE : u8 = 0;
+pub const REASON_NOT_OFFERED : u8 = 1;
+pub const REASON_NO_UNITS : u8 = 2;
+pub const REASON_NEITHER : u8 = 3;
+pub const REASON_NAMES : [4]str = ["bookable", "not_offered", "no_units_available", "not_offered_and_no_units"];
+
+pub fn unbookable_reason(offered: bool, units_available: u8) u8 {
+    if (is_bookable(offered, units_available)) {
+        return REASON_BOOKABLE;
+    }
+    if (!offered and !has_an_available_unit(units_available)) {
+        return REASON_NEITHER;
+    }
+    if (!offered) {
+        return REASON_NOT_OFFERED;
+    }
+    return REASON_NO_UNITS;
+}
+
+pub fn may_confirm(offered: bool, units_available: u8, checked_with_shop: bool) bool {
+    return is_bookable(offered, units_available) and checked_with_shop;
+}
+
+pub fn usable_click_redirect_count() u8 {
+    var found : u8 = 0;
+    var i : u8 = 0;
+    while (i < CLICK_125_REDIRECTS.len) {
+        if (is_bookable(true, CLICK_125_REDIRECT_UNITS_AVAILABLE[i])) {
+            found += @as(u8, 1);
+        }
+        i += @as(u8, 1);
+    }
+    return found;
+}
+
+; Sum one column of the measured table. The largest column total is 37, far below the u8 rail,
+; so the accumulator needs no wider width and no cast.
+pub fn sum_column(counts: [14]u8) u8 {
+    var total : u8 = 0;
+    var i : u8 = 0;
+    while (i < FAMILIES_IN_STOCK) {
+        total = total + counts[i];
+        i += @as(u8, 1);
+    }
+    return total;
+}
+
+; Every family's own three numbers must close: units == rented + available. A unit counted in
+; both classes breaks its row, and so does a unit counted in neither.
+pub fn verify_family_rows_close() bool {
+    var i : u8 = 0;
+    while (i < FAMILIES_IN_STOCK) {
+        if (FAMILY_UNITS[i] != FAMILY_RENTED[i] + FAMILY_AVAILABLE[i]) {
+            return false;
+        }
+        i += @as(u8, 1);
+    }
+    return true;
+}
+
+; The largest number of units any family holds, SCANNED rather than quoted. The capacity claim
+; above names nmax-155 at 10, and a name goes stale silently: adv-350 or xmax-300-new growing
+; past 10 leaves a one-row assert green while available_count clamps the eleventh slot out of
+; every count. Returning the maximum rather than a bool buys the second invariant below -- that
+; the family this file NAMES as the largest still is -- so neither the capacity nor the comment
+; that justifies it can drift alone.
+pub fn largest_family_units() u8 {
+    var largest : u8 = 0;
+    var i : u8 = 0;
+    while (i < FAMILIES_IN_STOCK) {
+        if (FAMILY_UNITS[i] > largest) {
+            largest = FAMILY_UNITS[i];
+        }
+        i += @as(u8, 1);
+    }
+    return largest;
+}
+
+; --- Corrections of 2026-09-24 -----------------------------------------------------------------
+; Placed after the functions and not beside the constants they correct, so that no line of this
+; file cited from elsewhere moves (scripts/execute_t27_assertions.py cites :224, :269 and :272,
+; delivery_terms.t27 cites :342).
+
+; CORRECTED 2026-09-24. CLICK_125_REDIRECTS above records what the owner's FAQ SUGGESTS
+; (brain:knowledge_base:106 and :434 still read "PCX 150 / ADV 150 / NMAX 155"), and until this
+; date those three were also what the customer was SHOWN: src/ui/screens/catalog_screen.rs held
+; CLICK_125_ALTERNATIVES = ["PCX 150", "ADV 150", "NMAX 155"] and printed it under the closed
+; CLICK 125 card on both customer screens. Two of the three have zero units, and the owner's later
+; rules forbid naming a model outside the fleet at all, "not even as a replacement"
+; (brain:knowledge_base:108-110, marked 05.07.2026; :345-346, 06.07.2026;
+; brain:business_rules:7-8). So the suggestion stays recorded as it is, and what is shown is its
+; bookable subset, by the same predicate usable_click_redirect_count() applies. The label is the
+; seed's model name for that key (data/fleet_seed.json families[].model), because the screen
+; prints a label and not a key. Gate 3 binds CLICK_125_REDIRECT_LABELS_SHOWN to the Rust constant,
+; and tests/catalog_honesty_wiring.rs ties every Rust label to an offered seed family with units.
+; No gate resolves a brain: citation; the lines were read on 2026-09-24.
+pub const CLICK_125_REDIRECTS_SHOWN : [1]str = ["nmax-155"];
+pub const CLICK_125_REDIRECT_LABELS_SHOWN : [1]str = ["NMAX 155"];
+pub const CLICK_125_REDIRECT_LABELS_SHOWN_BEFORE_2026_09_24 : [3]str = ["PCX 150", "ADV 150", "NMAX 155"];
+
+; DECIDED 2026-09-25. The owner answered the redirect question directly, in answer 10 of a
+; numbered list: for now, NMAX 155 is what is offered instead of CLICK 125, and not PCX 150 or
+; ADV 150. The answer says "for now" twice, so the decision is recorded as provisional; the Russian
+; original is in DECISIONS.md, the D12 amendment of that date. CLICK_125_REDIRECTS above held the
+; three names of KB_faq's redirect until this date -- the paragraph before this one describes it in
+; that state -- and holds the decision now. The three names are kept below with their units, so
+; the correction of 2026-09-24 still executes against them. Nothing a customer sees changes: the
+; screen already showed NMAX 155 alone, and the decided list and the shown list are now one list,
+; which the_owners_click_redirect_is_shown_whole holds. Gate 3 binds CLICK_125_REDIRECTS and
+; CLICK_125_REDIRECTS_ARE_PROVISIONAL to data/fleet_seed.json (pricing_policy.not_offered.click-125,
+; offer_instead and offer_instead_provisional), whose dated source for the list is the seed's
+; sources.owner_decision_2026_09_25. The brain's text is the operator's to change, not this file's.
+pub const CLICK_125_REDIRECTS_DECIDED_ON : str = "2026-09-25";
+pub const CLICK_125_REDIRECTS_ARE_PROVISIONAL : bool = true;
+pub const CLICK_125_REDIRECTS_BEFORE_2026_09_25 : [3]str = ["pcx-150", "adv-150", "nmax-155"];
+pub const CLICK_125_REDIRECT_UNITS_AVAILABLE_BEFORE_2026_09_25 : [3]u8 = [0, 0, 5];
+
+; CORRECTED 2026-09-25, the bot's /start reply. No contract owns the welcome the bot sends on
+; /start (src/locales.rs, the welcome_feature1 field of both published locales), and its first line
+; named the catalog as running from CLICK 125 to X-ADV 750. CLICK 125 is closed to new rentals and
+; offered to nobody (D12, CLICK_125_CLOSED_ON above), so the line named a machine the shop does not
+; rent. It is recorded here because this file owns the fact the line rests on: which families are
+; offered. The lower bound is now the smallest family the seed OFFERS, measured from
+; data/fleet_seed.json: the families[] rows with offered = true -- thirteen, the price_list_only
+; block excluded -- ordered by displacement_cc. The smallest displacement, 155 cc, is shared by
+; nmax-155 (base_rate_thb_day 449) and xsr-155 (590); nmax-155 is the lower of the two by rate and
+; the lowest-rate offered family outright, so the bound is its seed model name. The upper bound is
+; unchanged: xadv-750, 750 cc, is the largest offered family, alone at that size. Nothing else in the
+; reply changed, and no other word of it is recorded here. tests/catalog_honesty_wiring.rs derives
+; both bounds from the seed by the same rule and compares them with the two locale rows and with
+; START_CATALOG_RANGE_LABELS; no gate here reads the Russian row (L3).
+pub const START_CATALOG_RANGE_KEYS : [2]str = ["nmax-155", "xadv-750"];
+pub const START_CATALOG_RANGE_LABELS : [2]str = ["NMAX 155", "X-ADV 750"];
+pub const START_CATALOG_RANGE_KEYS_BEFORE_2026_09_25 : [2]str = ["click-125", "xadv-750"];
+pub const START_CATALOG_RANGE_LOWER_BOUND_CC : u16 = 155;
+pub const START_CATALOG_RANGE_LOWER_BOUND_CC_TIES : [2]str = ["nmax-155", "xsr-155"];
+pub const START_CATALOG_RANGE_NAMES_ONLY_OFFERED_FAMILIES : bool = true;
+pub const START_CATALOG_RANGE_NAMED_A_CLOSED_FAMILY_BEFORE_2026_09_25 : bool = true;
+pub const START_CATALOG_RANGE_CORRECTED_ON : str = "2026-09-25";
+
+; CORRECTED 2026-09-24. FILE_MAY_RULE_OUT and FILE_MAY_CONFIRM above were declared while both
+; customer screens confirmed from the file anyway. availability_line in
+; src/ui/screens/catalog_screen.rs printed
+; T_BIKE_AVAILABILITY ("{0} of {1} free") on the detail screen and T_BIKE_AVAILABILITY_FREE
+; ("{0} free") on every list card, both from units_available: the bike_units rows seeded from this
+; file's table on 2026-09-12 and changed only by an admin, never by a live check with the shop.
+; The same count fed a T_BIKE_FILTER_FREE_NOW ("Free now") chip on the list and a
+; T_BIKE_COLORS_AVAILABLE ("Colours free:") row on the detail. The owner's rule is the same as
+; FILE_MAY_CONFIRM: do not promise without checking occupancy (brain:knowledge_base:336). Since
+; this date the customer screens print T_BIKE_AVAILABILITY_UNKNOWN ("A manager confirms
+; availability"), copy both locales already published; the chip is gone and the colour row is the
+; whole family's (T_BIKE_COLORS_ALL). What stays is the direction FILE_MAY_RULE_OUT allows: a zero
+; still rules a family out, in the detail's T_BIKE_UNITS_EMPTY line and in the Book control's
+; no-units reason. The admin screen keeps its count, because the admin is who writes it. Gate 3
+; counts the code lines under src/ui/ that use any of the four confirming keys: 7 on upstream main
+; f0640f8, 0 now.
+pub const CUSTOMER_SCREENS_CONFIRM_FROM_THE_FILE : bool = false;
+pub const CUSTOMER_SCREENS_CONFIRMED_FROM_THE_FILE_BEFORE_2026_09_24 : bool = true;
+pub const CUSTOMER_AVAILABILITY_KEY : str = "T_BIKE_AVAILABILITY_UNKNOWN";
+pub const CONFIRMING_KEYS : [4]str = ["T_BIKE_AVAILABILITY", "T_BIKE_AVAILABILITY_FREE", "T_BIKE_COLORS_AVAILABLE", "T_BIKE_FILTER_FREE_NOW"];
+pub const CONFIRMING_KEY_LINES_IN_UI : u8 = 0;
+pub const CONFIRMING_KEY_LINES_IN_UI_BEFORE_2026_09_24 : u8 = 7;
+
+; DECIDED 2026-09-25, answer 5 of the owner's second numbered list of that day. The paragraph
+; above describes the detail screen as it stood before this date: under a zero count it printed
+; T_BIKE_UNITS_EMPTY ("Every bike of this model is out right now.") below the manager line. That
+; zero is the same bike_units count, seeded on 2026-09-12 and changed only by an admin, so the
+; sentence read a file snapshot as occupancy "right now", which no live check had confirmed. On the
+; seed's counts it was reachable for the two families in OFFERED_OUT_ON_CONTRACT_KEYS; click-125
+; renders no availability block, because it is not offered. Asked whether to remove the line, the
+; owner answered "probably"; the Russian original is in DECISIONS.md, in the entry of that date on
+; this line. The answer hedges, so the removal is recorded as hedged, the way
+; CLICK_125_REDIRECTS_ARE_PROVISIONAL records a "for now": a later answer may restore the line, and
+; restoring it means declaring the key again with its two sentences, which git history keeps.
+; What changed: the availability block of src/ui/screens/bike_detail.rs renders nothing under a
+; zero count, and src/trios/i18n.rs deleted the key bike.units.empty outright, its declaration and
+; both arms each becoming a comment line, so no line of that file moved. turbobaby/locale-policy
+; owns the key count, and it moved there. The manager line, CUSTOMER_AVAILABILITY_KEY, stays and
+; now stands alone. No sentence was written in the removed one's place.
+; WHAT THE ANSWER DID NOT NAME, AND STAYS. Under the same zero the Book control is disabled with
+; T_BIKE_BOOK_BLOCKED_NO_UNITS ("Every bike of this model is taken") as its reason, read from the
+; same seeded count and saying nearly the same thing. The question named the availability line and
+; not this reason, and issue #9 forbids a disabled control without a named reason, so replacing it
+; needs an owner-approved sentence. It is kept, and it is open. FILE_MAY_RULE_OUT stays true: the
+; file still rules a family out of booking, through that control. tests/catalog_honesty_wiring.rs
+; holds both facts to the source, and holds UNITS_EMPTY_LINE_IS_SHOWN, UNITS_EMPTY_KEY_IS_DECLARED
+; and NO_UNITS_BOOK_REASON_IS_SHOWN below to what it finds there.
+pub const UNITS_EMPTY_LINE_DECIDED_ON : str = "2026-09-25";
+pub const UNITS_EMPTY_LINE_REMOVAL_IS_HEDGED : bool = true;
+pub const UNITS_EMPTY_KEY : str = "T_BIKE_UNITS_EMPTY";
+pub const UNITS_EMPTY_LINE_IS_SHOWN : bool = false;
+pub const UNITS_EMPTY_LINE_WAS_SHOWN_BEFORE_2026_09_25 : bool = true;
+pub const UNITS_EMPTY_KEY_IS_DECLARED : bool = false;
+pub const UNITS_EMPTY_REPLACEMENT_SENTENCES : u8 = 0;
+pub const NO_UNITS_BOOK_REASON_KEY : str = "T_BIKE_BOOK_BLOCKED_NO_UNITS";
+pub const NO_UNITS_BOOK_REASON_IS_SHOWN : bool = false;
+pub const NO_UNITS_BOOK_REASON_WAS_ANSWERED : bool = true;
+
+; DECIDED 2026-09-26, question I, by the owner. The paragraph above left the Book control's
+; no-units reason open, and the two flags just above said so (shown, not answered) until this
+; date; they are kept under _BEFORE_2026_09_26 names below. Asked on 2026-09-26 whether a family
+; the seed counts at zero should keep its Book control disabled with that reason, the owner
+; answered, in translation: "Allow booking; the manager will confirm availability." The Russian
+; original is in DECISIONS.md, in the entry of that date on question I. The answer is not hedged,
+; and it is read as written: the seeded count takes no part in whether a customer may book.
+;   * src/ui/screens/catalog_screen.rs, book_block: the arm that disabled the control under a zero
+;     (BookBlock::NoUnitsFree, NO_UNITS_BOOK_REASON_KEY) is gone. So is the arm that disabled it
+;     when the count was not served at all (BookBlock::UnknownAvailability,
+;     UNKNOWN_AVAILABILITY_BOOK_REASON_KEY, "Availability not confirmed"). The answer names the
+;     zero; removing the second arm is THIS FILE'S READING of it
+;     (UNKNOWN_AVAILABILITY_REMOVAL_IS_THIS_FILES_READING): a manager confirms availability for
+;     every family, so "not confirmed" is every family's state and no reason to refuse one. Both
+;     keys were deleted outright, their declarations and all four arms each becoming a comment
+;     line, so no src/trios/i18n.rs line moved; turbobaby/locale-policy owns the count. No sentence
+;     was written in their place: CUSTOMER_AVAILABILITY_KEY, the manager line, already says who
+;     confirms, on every card and on the detail.
+;   * src/ui/components/bike_card.rs, the card component no screen mounts, gated its add-to-cart
+;     on the same count and printed it as "free: N" or "all rented out". It now reads the offer
+;     and the rate only, and prints the manager line.
+;   * The server never refused on the count (SERVER_REFUSES_ON_THE_COUNT). check_bike_lines in
+;     src/api/orders.rs logs a shortfall for staff and accepts the order, and says why beside it:
+;     a count of what is at base today says nothing about a booking weeks out. create_order is
+;     unchanged, and tests/catalog_honesty_wiring.rs now holds it to that.
+;   * What still disables the control reads no count: a closed family (D12), no published rate
+;     (D11), and a screen with no booking handler (NotWired). customer_may_book below is that rule.
+;     is_bookable above stays the file's own predicate, which the CLICK 125 redirect and the ride
+;     game read (turbobaby/ride-game, RIDE_BOOKABILITY_INPUT); this answer moves neither of them.
+; FILE_MAY_RULE_OUT stays true as a statement of what the file may do, because the redirect still
+; uses it: a family with no unit at base is not offered INSTEAD of CLICK 125. What changed is that
+; no customer booking decision reads the file any more (CUSTOMER_BOOKING_READS_THE_FILE).
+pub const NO_UNITS_BOOK_REASON_DECIDED_ON : str = "2026-09-26";
+pub const NO_UNITS_BOOK_REASON_WAS_ANSWERED_BEFORE_2026_09_26 : bool = false;
+pub const NO_UNITS_BOOK_REASON_WAS_SHOWN_BEFORE_2026_09_26 : bool = true;
+pub const UNKNOWN_AVAILABILITY_BOOK_REASON_KEY : str = "T_BIKE_BOOK_BLOCKED_UNKNOWN_AVAILABILITY";
+pub const UNKNOWN_AVAILABILITY_BOOK_REASON_IS_SHOWN : bool = false;
+pub const UNKNOWN_AVAILABILITY_REMOVAL_IS_THIS_FILES_READING : bool = true;
+pub const BOOK_REASON_KEYS_DELETED_2026_09_26 : u8 = 2;
+pub const BOOK_REASON_REPLACEMENT_SENTENCES : u8 = 0;
+pub const CUSTOMER_BOOKING_READS_THE_FILE : bool = false;
+pub const CUSTOMER_BOOKING_READ_THE_FILE_BEFORE_2026_09_26 : bool = true;
+pub const SERVER_REFUSES_ON_THE_COUNT : bool = false;
+
+; The Book control's rule since 2026-09-26. The count is a parameter so that a test can show it
+; changes nothing; booking_wired, the third thing the control asks, is the screen's and not a
+; fleet fact, so it is not modelled here.
+pub fn customer_may_book(offered: bool, has_published_rate: bool, units_available: u8) bool {
+    return offered and has_published_rate;
+}
+
+; --- Fixtures -------------------------------------------------------------------------------
+; Not pub: the surface of this spec is the status set, the table and the functions. The slot
+; codes are written as their literal ordinals and every test ties the literal back to its named
+; discriminant, so renumbering a status fails a test instead of quietly testing another one.
+; --
+; The seed publishes COUNTS, not a per-slot assignment: which of the ten NMAX units is out is
+; not a number this repository holds, and it would be a renter fact if it were. The order inside
+; these fixtures is therefore arbitrary and only the multiset is claimed.
+
+; The empty fleet: no units at all. This is the shape of all 7 price-list-only families.
+const NO_UNITS : [10]u8 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+; forza-300: 1 unit, rented (seed: units_total 1, units_rented 1, units_available 0).
+const FORZA_300_SLOTS : [10]u8 = [2, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+; nmax-155: 10 units, 5 at base and 5 out (seed: 10 / 5 / 5). The mixed family.
+const NMAX_155_SLOTS : [10]u8 = [1, 1, 1, 1, 1, 2, 2, 2, 2, 2];
+; xmax-300-new: 7 units, 6 at base and 1 out (seed: 7 / 1 / 6). Three slots stay unwritten.
+const XMAX_300_NEW_SLOTS : [10]u8 = [1, 1, 1, 1, 1, 1, 2, 0, 0, 0];
+
+; --- Tests ----------------------------------------------------------------------------------
+
+test the_empty_fleet_counts_zero_and_is_not_an_error {
+    assert available_count(NO_UNITS, 0) == 0;
+    // and the same answer when the caller's count is wrong in the unsafe direction
+    assert available_count(NO_UNITS, 10) == 0;
+    // 7 real families are in exactly this state: a published tariff over zero stock
+    assert PRICE_LIST_ONLY_FAMILIES == 7;
+    assert PRICE_LIST_ONLY_UNITS == 0;
+    assert available_count(NO_UNITS, PRICE_LIST_ONLY_UNITS) == 0;
+}
+
+test forza_300_is_an_all_rented_family {
+    assert FAMILY_KEYS[4] == "forza-300";
+    assert FAMILY_UNITS[4] == 1;
+    assert FAMILY_RENTED[4] == 1;
+    assert FAMILY_AVAILABLE[4] == 0;
+    assert FORZA_300_SLOTS[0] == STATUS_RENTED;
+    assert available_count(FORZA_300_SLOTS, 1) == 0;
+    // mt-03-300 is the second family of this shape, 1 unit and 0 available
+    assert FAMILY_KEYS[5] == "mt-03-300";
+    assert FAMILY_UNITS[5] == 1;
+    assert FAMILY_AVAILABLE[5] == 0;
+}
+
+test nmax_155_is_a_mixed_family {
+    assert FAMILY_KEYS[1] == "nmax-155";
+    assert FAMILY_UNITS[1] == 10;
+    assert FAMILY_RENTED[1] == 5;
+    assert FAMILY_AVAILABLE[1] == 5;
+    assert NMAX_155_SLOTS[0] == STATUS_AVAILABLE;
+    assert NMAX_155_SLOTS[9] == STATUS_RENTED;
+    assert available_count(NMAX_155_SLOTS, 10) == FAMILY_AVAILABLE[1];
+}
+
+test xmax_300_new_counts_seven_slots_and_not_its_capacity {
+    assert FAMILY_KEYS[7] == "xmax-300-new";
+    assert FAMILY_UNITS[7] == 7;
+    assert FAMILY_RENTED[7] == 1;
+    assert FAMILY_AVAILABLE[7] == 6;
+    assert available_count(XMAX_300_NEW_SLOTS, 7) == 6;
+    // the three unwritten slots stay out of the count even at full capacity: this is the case
+    // that would have read 9 available had AVAILABLE been the zero code
+    assert available_count(XMAX_300_NEW_SLOTS, 10) == 6;
+}
+
+test a_unit_falls_into_exactly_one_class {
+    assert status_class_hits(STATUS_AVAILABLE) == 1;
+    assert status_class_hits(STATUS_RENTED) == 1;
+    assert status_class_hits(STATUS_SERVICE) == 1;
+    assert status_class_hits(STATUS_RETIRED) == 1;
+}
+
+test an_unknown_code_is_in_no_class_and_is_never_available {
+    assert status_class_hits(STATUS_UNSET) == 0;
+    // 200 stands for any code outside the declared set, including one a later migration adds
+    assert status_class_hits(200) == 0;
+    assert is_available(STATUS_UNSET) == false;
+    assert is_available(200) == false;
+    assert status_is_known(STATUS_UNSET) == false;
+    assert status_is_known(STATUS_RETIRED) == true;
+}
+
+test the_four_wire_values_are_the_check_constraint_of_078 {
+    assert STATUS_NAMES[0] == "available";
+    assert STATUS_NAMES[1] == "rented";
+    assert STATUS_NAMES[2] == "service";
+    // "retired", not #4's "sold": migrations/078_bike_units.sql:32 is the column, and the column
+    // rejects "sold" with a 23514 CHECK violation. See the second refutation in the header.
+    assert STATUS_NAMES[3] == "retired";
+    // and none of them is "reserved"
+    assert RESERVED_STATUS == "";
+}
+
+; The two re-measurements of 2026-09-21, as literals rather than as prose a later reader has to
+; take on trust. Both replace an absence this file used to assert and that had stopped being
+; true: the seed checker does read a spec now, and the sibling witness never existed.
+test the_seed_gate_reads_a_spec_and_it_is_not_this_one {
+    assert SEED_GATE_SCRIPT == "scripts/verify_fleet_seed.py";
+    assert SEED_GATE_SPEC_READ == "turbobaby/market";
+    assert SEED_GATE_SPEC_READ != ID;
+    // The gate exists and this file is outside it. Both halves matter: dropping the first
+    // restores the false "knows nothing about .t27", dropping the second lets a reader think
+    // the fleet table below is checked by something.
+    assert SEED_GATE_COVERS_THIS_FILE == false;
+}
+
+test no_sibling_contract_independently_writes_the_fourth_status {
+    // Empty for the same reason RESERVED_STATUS is empty: the honest value of a withdrawn
+    // citation is nothing, and the note beside it says what was withdrawn and why.
+    assert RETIRED_SIBLING_WITNESS == "";
+    assert RETIRED_SIBLING_WITNESS != "turbobaby/bike-catalog";
+    // The value itself is unaffected by the withdrawal; it comes from the column.
+    assert STATUS_NAMES[3] == "retired";
+}
+
+test the_table_reproduces_the_published_totals {
+    assert sum_column(FAMILY_UNITS) == FLEET_UNITS;
+    assert sum_column(FAMILY_RENTED) == FLEET_RENTED;
+    assert sum_column(FAMILY_AVAILABLE) == FLEET_AVAILABLE;
+    assert FLEET_UNITS == 37;
+    assert FLEET_RENTED == 11;
+    assert FLEET_AVAILABLE == 26;
+    assert FAMILY_KEYS.len == 14;
+    assert FAMILIES_IN_STOCK == 14;
+}
+
+test the_register_header_claims_a_unit_that_has_no_row {
+    assert REGISTER_HEADER_UNITS == 38;
+    assert REGISTER_HEADER_AT_BASE == 27;
+    assert REGISTER_HEADER_UNITS - FLEET_UNITS == 1;
+    // the header closes on its own arithmetic, which is why the totals had to be pinned to the
+    // rows: 11 + 27 == 38 is as consistent as 11 + 26 == 37 and it is wrong by one bike
+    assert REGISTER_HEADER_RENTED + REGISTER_HEADER_AT_BASE == REGISTER_HEADER_UNITS;
+    assert FLEET_RENTED == REGISTER_HEADER_RENTED;
+}
+
+test service_due_is_a_second_axis_and_not_a_status {
+    assert SERVICE_DUE_UNITS == 2;
+    // both overdue units are still counted in the 37 as rented or at base, so no unit sits in
+    // STATUS_SERVICE: 37 - 11 - 26 = 0
+    assert MEASURED_SERVICE_OR_RETIRED_UNITS == 0;
+    assert FLEET_UNITS - FLEET_RENTED - FLEET_AVAILABLE == MEASURED_SERVICE_OR_RETIRED_UNITS;
+    assert SERVICE_DUE_UNITS > MEASURED_SERVICE_OR_RETIRED_UNITS;
+}
+
+test click_125_offers_nothing_by_two_independent_rules {
+    assert FAMILY_KEYS[0] == "click-125";
+    // the measured rule: it has no unit at base
+    assert FAMILY_AVAILABLE[0] == 0;
+    assert offerable_count(FAMILY_AVAILABLE[0], false) == 0;
+    // the decided rule (D12): it would still offer nothing if its unit came back
+    assert offerable_count(1, false) == 0;
+    // and the gate does not otherwise touch the count
+    assert offerable_count(FAMILY_AVAILABLE[1], true) == 5;
+    assert FAMILIES_IN_STOCK - FAMILIES_OFFERED == 1;
+    assert FAMILY_RENTED[0] == 1;
+    assert CLICK_125_EXISTING_RENTAL_CONTINUES == true;
+    assert CLICK_125_STALE_GRID_IS_QUOTABLE == false;
+}
+
+test bookability_reasons_and_redirects_share_one_owner {
+    assert is_bookable(true, 1) == true;
+    assert unbookable_reason(true, 1) == REASON_BOOKABLE;
+    assert unbookable_reason(false, 1) == REASON_NOT_OFFERED;
+    assert unbookable_reason(true, 0) == REASON_NO_UNITS;
+    assert unbookable_reason(false, 0) == REASON_NEITHER;
+    assert usable_click_redirect_count() == 1;
+    assert may_confirm(true, 1, false) == false;
+    assert may_confirm(true, 1, true) == true;
+}
+
+; The two corrections of 2026-09-24, as literals. The suggestion they filtered is the three-name
+; list, read under its _BEFORE_2026_09_25 name since the owner's decision of that date.
+test the_shown_click_redirect_is_the_bookable_subset_of_the_suggestion {
+    // what is shown is exactly what the bookability predicate lets through
+    assert CLICK_125_REDIRECTS_SHOWN.len == usable_click_redirect_count();
+    assert CLICK_125_REDIRECTS_SHOWN[0] == CLICK_125_REDIRECTS_BEFORE_2026_09_25[2];
+    assert CLICK_125_REDIRECT_UNITS_AVAILABLE_BEFORE_2026_09_25[2] == 5;
+    assert is_bookable(true, CLICK_125_REDIRECT_UNITS_AVAILABLE_BEFORE_2026_09_25[2]) == true;
+    // and it is a family of the measured fleet, the one at index 1
+    assert FAMILY_KEYS[1] == CLICK_125_REDIRECTS_SHOWN[0];
+    assert FAMILY_UNITS[1] == 10;
+    // the two suggested rows the owner's later rule forbids, failed by the same predicate
+    assert is_bookable(true, CLICK_125_REDIRECT_UNITS_AVAILABLE_BEFORE_2026_09_25[0]) == false;
+    assert is_bookable(true, CLICK_125_REDIRECT_UNITS_AVAILABLE_BEFORE_2026_09_25[1]) == false;
+    // one label per shown key; the old label list had one per suggested key
+    assert CLICK_125_REDIRECT_LABELS_SHOWN.len == CLICK_125_REDIRECTS_SHOWN.len;
+    assert CLICK_125_REDIRECT_LABELS_SHOWN_BEFORE_2026_09_24.len == CLICK_125_REDIRECTS_BEFORE_2026_09_25.len;
+    assert CLICK_125_REDIRECT_LABELS_SHOWN[0] == CLICK_125_REDIRECT_LABELS_SHOWN_BEFORE_2026_09_24[2];
+}
+
+; The owner's decision of 2026-09-25, as literals: it is the one name of the old list that could be
+; handed over, it is provisional, and nothing it names is filtered out before the screen.
+test the_owner_decided_the_click_redirect_and_the_screen_already_shows_it {
+    assert CLICK_125_REDIRECTS_DECIDED_ON == "2026-09-25";
+    assert CLICK_125_REDIRECTS_ARE_PROVISIONAL == true;
+    assert CLICK_125_REDIRECTS.len == 1;
+    assert CLICK_125_REDIRECTS[0] == "nmax-155";
+    // the decided family is row 1 of the measured fleet, and the copied unit count is that row's
+    assert CLICK_125_REDIRECTS[0] == FAMILY_KEYS[1];
+    assert CLICK_125_REDIRECT_UNITS_AVAILABLE[0] == FAMILY_AVAILABLE[1];
+    // it is the third name of the list it replaced, the one that list could hand over
+    assert CLICK_125_REDIRECTS_BEFORE_2026_09_25.len == 3;
+    assert CLICK_125_REDIRECTS[0] == CLICK_125_REDIRECTS_BEFORE_2026_09_25[2];
+    assert CLICK_125_REDIRECT_UNITS_AVAILABLE[0] == CLICK_125_REDIRECT_UNITS_AVAILABLE_BEFORE_2026_09_25[2];
+    // decided and shown are one list: the predicate keeps every decided name
+    assert usable_click_redirect_count() == CLICK_125_REDIRECTS.len;
+    assert CLICK_125_REDIRECTS_SHOWN.len == CLICK_125_REDIRECTS.len;
+    assert CLICK_125_REDIRECTS_SHOWN[0] == CLICK_125_REDIRECTS[0];
+    assert CLICK_125_REDIRECT_LABELS_SHOWN[0] == "NMAX 155";
+}
+
+test the_bot_start_reply_names_offered_families_only {
+    // the old lower bound is the closed family at row 0: one unit, rented, none available
+    assert START_CATALOG_RANGE_KEYS_BEFORE_2026_09_25[0] == FAMILY_KEYS[0];
+    assert START_CATALOG_RANGE_KEYS_BEFORE_2026_09_25[0] == "click-125";
+    assert FAMILY_AVAILABLE[0] == 0;
+    assert START_CATALOG_RANGE_NAMED_A_CLOSED_FAMILY_BEFORE_2026_09_25 == true;
+    // the new bounds are rows of the table: nmax-155 at row 1 and xadv-750 at row 13
+    assert START_CATALOG_RANGE_KEYS.len == 2;
+    assert START_CATALOG_RANGE_KEYS[0] == FAMILY_KEYS[1];
+    assert START_CATALOG_RANGE_KEYS[1] == FAMILY_KEYS[13];
+    assert FAMILY_AVAILABLE[1] > 0;
+    // only the lower bound moved
+    assert START_CATALOG_RANGE_KEYS[0] != START_CATALOG_RANGE_KEYS_BEFORE_2026_09_25[0];
+    assert START_CATALOG_RANGE_KEYS[1] == START_CATALOG_RANGE_KEYS_BEFORE_2026_09_25[1];
+    // 155 cc is shared by two offered families; the bound is the one of them with the lower rate
+    assert START_CATALOG_RANGE_LOWER_BOUND_CC == 155;
+    assert START_CATALOG_RANGE_LOWER_BOUND_CC_TIES[0] == START_CATALOG_RANGE_KEYS[0];
+    assert START_CATALOG_RANGE_LOWER_BOUND_CC_TIES[1] == FAMILY_KEYS[2];
+    // one label per bound, and the rule holds for every word the line names
+    assert START_CATALOG_RANGE_LABELS.len == START_CATALOG_RANGE_KEYS.len;
+    assert START_CATALOG_RANGE_LABELS[0] == "NMAX 155";
+    assert START_CATALOG_RANGE_LABELS[1] == "X-ADV 750";
+    assert START_CATALOG_RANGE_NAMES_ONLY_OFFERED_FAMILIES == true;
+    assert START_CATALOG_RANGE_CORRECTED_ON == "2026-09-25";
+}
+
+test the_customer_screens_no_longer_confirm_from_the_file {
+    assert FILE_MAY_CONFIRM == false;
+    assert CUSTOMER_SCREENS_CONFIRM_FROM_THE_FILE == FILE_MAY_CONFIRM;
+    assert CUSTOMER_SCREENS_CONFIRMED_FROM_THE_FILE_BEFORE_2026_09_24 == true;
+    assert CUSTOMER_AVAILABILITY_KEY == "T_BIKE_AVAILABILITY_UNKNOWN";
+    assert CONFIRMING_KEYS.len == 4;
+    assert CONFIRMING_KEY_LINES_IN_UI == 0;
+    assert CONFIRMING_KEY_LINES_IN_UI_BEFORE_2026_09_24 == 7;
+    // ruling a family out from the file stays legal
+    assert FILE_MAY_RULE_OUT == true;
+}
+
+; The record of 2026-09-25, as it stood that day. What it left open was answered on 2026-09-26, and
+; the test after it holds the answer; the flags of that day are read under their _BEFORE_ names.
+test a_seeded_zero_stopped_printing_occupancy_on_2026_09_25_and_the_book_reason_stayed_open {
+    // the owner's second list of 2026-09-25, answer 5, hedged ("probably")
+    assert UNITS_EMPTY_LINE_DECIDED_ON == "2026-09-25";
+    assert UNITS_EMPTY_LINE_REMOVAL_IS_HEDGED == true;
+    assert UNITS_EMPTY_KEY == "T_BIKE_UNITS_EMPTY";
+    assert UNITS_EMPTY_LINE_WAS_SHOWN_BEFORE_2026_09_25 == true;
+    assert UNITS_EMPTY_LINE_IS_SHOWN == false;
+    assert UNITS_EMPTY_KEY_IS_DECLARED == false;
+    assert UNITS_EMPTY_REPLACEMENT_SENTENCES == 0;
+    // the manager line stays, and it is a different key from the one removed
+    assert CUSTOMER_AVAILABILITY_KEY == "T_BIKE_AVAILABILITY_UNKNOWN";
+    assert UNITS_EMPTY_KEY != CUSTOMER_AVAILABILITY_KEY;
+    // the line was reachable for the two offered families with no unit free on the seed
+    assert OFFERED_WITH_ZERO_AVAILABLE_FAMILIES == 2;
+    assert OFFERED_OUT_ON_CONTRACT_KEYS.len == OFFERED_WITH_ZERO_AVAILABLE_FAMILIES;
+    // what the answer did not name: the Book control's reason, from the same zero
+    assert NO_UNITS_BOOK_REASON_KEY == "T_BIKE_BOOK_BLOCKED_NO_UNITS";
+    assert NO_UNITS_BOOK_REASON_KEY != UNITS_EMPTY_KEY;
+    assert NO_UNITS_BOOK_REASON_WAS_ANSWERED_BEFORE_2026_09_26 == false;
+    assert NO_UNITS_BOOK_REASON_WAS_SHOWN_BEFORE_2026_09_26 == true;
+    assert FILE_MAY_RULE_OUT == true;
+    assert FILE_MAY_CONFIRM == false;
+    assert unbookable_reason(true, 0) == REASON_NO_UNITS;
+}
+
+test the_owner_allowed_booking_whatever_the_seeded_count_says {
+    // question I, answered 2026-09-26: allow booking, the manager confirms availability
+    assert NO_UNITS_BOOK_REASON_DECIDED_ON == "2026-09-26";
+    assert NO_UNITS_BOOK_REASON_WAS_ANSWERED == true;
+    assert NO_UNITS_BOOK_REASON_WAS_ANSWERED != NO_UNITS_BOOK_REASON_WAS_ANSWERED_BEFORE_2026_09_26;
+    assert NO_UNITS_BOOK_REASON_IS_SHOWN == false;
+    assert NO_UNITS_BOOK_REASON_IS_SHOWN != NO_UNITS_BOOK_REASON_WAS_SHOWN_BEFORE_2026_09_26;
+    // the absent-count reason went with it, on this file's reading, and it is a different key
+    assert UNKNOWN_AVAILABILITY_BOOK_REASON_IS_SHOWN == false;
+    assert UNKNOWN_AVAILABILITY_REMOVAL_IS_THIS_FILES_READING == true;
+    assert UNKNOWN_AVAILABILITY_BOOK_REASON_KEY != NO_UNITS_BOOK_REASON_KEY;
+    assert BOOK_REASON_KEYS_DELETED_2026_09_26 == 2;
+    assert BOOK_REASON_REPLACEMENT_SENTENCES == 0;
+    assert CUSTOMER_BOOKING_READS_THE_FILE == false;
+    assert CUSTOMER_BOOKING_READ_THE_FILE_BEFORE_2026_09_26 == true;
+    assert SERVER_REFUSES_ON_THE_COUNT == false;
+    // what a customer reads about availability instead: the manager line, unchanged
+    assert CUSTOMER_AVAILABILITY_KEY == "T_BIKE_AVAILABILITY_UNKNOWN";
+    // the two offered families the seed counts at zero may be booked now ...
+    assert FAMILY_KEYS[4] == OFFERED_OUT_ON_CONTRACT_KEYS[0];
+    assert FAMILY_KEYS[5] == OFFERED_OUT_ON_CONTRACT_KEYS[1];
+    assert customer_may_book(true, true, FAMILY_AVAILABLE[4]) == true;
+    assert customer_may_book(true, true, FAMILY_AVAILABLE[5]) == true;
+    // ... though the file's own predicate still finds no unit at base for them
+    assert is_bookable(true, FAMILY_AVAILABLE[4]) == false;
+    assert unbookable_reason(true, FAMILY_AVAILABLE[5]) == REASON_NO_UNITS;
+    // what still refuses reads no count
+    assert customer_may_book(false, true, 5) == false;
+    assert customer_may_book(true, false, 5) == false;
+    assert customer_may_book(true, true, 0) == customer_may_book(true, true, MAX_UNITS_PER_FAMILY);
+    // the closed family stays closed whatever its count (D12)
+    assert customer_may_book(false, true, FAMILY_AVAILABLE[0]) == false;
+    // the file may still rule a family out of being offered instead of CLICK 125
+    assert FILE_MAY_RULE_OUT == true;
+    assert FILE_MAY_CONFIRM == false;
+    assert usable_click_redirect_count() == CLICK_125_REDIRECTS.len;
+}
+
+test the_capacity_is_scanned_from_the_table_and_not_quoted {
+    // the measured maximum today, found by walking all 14 rows rather than reading row 1
+    assert largest_family_units() == 10;
+    assert largest_family_units() == MAX_UNITS_PER_FAMILY;
+    // it is nmax-155 that carries it, which is the claim the capacity comment makes
+    assert largest_family_units() == FAMILY_UNITS[1];
+    // the scan is not fooled by a later row: adv-350 at index 8 is the second largest at 5, and
+    // a one-row assert on index 1 would stay green whatever index 8 became
+    assert FAMILY_KEYS[8] == "adv-350";
+    assert FAMILY_UNITS[8] == 5;
+    assert largest_family_units() > FAMILY_UNITS[8];
+}
+
+; --- Invariants -----------------------------------------------------------------------------
+
+; The acceptance criterion of #19. A unit counted in both classes would push the sum past the
+; total; 11 + 26 is exactly 37, so no unit is in two classes and none is in neither.
+invariant no_unit_is_both_available_and_rented
+    assert FLEET_RENTED + FLEET_AVAILABLE == FLEET_UNITS
+
+; The same claim per family rather than over the fleet, where a compensating pair of errors
+; cannot hide: units == rented + available, fourteen times.
+invariant every_family_row_closes
+    assert verify_family_rows_close() == true
+
+invariant available_and_rented_are_different_codes
+    assert STATUS_AVAILABLE != STATUS_RENTED
+
+; Zero is not a status, so the unwritten remainder of a slot array is not a fleet of free bikes.
+invariant zero_is_not_available
+    assert STATUS_AVAILABLE > STATUS_UNSET
+
+invariant the_status_set_is_closed_at_four
+    assert STATUS_NAMES.len == 4
+
+; A held unit is excluded by construction rather than by name: nothing in this repository has a
+; reserved status, and available_count matches AVAILABLE alone.
+invariant reserved_is_not_a_status_in_this_repository
+    assert RESERVED_STATUS == ""
+
+; A published tariff over zero stock can never read as available: the empty set has no slot to
+; count. 7 of the 20 families the tariff names are permanently in that state -- a third of the
+; 21 the seed holds, which is a different denominator and is named as the seed above.
+invariant a_tariff_line_without_units_is_not_stock
+    assert PRICE_LIST_ONLY_UNITS == 0
+
+invariant confirmation_requires_a_live_check
+    assert FILE_MAY_CONFIRM == false and may_confirm(true, 1, false) == false
+
+; The customer screens follow the rule above rather than restate it (2026-09-24).
+invariant customer_screens_follow_file_may_confirm
+    assert CUSTOMER_SCREENS_CONFIRM_FROM_THE_FILE == FILE_MAY_CONFIRM and CONFIRMING_KEY_LINES_IN_UI == 0
+
+; Since 2026-09-25 (the owner's second list, answer 5) a seeded zero prints no occupancy line, and
+; since 2026-09-26 (question I) it decides no booking either. Until 2026-09-26 this invariant held
+; the Book reason to FILE_MAY_RULE_OUT; the owner's answer took the file out of the booking
+; decision, and the file's permission itself, which the redirect still uses, did not move.
+invariant a_seeded_zero_prints_nothing_and_decides_no_booking
+    assert UNITS_EMPTY_LINE_IS_SHOWN == false and UNITS_EMPTY_KEY_IS_DECLARED == false and NO_UNITS_BOOK_REASON_IS_SHOWN == false and CUSTOMER_BOOKING_READS_THE_FILE == false and customer_may_book(true, true, 0) == true
+
+; What the closed family points to is only what the bookability predicate lets through.
+invariant the_shown_click_redirect_is_bookable
+    assert CLICK_125_REDIRECTS_SHOWN.len == usable_click_redirect_count()
+
+; Since 2026-09-25 the owner's list and the shown list are one list: a name the owner decided that
+; the bookability predicate then dropped would be a redirect lost without anyone deciding it.
+invariant the_owners_click_redirect_is_shown_whole
+    assert usable_click_redirect_count() == CLICK_125_REDIRECTS.len and CLICK_125_REDIRECTS_SHOWN.len == CLICK_125_REDIRECTS.len
+
+invariant click_is_rented_unavailable_and_not_quotable
+    assert FAMILY_RENTED[0] == 1 and FAMILY_AVAILABLE[0] == 0 and CLICK_125_STALE_GRID_IS_QUOTABLE == false
+
+; The seeded fleet is the rows that exist, deliberately one short of the header's claim.
+invariant the_fleet_is_the_rows_and_not_the_header
+    assert FLEET_UNITS < REGISTER_HEADER_UNITS
+
+; The floor a counting gate needs (D16): the capacity must still hold EVERY family, which is the
+; claim this invariant used to name and not the one it made. It asserted the capacity against
+; FAMILY_UNITS[1] alone, so adv-350 or xmax-300-new growing to 11 left it green -- 10 >= 10 still
+; holds -- while available_count clamped the eleventh slot out of the count and returned a number
+; short by one, a bike the customer app would never see. D16's rule is that a gate must be able to
+; see the failure it exists to catch, and a one-row example cannot see thirteen of the fourteen
+; ways this one arrives. The scan below can.
+invariant the_slot_capacity_holds_every_family
+    assert largest_family_units() <= MAX_UNITS_PER_FAMILY
+
+; D16 again: a scan that found nothing passes vacuously, so the capacity is also pinned to the
+; row the file NAMES as the largest. If another family overtakes nmax-155 this fails and the
+; comment above MAX_UNITS_PER_FAMILY gets reread, instead of quietly becoming false.
+invariant the_named_largest_family_is_still_the_largest
+    assert largest_family_units() == FAMILY_UNITS[1]
+
+; The third face of the same constant: it is the clamp available_count applies AND the width of
+; the slot arrays it walks. Naming it in the clamp removed one hand-copied 10 (D15) but created a
+; new way to be wrong -- raising it to 12 without widening the [10]u8 fixtures would clamp two
+; slots past the end of them, and an array length cannot be named in a type position anywhere in
+; this corpus. Pinning it to a fixture's length closes that: the fixtures are what the signature
+; accepts, so this holds the constant, the clamp and the signature together.
+invariant the_capacity_is_the_width_of_the_slot_arrays
+    assert NO_UNITS.len == MAX_UNITS_PER_FAMILY

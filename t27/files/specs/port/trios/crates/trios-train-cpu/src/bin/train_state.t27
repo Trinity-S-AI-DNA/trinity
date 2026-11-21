@@ -1,0 +1,321 @@
+module port::trios::crates::trios_train_cpu::src::bin;
+
+// Port of gHashTag/trios crates/trios-train-cpu/src/bin/train_state.rs
+// (8b229e9489ee) to .t27. All four ported functions are pure decision logic
+// and keep real bodies: the optimizer construction parameters, the optimizer
+// dispatch with its lr handoff, and the training-state assembly. Everything
+// that touches the world - the AdamW/MuonOptimizer math, NgramModel,
+// JepaPredictor, the NCA objective, and the clock (Instant::now) - is
+// plumbing the caller drives, so the structs below carry only what the
+// decisions read or produce.
+//
+// Mapping notes (constructs .t27 cannot express were not faked):
+// - OptWrapper's Rust form is an enum with payloads; .t27 enum variants carry
+//   none, so it is a struct: the tag plus the parameters the original
+//   constructors set, and a step counter for the dispatch.
+// - Option<JepaPredictor>/Option<NcaObjective> become a present flag plus the
+//   one field the code reads (the predictor's d_model).
+// - The Vec of NUM_CTX identical ctx wrappers becomes one representative
+//   wrapper plus the count.
+// - Instant::now() becomes a `now` parameter the caller passes in; both
+//   timestamps are set to that one reading, as in the original.
+// - f32::MAX stays as the literal 3.4028235e38, exact in f32.
+
+pub enum OptKind {
+    AdamW,
+    Muon
+}
+
+pub struct Config {
+    seed: u64,
+    steps: usize,
+    opt_kind: OptKind,
+    encoder_lr: f64,
+    use_jepa: bool,
+    use_nca: bool,
+    ntp_weight: f32,
+    jepa_weight: f32,
+    nca_weight: f32
+}
+
+// The original OptWrapper: enum { LocalAdamW(AdamW), CrateMuon(MuonOptimizer) }.
+pub struct OptWrapper {
+    kind: OptKind,
+    size: usize,
+    lr: f64,
+    momentum: f64,
+    wd: f64,
+    steps: usize
+}
+
+pub struct TrainingState {
+    model_seed: u64,
+    target_model_seed: u64,
+    opt_embed: OptWrapper,
+    opt_ctx: OptWrapper,
+    ctx_count: usize,
+    opt_proj: OptWrapper,
+    opt_head: OptWrapper,
+    predictor_present: bool,
+    predictor_d_model: usize,
+    nca_present: bool,
+    ema_start: f64,
+    ema_end: f64,
+    ema_ramp_steps: usize,
+    ntp_weight: f32,
+    jepa_weight: f32,
+    nca_weight: f32,
+    best_val_bpb: f32,
+    start_time: u64,
+    last_heartbeat: u64
+}
+
+// Shape constants from the original.
+const VOCAB: usize = 128;
+const DIM: usize = 64;
+const HIDDEN: usize = 384;
+const NUM_CTX: usize = 4;
+
+// f32::MAX from the original: no validation loss recorded yet.
+const F32_MAX: f32 = 3.4028235e38;
+
+// line 45 - pub fn adamw(size: usize, wd: f32) -> Self
+// Wraps an AdamW optimizer under the LocalAdamW tag. AdamW::new is plumbing
+// the caller drives; the decision here is the tag plus the parameters the
+// wrapper carries.
+pub fn OptWrapper_adamw(size: usize, wd: f32) -> OptWrapper {
+    const wdw = wd as f64;
+    return OptWrapper{
+        .kind = OptKind::AdamW,
+        .size = size,
+        .lr = 0.0,
+        .momentum = 0.0,
+        .wd = wdw,
+        .steps = 0
+    };
+}
+
+// line 50 - pub fn muon(size: usize, lr: f64, wd: f32) -> Self
+// The original hardcodes momentum 0.95 and casts wd to f64 for
+// MuonOptimizer::new; MuonOptimizer is plumbing, so the wrapper carries the
+// parameters that decision chose.
+pub fn OptWrapper_muon(size: usize, lr: f64, wd: f32) -> OptWrapper {
+    const wdw = wd as f64;
+    return OptWrapper{
+        .kind = OptKind::Muon,
+        .size = size,
+        .lr = lr,
+        .momentum = 0.95,
+        .wd = wdw,
+        .steps = 0
+    };
+}
+
+// line 55 - pub fn step(&mut self, params: &mut [f32], grads: &[f32], lr: f32)
+// Dispatches by optimizer tag exactly as the original's match does: the AdamW
+// branch takes lr per call and never stores it; the Muon branch stores lr
+// (cast to f64) before stepping. params and grads are handed to the
+// underlying optimizer (AdamW::update / MuonOptimizer::step), which the
+// caller drives; the ported decision is the dispatch and the lr handoff.
+// Returns the updated wrapper.
+pub fn OptWrapper_step(w: OptWrapper, params: []f32, grads: []const f32, lr: f32) -> OptWrapper {
+    const next_lr = switch (w.kind) {
+        .Muon => lr as f64,
+        else => w.lr,
+    };
+    const stepped = w.steps + 1;
+    return OptWrapper{
+        .kind = w.kind,
+        .size = w.size,
+        .lr = next_lr,
+        .momentum = w.momentum,
+        .wd = w.wd,
+        .steps = stepped
+    };
+}
+
+// The original's `make_opt` closure, ported as a free function (closures do
+// not parse in .t27): pick the optimizer kind from cfg.opt_kind, feeding
+// cfg.encoder_lr to the Muon path.
+pub fn make_opt(cfg: Config, size: usize, wd: f32) -> OptWrapper {
+    const w = switch (cfg.opt_kind) {
+        .Muon => OptWrapper_muon(size, cfg.encoder_lr, wd),
+        else => OptWrapper_adamw(size, wd),
+    };
+    return w;
+}
+
+// line 70 - pub fn init_training(cfg: &Config) -> TrainingState
+// Assembles the training state from the config. The models (NgramModel::new),
+// the predictor (JepaPredictor), the NCA objective, and the clock are
+// plumbing the caller drives; the decisions here are which optimizer kind
+// every slot gets (via make_opt), the slot sizes, the predictor/NCA presence,
+// the EMA ramp (start 0.996, end 1.0, ramp_steps = cfg.steps), the objective
+// weights, and the f32::MAX sentinel for best_val_bpb.
+pub fn init_training(cfg: Config, now: u64) -> TrainingState {
+    const wd = 0.04;
+    const opt_embed = make_opt(cfg, VOCAB * DIM, wd);
+    const opt_ctx = make_opt(cfg, VOCAB * DIM, wd);
+    const opt_proj = make_opt(cfg, HIDDEN * DIM, wd);
+    const opt_head = make_opt(cfg, VOCAB * HIDDEN, wd);
+    return TrainingState{
+        .model_seed = cfg.seed,
+        .target_model_seed = cfg.seed,
+        .opt_embed = opt_embed,
+        .opt_ctx = opt_ctx,
+        .ctx_count = NUM_CTX,
+        .opt_proj = opt_proj,
+        .opt_head = opt_head,
+        .predictor_present = cfg.use_jepa,
+        .predictor_d_model = HIDDEN,
+        .nca_present = cfg.use_nca,
+        .ema_start = 0.996,
+        .ema_end = 1.0,
+        .ema_ramp_steps = cfg.steps,
+        .ntp_weight = cfg.ntp_weight,
+        .jepa_weight = cfg.jepa_weight,
+        .nca_weight = cfg.nca_weight,
+        .best_val_bpb = F32_MAX,
+        .start_time = now,
+        .last_heartbeat = now
+    };
+}
+
+// Tests - each asserts decisions the original makes.
+
+test optwrapper_adamw_tags_and_carries_params {
+    const w = OptWrapper_adamw(8192, 0.25);
+    assert(w.kind == OptKind::AdamW);
+    assert(w.size == 8192);
+    assert(w.wd == 0.25);
+    assert(w.steps == 0);
+}
+
+test optwrapper_muon_hardcodes_momentum {
+    const w = OptWrapper_muon(49152, 0.02, 0.25);
+    assert(w.kind == OptKind::Muon);
+    assert(w.size == 49152);
+    assert(w.lr == 0.02);
+    assert(w.momentum == 0.95);
+    assert(w.wd == 0.25);
+    assert(w.steps == 0);
+}
+
+test optwrapper_step_dispatches_by_kind {
+    var params: [4]f32 = [1.0, 2.0, 3.0, 4.0];
+    const grads: [4]f32 = [0.5, 0.5, 0.5, 0.5];
+    const muon_w = OptWrapper_muon(4, 0.02, 0.25);
+    const after_muon = OptWrapper_step(muon_w, &params, &grads, 0.125);
+    assert(after_muon.lr == 0.125);
+    assert(after_muon.steps == 1);
+    assert(after_muon.size == 4);
+    assert(after_muon.momentum == 0.95);
+    const adam_w = OptWrapper_adamw(4, 0.25);
+    const after_adam = OptWrapper_step(adam_w, &params, &grads, 0.125);
+    // The AdamW branch takes lr per call and never stores it: the per-call
+    // 0.125 must not land in the wrapper.
+    assert(after_adam.lr == 0.0);
+    assert(after_adam.steps == 1);
+    assert(after_adam.wd == 0.25);
+}
+
+test optwrapper_step_lr_handoff_repeats {
+    var params: [2]f32 = [1.0, -1.0];
+    const grads: [2]f32 = [0.25, 0.25];
+    const w = OptWrapper_muon(2, 0.5, 0.25);
+    const once = OptWrapper_step(w, &params, &grads, 0.5);
+    assert(once.lr == 0.5);
+    const twice = OptWrapper_step(once, &params, &grads, 0.25);
+    assert(twice.lr == 0.25);
+    assert(twice.steps == 2);
+}
+
+test make_opt_follows_config {
+    const cfg_adam = Config{
+        .seed = 7,
+        .steps = 1000,
+        .opt_kind = OptKind::AdamW,
+        .encoder_lr = 0.02,
+        .use_jepa = false,
+        .use_nca = false,
+        .ntp_weight = 1.0,
+        .jepa_weight = 0.0,
+        .nca_weight = 0.0
+    };
+    const w_adam = make_opt(cfg_adam, 8192, 0.25);
+    assert(w_adam.kind == OptKind::AdamW);
+    assert(w_adam.size == 8192);
+    assert(w_adam.wd == 0.25);
+    const cfg_muon = Config{
+        .seed = 7,
+        .steps = 1000,
+        .opt_kind = OptKind::Muon,
+        .encoder_lr = 0.05,
+        .use_jepa = false,
+        .use_nca = false,
+        .ntp_weight = 1.0,
+        .jepa_weight = 0.0,
+        .nca_weight = 0.0
+    };
+    const w_muon = make_opt(cfg_muon, 24576, 0.25);
+    assert(w_muon.kind == OptKind::Muon);
+    assert(w_muon.size == 24576);
+    assert(w_muon.lr == 0.05);
+}
+
+test init_training_adamw_defaults {
+    const cfg = Config{
+        .seed = 7,
+        .steps = 1000,
+        .opt_kind = OptKind::AdamW,
+        .encoder_lr = 0.02,
+        .use_jepa = false,
+        .use_nca = false,
+        .ntp_weight = 1.0,
+        .jepa_weight = 0.5,
+        .nca_weight = 0.0
+    };
+    const st = init_training(cfg, 42);
+    assert(st.model_seed == 7 && st.target_model_seed == 7);
+    assert(st.opt_embed.kind == OptKind::AdamW);
+    assert(st.opt_embed.size == 8192);
+    assert(st.opt_embed.wd > 0.03 && st.opt_embed.wd < 0.05);
+    assert(st.opt_ctx.size == 8192);
+    assert(st.ctx_count == 4);
+    assert(st.opt_proj.size == 24576);
+    assert(st.opt_head.size == 49152);
+    assert(st.predictor_present == false);
+    assert(st.nca_present == false);
+    assert(st.ema_start == 0.996 && st.ema_end == 1.0);
+    assert(st.ema_ramp_steps == 1000);
+    assert(st.ntp_weight == 1.0 && st.jepa_weight == 0.5);
+    assert(st.best_val_bpb == F32_MAX);
+    assert(st.best_val_bpb > 1000000.0);
+    assert(st.start_time == 42 && st.last_heartbeat == 42);
+}
+
+test init_training_muon_jepa_nca {
+    const cfg = Config{
+        .seed = 9,
+        .steps = 500,
+        .opt_kind = OptKind::Muon,
+        .encoder_lr = 0.05,
+        .use_jepa = true,
+        .use_nca = true,
+        .ntp_weight = 1.0,
+        .jepa_weight = 1.0,
+        .nca_weight = 0.25
+    };
+    const st = init_training(cfg, 7);
+    assert(st.opt_embed.kind == OptKind::Muon);
+    assert(st.opt_embed.lr == 0.05);
+    assert(st.opt_ctx.lr == 0.05);
+    assert(st.opt_proj.kind == OptKind::Muon);
+    assert(st.opt_head.kind == OptKind::Muon);
+    assert(st.predictor_present == true);
+    assert(st.predictor_d_model == 384);
+    assert(st.nca_present == true);
+    assert(st.nca_weight == 0.25);
+    assert(st.ema_ramp_steps == 500);
+    assert(st.start_time == 7 && st.last_heartbeat == 7);
+}

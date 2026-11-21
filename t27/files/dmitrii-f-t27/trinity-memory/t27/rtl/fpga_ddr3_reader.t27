@@ -1,0 +1,1334 @@
+module TrinityFpgaDdr3ReaderT27;
+
+// DDR3 read path of the AX7203 (issue #62): a Wishbone burst reader on UberDDR3's
+// user port with consumer (A), wired by fpga/ax7203/ddr3/tms_ddr3_reader.v (the
+// 128-bit split into u64 ports) into fpga/ax7203/ddr3/tms_ddr3_ax7203.v
+// when that top is read with `define DDR3_READER (make ... DDR3_APP=reader). x16
+// only: one Wishbone word is 128 bits, 16 bytes, byte n at bits [8n, 8n+7].
+// Like fpga_ddr3_pattern.t27 it owns the report line: the status lines of
+// fpga_ddr3_status.t27 pass through its arbiter to the line emitter.
+//
+// After o_calib_complete it runs `runs` runs (0 = until reset); run r writes and
+// reads format r & 1 (0 baseline2, 1 dense5) with the key of pair r >> 1, so runs 2p
+// and 2p+1 carry the same `trits` logical trits in the two layouts. A run
+//   1. fills the region: writes every word 0 .. W-1 (W = ceil(trits / 64) or
+//      ceil(trits / 80)) with the TMEM device-code bytes of the trit stream
+//      (no UART: the board generates the data), until every write is acknowledged;
+//   2. reads every word back through the burst reader, and consumer (A) decodes
+//      each acknowledged word, compares its lanes with the regenerated stream and
+//      accumulates the counts, the dot product and the checksum;
+//   3. reports the run on the UART.
+// tools/ddr3_read_model.py states the stream, the layouts and every result in Python.
+//
+// Trit stream (tools/ddr3_read_model.py): trit i is lane i & 15 of block i >> 4, the
+// 16 lane codes of raw(K, b) = (K xor post(lin(mix(b)))) mod 2^32 with a pair 11 read
+// as 00, K = lin(lin((seed << 32) | pair) + KADD), lin the nine xorshift steps of the
+// pattern test, mix and post one nonlinear step each (without them the +1 and -1 counts
+// and the dot product of a region of aligned ranges would not depend on the key; they do
+// not change that the baseline2 checksum of such a region is 0 for every key, nor make
+// the counts and dot product random-like: docs/hardware.md, "DDR3 read path (#62)");
+// lanes after `trits` are logical zeros. A baseline2 word holds blocks
+// 4w .. 4w+3 (64 lanes, lane j at bits [2j, 2j+1], four per byte, earliest lowest),
+// a dense5 word blocks 5w .. 5w+4 (80 lanes, byte n = the dense5 code of lanes 5n ..
+// 5n+4, the code of docs/format.md and t27/rtl/bram_trit_codec.t27). The generator is a pipeline of
+// four stages (G1 raw blocks, G2 padding mask, G3 encoded word, cur) that advances
+// by one word per write taken (fill) or per read acknowledged (read): cur holds the
+// word being written or the lanes the next acknowledged word must decode to.
+//
+// Burst reader (Wishbone, UberDDR3 79d8fd3e: docs/hardware.md, "What the #61
+// pattern test needs"): a request is taken on a clock with stb and not stall; a
+// presented request is never withdrawn or changed. A new request is presented only
+// while the requests taken and not yet acknowledged, counting the one being taken,
+// stay below `cap`, so at most `cap` are outstanding. Acks cannot be held off: consumer
+// (A) takes one word in every clock, with no FIFO and no ready, so an ack is always
+// accepted in its clock (consumer_stalls counts acks that arrive while cons_ready is
+// low; cons_ready is constant true, so it is 0 by construction and measures nothing). The
+// cap therefore only bounds the reader; it is reported, as are the clocks it held a request
+// back. A phase ends at its W-th ack, so the words of a run are W by construction; the
+// acks themselves are counted apart from that: every ack while the reader is in neither
+// FILL nor READ (stray acks), reported with every run, so an extra or a displaced ack shows
+// as stray acks > 0 (a lost ack stops the phase: t line). Every ack after calibration (all
+// acks) is reported too, but all acks = the runs' fill and read words + stray acks holds by
+// construction (each phase takes exactly its W acks), so it adds nothing to stray = 0 and
+// only guards the report path.
+//
+// Consumer (A), one 128-bit word per controller clock, nine register stages:
+// S1 the acknowledged word with its expected lanes; D the decoders on four 32-bit chunks
+// (20 dense5 lanes or 16 baseline2 lanes each, invalid groups in bits 55:48, the layout of
+// the codec's decode) and the checksum word; S2 the chunks assembled into 80 or 64 lanes and
+// the invalid groups added; S3 the lane compare and
+// per-class popcounts of the +1 and -1 lanes (class a = lane mod 8, activation a + 1);
+// S4 per-class sums; S5 pair sums and the weighted pairs; S6 the word's +1, -1 and
+// weighted sums; S7 the accumulators and the word's dot product; S8 the dot accumulator.
+//
+// Counters of a read (docs/hardware.md, "DDR3 read path (#62)"):
+//   cycles        controller clocks from the first read request presented to the last ack, inclusive
+//   words         acks of the phase, which ends at the W-th: W by construction
+//   bus bytes     16 per word consumed (consumer (A)'s valid chain; the same acks)
+//   payload bytes bytes of each word that hold at least one logical trit (ceil(trits/4), ceil(trits/5))
+//   padding bytes 16 - payload bytes, per word (so padding = bus - payload is an identity)
+//   scale/metadata bytes  0: this region stores no scale and no metadata
+//   logical trits lanes consumed below `trits` (padding lanes excluded)
+//   command stalls clocks with a request presented and o_wb_stall high
+//   wait stalls   clocks with at least one request outstanding and no ack
+//   consumer stalls acks while consumer (A) is not ready (0 by construction)
+//   max outstanding, cap holds (extra): the most requests outstanding at a clock, and the
+//                 clocks with no request presented while requests remained (the cap held them)
+//   stray acks, all acks (extra, since calibration, not cleared per run): acks while the
+//                 reader is in neither FILL nor READ (the evidence), and every ack (an identity
+//                 with the words and stray acks)
+//
+// Report lines (tag, a 32 bits, b 40 bits), after the status reporter's H and S lines:
+//   q a=trits per run   b=(READER_FORMAT << 32) | (byte lanes << 24) | cap
+//                       (READER_FORMAT 2: runs end with the x line; 1, a6d9745f: with h)
+//   k a=seed            b=controller clocks since reset when calib_complete was seen (low 40)
+//   v a=runs (0 = until reset)   b=watchdog clocks
+// then per run:
+//   a a=run   b=(format << 32) | (lanes per word << 24)
+//   f a=fill words acknowledged   b=fill cycles (first write request presented to last write ack)
+//   g a=fill max outstanding      b=fill command stalls
+//   c a=words                     b=cycles
+//   y a=consumer stalls           b=bus bytes
+//   p a=scale/metadata bytes      b=payload bytes
+//   d a=bad words                 b=padding bytes
+//   n a=invalid groups            b=logical trits
+//   o a=max outstanding           b=command stalls
+//   w a=cap holds                 b=wait stalls
+//   u a=-1 lanes (low 32 bits)    b=+1 lanes (low 40 bits)
+//   s a=dot product bits 63:40 (64-bit two's complement)   b=dot product bits 39:0
+//   h a=checksum bits 63:32       b=checksum bits 31:0
+//   x a=stray acks since calibration   b=all acks since calibration (low 40 bits)
+// and at the end
+//   t a=acks of the open phase   b=(read phase << 36) | (format << 32) | run   (watchdog; stops)
+//   z a=runs done   b=bad words over all runs                                 (after `runs` runs)
+// As in fpga_ddr3_pattern.t27, the module-level assignments are not lowered by the
+// pinned gen-c: the functions are checked in C against tools/ddr3_read_model.py and
+// the module in Icarus against a behavioural Wishbone memory (tests/test_ddr3_reader.py).
+const T_CALIB: u32 = 0;
+const T_KEY0: u32 = 1;
+const T_KEY1: u32 = 2;
+const T_KEY2: u32 = 3;
+const T_PRIME: u32 = 4;
+const T_FILL: u32 = 5;
+const T_READ: u32 = 6;
+const T_DRAIN: u32 = 7;
+const T_REPORT: u32 = 8;
+const T_STOP: u32 = 9;
+
+const K_HEAD: u32 = 0;
+const K_RUN: u32 = 1;
+const K_TIME: u32 = 2;
+const K_DONE: u32 = 3;
+
+const A_IDLE: u32 = 0;
+const A_START: u32 = 1;
+const A_WAIT: u32 = 2;
+
+const FMT_B2: u32 = 0;
+const FMT_D5: u32 = 1;
+const PRIME_STEPS: u32 = 4;
+const DRAIN_CLOCKS: u32 = 12;
+const READER_FORMAT: u64 = 2;
+const B40: u64 = 1099511627775;
+const M32: u64 = 4294967295;
+const M40: u64 = 1099511627775;
+const PAIRS32: u64 = 1431655765;
+const KADD: u64 = 6364136223846793005;
+const TAG_Q: u32 = 113;
+const TAG_K: u32 = 107;
+const TAG_V: u32 = 118;
+const TAG_A: u32 = 97;
+const TAG_F: u32 = 102;
+const TAG_G: u32 = 103;
+const TAG_C: u32 = 99;
+const TAG_Y: u32 = 121;
+const TAG_P: u32 = 112;
+const TAG_D: u32 = 100;
+const TAG_N: u32 = 110;
+const TAG_O: u32 = 111;
+const TAG_W: u32 = 119;
+const TAG_U: u32 = 117;
+const TAG_S: u32 = 115;
+const TAG_H: u32 = 104;
+const TAG_X: u32 = 120;
+const TAG_T: u32 = 116;
+const TAG_Z: u32 = 122;
+
+// Sequencer.
+var tstate: u32 = 0;
+var rd: bool = false;
+var run: u32 = 0;
+var fmt: u32 = 0;
+var cycles: u64 = 0;
+var calib_clocks: u64 = 0;
+var key: u64 = 0;
+var kk: u64 = 0;
+var pr: u32 = 0;
+var phase_clocks: u64 = 0;
+var quiet: u32 = 0;
+var drain: u32 = 0;
+var rkind: u32 = 0;
+var rline: u32 = 0;
+var total_bad: u64 = 0;
+
+// Wishbone master (outputs to ddr3_top) and the phase counters.
+var wb_cyc: bool = true;
+var wb_stb: bool = false;
+var wb_we: bool = false;
+var wb_addr: u32 = 0;
+var wb_sel: u32 = 4294967295;
+var issue_done: bool = false;
+var outst: u32 = 0;
+var acks: u32 = 0;
+var ph_cmd: u64 = 0;
+var ph_wait: u64 = 0;
+var ph_hold: u32 = 0;
+var ph_max: u32 = 0;
+var f_words: u32 = 0;
+var f_clocks: u64 = 0;
+var f_cmd: u64 = 0;
+var f_max: u32 = 0;
+var r_words: u32 = 0;
+var r_clocks: u64 = 0;
+
+// Consumer (A) accumulators of a read.
+var bus_bytes: u64 = 0;
+var pay_bytes: u64 = 0;
+var pad_bytes: u64 = 0;
+var trits_out: u64 = 0;
+var bad_words: u32 = 0;
+var inv_groups: u32 = 0;
+var pos: u64 = 0;
+var neg: u64 = 0;
+var dot: u64 = 0;
+var chk: u64 = 0;
+var cons_stalls: u32 = 0;
+
+// Acks since calibration: all of them, and those while in neither FILL nor READ.
+var all_acks: u64 = 0;
+var stray_acks: u32 = 0;
+
+// Generator: word index and block indices of G1's next word, then the stages.
+var gw: u32 = 0;
+var bk0: u32 = 0;
+var bk1: u32 = 0;
+var bk2: u32 = 0;
+var bk3: u32 = 0;
+var bk4: u32 = 0;
+var g1_r0: u64 = 0;
+var g1_r1: u64 = 0;
+var g1_r2: u64 = 0;
+var g1_last: bool = false;
+var g2_l0: u64 = 0;
+var g2_l1: u64 = 0;
+var g2_l2: u64 = 0;
+var g2_last: bool = false;
+var g3_l0: u64 = 0;
+var g3_l1: u64 = 0;
+var g3_l2: u64 = 0;
+var g3_lo: u64 = 0;
+var g3_hi: u64 = 0;
+var g3_last: bool = false;
+var c_l0: u64 = 0;
+var c_l1: u64 = 0;
+var c_l2: u64 = 0;
+var c_lo: u64 = 0;
+var c_hi: u64 = 0;
+var c_last: bool = false;
+
+// Consumer (A) pipeline.
+var s1_v: bool = false;
+var s1_lo: u64 = 0;
+var s1_hi: u64 = 0;
+var s1_e0: u64 = 0;
+var s1_e1: u64 = 0;
+var s1_e2: u64 = 0;
+var s1_last: bool = false;
+var sd_v: bool = false;
+var sd_d0: u64 = 0;
+var sd_d1: u64 = 0;
+var sd_d2: u64 = 0;
+var sd_d3: u64 = 0;
+var sd_e0: u64 = 0;
+var sd_e1: u64 = 0;
+var sd_e2: u64 = 0;
+var sd_last: bool = false;
+var sd_chkw: u64 = 0;
+var s2_v: bool = false;
+var s2_g0: u64 = 0;
+var s2_g1: u64 = 0;
+var s2_g2: u64 = 0;
+var s2_e0: u64 = 0;
+var s2_e1: u64 = 0;
+var s2_e2: u64 = 0;
+var s2_inv: u32 = 0;
+var s2_last: bool = false;
+var s2_chkw: u64 = 0;
+var s3_v: bool = false;
+var s3_hp: u64 = 0;
+var s3_hn: u64 = 0;
+var s3_mis: bool = false;
+var s3_inv: u32 = 0;
+var s3_last: bool = false;
+var s3_chkw: u64 = 0;
+var s4_v: bool = false;
+var s4_p: u64 = 0;
+var s4_n: u64 = 0;
+var s4_bad: bool = false;
+var s4_inv: u32 = 0;
+var s4_last: bool = false;
+var s4_chkw: u64 = 0;
+var s5_v: bool = false;
+var s5_pp: u64 = 0;
+var s5_np: u64 = 0;
+var s5_wp: u64 = 0;
+var s5_wn: u64 = 0;
+var s5_bad: bool = false;
+var s5_inv: u32 = 0;
+var s5_last: bool = false;
+var s5_chkw: u64 = 0;
+var s6_v: bool = false;
+var s6_pos: u64 = 0;
+var s6_neg: u64 = 0;
+var s6_wp: u64 = 0;
+var s6_wn: u64 = 0;
+var s6_bad: bool = false;
+var s6_inv: u32 = 0;
+var s6_last: bool = false;
+var s6_chkw: u64 = 0;
+var s7_v: bool = false;
+var s7_dw: u64 = 0;
+
+// Report line arbiter, as in fpga_ddr3_pattern.t27.
+var arb: u32 = 0;
+var sbuf_full: bool = false;
+var sb_tag: u32 = 0;
+var sb_a: u32 = 0;
+var sb_b: u64 = 0;
+var line_go: bool = false;
+var line_tag: u32 = 0;
+var line_a: u32 = 0;
+var line_b: u64 = 0;
+
+fn ones() -> u64 {
+    var z: u64 = 0;
+    return z - 1;
+}
+
+// Nine xorshift steps, the bijection of fpga_ddr3_pattern.t27 (tools/ddr3_pattern_model.py lin).
+fn lin(x: u64) -> u64 {
+    var y: u64 = x;
+    y = y ^ (y << 13);
+    y = y ^ (y >> 7);
+    y = y ^ (y << 17);
+    y = y ^ (y << 21);
+    y = y ^ (y >> 35);
+    y = y ^ (y << 4);
+    y = y ^ (y << 9);
+    y = y ^ (y >> 29);
+    y = y ^ (y << 25);
+    return y;
+}
+
+fn key_base(seed: u32, pair: u32) -> u64 {
+    return ((seed as u64) << 32) | (pair as u64);
+}
+
+// Every lane pair 11 of 32 bits read as 00.
+fn clean32(x: u64) -> u64 {
+    var both: u64 = x & (x >> 1) & PAIRS32;
+    return x ^ (both | (both << 1));
+}
+
+// Nonlinear, invertible steps before and after lin (bit i xored with an AND of lower
+// resp. higher bits).
+fn mix(b: u64) -> u64 {
+    return b ^ ((b << 3) & (b << 7));
+}
+
+fn post(y: u64) -> u64 {
+    return y ^ ((y >> 1) & (y >> 2));
+}
+
+// The 16 lane codes of block b.
+fn raw32(k: u64, b: u32) -> u64 {
+    return clean32((k ^ post(lin(mix(b as u64)))) & M32);
+}
+
+// Dense5 byte -> its five lane codes (lane i at bits 2i, 2i+1: digit 0 -> 10, 1 -> 00,
+// 2 -> 01, digit i = floor(code / 3^i) mod 3, docs/format.md), bit 10 set for an invalid
+// code (243-255, lanes 00). Truth tables rather than the divisions of
+// t27/rtl/bram_trit_codec.t27: with carry chains allowed, as in the DDR3 flow, yosys builds a
+// divider of CARRY4 chains for every / and % (one codec decoder and one encoder of four bytes
+// each took 183 CARRY4 and 609 LUTs out of context); with a chain of 243 constant compares
+// per byte instead, the reader held 486,935 cells in yosys's first optimisation and the
+// out-of-context synthesis ended after 4 minutes without a result. Output bit k of code c
+// is bit c mod 32 of word c / 32 of table k (d5t0 .. d5t10, eight u32 words each), so each
+// output is a function of the eight code bits. tests/test_ddr3_reader.py checks all 256 codes
+// against the codec's C and tools/ddr3_read_model.py.
+fn d5t0(w: u64) -> u64 {
+    var t: u64 = 613566756;
+    if (w == 1) { t = 1227133513; }
+    if (w == 2) { t = 2454267026; }
+    if (w == 3) { t = 613566756; }
+    if (w == 4) { t = 1227133513; }
+    if (w == 5) { t = 2454267026; }
+    if (w == 6) { t = 613566756; }
+    if (w == 7) { t = 299593; }
+    return t;
+}
+
+fn d5t1(w: u64) -> u64 {
+    var t: u64 = 1227133513;
+    if (w == 1) { t = 2454267026; }
+    if (w == 2) { t = 613566756; }
+    if (w == 3) { t = 1227133513; }
+    if (w == 4) { t = 2454267026; }
+    if (w == 5) { t = 613566756; }
+    if (w == 6) { t = 1227133513; }
+    if (w == 7) { t = 74898; }
+    return t;
+}
+
+fn d5t2(w: u64) -> u64 {
+    var t: u64 = 117670336;
+    if (w == 1) { t = 1882725390; }
+    if (w == 2) { t = 58835168; }
+    if (w == 3) { t = 941362695; }
+    if (w == 4) { t = 2176901232; }
+    if (w == 5) { t = 470681347; }
+    if (w == 6) { t = 3235934264; }
+    if (w == 7) { t = 459649; }
+    return t;
+}
+
+fn d5t3(w: u64) -> u64 {
+    var t: u64 = 941362695;
+    if (w == 1) { t = 2176901232; }
+    if (w == 2) { t = 470681347; }
+    if (w == 3) { t = 3235934264; }
+    if (w == 4) { t = 235340673; }
+    if (w == 5) { t = 3765450780; }
+    if (w == 6) { t = 117670336; }
+    if (w == 7) { t = 7182; }
+    return t;
+}
+
+fn d5t4(w: u64) -> u64 {
+    var t: u64 = 133955584;
+    if (w == 1) { t = 4186112; }
+    if (w == 2) { t = 130816; }
+    if (w == 3) { t = 3221229560; }
+    if (w == 4) { t = 4261412991; }
+    if (w == 5) { t = 535822339; }
+    if (w == 6) { t = 16744448; }
+    if (w == 7) { t = 523264; }
+    return t;
+}
+
+fn d5t5(w: u64) -> u64 {
+    var t: u64 = 4160750079;
+    if (w == 1) { t = 2143289359; }
+    if (w == 2) { t = 66977792; }
+    if (w == 3) { t = 2093056; }
+    if (w == 4) { t = 65408; }
+    if (w == 5) { t = 3758098428; }
+    if (w == 6) { t = 4278190143; }
+    if (w == 7) { t = 1; }
+    return t;
+}
+
+fn d5t6(w: u64) -> u64 {
+    var t: u64 = 0;
+    if (w == 1) { t = 4290772992; }
+    if (w == 2) { t = 131071; }
+    if (w == 3) { t = 0; }
+    if (w == 4) { t = 4294967168; }
+    if (w == 5) { t = 3; }
+    if (w == 6) { t = 4278190080; }
+    if (w == 7) { t = 524287; }
+    return t;
+}
+
+fn d5t7(w: u64) -> u64 {
+    var t: u64 = 134217727;
+    if (w == 1) { t = 0; }
+    if (w == 2) { t = 4294836224; }
+    if (w == 3) { t = 4095; }
+    if (w == 4) { t = 0; }
+    if (w == 5) { t = 536870908; }
+    if (w == 6) { t = 0; }
+    if (w == 7) { t = 0; }
+    return t;
+}
+
+fn d5t8(w: u64) -> u64 {
+    var t: u64 = 0;
+    if (w == 1) { t = 0; }
+    if (w == 2) { t = 0; }
+    if (w == 3) { t = 0; }
+    if (w == 4) { t = 0; }
+    if (w == 5) { t = 4294967292; }
+    if (w == 6) { t = 4294967295; }
+    if (w == 7) { t = 524287; }
+    return t;
+}
+
+fn d5t9(w: u64) -> u64 {
+    var t: u64 = 4294967295;
+    if (w == 1) { t = 4294967295; }
+    if (w == 2) { t = 131071; }
+    if (w == 3) { t = 0; }
+    if (w == 4) { t = 0; }
+    if (w == 5) { t = 0; }
+    if (w == 6) { t = 0; }
+    if (w == 7) { t = 0; }
+    return t;
+}
+
+fn d5t10(w: u64) -> u64 {
+    var t: u64 = 0;
+    if (w == 1) { t = 0; }
+    if (w == 2) { t = 0; }
+    if (w == 3) { t = 0; }
+    if (w == 4) { t = 0; }
+    if (w == 5) { t = 0; }
+    if (w == 6) { t = 0; }
+    if (w == 7) { t = 4294443008; }
+    return t;
+}
+
+fn d5_dec(code: u64) -> u64 {
+    var w: u64 = (code >> 5) & 7;
+    var s: u64 = code & 31;
+    return ((d5t0(w) >> s) & 1)
+         | (((d5t1(w) >> s) & 1) << 1)
+         | (((d5t2(w) >> s) & 1) << 2)
+         | (((d5t3(w) >> s) & 1) << 3)
+         | (((d5t4(w) >> s) & 1) << 4)
+         | (((d5t5(w) >> s) & 1) << 5)
+         | (((d5t6(w) >> s) & 1) << 6)
+         | (((d5t7(w) >> s) & 1) << 7)
+         | (((d5t8(w) >> s) & 1) << 8)
+         | (((d5t9(w) >> s) & 1) << 9)
+         | (((d5t10(w) >> s) & 1) << 10);
+}
+
+// Dense5 digits of three lanes (d0 + 4 d1 + 16 d2, each digit 0-2) -> d0 + 3 d1 + 9 d2.
+fn d5_lo(x: u64) -> u64 {
+    var v: u64 = 0;
+    if (x == 1) { v = 1;
+    } else if (x == 2) { v = 2;
+    } else if (x == 4) { v = 3;
+    } else if (x == 5) { v = 4;
+    } else if (x == 6) { v = 5;
+    } else if (x == 8) { v = 6;
+    } else if (x == 9) { v = 7;
+    } else if (x == 10) { v = 8;
+    } else if (x == 16) { v = 9;
+    } else if (x == 17) { v = 10;
+    } else if (x == 18) { v = 11;
+    } else if (x == 20) { v = 12;
+    } else if (x == 21) { v = 13;
+    } else if (x == 22) { v = 14;
+    } else if (x == 24) { v = 15;
+    } else if (x == 25) { v = 16;
+    } else if (x == 26) { v = 17;
+    } else if (x == 32) { v = 18;
+    } else if (x == 33) { v = 19;
+    } else if (x == 34) { v = 20;
+    } else if (x == 36) { v = 21;
+    } else if (x == 37) { v = 22;
+    } else if (x == 38) { v = 23;
+    } else if (x == 40) { v = 24;
+    } else if (x == 41) { v = 25;
+    } else if (x == 42) { v = 26;
+    }
+    return v;
+}
+
+// Dense5 digits of two lanes (d3 + 4 d4) -> 27 d3 + 81 d4.
+fn d5_hi(x: u64) -> u64 {
+    var v: u64 = 0;
+    if (x == 1) { v = 27;
+    } else if (x == 2) { v = 54;
+    } else if (x == 4) { v = 81;
+    } else if (x == 5) { v = 108;
+    } else if (x == 6) { v = 135;
+    } else if (x == 8) { v = 162;
+    } else if (x == 9) { v = 189;
+    } else if (x == 10) { v = 216;
+    }
+    return v;
+}
+
+// Lane code -> dense digit, as bram_trit_codec.t27 (00 -> 1, 01 -> 2, 10 -> 0; 11 -> 1).
+fn digit_of(code: u64) -> u64 {
+    var d: u64 = 1;
+    if (code == 1) { d = 2; }
+    if (code == 2) { d = 0; }
+    return d;
+}
+
+// Ten lane bits (five lanes) -> dense5 code: (d0 + 3 d1 + 9 d2) + (27 d3 + 81 d4).
+fn d5_enc(l: u64) -> u64 {
+    var d0: u64 = digit_of(l & 3);
+    var d1: u64 = digit_of((l >> 2) & 3);
+    var d2: u64 = digit_of((l >> 4) & 3);
+    var d3: u64 = digit_of((l >> 6) & 3);
+    var d4: u64 = digit_of((l >> 8) & 3);
+    return d5_lo(d0 | (d1 << 2) | (d2 << 4)) + d5_hi(d3 | (d4 << 2));
+}
+
+// Twenty lanes (40 bits) -> four dense5 bytes, lanes 5n .. 5n+4 in byte n.
+fn d5_enc4(l: u64) -> u64 {
+    return d5_enc(l & 1023) | (d5_enc((l >> 10) & 1023) << 8) | (d5_enc((l >> 20) & 1023) << 16)
+         | (d5_enc((l >> 30) & 1023) << 24);
+}
+
+// Four dense5 bytes -> 20 lanes in bits 39:0 and the invalid bytes in bits 55:48 (the layout
+// of bram_trit_codec.t27's decode).
+fn d5_dec4(w: u64) -> u64 {
+    var b0: u64 = d5_dec(w & 255);
+    var b1: u64 = d5_dec((w >> 8) & 255);
+    var b2: u64 = d5_dec((w >> 16) & 255);
+    var b3: u64 = d5_dec((w >> 24) & 255);
+    var lanes: u64 = (b0 & 1023) | ((b1 & 1023) << 10) | ((b2 & 1023) << 20) | ((b3 & 1023) << 30);
+    var bad: u64 = ((b0 >> 10) + (b1 >> 10)) + ((b2 >> 10) + (b3 >> 10));
+    return lanes | (bad << 48);
+}
+
+// Sixteen baseline2 lanes (32 bits) with every 11 lane cleared, the count of such lanes in bits
+// 55:48 (bram_trit_codec.t27's decode_b2 on a 32-bit chunk).
+fn b2_dec16(w: u64) -> u64 {
+    var x: u64 = w & M32;
+    var both: u64 = x & (x >> 1) & PAIRS32;
+    var bad: u64 = 0;
+    var j: u32 = 0;
+    while (j < 16) {
+        bad = bad + ((both >> (j << 1)) & 1);
+        j = j + 1;
+    }
+    return (x ^ (both | (both << 1))) | (bad << 48);
+}
+
+fn lanes_of(f: u32) -> u32 {
+    var n: u32 = 64;
+    if (f == FMT_D5) { n = 80; }
+    return n;
+}
+
+fn step_of(f: u32) -> u32 {
+    var n: u32 = 4;
+    if (f == FMT_D5) { n = 5; }
+    return n;
+}
+
+// Words of the region: ceil(trits / 64) or ceil(trits / 80), both computed and one selected.
+fn words_of(trits: u32, f: u32) -> u32 {
+    var w2: u32 = (trits + 63) >> 6;
+    var w5: u32 = (trits + 79) / 80;
+    var w: u32 = w2;
+    if (f == FMT_D5) { w = w5; }
+    return w;
+}
+
+// Logical trits in the last word: trits - lanes * (words - 1).
+fn last_lanes(trits: u32, f: u32) -> u32 {
+    var m: u32 = words_of(trits, f) - 1;
+    var full: u32 = m << 6;
+    if (f == FMT_D5) { full = (m << 6) + (m << 4); }
+    return trits - full;
+}
+
+// Payload bytes of the last word: ceil(n / 4) or ceil(n / 5), 16-bit digit arithmetic.
+fn last_payload(n: u32, f: u32) -> u32 {
+    var r: u16 = (n & 255) as u16;
+    var p2: u32 = (n + 3) >> 2;
+    var p5: u32 = ((r + 4) / 5) as u32;
+    var p: u32 = p2;
+    if (f == FMT_D5) { p = p5; }
+    return p;
+}
+
+// Lane mask (2 bits per lane) of lanes base .. base+31 that lie below n.
+fn therm(n: u32, base: u32) -> u64 {
+    var m: u64 = 0;
+    var three: u64 = 3;
+    var j: u32 = 0;
+    while (j < 32) {
+        if (base + j < n) { m = m | (three << (j << 1)); }
+        j = j + 1;
+    }
+    return m;
+}
+
+// Lanes 64-79 exist only in dense5.
+fn top_mask(f: u32, m: u64) -> u64 {
+    var r: u64 = 0;
+    if (f == FMT_D5) { r = m & M32; }
+    return r;
+}
+
+// Decoded lanes of the four 32-bit chunks (codec outputs), bits 64 * part .. of the word's
+// lane vector: dense5 chunks hold 20 lanes (40 bits), baseline2 chunks 16 lanes (32 bits).
+fn dec_part(f: u32, d0: u64, d1: u64, d2: u64, d3: u64, part: u32) -> u64 {
+    var x0: u64 = d0 & M40;
+    var x1: u64 = d1 & M40;
+    var x2: u64 = d2 & M40;
+    var x3: u64 = d3 & M40;
+    var y0: u64 = d0 & M32;
+    var y1: u64 = d1 & M32;
+    var y2: u64 = d2 & M32;
+    var y3: u64 = d3 & M32;
+    var dense: u64 = x0 | (x1 << 40);
+    var base2: u64 = y0 | (y1 << 32);
+    if (part == 1) {
+        dense = (x1 >> 24) | (x2 << 16) | (x3 << 56);
+        base2 = y2 | (y3 << 32);
+    }
+    if (part == 2) {
+        dense = x3 >> 8;
+        base2 = 0;
+    }
+    var r: u64 = base2;
+    if (f == FMT_D5) { r = dense; }
+    return r;
+}
+
+fn invalid_of(d0: u64, d1: u64, d2: u64, d3: u64) -> u32 {
+    return ((((d0 >> 48) & 255) + ((d1 >> 48) & 255)) + (((d2 >> 48) & 255) + ((d3 >> 48) & 255))) as u32;
+}
+
+// Bit 2j + sign of the 160-bit lane vector (sign 0: the lane is +1, sign 1: it is -1).
+fn lane_bit(l0: u64, l1: u64, l2: u64, j: u32, sign: u32) -> u64 {
+    var w: u64 = l0;
+    if (j >= 32) { w = l1; }
+    if (j >= 64) { w = l2; }
+    return (w >> (((j << 1) + sign) & 63)) & 1;
+}
+
+// Per activation class a (lanes j with j mod 8 = a), the count of lanes with the sign
+// among j < 40 (3 bits at 6a) and among j >= 40 (3 bits at 6a + 3).
+fn class_counts(l0: u64, l1: u64, l2: u64, sign: u32) -> u64 {
+    var out: u64 = 0;
+    var a: u32 = 0;
+    while (a < 8) {
+        var c0: u64 = ((lane_bit(l0, l1, l2, a, sign) + lane_bit(l0, l1, l2, a + 8, sign))
+                     + (lane_bit(l0, l1, l2, a + 16, sign) + lane_bit(l0, l1, l2, a + 24, sign)))
+                     + lane_bit(l0, l1, l2, a + 32, sign);
+        var c1: u64 = ((lane_bit(l0, l1, l2, a + 40, sign) + lane_bit(l0, l1, l2, a + 48, sign))
+                     + (lane_bit(l0, l1, l2, a + 56, sign) + lane_bit(l0, l1, l2, a + 64, sign)))
+                     + lane_bit(l0, l1, l2, a + 72, sign);
+        var sh: u32 = (a << 2) + (a << 1);
+        out = out | (c0 << sh) | (c1 << (sh + 3));
+        a = a + 1;
+    }
+    return out;
+}
+
+// Per class a, the two halves added: 4 bits at 4a (0 .. 10).
+fn class_sums(h: u64) -> u64 {
+    var out: u64 = 0;
+    var a: u32 = 0;
+    while (a < 8) {
+        var sh: u32 = (a << 2) + (a << 1);
+        var s: u64 = ((h >> sh) & 7) + ((h >> (sh + 3)) & 7);
+        out = out | (s << (a << 2));
+        a = a + 1;
+    }
+    return out;
+}
+
+fn cls(p: u64, a: u32) -> u64 {
+    return (p >> (a << 2)) & 15;
+}
+
+// Classes 2k and 2k+1 added: 16 bits at 16k.
+fn pair_sums(p: u64) -> u64 {
+    return (cls(p, 0) + cls(p, 1)) | ((cls(p, 2) + cls(p, 3)) << 16)
+         | ((cls(p, 4) + cls(p, 5)) << 32) | ((cls(p, 6) + cls(p, 7)) << 48);
+}
+
+// Classes weighted by their activation a + 1, in pairs: 16 bits at 16k
+// (1 P0 + 2 P1, 3 P2 + 4 P3, 5 P4 + 6 P5, 7 P6 + 8 P7), shifts and adds only.
+fn weighted_pairs(p: u64) -> u64 {
+    var p0: u64 = cls(p, 0);
+    var p1: u64 = cls(p, 1);
+    var p2: u64 = cls(p, 2);
+    var p3: u64 = cls(p, 3);
+    var p4: u64 = cls(p, 4);
+    var p5: u64 = cls(p, 5);
+    var p6: u64 = cls(p, 6);
+    var p7: u64 = cls(p, 7);
+    var w0: u64 = p0 + (p1 << 1);
+    var w1: u64 = ((p2 << 1) + p2) + (p3 << 2);
+    var w2: u64 = ((p4 << 2) + p4) + ((p5 << 2) + (p5 << 1));
+    var w3: u64 = (((p6 << 2) + (p6 << 1)) + p6) + (p7 << 3);
+    return w0 | (w1 << 16) | (w2 << 32) | (w3 << 48);
+}
+
+fn sum4(x: u64) -> u64 {
+    return ((x & 65535) + ((x >> 16) & 65535)) + (((x >> 32) & 65535) + ((x >> 48) & 65535));
+}
+
+fn pick64(c: bool, a: u64, b: u64) -> u64 {
+    var r: u64 = b;
+    if (c) { r = a; }
+    return r;
+}
+
+fn pick32(c: bool, a: u32, b: u32) -> u32 {
+    var r: u32 = b;
+    if (c) { r = a; }
+    return r;
+}
+
+fn pick_bool(c: bool, a: bool, b: bool) -> bool {
+    var r: bool = b;
+    if (c) { r = a; }
+    return r;
+}
+
+fn rotl1(x: u64) -> u64 {
+    return (x << 1) | (x >> 63);
+}
+
+fn rotl2(x: u64) -> u64 {
+    return (x << 2) | (x >> 62);
+}
+
+fn rep_last(kind: u32) -> u32 {
+    var n: u32 = 0;
+    if (kind == K_HEAD) { n = 2; }
+    if (kind == K_RUN) { n = 13; }
+    return n;
+}
+
+fn rep_tag(kind: u32, n: u32) -> u32 {
+    var t: u32 = TAG_Z;
+    if (kind == K_HEAD) {
+        t = TAG_Q;
+        if (n == 1) { t = TAG_K; }
+        if (n == 2) { t = TAG_V; }
+    }
+    if (kind == K_RUN) {
+        t = TAG_A;
+        if (n == 1) { t = TAG_F; }
+        if (n == 2) { t = TAG_G; }
+        if (n == 3) { t = TAG_C; }
+        if (n == 4) { t = TAG_Y; }
+        if (n == 5) { t = TAG_P; }
+        if (n == 6) { t = TAG_D; }
+        if (n == 7) { t = TAG_N; }
+        if (n == 8) { t = TAG_O; }
+        if (n == 9) { t = TAG_W; }
+        if (n == 10) { t = TAG_U; }
+        if (n == 11) { t = TAG_S; }
+        if (n == 12) { t = TAG_H; }
+        if (n == 13) { t = TAG_X; }
+    }
+    if (kind == K_TIME) { t = TAG_T; }
+    return t;
+}
+
+fn head_b(lanes: u32, cap: u32) -> u64 {
+    var fmtv: u64 = READER_FORMAT;
+    return (fmtv << 32) | (((lanes & 255) as u64) << 24) | ((cap & 16777215) as u64);
+}
+
+fn run_b(f: u32) -> u64 {
+    return (((f & 1) as u64) << 32) | ((lanes_of(f) as u64) << 24);
+}
+
+fn time_b(rdph: bool, f: u32, r: u32) -> u64 {
+    var x: u64 = 0;
+    var one: u64 = 1;
+    if (rdph) { x = one << 36; }
+    return x | (((f & 1) as u64) << 32) | (r as u64);
+}
+
+fn rep_a(kind: u32, n: u32, trits: u32, seed: u32, runs: u32, r: u32, fw: u32, fm: u32, rw: u32, cs: u32,
+         bw: u32, ig: u32, rm: u32, rh: u32, ng: u64, dt: u64, ck: u64, nacks: u32, st: u32) -> u32 {
+    var a: u32 = r;
+    if (kind == K_HEAD) {
+        a = trits;
+        if (n == 1) { a = seed; }
+        if (n == 2) { a = runs; }
+    }
+    if (kind == K_RUN) {
+        if (n == 1) { a = fw; }
+        if (n == 2) { a = fm; }
+        if (n == 3) { a = rw; }
+        if (n == 4) { a = cs; }
+        if (n == 5) { a = 0; }
+        if (n == 6) { a = bw; }
+        if (n == 7) { a = ig; }
+        if (n == 8) { a = rm; }
+        if (n == 9) { a = rh; }
+        if (n == 10) { a = (ng & M32) as u32; }
+        if (n == 11) { a = ((dt >> 40) & M32) as u32; }
+        if (n == 12) { a = (ck >> 32) as u32; }
+        if (n == 13) { a = st; }
+    }
+    if (kind == K_TIME) { a = nacks; }
+    return a;
+}
+
+fn rep_b(kind: u32, n: u32, lanes: u32, cap: u32, cal: u64, wd: u32, f: u32, fc: u64, fcmd: u64, rc: u64,
+         bus: u64, pay: u64, pad: u64, tr: u64, cmd: u64, wt: u64, ps: u64, dt: u64, ck: u64, tb: u64,
+         tbad: u64, aa: u64) -> u64 {
+    var b: u64 = tbad & B40;
+    if (kind == K_HEAD) {
+        b = head_b(lanes, cap);
+        if (n == 1) { b = cal & B40; }
+        if (n == 2) { b = wd as u64; }
+    }
+    if (kind == K_RUN) {
+        b = run_b(f);
+        if (n == 1) { b = fc & B40; }
+        if (n == 2) { b = fcmd & B40; }
+        if (n == 3) { b = rc & B40; }
+        if (n == 4) { b = bus & B40; }
+        if (n == 5) { b = pay & B40; }
+        if (n == 6) { b = pad & B40; }
+        if (n == 7) { b = tr & B40; }
+        if (n == 8) { b = cmd & B40; }
+        if (n == 9) { b = wt & B40; }
+        if (n == 10) { b = ps & B40; }
+        if (n == 11) { b = dt & B40; }
+        if (n == 12) { b = ck & M32; }
+        if (n == 13) { b = aa & B40; }
+    }
+    if (kind == K_TIME) { b = tb; }
+    return b;
+}
+
+// Module-level (combinational) rather than locals of on_clock: gen-verilog declares
+// an on_clock local where it appears, which plain Verilog rejects.
+var accept: bool;
+var progress: bool;
+var rd_ack: bool;
+var advance: bool;
+var nwords: u32;
+var wlast: u32;
+var final_ack: bool;
+var timeout: bool;
+var out_up: u32;
+var out_down: u32;
+var room_up: bool;
+var room_same: bool;
+var room_down: bool;
+var out_next: u32;
+var can_issue: bool;
+var lanes_w: u32;
+var step: u32;
+var rl: u32;
+var pl: u32;
+var ml0: u64;
+var ml1: u64;
+var ml2: u64;
+var full2: u64;
+var m0: u64;
+var m1: u64;
+var m2: u64;
+var raw0: u64;
+var raw1: u64;
+var raw2: u64;
+var enc_lo: u64;
+var enc_hi: u64;
+var w_lo: u64;
+var w_hi: u64;
+var dec0: u64;
+var dec1: u64;
+var dec2: u64;
+var dec3: u64;
+var dg0: u64;
+var dg1: u64;
+var dg2: u64;
+var dinv: u32;
+var hp: u64;
+var hn: u64;
+var mis: bool;
+var word_trits: u64;
+var word_pay: u64;
+var cons_ready: bool;
+var next_run: u32;
+var rp_t: u32;
+var rp_a: u32;
+var rp_b: u64;
+var sfire: bool;
+var pfire: bool;
+var status_idle: bool;
+var running: bool;
+var ack_seen: bool;
+var ack_stray: bool;
+accept = wb_stb && !stall;
+progress = accept || ack;
+rd_ack = tstate == T_READ && ack;
+advance = (tstate == T_PRIME && pr != 0) || (tstate == T_FILL && accept) || rd_ack;
+nwords = words_of(trits, fmt);
+wlast = nwords - 1;
+final_ack = ack && acks == wlast;
+timeout = !progress && quiet >= watchdog;
+// The outstanding count after this clock and whether it leaves room under the cap, computed
+// from the registered count and selected by the request taken and the ack, so no adder or
+// compare sits between o_wb_stall and the next stb.
+out_up = outst + 1;
+out_down = outst - 1;
+room_up = out_up < cap;
+room_same = outst < cap;
+room_down = out_down < cap;
+out_next = pick32(accept && !ack, out_up, pick32(ack && !accept, out_down, outst));
+can_issue = pick_bool(accept && !ack, room_up, pick_bool(ack && !accept, room_down, room_same));
+lanes_w = lanes_of(fmt);
+step = step_of(fmt);
+rl = last_lanes(trits, fmt);
+pl = last_payload(rl, fmt);
+ml0 = therm(rl, 0);
+ml1 = therm(rl, 32);
+ml2 = top_mask(fmt, therm(rl, 64));
+full2 = top_mask(fmt, ones());
+m0 = pick64(g1_last, ml0, ones());
+m1 = pick64(g1_last, ml1, ones());
+m2 = pick64(g1_last, ml2, full2);
+raw0 = raw32(kk, bk0) | (raw32(kk, bk1) << 32);
+raw1 = raw32(kk, bk2) | (raw32(kk, bk3) << 32);
+raw2 = raw32(kk, bk4);
+enc_lo = d5_enc4(g2_l0 & M40) | (d5_enc4(((g2_l0 >> 40) | (g2_l1 << 24)) & M40) << 32);
+enc_hi = d5_enc4((g2_l1 >> 16) & M40) | (d5_enc4(((g2_l1 >> 56) | (g2_l2 << 8)) & M40) << 32);
+w_lo = pick64(fmt == FMT_D5, enc_lo, g2_l0);
+w_hi = pick64(fmt == FMT_D5, enc_hi, g2_l1);
+dec0 = pick64(fmt == FMT_D5, d5_dec4(s1_lo & M32), b2_dec16(s1_lo));
+dec1 = pick64(fmt == FMT_D5, d5_dec4(s1_lo >> 32), b2_dec16(s1_lo >> 32));
+dec2 = pick64(fmt == FMT_D5, d5_dec4(s1_hi & M32), b2_dec16(s1_hi));
+dec3 = pick64(fmt == FMT_D5, d5_dec4(s1_hi >> 32), b2_dec16(s1_hi >> 32));
+dg0 = dec_part(fmt, sd_d0, sd_d1, sd_d2, sd_d3, 0);
+dg1 = dec_part(fmt, sd_d0, sd_d1, sd_d2, sd_d3, 1);
+dg2 = dec_part(fmt, sd_d0, sd_d1, sd_d2, sd_d3, 2);
+dinv = invalid_of(sd_d0, sd_d1, sd_d2, sd_d3);
+hp = class_counts(s2_g0, s2_g1, s2_g2, 0);
+hn = class_counts(s2_g0, s2_g1, s2_g2, 1);
+mis = (s2_g0 != s2_e0) || (s2_g1 != s2_e1) || (s2_g2 != s2_e2);
+word_trits = pick64(s6_last, rl as u64, lanes_w as u64);
+word_pay = pick64(s6_last, pl as u64, 16);
+cons_ready = true;
+next_run = run + 1;
+rp_t = rep_tag(rkind, rline);
+rp_a = rep_a(rkind, rline, trits, seed, runs, run, f_words, f_max, r_words, cons_stalls, bad_words, inv_groups,
+             ph_max, ph_hold, neg, dot, chk, acks, stray_acks);
+rp_b = rep_b(rkind, rline, lanes_bus, cap, calib_clocks, watchdog, fmt, f_clocks, f_cmd, r_clocks, bus_bytes,
+             pay_bytes, pad_bytes, trits_out, ph_cmd, ph_wait, pos, dot, chk, time_b(rd, fmt, run), total_bad,
+             all_acks);
+sfire = arb == A_IDLE && sbuf_full && line_idle;
+pfire = arb == A_IDLE && !sbuf_full && line_idle && tstate == T_REPORT;
+status_idle = !sbuf_full;
+running = tstate != T_CALIB && tstate != T_STOP;
+ack_seen = ack && tstate != T_CALIB;
+ack_stray = ack_seen && tstate != T_FILL && tstate != T_READ;
+
+// calib: ddr3_top o_calib_complete. stall, ack: o_wb_stall, o_wb_ack; rdata_lo, rdata_hi: bits
+// 63:0 and 127:64 of o_wb_data.
+// trits >= 1: logical trits per run (below 2^31); seed; cap >= 1: requests outstanding at most;
+// runs (0 = until reset); watchdog >= 1: clocks without a request taken or an ack after which a
+// phase gives up; lanes_bus: byte lanes, reported. s_go, s_tag, s_a, s_b: the status reporter's
+// line request; line_idle: the emitter's.
+fn on_clock(calib: bool, stall: bool, ack: bool, rdata_lo: u64, rdata_hi: u64, trits: u32, seed: u32, cap: u32, runs: u32, watchdog: u32, lanes_bus: u32,
+            s_go: bool, s_tag: u32, s_a: u32, s_b: u64, line_idle: bool) {
+    // Consumer (A), last stage first, so every value read is the one from before this tick.
+    if (s7_v) { dot = dot + s7_dw; }
+    s7_v = s6_v;
+    s7_dw = s6_wp - s6_wn;
+    if (s6_v) {
+        pos = pos + s6_pos;
+        neg = neg + s6_neg;
+        if (s6_bad) { bad_words = bad_words + 1; }
+        inv_groups = inv_groups + s6_inv;
+        bus_bytes = bus_bytes + 16;
+        pay_bytes = pay_bytes + word_pay;
+        pad_bytes = pad_bytes + (16 - word_pay);
+        trits_out = trits_out + word_trits;
+        chk = rotl2(chk) ^ s6_chkw;
+    }
+    s6_v = s5_v;
+    s6_pos = sum4(s5_pp);
+    s6_neg = sum4(s5_np);
+    s6_wp = sum4(s5_wp);
+    s6_wn = sum4(s5_wn);
+    s6_bad = s5_bad;
+    s6_inv = s5_inv;
+    s6_last = s5_last;
+    s6_chkw = s5_chkw;
+    s5_v = s4_v;
+    s5_pp = pair_sums(s4_p);
+    s5_np = pair_sums(s4_n);
+    s5_wp = weighted_pairs(s4_p);
+    s5_wn = weighted_pairs(s4_n);
+    s5_bad = s4_bad;
+    s5_inv = s4_inv;
+    s5_last = s4_last;
+    s5_chkw = s4_chkw;
+    s4_v = s3_v;
+    s4_p = class_sums(s3_hp);
+    s4_n = class_sums(s3_hn);
+    s4_bad = s3_mis;
+    s4_inv = s3_inv;
+    s4_last = s3_last;
+    s4_chkw = s3_chkw;
+    s3_v = s2_v;
+    s3_hp = hp;
+    s3_hn = hn;
+    s3_mis = mis;
+    s3_inv = s2_inv;
+    s3_last = s2_last;
+    s3_chkw = s2_chkw;
+    s2_v = sd_v;
+    s2_g0 = dg0;
+    s2_g1 = dg1;
+    s2_g2 = dg2;
+    s2_e0 = sd_e0;
+    s2_e1 = sd_e1;
+    s2_e2 = sd_e2;
+    s2_inv = dinv;
+    s2_last = sd_last;
+    s2_chkw = sd_chkw;
+    sd_v = s1_v;
+    sd_d0 = dec0;
+    sd_d1 = dec1;
+    sd_d2 = dec2;
+    sd_d3 = dec3;
+    sd_e0 = s1_e0;
+    sd_e1 = s1_e1;
+    sd_e2 = s1_e2;
+    sd_last = s1_last;
+    sd_chkw = rotl1(s1_lo) ^ s1_hi;
+    s1_v = rd_ack;
+    if (rd_ack) {
+        s1_lo = rdata_lo;
+        s1_hi = rdata_hi;
+        s1_e0 = c_l0;
+        s1_e1 = c_l1;
+        s1_e2 = c_l2;
+        s1_last = c_last;
+        if (!cons_ready) { cons_stalls = cons_stalls + 1; }
+    }
+    if (ack_seen) { all_acks = all_acks + 1; }
+    if (ack_stray) { stray_acks = stray_acks + 1; }
+
+    if (tstate == T_CALIB) {
+        if (calib) {
+            calib_clocks = cycles;
+            run = 0;
+            fmt = FMT_B2;
+            total_bad = 0;
+            rkind = K_HEAD;
+            rline = 0;
+            tstate = T_REPORT;
+        }
+    } else if (tstate == T_KEY0) {
+        key = lin(key_base(seed, run >> 1));
+        tstate = T_KEY1;
+    } else if (tstate == T_KEY1) {
+        key = key + KADD;
+        tstate = T_KEY2;
+    } else if (tstate == T_KEY2) {
+        kk = lin(key);
+        rd = false;
+        pr = 0;
+        tstate = T_PRIME;
+    } else if (tstate == T_PRIME) {
+        if (pr == 0) {
+            gw = 0;
+            bk0 = 0;
+            bk1 = 1;
+            bk2 = 2;
+            bk3 = 3;
+            bk4 = 4;
+            if (rd) {
+                // The fill's counters are final: keep them; clear the read's.
+                f_cmd = ph_cmd;
+                f_max = ph_max;
+                bus_bytes = 0;
+                pay_bytes = 0;
+                pad_bytes = 0;
+                trits_out = 0;
+                bad_words = 0;
+                inv_groups = 0;
+                pos = 0;
+                neg = 0;
+                dot = 0;
+                chk = 0;
+                cons_stalls = 0;
+            }
+        }
+        if (pr == PRIME_STEPS) {
+            wb_addr = 0;
+            wb_stb = true;
+            wb_we = !rd;
+            issue_done = false;
+            outst = 0;
+            acks = 0;
+            phase_clocks = 0;
+            quiet = 0;
+            ph_cmd = 0;
+            ph_wait = 0;
+            ph_hold = 0;
+            ph_max = 0;
+            pr = 0;
+            if (rd) { tstate = T_READ; } else { tstate = T_FILL; }
+        } else {
+            pr = pr + 1;
+        }
+    } else if (tstate == T_FILL || tstate == T_READ) {
+        if (wb_stb && stall) { ph_cmd = ph_cmd + 1; }
+        if (outst != 0 && !ack) { ph_wait = ph_wait + 1; }
+        if (!wb_stb && !issue_done) { ph_hold = ph_hold + 1; }
+        if (outst > ph_max) { ph_max = outst; }
+        if (accept) {
+            if (wb_addr == wlast) {
+                wb_stb = false;
+                issue_done = true;
+            } else {
+                wb_addr = wb_addr + 1;
+                wb_stb = can_issue;
+            }
+        } else if (!wb_stb && !issue_done) {
+            wb_stb = can_issue;
+        }
+        outst = out_next;
+        if (ack) { acks = acks + 1; }
+        if (progress) { quiet = 0; } else { quiet = quiet + 1; }
+        phase_clocks = phase_clocks + 1;
+        if (final_ack) {
+            if (tstate == T_FILL) {
+                f_clocks = phase_clocks + 1;
+                f_words = acks + 1;
+                rd = true;
+                pr = 0;
+                tstate = T_PRIME;
+            } else {
+                r_clocks = phase_clocks + 1;
+                r_words = acks + 1;
+                drain = 0;
+                tstate = T_DRAIN;
+            }
+        } else if (timeout) {
+            wb_stb = false;
+            wb_cyc = false;
+            rkind = K_TIME;
+            rline = 0;
+            tstate = T_REPORT;
+        }
+    } else if (tstate == T_DRAIN) {
+        if (drain == DRAIN_CLOCKS) {
+            rkind = K_RUN;
+            rline = 0;
+            tstate = T_REPORT;
+        } else {
+            drain = drain + 1;
+        }
+    } else if (tstate == T_REPORT) {
+        if (pfire) {
+            if (rline == rep_last(rkind)) {
+                rline = 0;
+                if (rkind == K_HEAD) {
+                    tstate = T_KEY0;
+                } else if (rkind == K_RUN) {
+                    total_bad = total_bad + (bad_words as u64);
+                    run = next_run;
+                    if (runs != 0 && next_run >= runs) {
+                        rkind = K_DONE;
+                    } else if ((next_run & 1) == FMT_D5) {
+                        // Same pair, same key: the dense5 run of the trits just read as baseline2.
+                        fmt = FMT_D5;
+                        rd = false;
+                        pr = 0;
+                        tstate = T_PRIME;
+                    } else {
+                        fmt = FMT_B2;
+                        tstate = T_KEY0;
+                    }
+                } else {
+                    tstate = T_STOP;
+                }
+            } else {
+                rline = rline + 1;
+            }
+        }
+    }
+
+    // Generator pipeline: one word on with every write taken, read acknowledged or priming step.
+    if (advance) {
+        c_l0 = g3_l0;
+        c_l1 = g3_l1;
+        c_l2 = g3_l2;
+        c_lo = g3_lo;
+        c_hi = g3_hi;
+        c_last = g3_last;
+        g3_l0 = g2_l0;
+        g3_l1 = g2_l1;
+        g3_l2 = g2_l2;
+        g3_lo = w_lo;
+        g3_hi = w_hi;
+        g3_last = g2_last;
+        g2_l0 = g1_r0 & m0;
+        g2_l1 = g1_r1 & m1;
+        g2_l2 = g1_r2 & m2;
+        g2_last = g1_last;
+        g1_r0 = raw0;
+        g1_r1 = raw1;
+        g1_r2 = raw2;
+        g1_last = gw == wlast;
+        gw = gw + 1;
+        bk0 = bk0 + step;
+        bk1 = bk1 + step;
+        bk2 = bk2 + step;
+        bk3 = bk3 + step;
+        bk4 = bk4 + step;
+    }
+
+    // Report line arbiter.
+    line_go = false;
+    if (arb == A_IDLE) {
+        if (sfire) {
+            line_go = true;
+            line_tag = sb_tag;
+            line_a = sb_a;
+            line_b = sb_b;
+            sbuf_full = false;
+            arb = A_START;
+        } else if (pfire) {
+            line_go = true;
+            line_tag = rp_t;
+            line_a = rp_a;
+            line_b = rp_b;
+            arb = A_START;
+        }
+    } else if (arb == A_START) {
+        arb = A_WAIT;
+    } else {
+        if (line_idle) { arb = A_IDLE; }
+    }
+    if (s_go) {
+        sbuf_full = true;
+        sb_tag = s_tag;
+        sb_a = s_a;
+        sb_b = s_b;
+    }
+    cycles = cycles + 1;
+}
+
+test xorshift_is_the_pattern_tests { assert_eq(lin(1), 1750279251066886390); assert_eq(lin(4294967296), 5079629637630073896); }
+test pair_key_base { assert_eq(key_base(1, 2), 4294967298); }
+test lane_pairs_eleven_read_as_zero { assert_eq(clean32(15), 0); assert_eq(clean32(6), 6); assert_eq(clean32(4294967295), 0); }
+test region_words { assert_eq(words_of(1237, 0), 20); assert_eq(words_of(1237, 1), 16); assert_eq(words_of(160, 1), 2); }
+test last_word_lanes { assert_eq(last_lanes(1237, 0), 21); assert_eq(last_lanes(1237, 1), 37); assert_eq(last_lanes(160, 1), 80); }
+test last_word_payload { assert_eq(last_payload(21, 0), 6); assert_eq(last_payload(37, 1), 8); assert_eq(last_payload(80, 1), 16); }
+test lane_masks { assert_eq(therm(3, 0), 63); assert_eq(therm(37, 32), 1023); assert_eq(therm(10, 32), 0); assert_eq(top_mask(0, 255), 0); }
+test class_popcounts { assert_eq(class_counts(1, 0, 0, 0), 1); assert_eq(class_counts(2, 0, 0, 1), 1); assert_eq(class_counts(0, 0, 1, 0), 8); }
+test weighted_sums { assert_eq(weighted_pairs(268435457), 2251799813685249); assert_eq(sum4(weighted_pairs(268435457)), 9); }
+test report_tags { assert_eq(rep_tag(0, 0), 113); assert_eq(rep_tag(1, 12), 104); assert_eq(rep_tag(1, 13), 120); assert_eq(rep_tag(2, 0), 116); assert_eq(rep_tag(3, 0), 122); assert_eq(rep_last(1), 13); }
+test dense5_tables { assert_eq(d5_dec(121), 0); assert_eq(d5_dec(242), 341); assert_eq(d5_dec(0), 682); assert_eq(d5_dec(243), 1024); assert_eq(d5_enc(0), 121); assert_eq(d5_enc(341), 242); assert_eq(d5_enc(682), 0); }
+test baseline2_invalid_lanes { assert_eq(b2_dec16(15), 562949953421312); assert_eq(b2_dec16(6), 6); }
+test report_fields { assert_eq(head_b(2, 48), 8623489072); assert_eq(run_b(1), 5637144576); assert_eq(time_b(true, 1, 2), 73014444034); }
+endmodule

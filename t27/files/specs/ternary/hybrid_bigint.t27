@@ -1,0 +1,1119 @@
+// HybridBigInt: Optimal Memory/Speed Trade-off
+// Uses packed storage (4.5x memory savings) with unpacked computation
+// SIMD-accelerated operations for high performance
+//
+// Author: Dmitrii Vasilev
+// SPDX-License-Identifier: Apache-2.0
+
+// Dialect notes (the spec was written in Rust syntax): `import x;` is
+// `use x;`; `pub type T = U;` is `pub const T = U;`; `Option<T>` is `?T`
+// (`Some(v)` is `v`, `None` is `null`, `if let Some(ref c) = o` is a null
+// test plus a pointer `&o.?` to the payload); `let mut` / `let` are `var` /
+// `const`; a trailing expression is an explicit `return`; `&&` / `||` are
+// `and` / `or`; `x.min(y)` / `x.max(y)` are `@min(x, y)` / `@max(x, y)`;
+// `v as Trit` is `@as(Trit, @intCast(v))` and `n as gf16` is
+// `@as(gf16, @floatFromInt(n))` (the cast whitelist has neither type);
+// `assert!(c)` / `assert_eq!(a, b)` are `assert(c)` / `assert(a == b)`.
+// t27 models behaviour as free functions: `impl HybridBigInt { fn m(&mut
+// self, ...) }` is `fn hybrid_m(self: *HybridBigInt, ...)` (`&self` is
+// `*const HybridBigInt`), and `x.m(&mut y)` is `hybrid_m(&x, &y)`.
+
+module hybrid_bigint;
+
+use numeric::gf16;
+use base::types::Trit;
+use ternary::bigint;
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+/// Maximum number of trits (3^10)
+pub const MAX_TRITS: usize = 59049;
+
+/// Number of trits packed per byte (5 trits per byte)
+pub const TRITS_PER_BYTE: usize = 5;
+
+/// Maximum packed bytes required
+pub const MAX_PACKED_BYTES: usize = (MAX_TRITS + TRITS_PER_BYTE - 1) / TRITS_PER_BYTE;
+
+/// SIMD width for parallel trit operations (32 trits at once)
+pub const SIMD_WIDTH: usize = 32;
+
+/// Number of SIMD chunks for MAX_TRITS
+pub const SIMD_CHUNKS: usize = MAX_TRITS / SIMD_WIDTH;
+
+/// Memory efficiency factor (unpacked vs packed)
+pub const MEMORY_EFFICIENCY: gf16 = 5.0;
+
+/// Slots of add_simd's per-chunk carry table: the Rust
+/// `[[Trit; SIMD_WIDTH]; SIMD_CHUNKS + 1]` is stored flat, row-major
+/// (entry [chunk][i] is at chunk * SIMD_WIDTH + i), because the Verilog
+/// backend cannot lower a 2-D array of Trit.
+const CARRY_SLOTS: usize = (SIMD_CHUNKS + 1) * SIMD_WIDTH;
+
+// ============================================================================
+// Types
+// ============================================================================
+
+/// Storage mode for HybridBigInt
+/// Packed mode: 5 trits per byte, memory efficient
+/// Unpacked mode: 1 trit per byte, compute efficient
+pub const StorageMode = enum(u8) {
+    packed_mode,
+    unpacked_mode,
+};
+
+/// SIMD vector for 32 trits
+pub const Vec32 = [SIMD_WIDTH]Trit;
+
+/// HybridBigInt combines packed storage with unpacked computation
+/// - Stores in packed format for memory efficiency (4.5x savings)
+/// - Unpacks lazily for computation
+/// - Re-packs after computation if dirty
+/// - Uses SIMD for parallel trit operations
+pub const HybridBigInt = struct {
+    /// Packed storage (always valid, 5 trits per byte)
+    packed_data: [MAX_PACKED_BYTES]u8,
+    /// Unpacked cache (null when packed, allocated on heap when needed)
+    unpacked_cache: ?[MAX_TRITS]Trit,
+    /// Current storage mode
+    mode: StorageMode,
+    /// Number of significant trits
+    trit_len: usize,
+    /// Dirty flag: unpacked cache modified, needs re-pack
+    dirty: bool,
+};
+
+// ============================================================================
+// SIMD Operations
+// ============================================================================
+
+/// SIMD add 32 trits in parallel with carry propagation
+/// Returns: (sum_vector, carry_vector)
+pub fn simd_add(a: Vec32, b: Vec32) -> (Vec32, Vec32) {
+    var sum: Vec32 = [TRIT_ZERO; SIMD_WIDTH];
+    var carry: Vec32 = [TRIT_ZERO; SIMD_WIDTH];
+
+    for i in 0..SIMD_WIDTH {
+        const ai = a[i];
+        const bi = b[i];
+        const s: i16 = (ai as i16) + (bi as i16);
+
+        if (s > 1) {
+            sum[i] = TRIT_NEG;
+            carry[i] = TRIT_POS;
+        } else if (s < -1) {
+            sum[i] = TRIT_POS;
+            carry[i] = TRIT_NEG;
+        } else {
+            sum[i] = @as(Trit, @intCast(s));
+            carry[i] = TRIT_ZERO;
+        }
+    }
+
+    return (sum, carry);
+}
+
+/// SIMD negate 32 trits
+pub fn simd_negate(v: Vec32) -> Vec32 {
+    var result: Vec32 = [TRIT_ZERO; SIMD_WIDTH];
+    for i in 0..SIMD_WIDTH {
+        result[i] = -v[i];
+    }
+    return result;
+}
+
+/// SIMD dot product of 32 trits (returns scalar)
+pub fn simd_dot_product(a: Vec32, b: Vec32) -> i32 {
+    var total: i32 = 0;
+    for i in 0..SIMD_WIDTH {
+        total += (a[i] as i32) * (b[i] as i32);
+    }
+    return total;
+}
+
+/// SIMD check if all zeros
+pub fn simd_is_zero(v: Vec32) -> bool {
+    for i in 0..SIMD_WIDTH {
+        if (v[i] != TRIT_ZERO) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// 3^exp as u32 (stands in for Rust's `3u32.pow(exp)` in hybrid_pack)
+fn pow3_u32(exp: u32) -> u32 {
+    var result: u32 = 1;
+    var k: u32 = 0;
+    while (k < exp) {
+        result *= 3;
+        k += 1;
+    }
+    return result;
+}
+
+// ============================================================================
+// HybridBigInt Methods
+// ============================================================================
+
+// impl HybridBigInt
+
+/// Create zero value (minimal stack usage)
+pub fn hybrid_zero() -> HybridBigInt {
+    return HybridBigInt{
+        .packed_data = [0; MAX_PACKED_BYTES],
+        .unpacked_cache = null,
+        .mode = StorageMode.packed_mode,
+        .trit_len = 1,
+        .dirty = false,
+    };
+}
+
+/// Ensure unpacked cache is allocated and valid
+pub fn hybrid_ensure_unpacked(self: *HybridBigInt) {
+    if (self.mode == StorageMode.unpacked_mode) {
+        if (self.unpacked_cache != null) {
+            return;
+        }
+    }
+
+    // Allocate unpacked cache
+    var cache: [MAX_TRITS]Trit = [TRIT_ZERO; MAX_TRITS];
+
+    // Unpack from packed_data to cache
+    const num_packs = (self.trit_len + TRITS_PER_BYTE - 1) / TRITS_PER_BYTE;
+    for pack_idx in 0..num_packs {
+        const pack_byte = self.packed_data[pack_idx];
+        const base = pack_idx * TRITS_PER_BYTE;
+
+        // Decode 5 trits from pack byte (using base-3 encoding)
+        var value = pack_byte as u32;
+        for j in 0..TRITS_PER_BYTE {
+            const pos = base + j;
+            if (pos < MAX_TRITS and pos < self.trit_len) {
+                // Decode balanced ternary from packed representation
+                const trit_val = ((value % 3) as i8) - 1;
+                cache[pos] = trit_val;
+                value /= 3;
+            }
+        }
+    }
+
+    self.unpacked_cache = cache;
+    self.mode = StorageMode.unpacked_mode;
+}
+
+/// Pack the unpacked cache back to packed storage
+pub fn hybrid_pack(self: *HybridBigInt) {
+    if (!self.dirty and self.mode == StorageMode.packed_mode) {
+        return;
+    }
+
+    hybrid_ensure_unpacked(self);
+
+    if (self.unpacked_cache != null) {
+        const cache = &self.unpacked_cache.?;
+        const num_packs = (self.trit_len + TRITS_PER_BYTE - 1) / TRITS_PER_BYTE;
+        for pack_idx in 0..num_packs {
+            const base = pack_idx * TRITS_PER_BYTE;
+            var pack_value: u32 = 0;
+
+            // Encode 5 trits to pack byte
+            for j in 0..TRITS_PER_BYTE {
+                const pos = base + j;
+                if (pos < self.trit_len) {
+                    const trit = cache[pos] + 1; // Convert to 0,1,2
+                    pack_value += (trit as u32) * pow3_u32(j as u32);
+                }
+            }
+
+            self.packed_data[pack_idx] = (pack_value % 256) as u8;
+        }
+    }
+
+    self.mode = StorageMode.packed_mode;
+    self.dirty = false;
+}
+
+/// Memory usage in bytes (packed)
+pub fn hybrid_memory_usage(self: *const HybridBigInt) -> usize {
+    return (self.trit_len + TRITS_PER_BYTE - 1) / TRITS_PER_BYTE;
+}
+
+/// Create from i64
+pub fn hybrid_from_i64(value: i64) -> HybridBigInt {
+    var result = hybrid_zero();
+    if (value == 0) {
+        return result;
+    }
+
+    hybrid_ensure_unpacked(&result);
+    if (result.unpacked_cache != null) {
+        const cache = &result.unpacked_cache.?;
+        var v = value;
+        var pos: usize = 0;
+
+        while (v != 0 and pos < MAX_TRITS) {
+            var rem = v % 3;
+            if (rem == 2) {
+                rem = -1;
+                v += 1; // Adjust for balanced ternary
+            } else if (rem == -2) {
+                rem = 1;
+                v -= 1;
+            }
+            cache[pos] = @as(Trit, @intCast(rem));
+            v /= 3;
+            pos += 1;
+        }
+
+        result.trit_len = if (pos == 0) 1 else pos;
+    }
+
+    result.mode = StorageMode.unpacked_mode;
+    result.dirty = true;
+    return result;
+}
+
+/// Convert to i64
+pub fn hybrid_to_i64(self: *const HybridBigInt) -> i64 {
+    var result: i64 = 0;
+    var power: i64 = 1;
+
+    const num_trits = @min(self.trit_len, 40); // i64 can hold ~40 trits
+    for i in 0..num_trits {
+        var trit: Trit = TRIT_ZERO;
+        if (self.mode == StorageMode.unpacked_mode) {
+            // unpacked_cache.as_ref().map_or(TRIT_ZERO, |c| c[i])
+            if (self.unpacked_cache != null) {
+                trit = self.unpacked_cache.?[i];
+            }
+        } else {
+            // Need to unpack first (simplified: assume unpacked for this example)
+            trit = TRIT_ZERO;
+        }
+        result += (trit as i64) * power;
+        power *= 3;
+    }
+
+    return result;
+}
+
+/// Get trit at position (auto-unpacks if needed)
+pub fn hybrid_get_trit(self: *HybridBigInt, pos: usize) -> Trit {
+    if (pos >= self.trit_len) {
+        return TRIT_ZERO;
+    }
+    hybrid_ensure_unpacked(self);
+    // unpacked_cache.as_ref().map_or(TRIT_ZERO, |c| c[pos])
+    if (self.unpacked_cache != null) {
+        return self.unpacked_cache.?[pos];
+    }
+    return TRIT_ZERO;
+}
+
+/// Set trit at position (marks dirty)
+pub fn hybrid_set_trit(self: *HybridBigInt, pos: usize, value: Trit) {
+    if (pos >= MAX_TRITS) {
+        return;
+    }
+    hybrid_ensure_unpacked(self);
+    if (self.unpacked_cache != null) {
+        const cache = &self.unpacked_cache.?;
+        cache[pos] = value;
+        self.dirty = true;
+        if (pos >= self.trit_len and value != TRIT_ZERO) {
+            self.trit_len = pos + 1;
+        }
+    }
+}
+
+/// Check if zero
+pub fn hybrid_is_zero(self: *HybridBigInt) -> bool {
+    if (self.trit_len == 1) {
+        return hybrid_get_trit(self, 0) == TRIT_ZERO;
+    }
+    return false;
+}
+
+/// Check if negative
+pub fn hybrid_is_negative(self: *HybridBigInt) -> bool {
+    if (self.trit_len == 0) {
+        return false;
+    }
+    return hybrid_get_trit(self, self.trit_len - 1) < 0;
+}
+
+/// Negate
+pub fn hybrid_negate(self: *HybridBigInt) -> HybridBigInt {
+    var result = hybrid_zero();
+    hybrid_ensure_unpacked(&result);
+    hybrid_ensure_unpacked(self);
+
+    if (result.unpacked_cache != null and self.unpacked_cache != null) {
+        const dst = &result.unpacked_cache.?;
+        const src = &self.unpacked_cache.?;
+        for i in 0..self.trit_len {
+            dst[i] = -src[i];
+        }
+    }
+
+    result.trit_len = self.trit_len;
+    result.mode = StorageMode.unpacked_mode;
+    result.dirty = true;
+    return result;
+}
+
+/// Add two HybridBigInts (uses unpacked for speed)
+pub fn hybrid_add(self: *HybridBigInt, other: *HybridBigInt) -> HybridBigInt {
+    hybrid_ensure_unpacked(self);
+    hybrid_ensure_unpacked(other);
+
+    var result = hybrid_zero();
+    hybrid_ensure_unpacked(&result);
+
+    const max_len = @max(self.trit_len, other.trit_len);
+    var carry: Trit = TRIT_ZERO;
+
+    if (result.unpacked_cache != null and self.unpacked_cache != null and other.unpacked_cache != null) {
+        const dst = &result.unpacked_cache.?;
+        const src_a = &self.unpacked_cache.?;
+        const src_b = &other.unpacked_cache.?;
+        for i in 0..=max_len {
+            if (i >= MAX_TRITS) {
+                break;
+            }
+
+            const a_trit: i16 = if (i < self.trit_len) (src_a[i] as i16) else 0;
+            const b_trit: i16 = if (i < other.trit_len) (src_b[i] as i16) else 0;
+
+            var sum = a_trit + b_trit + (carry as i16);
+            carry = TRIT_ZERO;
+
+            while (sum > 1) {
+                sum -= 3;
+                carry = TRIT_POS;
+            }
+            while (sum < -1) {
+                sum += 3;
+                carry = TRIT_NEG;
+            }
+
+            dst[i] = @as(Trit, @intCast(sum));
+        }
+    }
+
+    result.trit_len = @min(max_len + 1, MAX_TRITS);
+    hybrid_normalize(&result);
+    return result;
+}
+
+/// SIMD-accelerated add (32 trits at a time)
+pub fn hybrid_add_simd(self: *HybridBigInt, other: *HybridBigInt) -> HybridBigInt {
+    hybrid_ensure_unpacked(self);
+    hybrid_ensure_unpacked(other);
+
+    var result = hybrid_zero();
+    hybrid_ensure_unpacked(&result);
+
+    const max_len = @max(self.trit_len, other.trit_len);
+    const num_chunks = (max_len + SIMD_WIDTH - 1) / SIMD_WIDTH;
+
+    // Phase 1: SIMD parallel addition
+    // carries[chunk][i] is carries[chunk * SIMD_WIDTH + i] (see CARRY_SLOTS)
+    var carries: [CARRY_SLOTS]Trit = [TRIT_ZERO; CARRY_SLOTS];
+
+    if (result.unpacked_cache != null and self.unpacked_cache != null and other.unpacked_cache != null) {
+        const dst = &result.unpacked_cache.?;
+        const src_a = &self.unpacked_cache.?;
+        const src_b = &other.unpacked_cache.?;
+        for chunk in 0..num_chunks {
+            const base = chunk * SIMD_WIDTH;
+
+            var a_vec: Vec32 = [TRIT_ZERO; SIMD_WIDTH];
+            var b_vec: Vec32 = [TRIT_ZERO; SIMD_WIDTH];
+
+            for i in 0..SIMD_WIDTH {
+                const idx = base + i;
+                a_vec[i] = if (idx < self.trit_len) src_a[idx] else TRIT_ZERO;
+                b_vec[i] = if (idx < other.trit_len) src_b[idx] else TRIT_ZERO;
+            }
+
+            const (sum_vec, carry_vec) = simd_add(a_vec, b_vec);
+
+            for i in 0..SIMD_WIDTH {
+                const idx = base + i;
+                if (idx < MAX_TRITS) {
+                    dst[idx] = sum_vec[i];
+                }
+                carries[chunk * SIMD_WIDTH + i] = carry_vec[i];
+            }
+        }
+
+        // Phase 2: Sequential carry propagation
+        var carry: Trit = TRIT_ZERO;
+        for i in 0..=max_len {
+            if (i >= MAX_TRITS) {
+                break;
+            }
+
+            const chunk = i / SIMD_WIDTH;
+            const offset = i % SIMD_WIDTH;
+
+            var val: i16 = dst[i] as i16;
+
+            // Add carry from SIMD
+            if (i > 0) {
+                const prev_chunk = (i - 1) / SIMD_WIDTH;
+                const prev_offset = (i - 1) % SIMD_WIDTH;
+                if (prev_chunk < num_chunks) {
+                    val += carries[prev_chunk * SIMD_WIDTH + prev_offset] as i16;
+                }
+            }
+
+            val += carry as i16;
+            carry = TRIT_ZERO;
+
+            while (val > 1) {
+                val -= 3;
+                carry = TRIT_POS;
+            }
+            while (val < -1) {
+                val += 3;
+                carry = TRIT_NEG;
+            }
+
+            dst[i] = @as(Trit, @intCast(val));
+        }
+    }
+
+    result.trit_len = @min(max_len + 1, MAX_TRITS);
+    hybrid_normalize(&result);
+    return result;
+}
+
+/// Subtract
+pub fn hybrid_sub(self: *HybridBigInt, other: *HybridBigInt) -> HybridBigInt {
+    var neg_other = hybrid_negate(other);
+    return hybrid_add(self, &neg_other);
+}
+
+/// Multiply two HybridBigInts
+pub fn hybrid_mul(self: *HybridBigInt, other: *HybridBigInt) -> HybridBigInt {
+    hybrid_ensure_unpacked(self);
+    hybrid_ensure_unpacked(other);
+
+    var result = hybrid_zero();
+    hybrid_ensure_unpacked(&result);
+
+    if (result.unpacked_cache != null and self.unpacked_cache != null and other.unpacked_cache != null) {
+        const dst = &result.unpacked_cache.?;
+        const src_a = &self.unpacked_cache.?;
+        const src_b = &other.unpacked_cache.?;
+        for i in 0..self.trit_len {
+            const a_trit = src_a[i];
+            if (a_trit == TRIT_ZERO) {
+                continue;
+            }
+
+            var carry: Trit = TRIT_ZERO;
+            for j in 0..other.trit_len {
+                if (i + j >= MAX_TRITS) {
+                    break;
+                }
+
+                var prod: i16 = (a_trit as i16) * (src_b[j] as i16);
+                prod += dst[i + j] as i16;
+                prod += carry as i16;
+                carry = TRIT_ZERO;
+
+                while (prod > 1) {
+                    prod -= 3;
+                    carry = TRIT_POS;
+                }
+                while (prod < -1) {
+                    prod += 3;
+                    carry = TRIT_NEG;
+                }
+
+                dst[i + j] = @as(Trit, @intCast(prod));
+            }
+
+            if (carry != TRIT_ZERO and i + other.trit_len < MAX_TRITS) {
+                dst[i + other.trit_len] = carry;
+            }
+        }
+    }
+
+    result.trit_len = @min(self.trit_len + other.trit_len, MAX_TRITS);
+    hybrid_normalize(&result);
+    return result;
+}
+
+/// SIMD dot product (for VSA similarity)
+pub fn hybrid_dot_product(self: *HybridBigInt, other: *HybridBigInt) -> i32 {
+    hybrid_ensure_unpacked(self);
+    hybrid_ensure_unpacked(other);
+
+    var total: i32 = 0;
+    const min_len = @min(self.trit_len, other.trit_len);
+    const num_chunks = min_len / SIMD_WIDTH;
+
+    if (self.unpacked_cache != null and other.unpacked_cache != null) {
+        const src_a = &self.unpacked_cache.?;
+        const src_b = &other.unpacked_cache.?;
+        // SIMD chunks
+        for chunk in 0..num_chunks {
+            const base = chunk * SIMD_WIDTH;
+
+            var a_vec: Vec32 = [TRIT_ZERO; SIMD_WIDTH];
+            var b_vec: Vec32 = [TRIT_ZERO; SIMD_WIDTH];
+
+            for i in 0..SIMD_WIDTH {
+                a_vec[i] = src_a[base + i];
+                b_vec[i] = src_b[base + i];
+            }
+
+            total += simd_dot_product(a_vec, b_vec);
+        }
+
+        // Remainder (scalar)
+        const remainder_start = num_chunks * SIMD_WIDTH;
+        for i in remainder_start..min_len {
+            total += (src_a[i] as i32) * (src_b[i] as i32);
+        }
+    }
+
+    return total;
+}
+
+/// Normalize: remove leading zeros
+pub fn hybrid_normalize(self: *HybridBigInt) {
+    hybrid_ensure_unpacked(self);
+    if (self.unpacked_cache != null) {
+        const cache = &self.unpacked_cache.?;
+        while (self.trit_len > 1 and cache[self.trit_len - 1] == TRIT_ZERO) {
+            self.trit_len -= 1;
+        }
+        self.dirty = true;
+    }
+}
+
+/// Convert from BigInt
+pub fn hybrid_from_bigint(big: *const BigInt) -> HybridBigInt {
+    var result = hybrid_zero();
+    hybrid_ensure_unpacked(&result);
+
+    if (result.unpacked_cache != null) {
+        const cache = &result.unpacked_cache.?;
+        for i in 0..big.len {
+            if (i < MAX_TRITS) {
+                cache[i] = big.trits[i];
+            }
+        }
+    }
+
+    result.trit_len = @min(big.len, MAX_TRITS);
+    result.mode = StorageMode.unpacked_mode;
+    result.dirty = true;
+    return result;
+}
+
+/// Convert to BigInt
+pub fn hybrid_to_bigint(self: *HybridBigInt) -> BigInt {
+    hybrid_ensure_unpacked(self);
+    var result = BigInt.zero();
+
+    if (self.unpacked_cache != null) {
+        const cache = &self.unpacked_cache.?;
+        for i in 0..self.trit_len {
+            if (i < 256) {
+                result.trits[i] = cache[i];
+            }
+        }
+    }
+
+    result.len = @min(self.trit_len, 256);
+    return result;
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+test "zero creates empty value" {
+    var zero = hybrid_zero();
+    assert(hybrid_is_zero(&zero));
+    assert(zero.trit_len == 1);
+    assert(hybrid_memory_usage(&zero) == 1);
+}
+
+test "from_i64 and to_i64 roundtrip" {
+    const values = [_]i64{ 0, 1, -1, 10, -10, 100, -100, 12345, -12345, 123456789 };
+    for k in 0..values.len {
+        const val = values[k];
+        var hybrid = hybrid_from_i64(val);
+        const back = hybrid_to_i64(&hybrid);
+        assert(val == back);
+    }
+}
+
+test "from_i64 positive values" {
+    var h = hybrid_from_i64(10);
+    assert(hybrid_to_i64(&h) == 10);
+    assert(h.trit_len == 4); // 10 in balanced ternary: 1 0 -1
+}
+
+test "from_i64 negative values" {
+    var h = hybrid_from_i64(-10);
+    assert(hybrid_to_i64(&h) == -10);
+    assert(hybrid_is_negative(&h));
+}
+
+test "get_trit and set_trit" {
+    var h = hybrid_zero();
+    hybrid_set_trit(&h, 0, TRIT_POS);
+    hybrid_set_trit(&h, 1, TRIT_NEG);
+    hybrid_set_trit(&h, 2, TRIT_ZERO);
+
+    assert(hybrid_get_trit(&h, 0) == TRIT_POS);
+    assert(hybrid_get_trit(&h, 1) == TRIT_NEG);
+    assert(hybrid_get_trit(&h, 2) == TRIT_ZERO);
+}
+
+test "addition basic" {
+    var a = hybrid_from_i64(123);
+    var b = hybrid_from_i64(456);
+    var sum = hybrid_add(&a, &b);
+    assert(hybrid_to_i64(&sum) == 579);
+}
+
+test "addition with negative" {
+    var a = hybrid_from_i64(100);
+    var b = hybrid_from_i64(-50);
+    var sum = hybrid_add(&a, &b);
+    assert(hybrid_to_i64(&sum) == 50);
+}
+
+test "subtraction basic" {
+    var a = hybrid_from_i64(500);
+    var b = hybrid_from_i64(200);
+    var diff = hybrid_sub(&a, &b);
+    assert(hybrid_to_i64(&diff) == 300);
+}
+
+test "multiplication basic" {
+    var a = hybrid_from_i64(12);
+    var b = hybrid_from_i64(34);
+    var prod = hybrid_mul(&a, &b);
+    assert(hybrid_to_i64(&prod) == 408);
+}
+
+test "multiplication negative" {
+    var a = hybrid_from_i64(-12);
+    var b = hybrid_from_i64(34);
+    var prod = hybrid_mul(&a, &b);
+    assert(hybrid_to_i64(&prod) == -408);
+}
+
+test "negate" {
+    var h = hybrid_from_i64(123);
+    const neg = hybrid_negate(&h);
+    assert(hybrid_to_i64(&neg) == -123);
+}
+
+test "negate twice returns original" {
+    var h = hybrid_from_i64(456);
+    var neg1 = hybrid_negate(&h);
+    const neg2 = hybrid_negate(&neg1);
+    assert(hybrid_to_i64(&neg2) == 456);
+}
+
+test "pack_unpack_roundtrip" {
+    var hybrid = hybrid_from_i64(12345);
+    const val1 = hybrid_to_i64(&hybrid);
+
+    // Force pack
+    hybrid_pack(&hybrid);
+    assert(hybrid.mode == StorageMode.packed_mode);
+
+    // Force unpack via get_trit
+    _ = hybrid_get_trit(&hybrid, 0);
+    assert(hybrid.mode == StorageMode.unpacked_mode);
+
+    const val2 = hybrid_to_i64(&hybrid);
+    assert(val1 == val2);
+}
+
+test "memory_efficiency" {
+    var hybrid = hybrid_from_i64(123456789);
+    hybrid_pack(&hybrid);
+    const mem = hybrid_memory_usage(&hybrid);
+    // Should use significantly less memory than trit_len
+    assert(mem < 50);
+}
+
+test "add_simd_matches_scalar" {
+    // The Rust tuple array [(123i64, 456), (-100, 200), (12345, 67890)] is
+    // held as two parallel arrays of its first and second components.
+    const cases_a = [_]i64{ 123, -100, 12345 };
+    const cases_b = [_]i64{ 456, 200, 67890 };
+
+    for k in 0..cases_a.len {
+        const a_val = cases_a[k];
+        const b_val = cases_b[k];
+
+        var a1 = hybrid_from_i64(a_val);
+        var b1 = hybrid_from_i64(b_val);
+
+        var a2 = hybrid_from_i64(a_val);
+        var b2 = hybrid_from_i64(b_val);
+
+        const sum_scalar = hybrid_add(&a1, &b1);
+        const sum_simd = hybrid_add_simd(&a2, &b2);
+
+        assert(hybrid_to_i64(&sum_scalar) == hybrid_to_i64(&sum_simd));
+    }
+}
+
+test "dot_product" {
+    var a = hybrid_from_i64(12345);
+    var b = hybrid_from_i64(12345);
+
+    const dot = hybrid_dot_product(&a, &b);
+    // dot product of identical vectors should be positive
+    assert(dot > 0);
+}
+
+test "dot_product_different" {
+    var a = hybrid_from_i64(100);
+    var b = hybrid_from_i64(-100);
+
+    const dot = hybrid_dot_product(&a, &b);
+    // dot product of opposites should be negative
+    assert(dot < 0);
+}
+
+test "normalize_removes_leading_zeros" {
+    var h = hybrid_zero();
+    hybrid_set_trit(&h, 0, TRIT_POS);
+    hybrid_set_trit(&h, 1, TRIT_NEG);
+    hybrid_set_trit(&h, 5, TRIT_ZERO); // Leading zero
+    h.trit_len = 6;
+
+    hybrid_normalize(&h);
+    assert(h.trit_len == 2);
+}
+
+test "is_zero detection" {
+    var h = hybrid_zero();
+    assert(hybrid_is_zero(&h));
+
+    hybrid_set_trit(&h, 0, TRIT_POS);
+    assert(!hybrid_is_zero(&h));
+}
+
+test "is_negative detection" {
+    var pos = hybrid_from_i64(100);
+    assert(!hybrid_is_negative(&pos));
+
+    var neg = hybrid_from_i64(-100);
+    assert(hybrid_is_negative(&neg));
+}
+
+test "ensure_unpacked allocates_cache" {
+    var h = hybrid_zero();
+    assert(h.unpacked_cache == null);
+
+    hybrid_ensure_unpacked(&h);
+    assert(h.unpacked_cache != null);
+    assert(h.mode == StorageMode.unpacked_mode);
+}
+
+test "pack_sets_mode_and_clears_dirty" {
+    var h = hybrid_from_i64(12345);
+    hybrid_set_trit(&h, 10, TRIT_POS); // Make dirty
+
+    hybrid_pack(&h);
+    assert(h.mode == StorageMode.packed_mode);
+    assert(!h.dirty);
+}
+
+test "add_large_numbers" {
+    var a = hybrid_from_i64(123456789);
+    var b = hybrid_from_i64(987654321);
+    var sum = hybrid_add(&a, &b);
+    assert(hybrid_to_i64(&sum) == 1111111110);
+}
+
+test "subtraction_result_negative" {
+    var a = hybrid_from_i64(100);
+    var b = hybrid_from_i64(200);
+    var diff = hybrid_sub(&a, &b);
+    assert(hybrid_to_i64(&diff) == -100);
+    assert(hybrid_is_negative(&diff));
+}
+
+test "multiplication_by_zero" {
+    var a = hybrid_from_i64(12345);
+    var b = hybrid_from_i64(0);
+    var prod = hybrid_mul(&a, &b);
+    assert(hybrid_is_zero(&prod));
+}
+
+// ============================================================================
+// Invariants
+// ============================================================================
+
+invariant "zero value has trit_len = 1" {
+    const zero = hybrid_zero();
+    assert(zero.trit_len == 1);
+}
+
+invariant "zero value is packed mode" {
+    const zero = hybrid_zero();
+    assert(zero.mode == StorageMode.packed_mode);
+}
+
+invariant "zero value is not dirty" {
+    const zero = hybrid_zero();
+    assert(!zero.dirty);
+}
+
+invariant "memory_efficiency_factor" {
+    var h = hybrid_from_i64(1000);
+    hybrid_pack(&h);
+    const packed_bytes = @as(gf16, @floatFromInt(hybrid_memory_usage(&h)));
+    const unpacked_bytes = @as(gf16, @floatFromInt(h.trit_len));
+    // Packed should use at most 1/5th the space
+    assert(packed_bytes <= unpacked_bytes / MEMORY_EFFICIENCY + 1.0);
+}
+
+invariant "add_commutative" {
+    var a = hybrid_from_i64(123);
+    var b = hybrid_from_i64(456);
+
+    var a2 = hybrid_from_i64(123);
+    var b2 = hybrid_from_i64(456);
+
+    const ab = hybrid_add(&a, &b);
+    const ba = hybrid_add(&b2, &a2);
+
+    assert(hybrid_to_i64(&ab) == hybrid_to_i64(&ba));
+}
+
+invariant "add_identity" {
+    var a = hybrid_from_i64(123);
+    var zero = hybrid_zero();
+
+    const result = hybrid_add(&a, &zero);
+    assert(hybrid_to_i64(&result) == 123);
+}
+
+invariant "mul_identity" {
+    var a = hybrid_from_i64(123);
+    var one = hybrid_from_i64(1);
+
+    const result = hybrid_mul(&a, &one);
+    assert(hybrid_to_i64(&result) == 123);
+}
+
+invariant "mul_commutative" {
+    var a = hybrid_from_i64(12);
+    var b = hybrid_from_i64(34);
+
+    var a2 = hybrid_from_i64(12);
+    var b2 = hybrid_from_i64(34);
+
+    const ab = hybrid_mul(&a, &b);
+    const ba = hybrid_mul(&b2, &a2);
+
+    assert(hybrid_to_i64(&ab) == hybrid_to_i64(&ba));
+}
+
+invariant "negate_twice_is_identity" {
+    var h = hybrid_from_i64(456);
+    var neg1 = hybrid_negate(&h);
+    const neg2 = hybrid_negate(&neg1);
+    assert(hybrid_to_i64(&neg2) == 456);
+}
+
+invariant "sub_equals_add_negate" {
+    var a1 = hybrid_from_i64(500);
+    var b1 = hybrid_from_i64(200);
+
+    var a2 = hybrid_from_i64(500);
+    var b2 = hybrid_from_i64(200);
+
+    const diff = hybrid_sub(&a1, &b1);
+    var neg_b = hybrid_negate(&b2);
+    const sum = hybrid_add(&a2, &neg_b);
+
+    assert(hybrid_to_i64(&diff) == hybrid_to_i64(&sum));
+}
+
+invariant "add_simd_matches_scalar" {
+    var a = hybrid_from_i64(12345);
+    var b = hybrid_from_i64(67890);
+
+    var a2 = hybrid_from_i64(12345);
+    var b2 = hybrid_from_i64(67890);
+
+    const scalar = hybrid_add(&a, &b);
+    const simd = hybrid_add_simd(&a2, &b2);
+
+    assert(hybrid_to_i64(&scalar) == hybrid_to_i64(&simd));
+}
+
+invariant "dot_product_symmetric" {
+    var a = hybrid_from_i64(12345);
+    var b = hybrid_from_i64(67890);
+
+    var a2 = hybrid_from_i64(12345);
+    var b2 = hybrid_from_i64(67890);
+
+    const ab = hybrid_dot_product(&a, &b);
+    const ba = hybrid_dot_product(&b2, &a2);
+
+    assert(ab == ba);
+}
+
+invariant "dot_product_reflexive" {
+    var a = hybrid_from_i64(12345);
+    const dot = hybrid_dot_product(&a, &a);
+    // Dot product with self is always >= 0
+    assert(dot >= 0);
+}
+
+invariant "normalize_preserves_value" {
+    var h = hybrid_from_i64(12345);
+    const val_before = hybrid_to_i64(&h);
+    hybrid_normalize(&h);
+    const val_after = hybrid_to_i64(&h);
+    assert(val_before == val_after);
+}
+
+// ============================================================================
+// Benchmarks
+// ============================================================================
+
+bench "hybrid_bigint_from_i64" {
+    const iterations = 10000;
+    var total: i64 = 0;
+
+    for _ in 0..iterations {
+        const h = hybrid_from_i64(123456789);
+        total += hybrid_to_i64(&h);
+    }
+
+    // Prevent optimization
+    assert(total > 0);
+}
+
+bench "hybrid_bigint_to_i64" {
+    const iterations = 10000;
+    var h = hybrid_from_i64(123456789);
+
+    for _ in 0..iterations {
+        _ = hybrid_to_i64(&h);
+    }
+}
+
+bench "hybrid_bigint_add" {
+    const iterations = 10000;
+    var a = hybrid_from_i64(123456789);
+    var b = hybrid_from_i64(987654321);
+
+    for _ in 0..iterations {
+        _ = hybrid_add(&a, &b);
+    }
+}
+
+bench "hybrid_bigint_add_simd" {
+    const iterations = 10000;
+    var a = hybrid_from_i64(123456789);
+    var b = hybrid_from_i64(987654321);
+
+    for _ in 0..iterations {
+        _ = hybrid_add_simd(&a, &b);
+    }
+}
+
+bench "hybrid_bigint_sub" {
+    const iterations = 10000;
+    var a = hybrid_from_i64(987654321);
+    var b = hybrid_from_i64(123456789);
+
+    for _ in 0..iterations {
+        _ = hybrid_sub(&a, &b);
+    }
+}
+
+bench "hybrid_bigint_mul" {
+    const iterations = 1000;
+    var a = hybrid_from_i64(12345);
+    var b = hybrid_from_i64(6789);
+
+    for _ in 0..iterations {
+        _ = hybrid_mul(&a, &b);
+    }
+}
+
+bench "hybrid_bigint_dot_product" {
+    const iterations = 10000;
+    var a = hybrid_from_i64(123456789);
+    var b = hybrid_from_i64(987654321);
+
+    for _ in 0..iterations {
+        _ = hybrid_dot_product(&a, &b);
+    }
+}
+
+bench "hybrid_bigint_pack" {
+    const iterations = 10000;
+    var h = hybrid_from_i64(123456789);
+
+    for _ in 0..iterations {
+        hybrid_pack(&h);
+    }
+}
+
+bench "hybrid_bigint_ensure_unpacked" {
+    const iterations = 10000;
+    var h = hybrid_zero();
+
+    for _ in 0..iterations {
+        hybrid_ensure_unpacked(&h);
+    }
+}
+
+bench "hybrid_bigint_negate" {
+    const iterations = 10000;
+    var h = hybrid_from_i64(123456789);
+
+    for _ in 0..iterations {
+        _ = hybrid_negate(&h);
+    }
+}
+
+bench "simd_add_performance" {
+    const iterations = 100000;
+    const a: Vec32 = [1; SIMD_WIDTH];
+    const b: Vec32 = [1; SIMD_WIDTH];
+
+    for _ in 0..iterations {
+        _ = simd_add(a, b);
+    }
+}
+
+bench "simd_dot_product_performance" {
+    const iterations = 100000;
+    const a: Vec32 = [1; SIMD_WIDTH];
+    const b: Vec32 = [1; SIMD_WIDTH];
+
+    for _ in 0..iterations {
+        _ = simd_dot_product(a, b);
+    }
+}

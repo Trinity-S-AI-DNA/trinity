@@ -1,0 +1,437 @@
+// SPDX-License-Identifier: Apache-2.0
+// Port of scripts/gen_w384_lean.py (issue #6080).
+//
+// The original appends four Wave Loop 384 theorems to
+// proofs/lean4/Trinity/TernaryInference.lean. This port builds the SAME text,
+// byte for byte, into caller-supplied byte buffers: t27 has no string
+// concatenation, f-strings or growable lists, so every function that returned
+// a str in Python writes it into `buf` starting at `pos` and returns the new
+// end position, and a function that returned a (str, str) tuple writes into
+// two buffers and returns both lengths.
+//
+// What differs from the original, and why:
+// - var_names(n) returned list[str]. Every caller either joins that list
+//   (" ".join, " + ".join) or walks it as activations, so var_names here
+//   writes the n names joined by `sep`; an activation list is a list of name
+//   ordinals (k = the k-th name), rendered by put_name.
+// - main() reads and rewrites the Lean file and prints; that I/O keeps the
+//   name main with an `undefined;` body that no test calls. Its two
+//   decisions are ported and tested: already_present (the idempotence check)
+//   and w384_appendix (the exact text main appends).
+// - The two docstrings contain U+2200 (FOR ALL). Sources here are ASCII only
+//   (law L3), so put_forall writes its UTF-8 bytes 0xE2 0x88 0x80.
+module gen_w384_lean {
+    const WEIGHT_PLUS: str = "plus";
+    const MAX_ACTS: usize = 128;
+
+    // ---- byte-buffer helpers -------------------------------------------
+
+    // Copies s into buf at pos; returns the end position.
+    fn put(buf: []u8, pos: usize, s: []const u8) -> usize {
+        var i: usize = 0;
+        while (i < s.len) {
+            buf[pos + i] = s[i];
+            i += 1;
+        }
+        return pos + s.len;
+    }
+
+    // UTF-8 for U+2200, the FOR ALL sign in two of the docstrings.
+    fn put_forall(buf: []u8, pos: usize) -> usize {
+        buf[pos] = 0xE2;
+        buf[pos + 1] = 0x88;
+        buf[pos + 2] = 0x80;
+        return pos + 3;
+    }
+
+    // Does `needle` occur in `hay`? (Python's `needle in text`.)
+    fn contains(hay: []const u8, needle: []const u8) -> bool {
+        if (needle.len > hay.len) {
+            return false;
+        }
+        var i: usize = 0;
+        while (i + needle.len <= hay.len) {
+            var j: usize = 0;
+            while (j < needle.len and hay[i + j] == needle[j]) {
+                j += 1;
+            }
+            if (j == needle.len) {
+                return true;
+            }
+            i += 1;
+        }
+        return false;
+    }
+
+    // FNV-1a 32-bit, used by the tests to pin long generated texts.
+    fn fnv1a(s: []const u8) -> u64 {
+        var h: u64 = 2166136261;
+        var i: usize = 0;
+        while (i < s.len) {
+            h = ((h ^ (s[i] as u64)) * 16777619) % 4294967296;
+            i += 1;
+        }
+        return h;
+    }
+
+    // ---- var_names ------------------------------------------------------
+
+    // Candidate i: a..z for i < 26, then two letters aa, ab, ... az, ba, ...
+    // Returns the two letter codes; the first is 0 for a one-letter name.
+    fn candidate(i: usize) -> (u8, u8) {
+        if (i < 26) {
+            return (0, (97 + i) as u8);
+        }
+        const first = (97 + (i - 26) / 26) as u8;
+        const second = (97 + (i - 26) % 26) as u8;
+        return (first, second);
+    }
+
+    // The original's skip set: {"at", "by", "do", "if", "in", "or", "to"}.
+    fn is_skipped(first: u8, second: u8) -> bool {
+        return (first == 'a' and second == 't')
+            or (first == 'b' and second == 'y')
+            or (first == 'd' and second == 'o')
+            or (first == 'i' and second == 'f')
+            or (first == 'i' and second == 'n')
+            or (first == 'o' and second == 'r')
+            or (first == 't' and second == 'o');
+    }
+
+    // The candidate index of the k-th name (0-based) once skipped names are dropped.
+    fn name_candidate(k: usize) -> usize {
+        var produced: usize = 0;
+        var i: usize = 0;
+        while (true) {
+            const (f, s) = candidate(i);
+            if (!is_skipped(f, s)) {
+                if (produced == k) {
+                    return i;
+                }
+                produced += 1;
+            }
+            i += 1;
+        }
+        return 0;
+    }
+
+    // Writes the k-th name.
+    fn put_name(buf: []u8, pos: usize, k: usize) -> usize {
+        const (f, s) = candidate(name_candidate(k));
+        var p: usize = pos;
+        if (f != 0) {
+            buf[p] = f;
+            p += 1;
+        }
+        buf[p] = s;
+        return p + 1;
+    }
+
+    // var_names(n), joined by sep: the first n names, skipping Lean keywords.
+    pub fn var_names(n: usize, sep: []const u8, buf: []u8, pos: usize) -> usize {
+        var p: usize = pos;
+        var k: usize = 0;
+        while (k < n) {
+            if (k > 0) {
+                p = put(buf, p, sep);
+            }
+            p = put_name(buf, p, k);
+            k += 1;
+        }
+        return p;
+    }
+
+    // ---- MAC chains -----------------------------------------------------
+
+    // One wrap of the f-string `ternaryMac ({expr}) {act} (TernaryWeight.mk .{w})`
+    // happens per step. Wrapping n times is n prefixes, the base, then each
+    // step's tail in order; these two write those pieces.
+    fn put_prefixes(buf: []u8, pos: usize, n: usize) -> usize {
+        var p: usize = pos;
+        var i: usize = 0;
+        while (i < n) {
+            p = put(buf, p, "ternaryMac (");
+            i += 1;
+        }
+        return p;
+    }
+
+    fn put_tail(buf: []u8, pos: usize, act: usize, weight: []const u8) -> usize {
+        var p: usize = put(buf, pos, ") ");
+        p = put_name(buf, p, act);
+        p = put(buf, p, " (TernaryWeight.mk .");
+        p = put(buf, p, weight);
+        return put(buf, p, ")");
+    }
+
+    // nest_mac(base, activations, weight); activations are name ordinals.
+    pub fn nest_mac(base: []const u8, activations: []const usize, weight: []const u8, buf: []u8, pos: usize) -> usize {
+        var p: usize = put_prefixes(buf, pos, activations.len);
+        p = put(buf, p, base);
+        for act in activations {
+            p = put_tail(buf, p, act, weight);
+        }
+        return p;
+    }
+
+    // plus_chain(n) -> (lhs, rhs): lhs nests n plus-weight MACs over 0, rhs is "a + b + ...".
+    pub fn plus_chain(n: usize, lhs: []u8, rhs: []u8) -> (usize, usize) {
+        var acts: [128]usize = [_]usize{0} ** 128;
+        var k: usize = 0;
+        while (k < n) {
+            acts[k] = k;
+            k += 1;
+        }
+        const nl = nest_mac("0", acts[0:n], "plus", lhs, 0);
+        const nr = var_names(n, " + ", rhs, 0);
+        return (nl, nr);
+    }
+
+    // minus_chain(n) -> (lhs, rhs): minus weights, rhs is "-(a + b + ...)".
+    pub fn minus_chain(n: usize, lhs: []u8, rhs: []u8) -> (usize, usize) {
+        var acts: [128]usize = [_]usize{0} ** 128;
+        var k: usize = 0;
+        while (k < n) {
+            acts[k] = k;
+            k += 1;
+        }
+        const nl = nest_mac("0", acts[0:n], "minus", lhs, 0);
+        var p: usize = put(rhs, 0, "-(");
+        p = var_names(n, " + ", rhs, p);
+        p = put(rhs, p, ")");
+        return (nl, p);
+    }
+
+    // cancellation_chain(depth): `depth` wraps of x with activation a, weight
+    // plus on even steps and minus on odd ones. Activation a is name ordinal 0.
+    pub fn cancellation_chain(depth: usize, buf: []u8, pos: usize) -> usize {
+        var p: usize = put_prefixes(buf, pos, depth);
+        p = put(buf, p, "x");
+        var i: usize = 0;
+        while (i < depth) {
+            const w = if (i % 2 == 0) "plus" else "minus";
+            p = put_tail(buf, p, 0, w);
+            i += 1;
+        }
+        return p;
+    }
+
+    // The inner chain() of zero_weight_closure: weight plus at step plus_idx, zero elsewhere.
+    fn zero_chain(acts: []const usize, plus_idx: usize, buf: []u8, pos: usize) -> usize {
+        var p: usize = put_prefixes(buf, pos, acts.len);
+        p = put(buf, p, "x");
+        var i: usize = 0;
+        while (i < acts.len) {
+            const w = if (i == plus_idx) "plus" else "zero";
+            p = put_tail(buf, p, acts[i], w);
+            i += 1;
+        }
+        return p;
+    }
+
+    // zero_weight_closure(before, after) -> (lhs, rhs): lhs runs the names in order,
+    // rhs the same names with the first and the last swapped; plus stays at step `before`.
+    pub fn zero_weight_closure(before: usize, after: usize, lhs: []u8, rhs: []u8) -> (usize, usize) {
+        const total = before + 1 + after;
+        var names: [128]usize = [_]usize{0} ** 128;
+        var k: usize = 0;
+        while (k < total) {
+            names[k] = k;
+            k += 1;
+        }
+        const nl = zero_chain(names[0:total], before, lhs, 0);
+        var reordered: [128]usize = names;
+        const first = reordered[0];
+        reordered[0] = reordered[total - 1];
+        reordered[total - 1] = first;
+        const nr = zero_chain(reordered[0:total], before, rhs, 0);
+        return (nl, nr);
+    }
+
+    // ---- theorem text ---------------------------------------------------
+
+    pub fn theorem_block(name: []const u8, doc: []const u8, vars: []const u8, lhs: []const u8, rhs: []const u8, buf: []u8, pos: usize) -> usize {
+        var p: usize = put(buf, pos, "/-- ");
+        p = put(buf, p, doc);
+        p = put(buf, p, " -/\n\ntheorem ");
+        p = put(buf, p, name);
+        p = put(buf, p, " (");
+        p = put(buf, p, vars);
+        p = put(buf, p, " : Int) :\n    ");
+        p = put(buf, p, lhs);
+        p = put(buf, p, " = ");
+        p = put(buf, p, rhs);
+        p = put(buf, p, " := by\n  simp [ternaryMac_eq_acc_plus_mul, ternaryMul, ternaryDecode]\n  <;> try omega\n");
+        return p;
+    }
+
+    // main()'s idempotence check: the file already carries the W384 theorems.
+    pub fn already_present(text: []const u8) -> bool {
+        return contains(text, "ternaryMacZeroWeightNineteenPairClosureGeneric");
+    }
+
+    // The exact text main() appends: "\n\n" + "\n\n".join(blocks) + "\n".
+    pub fn w384_appendix(buf: []u8) -> usize {
+        var lhs: [4096]u8 = undefined;
+        var rhs: [4096]u8 = undefined;
+        var vars: [512]u8 = undefined;
+        var doc: [256]u8 = undefined;
+        var p: usize = put(buf, 0, "\n\n");
+
+        // 62-variable plus accumulation
+        const (l1, r1) = plus_chain(62, &lhs, &rhs);
+        const v1 = var_names(62, " ", &vars, 0);
+        var d: usize = put(&doc, 0, "Generic theorem: 62-variable plus accumulation. **277 generic ");
+        d = put_forall(&doc, d);
+        d = put(&doc, d, " milestone.**");
+        p = theorem_block("ternaryMacAccumulateSixtyTwoPlusGeneric", doc[0:d], vars[0:v1], lhs[0:l1], rhs[0:r1], buf, p);
+        p = put(buf, p, "\n\n");
+
+        // 61-variable minus accumulation
+        const (l2, r2) = minus_chain(61, &lhs, &rhs);
+        const v2 = var_names(61, " ", &vars, 0);
+        p = theorem_block("ternaryMacAccumulateSixtyOneMinusGeneric", "Generic theorem: 61-variable minus accumulation lattice.", vars[0:v2], lhs[0:l2], rhs[0:r2], buf, p);
+        p = put(buf, p, "\n\n");
+
+        // depth-44 cancellation
+        const l3 = cancellation_chain(44, &lhs, 0);
+        p = theorem_block("ternaryMacQuadragintupleQuattuorCancellationGeneric", "Generic theorem: depth-44 activation cancellation. mac^44(x,a,[.plus,.minus,...]) = x.", "x a", lhs[0:l3], "x", buf, p);
+        p = put(buf, p, "\n\n");
+
+        // zero-weight closure: 19 zero before + plus + 19 zero after
+        const (l4, r4) = zero_weight_closure(19, 19, &lhs, &rhs);
+        var v4: usize = put(&vars, 0, "x ");
+        v4 = var_names(39, " ", &vars, v4);
+        d = put(&doc, 0, "Generic theorem: 19 zero-weight MACs before and after a plus-weight MAC are transparent. **280 generic ");
+        d = put_forall(&doc, d);
+        d = put(&doc, d, " milestone.**");
+        p = theorem_block("ternaryMacZeroWeightNineteenPairClosureGeneric", doc[0:d], vars[0:v4], lhs[0:l4], rhs[0:r4], buf, p);
+        return put(buf, p, "\n");
+    }
+
+    // Plumbing: reads TernaryInference.lean, returns early (with a message) when
+    // already_present, else writes text + w384_appendix and prints. No test calls it.
+    fn main() -> void {
+        undefined;
+    }
+
+    // ---- tests: every expected value below was printed by the Python original ----
+
+    test var_names_first_thirty {
+        var buf: [256]u8 = undefined;
+        const n = var_names(30, " ", &buf, 0);
+        assert(std.mem.eql(u8, buf[0:n], "a b c d e f g h i j k l m n o p q r s t u v w x y z aa ab ac ad"));
+    }
+
+    test var_names_skips_at_so_62_names_end_at_bk {
+        var buf: [512]u8 = undefined;
+        const n = var_names(62, " ", &buf, 0);
+        assert(n == 159);
+        assert(std.mem.eql(u8, buf[n - 40:n], "x ay az ba bb bc bd be bf bg bh bi bj bk"));
+        assert(!contains(buf[0:n], " at "));
+    }
+
+    test var_names_zero_is_empty {
+        var buf: [16]u8 = undefined;
+        assert(var_names(0, " ", &buf, 0) == 0);
+    }
+
+    test nest_mac_two_activations {
+        var buf: [256]u8 = undefined;
+        var acts: [2]usize = [0, 1];
+        const n = nest_mac("0", &acts, "plus", &buf, 0);
+        assert(std.mem.eql(u8, buf[0:n], "ternaryMac (ternaryMac (0) a (TernaryWeight.mk .plus)) b (TernaryWeight.mk .plus)"));
+    }
+
+    test plus_chain_two_and_sixty_two {
+        var lhs: [4096]u8 = undefined;
+        var rhs: [4096]u8 = undefined;
+        const (nl, nr) = plus_chain(2, &lhs, &rhs);
+        assert(std.mem.eql(u8, lhs[0:nl], "ternaryMac (ternaryMac (0) a (TernaryWeight.mk .plus)) b (TernaryWeight.mk .plus)"));
+        assert(std.mem.eql(u8, rhs[0:nr], "a + b"));
+        const (bl, br) = plus_chain(62, &lhs, &rhs);
+        assert(bl == 2517);
+        assert(fnv1a(lhs[0:bl]) == 1623019476);
+        assert(br == 281);
+        assert(fnv1a(rhs[0:br]) == 3108323787);
+    }
+
+    test minus_chain_two_and_sixty_one {
+        var lhs: [4096]u8 = undefined;
+        var rhs: [4096]u8 = undefined;
+        const (nl, nr) = minus_chain(2, &lhs, &rhs);
+        assert(std.mem.eql(u8, lhs[0:nl], "ternaryMac (ternaryMac (0) a (TernaryWeight.mk .minus)) b (TernaryWeight.mk .minus)"));
+        assert(std.mem.eql(u8, rhs[0:nr], "-(a + b)"));
+        const (bl, br) = minus_chain(61, &lhs, &rhs);
+        assert(bl == 2537);
+        assert(fnv1a(lhs[0:bl]) == 1845576666);
+        assert(br == 279);
+        assert(fnv1a(rhs[0:br]) == 1688644695);
+    }
+
+    test cancellation_chain_alternates_plus_and_minus {
+        var buf: [4096]u8 = undefined;
+        const n0 = cancellation_chain(0, &buf, 0);
+        assert(std.mem.eql(u8, buf[0:n0], "x"));
+        const n2 = cancellation_chain(2, &buf, 0);
+        assert(std.mem.eql(u8, buf[0:n2], "ternaryMac (ternaryMac (x) a (TernaryWeight.mk .plus)) a (TernaryWeight.mk .minus)"));
+        const n44 = cancellation_chain(44, &buf, 0);
+        assert(n44 == 1783);
+        assert(fnv1a(buf[0:n44]) == 3448531167);
+    }
+
+    test zero_weight_closure_swaps_first_and_last {
+        var lhs: [4096]u8 = undefined;
+        var rhs: [4096]u8 = undefined;
+        const (nl, nr) = zero_weight_closure(1, 1, &lhs, &rhs);
+        assert(std.mem.eql(u8, lhs[0:nl], "ternaryMac (ternaryMac (ternaryMac (x) a (TernaryWeight.mk .zero)) b (TernaryWeight.mk .plus)) c (TernaryWeight.mk .zero)"));
+        assert(std.mem.eql(u8, rhs[0:nr], "ternaryMac (ternaryMac (ternaryMac (x) c (TernaryWeight.mk .zero)) b (TernaryWeight.mk .plus)) a (TernaryWeight.mk .zero)"));
+        const (bl, br) = zero_weight_closure(19, 19, &lhs, &rhs);
+        assert(bl == 1574);
+        assert(br == 1574);
+        assert(fnv1a(lhs[0:bl]) == 4220783399);
+        assert(fnv1a(rhs[0:br]) == 1586472753);
+    }
+
+    test theorem_block_layout {
+        var buf: [512]u8 = undefined;
+        const n = theorem_block("T", "D", "x a", "L", "R", &buf, 0);
+        assert(std.mem.eql(u8, buf[0:n], "/-- D -/\n\ntheorem T (x a : Int) :\n    L = R := by\n  simp [ternaryMac_eq_acc_plus_mul, ternaryMul, ternaryDecode]\n  <;> try omega\n"));
+    }
+
+    test main_appends_the_exact_w384_text {
+        // 11964 characters in Python, 11968 UTF-8 bytes (two U+2200 signs).
+        var buf: [16384]u8 = undefined;
+        const n = w384_appendix(&buf);
+        assert(n == 11968);
+        assert(fnv1a(buf[0:n]) == 3649620679);
+        assert(already_present(buf[0:n]));
+    }
+
+    test name_helpers_match_the_python_loop {
+        const (f0, s0) = candidate(0);
+        assert(f0 == 0);
+        assert(s0 == 'a');
+        const (f45, s45) = candidate(45);
+        assert(f45 == 'a');
+        assert(s45 == 't');
+        assert(is_skipped('a', 't'));
+        assert(is_skipped('t', 'o'));
+        assert(!is_skipped('a', 's'));
+        // "at" is candidate 45: name 45 is "au", candidate 46
+        assert(name_candidate(44) == 44);
+        assert(name_candidate(45) == 46);
+        var buf: [8]u8 = undefined;
+        const n = put_name(&buf, 0, 45);
+        assert(std.mem.eql(u8, buf[0:n], "au"));
+        const m = put_forall(&buf, 0);
+        assert(m == 3);
+        assert(buf[0] == 0xE2);
+    }
+
+    test already_present_guards_a_second_run {
+        assert(!already_present(""));
+        assert(!already_present("theorem ternaryMacAccumulateSixtyTwoPlusGeneric"));
+        assert(already_present("x\ntheorem ternaryMacZeroWeightNineteenPairClosureGeneric (x a"));
+    }
+}

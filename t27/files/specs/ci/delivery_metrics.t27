@@ -1,0 +1,324 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/ci/delivery_metrics.t27 -- what t27 counts as delivery speed and delivery damage, DORA style
+; (epic gHashTag/t27#6595, item H). One home for the definitions; a report or a dashboard that measures
+; lead time, red time or change failure reads them from here and does not restate them.
+; --
+; Definitions, stated where they live:
+; - LEAD TIME of a pull request is merged_at minus created_at, in whole minutes. Only merged pull requests
+;   count; one closed without a merge has no lead time. A draft counts from creation, not from "ready".
+; - AUTHOR KIND: a BEE pull request is one the Queen published (head branch queen-<issue>, or a body that
+;   names tools/queen/publish.py); BOT is dependabot; AGENT is any other one whose body carries an agent
+;   footer ("Generated with", a Claude co-author line, Codex) or whose author is the agent account
+;   dmitrii-f-t27; OWNER is what is left. Every account here is the owner's, so the kind is read from the
+;   pull request, not from the login.
+; - RED TIME of one check is measured on master's first-parent history. At each master commit the check's
+;   state is the conclusion of its latest completed run there. failure, timed_out, startup_failure and
+;   action_required are RED; success is GREEN; cancelled, skipped, neutral and "no run on this commit"
+;   keep the previous state (a cancelled run was superseded, a path filter skipped it). Red time runs from
+;   the commit time of the commit that turned it red to the commit time of the next commit that turned it
+;   green, or to the end of the window. "Master red" is red time of the union of the REQUIRED checks of
+;   the ruleset t27-master-protection (validate, check-linked-issue, parse-ratchet).
+; - CHANGE FAILURE: a merged pull request M failed if a pull request merged within FIX_WINDOW_MIN after
+;   M, whose title starts with revert, fix or hotfix, names M (#M or M's merge sha) other than as
+;   "Closes #M". A revert of M counts whatever its timing. This is an upper bound on damage: a fix that
+;   names M only to say "the follow-up to M" is counted too.
+; - BEE RUN WITH NO DIFF: a queen-<issue> branch whose tip has no commit ahead of master and was not
+;   written by the bee (Trinity Bee or queen-publisher[bot]), or whose commits ahead cancel to an empty
+;   diff. A tip written by the bee with nothing ahead is LANDED (merged with a merge commit), not empty.
+;   One branch per issue: a re-run reuses the branch, so this counts issues, not runs.
+; --
+; The measured constants below are 2026-10-05, window 2026-09-28T18:57Z .. 2026-10-05T18:57Z, read with gh
+; and the Queen's public endpoints; the table and the method are in docs/now/2026-10-05-delivery-metrics.md.
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module CiDeliveryMetrics;
+
+use compiler::theory::toolchain;
+
+/// Author kinds.
+pub const KIND_BEE : u8 = 0;
+pub const KIND_AGENT : u8 = 1;
+pub const KIND_OWNER : u8 = 2;
+pub const KIND_BOT : u8 = 3;
+
+/// Check-run conclusions as GitHub names them, plus "no completed run on this commit".
+pub const C_SUCCESS : u8 = 0;
+pub const C_FAILURE : u8 = 1;
+pub const C_TIMED_OUT : u8 = 2;
+pub const C_STARTUP_FAILURE : u8 = 3;
+pub const C_ACTION_REQUIRED : u8 = 4;
+pub const C_CANCELLED : u8 = 5;
+pub const C_SKIPPED : u8 = 6;
+pub const C_NEUTRAL : u8 = 7;
+pub const C_NO_RUN : u8 = 8;
+
+/// What a queen-<issue> branch holds.
+pub const RUN_WORK : u8 = 0;
+pub const RUN_LANDED : u8 = 1;
+pub const RUN_EMPTY : u8 = 2;
+
+/// The window every metric is taken over, and the fix window of a change failure.
+pub const WINDOW_DAYS : u32 = 7;
+pub const FIX_WINDOW_MIN : u32 = 1440;
+
+/// Alert thresholds. A metric alerts when it is strictly past its threshold.
+pub const LEAD_P90_ALERT_MIN : u32 = 1440;
+pub const REQUIRED_RED_ALERT_MIN : u32 = 60;
+pub const CHECK_RED_ALERT_MIN : u32 = 2880;
+pub const CHANGE_FAILURE_ALERT_PERMILLE : u32 = 150;
+pub const OPEN_STALE_DAYS : u32 = 7;
+pub const OPEN_STALE_ALERT_PERMILLE : u32 = 250;
+pub const BEE_EMPTY_ALERT_PERMILLE : u32 = 200;
+/// Merges per day, times ten. Fewer than one merge a day alerts.
+pub const MERGES_PER_DAY_FLOOR_X10 : u32 = 10;
+
+/// Measured 2026-10-05 (see the header). Minutes, counts, and permille.
+pub const M_MERGED : u32 = 442;
+pub const M_MERGED_BEE : u32 = 153;
+pub const M_MERGED_AGENT : u32 = 276;
+pub const M_MERGED_OWNER : u32 = 5;
+pub const M_MERGED_BOT : u32 = 8;
+pub const M_LEAD_MEDIAN_ALL_MIN : u32 = 18;
+pub const M_LEAD_P90_ALL_MIN : u32 = 938;
+pub const M_LEAD_MEDIAN_BEE_MIN : u32 = 6;
+pub const M_LEAD_P90_BEE_MIN : u32 = 1113;
+pub const M_LEAD_MEDIAN_AGENT_MIN : u32 = 26;
+pub const M_LEAD_P90_AGENT_MIN : u32 = 460;
+pub const M_LEAD_MEDIAN_OWNER_MIN : u32 = 22421;
+pub const M_LEAD_P90_OWNER_MIN : u32 = 23663;
+pub const M_REVERTED : u32 = 0;
+pub const M_FIX_NAMES_IT : u32 = 40;
+pub const M_REQUIRED_RED_MIN : u32 = 0;
+pub const M_SCORECARD_RED_MIN : u32 = 10020;
+pub const M_CORPUS_RATCHET_RED_MIN : u32 = 6090;
+pub const M_GATE_TOPOLOGY_RED_MIN : u32 = 108;
+pub const M_NONREQUIRED_CHECKS_PAST_ALERT : u32 = 9;
+pub const M_OPEN : u32 = 58;
+pub const M_OPEN_OLDER_THAN_7D : u32 = 19;
+pub const M_BEE_BRANCHES_7D : u32 = 745;
+pub const M_BEE_EMPTY_7D : u32 = 417;
+pub const M_BEE_LANDED_7D : u32 = 38;
+pub const M_BEE_WORK_7D : u32 = 290;
+
+/// The author kind of one merged pull request.
+pub fn author_kind(queen_branch: bool, publisher_body: bool, is_dependabot: bool, agent_footer: bool, agent_account: bool) -> u8 {
+    if (queen_branch) { return KIND_BEE; }
+    if (publisher_body) { return KIND_BEE; }
+    if (is_dependabot) { return KIND_BOT; }
+    if (agent_footer) { return KIND_AGENT; }
+    if (agent_account) { return KIND_AGENT; }
+    return KIND_OWNER;
+}
+
+/// Lead time in minutes from two minute stamps; a merge stamped before its creation is clock skew, 0.
+pub fn lead_minutes(created_min: u32, merged_min: u32) -> u32 {
+    if (merged_min < created_min) { return 0; }
+    return merged_min - created_min;
+}
+
+/// The rank of a quantile in a sorted list of n values, times 1000: (n - 1) * q. Its integer part is
+/// the lower index, its remainder the interpolation weight of the next value (linear interpolation).
+pub fn quantile_rank_x1000(n: u32, q_permille: u32) -> u32 {
+    if (n == 0) { return 0; }
+    return (n - 1) * q_permille;
+}
+
+/// The interpolated value between the two neighbours lo <= hi, weight in permille.
+pub fn interpolate(lo: u32, hi: u32, weight_permille: u32) -> u32 {
+    return lo + ((hi - lo) * weight_permille) / 1000;
+}
+
+/// A conclusion that makes a check red.
+pub fn is_red_conclusion(c: u8) -> bool {
+    if (c == C_FAILURE) { return true; }
+    if (c == C_TIMED_OUT) { return true; }
+    if (c == C_STARTUP_FAILURE) { return true; }
+    if (c == C_ACTION_REQUIRED) { return true; }
+    return false;
+}
+
+/// The state of a check after one master commit: red, green, or what it was.
+pub fn next_red(prev_red: bool, c: u8) -> bool {
+    if (is_red_conclusion(c)) { return true; }
+    if (c == C_SUCCESS) { return false; }
+    return prev_red;
+}
+
+/// Red minutes added by one gap between consecutive master commits.
+pub fn red_minutes_for_gap(red_during_gap: bool, gap_min: u32) -> u32 {
+    if (red_during_gap) { return gap_min; }
+    return 0;
+}
+
+/// Whether merged pull request M counts as a change failure.
+pub fn is_change_failure(reverted: bool, fix_title: bool, names_m: bool, names_only_as_closes: bool, minutes_after_merge: u32) -> bool {
+    if (reverted) { return true; }
+    if (fix_title == false) { return false; }
+    if (names_m == false) { return false; }
+    if (names_only_as_closes) { return false; }
+    return minutes_after_merge <= FIX_WINDOW_MIN;
+}
+
+/// What a queen-<issue> branch holds.
+pub fn bee_branch_class(commits_ahead: u32, diff_empty: bool, tip_by_bee: bool) -> u8 {
+    if (commits_ahead == 0) {
+        if (tip_by_bee) { return RUN_LANDED; }
+        return RUN_EMPTY;
+    }
+    if (diff_empty) { return RUN_EMPTY; }
+    return RUN_WORK;
+}
+
+/// Merges per day, times ten, over the window.
+pub fn merges_per_day_x10(merged: u32, days: u32) -> u32 {
+    if (days == 0) { return 0; }
+    return (merged * 10) / days;
+}
+
+pub fn lead_alert(p90_min: u32) -> bool { return p90_min > LEAD_P90_ALERT_MIN; }
+pub fn required_red_alert(red_min: u32) -> bool { return red_min > REQUIRED_RED_ALERT_MIN; }
+pub fn check_red_alert(red_min: u32) -> bool { return red_min > CHECK_RED_ALERT_MIN; }
+pub fn change_failure_alert(permille: u32) -> bool { return permille > CHANGE_FAILURE_ALERT_PERMILLE; }
+pub fn open_stale_alert(permille: u32) -> bool { return permille > OPEN_STALE_ALERT_PERMILLE; }
+pub fn bee_empty_alert(permille: u32) -> bool { return permille > BEE_EMPTY_ALERT_PERMILLE; }
+pub fn merges_floor_alert(per_day_x10: u32) -> bool { return per_day_x10 < MERGES_PER_DAY_FLOOR_X10; }
+
+test the_kinds_add_up_to_the_merged_count {
+    assert M_MERGED_BEE + M_MERGED_AGENT + M_MERGED_OWNER + M_MERGED_BOT == M_MERGED;
+}
+
+test author_kind_reads_the_pull_request_not_the_login {
+    assert author_kind(true, false, false, true, false) == KIND_BEE;
+    assert author_kind(false, true, false, false, false) == KIND_BEE;
+    assert author_kind(false, false, true, false, false) == KIND_BOT;
+    assert author_kind(false, false, false, true, false) == KIND_AGENT;
+    assert author_kind(false, false, false, false, true) == KIND_AGENT;
+    assert author_kind(false, false, false, false, false) == KIND_OWNER;
+}
+
+test lead_time_is_merge_minus_open {
+    assert lead_minutes(100, 1540) == 1440;
+    assert lead_minutes(100, 100) == 0;
+    assert lead_minutes(200, 100) == 0;
+}
+
+test quantile_rank_matches_the_measured_lists {
+    assert quantile_rank_x1000(153, 900) == 136800;
+    assert quantile_rank_x1000(442, 500) == 220500;
+    assert quantile_rank_x1000(0, 900) == 0;
+    assert interpolate(100, 200, 500) == 150;
+    assert interpolate(100, 100, 999) == 100;
+}
+
+test today_lead_time_is_under_its_alert {
+    assert lead_alert(M_LEAD_P90_ALL_MIN) == false;
+    assert lead_alert(M_LEAD_P90_BEE_MIN) == false;
+    assert lead_alert(M_LEAD_P90_AGENT_MIN) == false;
+    assert M_LEAD_MEDIAN_BEE_MIN < M_LEAD_MEDIAN_AGENT_MIN;
+    assert M_LEAD_MEDIAN_AGENT_MIN < M_LEAD_MEDIAN_OWNER_MIN;
+}
+
+test negative_control_lead_alert_fires_one_minute_past {
+    assert lead_alert(LEAD_P90_ALERT_MIN) == false;
+    assert lead_alert(LEAD_P90_ALERT_MIN + 1);
+    assert lead_alert(M_LEAD_P90_OWNER_MIN);
+}
+
+test only_failure_kinds_turn_a_check_red {
+    assert is_red_conclusion(C_FAILURE);
+    assert is_red_conclusion(C_TIMED_OUT);
+    assert is_red_conclusion(C_STARTUP_FAILURE);
+    assert is_red_conclusion(C_ACTION_REQUIRED);
+    assert is_red_conclusion(C_SUCCESS) == false;
+    assert is_red_conclusion(C_CANCELLED) == false;
+    assert is_red_conclusion(C_SKIPPED) == false;
+}
+
+test cancelled_skipped_and_no_run_keep_the_state {
+    assert next_red(true, C_CANCELLED);
+    assert next_red(false, C_CANCELLED) == false;
+    assert next_red(true, C_SKIPPED);
+    assert next_red(true, C_NEUTRAL);
+    assert next_red(true, C_NO_RUN);
+    assert next_red(true, C_SUCCESS) == false;
+    assert next_red(false, C_FAILURE);
+}
+
+test red_time_accumulates_only_while_red {
+    var r1 : bool = next_red(false, C_FAILURE);
+    var r2 : bool = next_red(r1, C_CANCELLED);
+    var r3 : bool = next_red(r2, C_SUCCESS);
+    var total : u32 = red_minutes_for_gap(r1, 30) + red_minutes_for_gap(r2, 45) + red_minutes_for_gap(r3, 600);
+    assert total == 75;
+}
+
+test today_master_required_checks_were_never_red {
+    assert required_red_alert(M_REQUIRED_RED_MIN) == false;
+    assert required_red_alert(REQUIRED_RED_ALERT_MIN + 1);
+}
+
+test today_nonrequired_checks_past_the_red_alert {
+    assert check_red_alert(M_SCORECARD_RED_MIN);
+    assert check_red_alert(M_CORPUS_RATCHET_RED_MIN);
+    assert check_red_alert(M_GATE_TOPOLOGY_RED_MIN) == false;
+    assert M_NONREQUIRED_CHECKS_PAST_ALERT == 9;
+}
+
+test change_failure_definition {
+    assert is_change_failure(true, false, false, false, 99999);
+    assert is_change_failure(false, true, true, false, 1440);
+    assert is_change_failure(false, true, true, false, 1441) == false;
+    assert is_change_failure(false, false, true, false, 10) == false;
+    assert is_change_failure(false, true, false, false, 10) == false;
+    assert is_change_failure(false, true, true, true, 10) == false;
+}
+
+test today_change_failure_rate_is_under_its_alert {
+    var cfr : u32 = toolchain::per_mille(M_REVERTED + M_FIX_NAMES_IT, M_MERGED);
+    assert cfr == 90;
+    assert change_failure_alert(cfr) == false;
+    assert change_failure_alert(toolchain::per_mille(67, M_MERGED));
+}
+
+test today_merges_per_day {
+    assert merges_per_day_x10(M_MERGED, WINDOW_DAYS) == 631;
+    assert merges_floor_alert(merges_per_day_x10(M_MERGED, WINDOW_DAYS)) == false;
+    assert merges_floor_alert(merges_per_day_x10(6, WINDOW_DAYS));
+}
+
+test today_open_pull_requests_are_stale {
+    var stale : u32 = toolchain::per_mille(M_OPEN_OLDER_THAN_7D, M_OPEN);
+    assert stale == 327;
+    assert open_stale_alert(stale);
+    assert open_stale_alert(toolchain::per_mille(14, M_OPEN)) == false;
+}
+
+test bee_branch_classes {
+    assert bee_branch_class(0, true, false) == RUN_EMPTY;
+    assert bee_branch_class(0, true, true) == RUN_LANDED;
+    assert bee_branch_class(3, true, true) == RUN_EMPTY;
+    assert bee_branch_class(3, false, true) == RUN_WORK;
+}
+
+test today_most_bee_branches_end_with_no_diff {
+    assert M_BEE_EMPTY_7D + M_BEE_LANDED_7D + M_BEE_WORK_7D == M_BEE_BRANCHES_7D;
+    var empty : u32 = toolchain::per_mille(M_BEE_EMPTY_7D, M_BEE_BRANCHES_7D);
+    assert empty == 559;
+    assert bee_empty_alert(empty);
+    assert bee_empty_alert(toolchain::per_mille(149, M_BEE_BRANCHES_7D)) == false;
+}
+
+test share_of_nothing_is_zero {
+    assert toolchain::per_mille(5, 0) == 0;
+    assert merges_per_day_x10(5, 0) == 0;
+}
+
+invariant thresholds_are_positive_and_ordered {
+    assert FIX_WINDOW_MIN == 1440;
+    assert REQUIRED_RED_ALERT_MIN < CHECK_RED_ALERT_MIN;
+    assert CHANGE_FAILURE_ALERT_PERMILLE < 1000;
+    assert OPEN_STALE_ALERT_PERMILLE < 1000;
+    assert BEE_EMPTY_ALERT_PERMILLE < 1000;
+    assert MERGES_PER_DAY_FLOOR_X10 > 0;
+    assert WINDOW_DAYS == 7;
+}

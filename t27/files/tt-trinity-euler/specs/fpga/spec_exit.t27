@@ -1,0 +1,540 @@
+// SPDX-License-Identifier: Apache-2.0
+; spec_exit.t27 — Sacred Opcode 0xEB: Speculative Exit
+; Hardware for speculative exit and recovery
+; φ² + 1/φ² = 3 | TRINITY
+
+module sacred-spec_exit;
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+pub const OP_SPEC_EXIT : u8 = 0xEB;
+
+pub const MAX_NESTING_DEPTH : u8 = 8;
+pub const EXIT_REASON_BITS : u8 = 3;
+
+pub const EXIT_SUCCESS : u8 = 0;
+pub const EXIT_SPEC_FAIL : u8 = 1;
+pub const EXIT_TIMEOUT : u8 = 2;
+pub const EXIT_EXCEPTION : u8 = 3;
+pub const EXIT_RESOURCE : u8 = 4;
+pub const EXIT_ABORT : u8 = 5;
+pub const EXIT_RECOVER : u8 = 6;
+pub const EXIT_MAX : u8 = 7;
+
+pub const STATE_RUNNING : u8 = 0;
+pub const STATE_SPECULATING : u8 = 1;
+pub const STATE_EXITING : u8 = 2;
+pub const STATE_EXITED : u8 = 3;
+pub const STATE_RECOVERING : u8 = 4;
+pub const STATE_ERROR : u8 = 5;
+
+// ============================================================================
+// Types
+// ============================================================================
+
+pub const ExitReason = enum(u8) {
+    success = EXIT_SUCCESS,
+    spec_fail = EXIT_SPEC_FAIL,
+    timeout = EXIT_TIMEOUT,
+    exception = EXIT_EXCEPTION,
+    resource = EXIT_RESOURCE,
+    abort = EXIT_ABORT,
+    recover = EXIT_RECOVER,
+}
+
+pub const SpecState = enum(u8) {
+    running = STATE_RUNNING,
+    speculating = STATE_SPECULATING,
+    exiting = STATE_EXITING,
+    exited = STATE_EXITED,
+    recovering = STATE_RECOVERING,
+    error = STATE_ERROR,
+}
+
+pub const SpecExit = struct {
+    reason : ExitReason,
+    depth : u8,
+    checkpoint_addr : u16,
+    recovery_possible : bool,
+}
+
+pub const SpecContext = struct {
+    state : SpecState,
+    current_depth : u8,
+    spec_count : u32,
+    exit_count : u32,
+}
+
+pub const SpecConfig = struct {
+    max_depth : u8,
+    timeout_cycles : u32,
+    enable_recovery : bool,
+    checkpoint_interval : u8,
+}
+
+// ============================================================================
+// Spec State Functions
+// ============================================================================
+
+// spec_state_is_running(state: SpecState) -> bool
+// Check if state is running
+pub fn spec_state_is_running(state: SpecState) bool {
+    return state == SpecState.running;
+}
+
+// spec_state_is_speculating(state: SpecState) -> bool
+// Check if state is speculating
+pub fn spec_state_is_speculating(state: SpecState) -> bool {
+    return state == SpecState.speculating;
+}
+
+// spec_state_is_exiting(state: SpecState) -> bool
+// Check if state is exiting
+pub fn spec_state_is_exiting(state: SpecState) -> bool {
+    return state == SpecState.exiting;
+}
+
+// spec_state_is_exited(state: SpecState) -> bool
+// Check if state has exited
+pub fn spec_state_is_exited(state: SpecState) -> bool {
+    return state == SpecState.exited;
+}
+
+// spec_state_is_recovering(state: SpecState) -> bool
+// Check if state is recovering
+pub fn spec_state_is_recovering(state: SpecState) -> bool {
+    return state == SpecState.recovering;
+}
+
+// spec_state_is_terminal(state: SpecState) -> bool
+// Check if state is terminal (no further execution)
+pub fn spec_state_is_terminal(state: SpecState) bool {
+    return state == SpecState.exited or state == SpecState.error;
+}
+
+// spec_state_can_speculate(state: SpecState) -> bool
+// Check if can start speculation
+pub fn spec_state_can_speculate(state: SpecState) -> bool {
+    return state == SpecState.running or state == SpecState.recovering;
+}
+
+// ============================================================================
+// Exit Functions
+// ============================================================================
+
+// spec_exit_success(depth: u8, checkpoint: u16) -> SpecExit
+// Create successful exit
+pub fn spec_exit_success(depth: u8, checkpoint: u16) -> SpecExit {
+    return SpecExit {
+        .reason = ExitReason.success,
+        .depth = depth,
+        .checkpoint_addr = checkpoint,
+        .recovery_possible = true,
+    };
+}
+
+// spec_exit_fail(reason: ExitReason, depth: u8, checkpoint: u16, can_recover: bool) -> SpecExit
+// Create failure exit
+pub fn spec_exit_fail(reason: ExitReason, depth: u8, checkpoint: u16, can_recover: bool) -> SpecExit {
+    return SpecExit {
+        .reason = reason,
+        .depth = depth,
+        .checkpoint_addr = checkpoint,
+        .recovery_possible = can_recover,
+    };
+}
+
+// spec_exit_timeout(depth: u8, checkpoint: u16) -> SpecExit
+// Create timeout exit
+pub fn spec_exit_timeout(depth: u8, checkpoint: u16) -> SpecExit {
+    return spec_exit_fail(ExitReason.timeout, depth, checkpoint, true);
+}
+
+// spec_exit_exception(depth: u8, checkpoint: u16) -> SpecExit
+// Create exception exit
+pub fn spec_exit_exception(depth: u8, checkpoint: u16) -> SpecExit {
+    return spec_exit_fail(ExitReason.exception, depth, checkpoint, false);
+}
+
+// spec_exit_resource(depth: u8, checkpoint: u16) -> SpecExit
+// Create resource exit
+pub fn spec_exit_resource(depth: u8, checkpoint: u16) -> SpecExit {
+    return spec_exit_fail(ExitReason.resource, depth, checkpoint, true);
+}
+
+// spec_exit_abort(depth: u8) -> SpecExit
+// Create abort exit (no recovery)
+pub fn spec_exit_abort(depth: u8) -> SpecExit {
+    return SpecExit {
+        .reason = ExitReason.abort,
+        .depth = depth,
+        .checkpoint_addr = 0,
+        .recovery_possible = false,
+    };
+}
+
+// spec_exit_recover(depth: u8, checkpoint: u16) -> SpecExit
+// Create recover exit
+pub fn spec_exit_recover(depth: u8, checkpoint: u16) -> SpecExit {
+    return SpecExit {
+        .reason = ExitReason.recover,
+        .depth = depth,
+        .checkpoint_addr = checkpoint,
+        .recovery_possible = true,
+    };
+}
+
+// ============================================================================
+// Spec Context Functions
+// ============================================================================
+
+// spec_context_init() -> SpecContext
+// Initialize speculation context
+pub fn spec_context_init() -> SpecContext {
+    return SpecContext {
+        .state = SpecState.running,
+        .current_depth = 0,
+        .spec_count = 0,
+        .exit_count = 0,
+    };
+}
+
+// spec_context_enter_speculation(context: SpecContext, depth_limit: u8) -> SpecContext
+// Enter speculation
+pub fn spec_context_enter_speculation(context: SpecContext, depth_limit: u8) -> SpecContext {
+    if (!spec_state_can_speculate(context.state)) {
+        return context;
+    }
+    if (context.current_depth >= depth_limit) {
+        return context;
+    }
+
+    return SpecContext {
+        .state = SpecState.speculating,
+        .current_depth = context.current_depth + 1,
+        .spec_count = context.spec_count + 1,
+        .exit_count = context.exit_count,
+    };
+}
+
+// spec_context_exit(context: SpecContext, exit: SpecExit) -> SpecContext
+// Handle exit from speculation
+pub fn spec_context_exit(context: SpecContext, exit: SpecExit) -> SpecContext {
+    var new_state = context.state;
+
+    if (exit.reason == ExitReason.success or exit.reason == ExitReason.recover) {
+        new_state = SpecState.exiting;
+    } else if (exit.recovery_possible) {
+        new_state = SpecState.recovering;
+    } else {
+        new_state = SpecState.error;
+    }
+
+    return SpecContext {
+        .state = new_state,
+        .current_depth = if (new_state == SpecState.recovering) exit.depth else context.current_depth,
+        .spec_count = context.spec_count + 1,
+        .exit_count = context.exit_count + 1,
+    };
+}
+
+// spec_context_complete(context: SpecContext) -> SpecContext
+// Complete speculation
+pub fn spec_context_complete(context: SpecContext) -> SpecContext {
+    return SpecContext {
+        .state = SpecState.exited,
+        .current_depth = 0,
+        .spec_count = context.spec_count + 1,
+        .exit_count = context.exit_count,
+    };
+}
+
+// spec_context_check_timeout(context: SpecContext, config: SpecConfig, current_cycle: u32) -> bool
+// Check for timeout
+pub fn spec_context_check_timeout(context: SpecContext, config: SpecConfig, current_cycle: u32) -> bool {
+    if (config.timeout_cycles == 0) {
+        return false;
+    }
+    return (context.spec_count * 100) >= config.timeout_cycles;
+}
+
+// ============================================================================
+// Opcode Encoding/Decoding
+// ============================================================================
+
+// encode_spec_exit(reason: u8, depth: u8, checkpoint: u16) -> u32
+// Encode speculative exit instruction
+pub fn encode_spec_exit(reason: u8, depth: u8, checkpoint: u16) u32 {
+    // Format: [OP:8][REASON:3][DEPTH:5][CHECKPOINT:16]
+    const op : u32 = @as(u32, OP_SPEC_EXIT) << 24;
+    const reason_field : u32 = @as(u32, reason & 0x07) << 21;
+    const depth_field : u32 = @as(u32, depth & 0x1F) << 16;
+    const checkpoint_field : u32 = @as(u32, checkpoint & 0xFFFF);
+    return op | reason_field | depth_field | checkpoint_field;
+}
+
+// decode_spec_exit(encoded: u32) -> struct { reason: u8, depth: u8, checkpoint: u16 }
+// Decode speculative exit instruction
+pub fn decode_spec_exit(encoded: u32) -> struct { reason: u8, depth: u8, checkpoint: u16 } {
+    const reason : u8 = @as(u8, @truncate((encoded >> 21) & 0x07));
+    const depth : u8 = @as(u8, @truncate((encoded >> 16) & 0x1F));
+    const checkpoint : u16 = @as(u16, @truncate(encoded & 0xFFFF));
+    return .{ .reason = reason, .depth = depth, .checkpoint = checkpoint };
+}
+
+// ============================================================================
+// TDD Tests
+// ============================================================================
+
+test "max_nesting_depth_eight" {
+    assert(MAX_NESTING_DEPTH == 8);
+}
+
+test "exit_reason_constants" {
+    assert(EXIT_SUCCESS == 0);
+    assert(EXIT_ABORT == 5);
+    assert(EXIT_RECOVER == 6);
+}
+
+test "state_constants" {
+    assert(STATE_RUNNING == 0);
+    assert(STATE_EXITED == 3);
+    assert(STATE_ERROR == 5);
+}
+
+test "spec_state_is_running_true" {
+    assert(spec_state_is_running(SpecState.running) == true);
+}
+
+test "spec_state_is_running_false" {
+    assert(spec_state_is_running(SpecState.speculating) == false);
+}
+
+test "spec_state_is_terminal_true" {
+    assert(spec_state_is_terminal(SpecState.exited) == true);
+    assert(spec_state_is_terminal(SpecState.error) == true);
+}
+
+test "spec_state_is_terminal_false" {
+    assert(spec_state_is_terminal(SpecState.running) == false);
+}
+
+test "spec_state_can_speculate_true" {
+    assert(spec_state_can_speculate(SpecState.running) == true);
+    assert(spec_state_can_speculate(SpecState.recovering) == true);
+}
+
+test "spec_state_can_speculate_false" {
+    assert(spec_state_can_speculate(SpecState.exiting) == false);
+    assert(spec_state_can_speculate(SpecState.error) == false);
+}
+
+test "spec_exit_success_structure" {
+    const exit = spec_exit_success(5, 0x1000);
+    assert(exit.reason == ExitReason.success);
+    assert(exit.depth == 5);
+    assert(exit.recovery_possible == true);
+}
+
+test "spec_exit_fail_structure" {
+    const exit = spec_exit_fail(ExitReason.exception, 3, 0x2000, true);
+    assert(exit.reason == ExitReason.exception);
+    assert(exit.recovery_possible == true);
+}
+
+test "spec_exit_abort_no_recovery" {
+    const exit = spec_exit_abort(5);
+    assert(exit.reason == ExitReason.abort);
+    assert(exit.recovery_possible == false);
+}
+
+test "spec_exit_recover_structure" {
+    const exit = spec_exit_recover(3, 0x3000);
+    assert(exit.reason == ExitReason.recover);
+    assert(exit.recovery_possible == true);
+}
+
+test "spec_context_init_structure" {
+    const context = spec_context_init();
+    assert(context.state == SpecState.running);
+    assert(context.current_depth == 0);
+    assert(context.spec_count == 0);
+}
+
+test "spec_context_enter_speculation" {
+    const context = spec_context_init();
+    const result = spec_context_enter_speculation(context, 8);
+    assert(result.state == SpecState.speculating);
+    assert(result.current_depth == 1);
+}
+
+test "spec_context_enter_depth_limit" {
+    const context = spec_context_init();
+    const deep = spec_context_enter_speculation(spec_context_enter_speculation(context, 8), 8);
+    assert(deep.current_depth == 2);
+}
+
+test "spec_context_enter_depth_limit_exceeded" {
+    const context = SpecContext{.state = SpecState.running, .current_depth = 8, .spec_count = 0, .exit_count = 0};
+    const result = spec_context_enter_speculation(context, 8);
+    assert(result.current_depth == 8);
+}
+
+test "spec_context_exit_success" {
+    const context = spec_context_init();
+    const exit = spec_exit_success(5, 0x1000);
+    const result = spec_context_exit(context, exit);
+    assert(result.state == SpecState.exiting);
+}
+
+test "spec_context_exit_fail_recover" {
+    const context = spec_context_init();
+    const exit = spec_exit_fail(ExitReason.exception, 3, 0x2000, true);
+    const result = spec_context_exit(context, exit);
+    assert(result.state == SpecState.recovering);
+}
+
+test "spec_context_exit_fail_no_recover" {
+    const context = spec_context_init();
+    const exit = spec_exit_fail(ExitReason.abort, 3, 0, false);
+    const result = spec_context_exit(context, exit);
+    assert(result.state == SpecState.error);
+}
+
+test "spec_context_complete" {
+    const context = spec_context_init();
+    const result = spec_context_complete(context);
+    assert(result.state == SpecState.exited);
+    assert(result.current_depth == 0);
+}
+
+test "spec_context_check_timeout_true" {
+    const context = SpecContext{.state = SpecState.speculating, .current_depth = 3, .spec_count = 10, .exit_count = 0};
+    const config = SpecConfig{.max_depth = 8, .timeout_cycles = 500, .enable_recovery = true, .checkpoint_interval = 1};
+    assert(spec_context_check_timeout(context, config, 1000) == true);
+}
+
+test "spec_context_check_timeout_false" {
+    const context = SpecContext{.state = SpecState.speculating, .current_depth = 3, .spec_count = 1, .exit_count = 0};
+    const config = SpecConfig{.max_depth = 8, .timeout_cycles = 500, .enable_recovery = true, .checkpoint_interval = 1};
+    assert(spec_context_check_timeout(context, config, 1000) == false);
+}
+
+test "encode_spec_exit" {
+    const encoded = encode_spec_exit(1, 5, 0x1234);
+    assert((encoded >> 24) == OP_SPEC_EXIT);
+}
+
+test "decode_spec_exit" {
+    const decoded = decode_spec_exit(0xEB081234);
+    assert(decoded.reason == 1);
+    assert(decoded.depth == 5);
+    assert(decoded.checkpoint == 0x1234);
+}
+
+test "opcode_constant" {
+    assert(OP_SPEC_EXIT == 0xEB);
+}
+
+// ============================================================================
+// Invariants
+// ============================================================================
+
+invariant max_nesting_depth_eight
+    assert MAX_NESTING_DEPTH == 8
+
+invariant exit_reason_values
+    assert EXIT_SUCCESS >= 0 and EXIT_MAX <= 7
+
+invariant state_values
+    assert STATE_RUNNING >= 0 and STATE_ERROR <= 5
+
+invariant spec_exit_success_recoverable
+    given exit = spec_exit_success(0, 0x1000)
+    assert exit.recovery_possible == true
+
+invariant spec_exit_abort_not_recoverable
+    given exit = spec_exit_abort(5)
+    assert exit.recovery_possible == false
+
+invariant spec_exit_depth_bound
+    assert spec_exit_abort(0).depth == 0
+    assert spec_exit_abort(MAX_NESTING_DEPTH).depth == MAX_NESTING_DEPTH
+
+invariant spec_context_init_zero_depth
+    given context = spec_context_init()
+    assert context.current_depth == 0
+
+invariant spec_context_enter_increases_depth
+    given context = spec_context_init()
+    and result = spec_context_enter_speculation(context, 8)
+    assert result.current_depth == context.current_depth + 1
+
+invariant spec_context_exit_preserves_reason
+    given context = spec_context_init()
+    and exit = spec_exit_fail(ExitReason.exception, 3, 0x2000, true)
+    and result = spec_context_exit(context, exit)
+    assert exit.reason == ExitReason.exception
+
+invariant spec_context_complete_zero_depth
+    given context = SpecContext{.state = SpecState.running, .current_depth = 5, .spec_count = 10, .exit_count = 0}
+    and result = spec_context_complete(context)
+    assert result.current_depth == 0
+
+invariant spec_context_complete_exited_state
+    given context = spec_context_init()
+    and result = spec_context_complete(context)
+    assert result.state == SpecState.exited
+
+invariant spec_context_check_timeout_no_timeout
+    given config = SpecConfig{.max_depth = 8, .timeout_cycles = 0, .enable_recovery = true, .checkpoint_interval = 1}
+    and context = SpecContext{.state = SpecState.speculating, .current_depth = 3, .spec_count = 1000, .exit_count = 0}
+    assert spec_context_check_timeout(context, config, 1000) == false
+
+invariant spec_context_enter_speculate_requires_running_or_recovering
+    given context = SpecContext{.state = SpecState.exiting, .current_depth = 0, .spec_count = 0, .exit_count = 0}
+    assert spec_context_enter_speculation(context, 8).current_depth == 0
+
+invariant spec_context_exit_increases_exit_count
+    given context = spec_context_init()
+    and exit = spec_exit_success(0, 0x1000)
+    and result = spec_context_exit(context, exit)
+    assert result.exit_count == context.exit_count + 1
+
+// ============================================================================
+// Benchmarks
+// ============================================================================
+
+bench spec_exit_success_latency
+    measure: nanoseconds to spec_exit_success(5, 0x1000)
+    target: < 30ns
+
+bench spec_exit_fail_latency
+    measure: nanoseconds to spec_exit_fail(ExitReason.exception, 3, 0x2000, true)
+    target: < 30ns
+
+bench spec_exit_abort_latency
+    measure: nanoseconds to spec_exit_abort(5)
+    target: < 30ns
+
+bench spec_context_enter_speculation_latency
+    measure: nanoseconds to spec_context_enter_speculation(spec_context_init(), 8)
+    target: < 50ns
+
+bench spec_context_exit_latency
+    measure: nanoseconds to spec_context_exit(spec_context_init(), spec_exit_success(5, 0x1000))
+    target: < 50ns
+
+bench spec_context_check_timeout_latency
+    measure: nanoseconds to spec_context_check_timeout(.{.state = SpecState.speculating, .current_depth = 3, .spec_count = 10, .exit_count = 0}, .{.max_depth = 8, .timeout_cycles = 500, .enable_recovery = true, .checkpoint_interval = 1}, 1000)
+    target: < 30ns
+
+bench encode_spec_exit_latency
+    measure: nanoseconds to encode_spec_exit(1, 5, 0x1234)
+    target: < 30ns
+
+bench decode_spec_exit_latency
+    measure: nanoseconds to decode_spec_exit(0xEB081234)
+    target: < 30ns

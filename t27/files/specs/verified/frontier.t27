@@ -1,0 +1,175 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/verified/frontier.t27 -- the invalidation frontier: walk a dependency graph once and decide, for
+; every node, REUSE or the reason to rebuild. Epic gHashTag/t27#6655, Phase A (dependency closure and
+; invalidation semantics). The per-node rule is specs/verified/reuse.t27; this file only walks.
+; --
+; Input:
+; - n nodes in topological order: every node's imports come before it. specs/ci/affected.t27 and
+;   `t27c deps-tree` already know the `use` edges; the caller feeds them here, nothing is re-parsed.
+; - m edges as two parallel arrays: imp_from[k] imports imp_to[k] (node indices).
+; - per node: its own spec part (PART_SAME / PART_DIFF / PART_MISSING) and its sealed verdict.
+; - for the whole run: one toolchain part and one config part. A different t27c rebuilds everything.
+; Output: decision[i] for every node, and the number of nodes reused.
+; --
+; Fail closed: an edge that points at itself, forward (to a node not yet judged) or out of range means
+; the order is not topological or the graph is not this graph. The importer then gets PART_MISSING for
+; its closure and is rebuilt -- never reused on an edge nobody could check.
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module VerifiedFrontier;
+
+use verified::reuse;
+
+/// The closure part of node i: MISSING when one of its edges cannot be checked, DIFF when an import
+/// was not reused, SAME otherwise.
+pub fn closure_of(i: usize, n: usize, imp_from: []const usize, imp_to: []const usize, m: usize, decision: []const u8) -> u8 {
+    var rebuilt : bool = false;
+    var missing : bool = false;
+    var k : usize = 0;
+    while (k < m) {
+        if (imp_from[k] == i) {
+            var j : usize = imp_to[k];
+            if (j >= i or j >= n) {
+                missing = true;
+            } else {
+                if (decision[j] != REUSE) {
+                    rebuilt = true;
+                }
+            }
+        }
+        k = k + 1;
+    }
+    return closure_part(rebuilt, missing);
+}
+
+/// Judge every node in order. Returns how many were reused; decision[] holds the per-node answer.
+pub fn walk(n: usize, imp_from: []const usize, imp_to: []const usize, m: usize, spec: []const u8, verdict_pass: []const bool, toolchain: u8, config: u8, decision: []u8) -> usize {
+    var reused : usize = 0;
+    var i : usize = 0;
+    while (i < n) {
+        var c : u8 = closure_of(i, n, imp_from, imp_to, m, decision);
+        decision[i] = reuse_decision(spec[i], c, toolchain, config, verdict_pass[i]);
+        if (decision[i] == REUSE) {
+            reused = reused + 1;
+        }
+        i = i + 1;
+    }
+    return reused;
+}
+
+; The test graph, a diamond with a bystander:
+;   0 base      (imports nothing)
+;   1 left      imports 0
+;   2 right     imports 0
+;   3 top       imports 1 and 2
+;   4 bystander imports nothing
+
+test nothing_changed_everything_is_reused {
+    var from : [4]usize = [4]usize{ 1, 2, 3, 3 };
+    var to : [4]usize = [4]usize{ 0, 0, 1, 2 };
+    var spec : [5]u8 = [5]u8{ PART_SAME, PART_SAME, PART_SAME, PART_SAME, PART_SAME };
+    var ok : [5]bool = [5]bool{ true, true, true, true, true };
+    var d : [5]u8 = undefined;
+    assert walk(5, &from, &to, 4, &spec, &ok, PART_SAME, PART_SAME, &d) == 5;
+}
+
+test a_leaf_change_rebuilds_only_the_leaf {
+    var from : [4]usize = [4]usize{ 1, 2, 3, 3 };
+    var to : [4]usize = [4]usize{ 0, 0, 1, 2 };
+    var spec : [5]u8 = [5]u8{ PART_SAME, PART_SAME, PART_SAME, PART_DIFF, PART_SAME };
+    var ok : [5]bool = [5]bool{ true, true, true, true, true };
+    var d : [5]u8 = undefined;
+    assert walk(5, &from, &to, 4, &spec, &ok, PART_SAME, PART_SAME, &d) == 4;
+    assert d[3] == REBUILD_SPEC;
+    assert d[0] == REUSE;
+    assert d[1] == REUSE;
+}
+
+test a_shared_change_rebuilds_its_whole_cone_and_spares_the_bystander {
+    var from : [4]usize = [4]usize{ 1, 2, 3, 3 };
+    var to : [4]usize = [4]usize{ 0, 0, 1, 2 };
+    var spec : [5]u8 = [5]u8{ PART_DIFF, PART_SAME, PART_SAME, PART_SAME, PART_SAME };
+    var ok : [5]bool = [5]bool{ true, true, true, true, true };
+    var d : [5]u8 = undefined;
+    assert walk(5, &from, &to, 4, &spec, &ok, PART_SAME, PART_SAME, &d) == 1;
+    assert d[0] == REBUILD_SPEC;
+    assert d[1] == REBUILD_CLOSURE;
+    assert d[2] == REBUILD_CLOSURE;
+    assert d[3] == REBUILD_CLOSURE;
+    assert d[4] == REUSE;
+}
+
+test one_side_of_the_diamond_still_reaches_the_top {
+    var from : [4]usize = [4]usize{ 1, 2, 3, 3 };
+    var to : [4]usize = [4]usize{ 0, 0, 1, 2 };
+    var spec : [5]u8 = [5]u8{ PART_SAME, PART_SAME, PART_DIFF, PART_SAME, PART_SAME };
+    var ok : [5]bool = [5]bool{ true, true, true, true, true };
+    var d : [5]u8 = undefined;
+    assert walk(5, &from, &to, 4, &spec, &ok, PART_SAME, PART_SAME, &d) == 3;
+    assert d[1] == REUSE;
+    assert d[2] == REBUILD_SPEC;
+    assert d[3] == REBUILD_CLOSURE;
+}
+
+test a_toolchain_change_rebuilds_everything {
+    var from : [4]usize = [4]usize{ 1, 2, 3, 3 };
+    var to : [4]usize = [4]usize{ 0, 0, 1, 2 };
+    var spec : [5]u8 = [5]u8{ PART_SAME, PART_SAME, PART_SAME, PART_SAME, PART_SAME };
+    var ok : [5]bool = [5]bool{ true, true, true, true, true };
+    var d : [5]u8 = undefined;
+    assert walk(5, &from, &to, 4, &spec, &ok, PART_DIFF, PART_SAME, &d) == 0;
+    assert d[4] == REBUILD_TOOLCHAIN;
+}
+
+test a_failed_import_rebuilds_its_importers {
+    var from : [4]usize = [4]usize{ 1, 2, 3, 3 };
+    var to : [4]usize = [4]usize{ 0, 0, 1, 2 };
+    var spec : [5]u8 = [5]u8{ PART_SAME, PART_SAME, PART_SAME, PART_SAME, PART_SAME };
+    var ok : [5]bool = [5]bool{ true, false, true, true, true };
+    var d : [5]u8 = undefined;
+    assert walk(5, &from, &to, 4, &spec, &ok, PART_SAME, PART_SAME, &d) == 3;
+    assert d[1] == REBUILD_VERDICT;
+    assert d[3] == REBUILD_CLOSURE;
+}
+
+test negative_control_a_forward_edge_fails_closed {
+    var from : [1]usize = [1]usize{ 0 };
+    var to : [1]usize = [1]usize{ 1 };
+    var spec : [2]u8 = [2]u8{ PART_SAME, PART_SAME };
+    var ok : [2]bool = [2]bool{ true, true };
+    var d : [2]u8 = undefined;
+    assert walk(2, &from, &to, 1, &spec, &ok, PART_SAME, PART_SAME, &d) == 1;
+    assert d[0] == REBUILD_MISSING;
+    assert d[1] == REUSE;
+}
+
+test negative_control_a_self_or_out_of_range_edge_fails_closed {
+    var from : [2]usize = [2]usize{ 0, 1 };
+    var to : [2]usize = [2]usize{ 0, 9 };
+    var spec : [2]u8 = [2]u8{ PART_SAME, PART_SAME };
+    var ok : [2]bool = [2]bool{ true, true };
+    var d : [2]u8 = undefined;
+    assert walk(2, &from, &to, 2, &spec, &ok, PART_SAME, PART_SAME, &d) == 0;
+    assert d[0] == REBUILD_MISSING;
+    assert d[1] == REBUILD_MISSING;
+}
+
+test the_same_graph_gives_the_same_frontier {
+    var from : [4]usize = [4]usize{ 1, 2, 3, 3 };
+    var to : [4]usize = [4]usize{ 0, 0, 1, 2 };
+    var spec : [5]u8 = [5]u8{ PART_SAME, PART_DIFF, PART_SAME, PART_SAME, PART_MISSING };
+    var ok : [5]bool = [5]bool{ true, true, true, true, true };
+    var d1 : [5]u8 = undefined;
+    var d2 : [5]u8 = undefined;
+    assert walk(5, &from, &to, 4, &spec, &ok, PART_SAME, PART_SAME, &d1) == walk(5, &from, &to, 4, &spec, &ok, PART_SAME, PART_SAME, &d2);
+    var i : usize = 0;
+    while (i < 5) {
+        assert d1[i] == d2[i];
+        i = i + 1;
+    }
+    assert d1[4] == REBUILD_MISSING;
+}
+
+invariant reuse_is_zero {
+    assert REUSE == 0;
+}

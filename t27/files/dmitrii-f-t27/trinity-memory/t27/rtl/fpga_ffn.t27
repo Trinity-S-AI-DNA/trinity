@@ -1,0 +1,404 @@
+module TrinityFpgaFfnT27;
+// Issue #92. Reference-first, serial Q16 FFN. All numerical/control behavior
+// lives here and in ffn_wide.t27; the board adapter only wires ports.
+// Baseline2 weights, 64 trits per 128-bit word, each row padded to 64 lanes.
+// One outstanding read. x/gamma entries occupy one 128-bit word (low s32).
+// Word addresses: descriptor 0x40, scales 0x50..52, x 0x1000,
+// post gamma 0x2000, sub gamma 0x3000, gate/up/down 0x10000/60000/b0000.
+// Descriptor: low u32 run, next u32 0x46464e31. Run zero is ignored.
+// Stages h,g,u,a,s,y emit low/high u32 as lower/upper ASCII tags with index.
+// Summary: c(run, clocks including reporting), k(0, report-wait clocks),
+// k(1, memory-wait clocks), t(stage, saturations), z(run,0). Every active
+// clock falls in exactly one bucket; compute = c - k0 - k1.
+// This implements the fixed arithmetic contract, not ActQuant/bf16 execution.
+
+// Construct large constants from positive small literals. The pinned compiler
+// emits unsized decimal literals; Icarus and Verilator extend them differently.
+const SIGN32: u64 = (1 as u64) << 31;
+const MASK32: u64 = ((1 as u64) << 32) - 1;
+const HIGH32: u64 = (0 as u64) - ((1 as u64) << 32);
+const SIGN64: u64 = (1 as u64) << 63;
+const EPS32: u64 = 42950;
+const EPS64: u64 = ((42949 as u64) << 32) | ((44103 as u64) << 16) | 6984;
+var state: u32 = 0;
+var stage: u32 = 0;
+var index: u32 = 0;
+var row: u32 = 0;
+var col: u32 = 0;
+var length: u32 = 0;
+var ncols: u32 = 0;
+var nrows: u32 = 0;
+var weight_addr: u32 = 0;
+var last_run: u32 = 0;
+var run_id: u32 = 0;
+var poll: u32 = 0;
+var active: bool = false;
+var cycles: u64 = 0;
+var report_cycles: u64 = 0;
+var memory_cycles: u64 = 0;
+var report_wait: bool = false;
+var memory_wait: bool = false;
+var error_code: u32 = 0;
+var vec: [8192]u32;
+var gate: [8192]u32;
+var up: [8192]u32;
+var wide: [8192]u64;
+var sats: [6]u32;
+var scale_g: u32 = 0;
+var scale_u: u32 = 0;
+var scale_d: u32 = 0;
+var sample: u64 = 0;
+var gamma: u64 = 0;
+var product_neg: bool = false;
+var root0: u64 = 0;
+var root1: u64 = 0;
+var sum0: u64 = 0;
+var sum1: u64 = 0;
+var sum2: u32 = 0;
+var acc: u64 = 0;
+var weight0: u64 = 0;
+var weight1: u64 = 0;
+var vr: u32 = 0;
+var wr: u64 = 0;
+var gr: u32 = 0;
+var ur: u32 = 0;
+
+var wb_cyc: bool = false;
+var wb_stb: bool = false;
+var wb_addr: u32 = 0;
+var response: u32 = 0;
+var read0: u64 = 0;
+var read1: u64 = 0;
+var quiet: u32 = 0;
+
+var math_start: bool = false;
+var math_mode: u32 = 0;
+var a0: u64 = 0;
+var a1: u64 = 0;
+var a2: u64 = 0;
+var b0: u64 = 0;
+var b1: u64 = 0;
+
+var pending: bool = false;
+var ptag: u32 = 0;
+var pa: u32 = 0;
+var pb: u64 = 0;
+var after_emit: u32 = 0;
+var emit_value: u64 = 0;
+var emit_index: u32 = 0;
+var arb: u32 = 0;
+var sbuf: bool = false;
+var sb_tag: u32 = 0;
+var sb_a: u32 = 0;
+var sb_b: u64 = 0;
+var line_go: bool = false;
+var line_tag: u32 = 0;
+var line_a: u32 = 0;
+var line_b: u64 = 0;
+
+fn pick(flag: bool, a: u64, b: u64) -> u64 { if (flag) { return a; } return b; }
+fn pick32(flag: bool, a: u32, b: u32) -> u32 { if (flag) { return a; } return b; }
+fn carry(a: u64, b: u64) -> u64 { if (a+b < a) { return 1; } return 0; }
+fn sx32(v: u32) -> u64 {
+    if ((v & 2147483648) != 0) { return (v as u64) | HIGH32; }
+    return v as u64;
+}
+fn magnitude(v: u64) -> u64 { if ((v >> 63) != 0) { return 0-v; } return v; }
+fn ge(a0: u64, a1: u64, b0: u64, b1: u64) -> bool { return a1 > b1 || (a1 == b1 && a0 >= b0); }
+fn rne_up(q: u64, r0: u64, r1: u64, d0: u64, d1: u64) -> u64 {
+    var t0: u64 = r0 << 1;
+    var t1: u64 = (r1 << 1) | (r0 >> 63);
+    if (ge(t0,t1,d0,d1) && (t0 != d0 || t1 != d1 || (q & 1) != 0)) { return 1; }
+    return 0;
+}
+fn sat32(lo: u64, hi: u64, neg: bool) -> bool { return hi != 0 || lo > pick(neg,SIGN32,SIGN32-1); }
+fn sat64(lo: u64, hi: u64, neg: bool) -> bool { return hi != 0 || lo > pick(neg,SIGN64,SIGN64-1); }
+fn clamp32(lo: u64, hi: u64, neg: bool) -> u32 {
+    if (sat32(lo,hi,neg)) { return pick32(neg,2147483648,2147483647); }
+    return pick(neg,0-lo,lo) as u32;
+}
+fn clamp64(lo: u64, hi: u64, neg: bool) -> u64 {
+    if (sat64(lo,hi,neg)) { return pick(neg,SIGN64,SIGN64-1); }
+    return pick(neg,0-lo,lo);
+}
+fn stage_tag(s: u32) -> u32 {
+    if (s == 0) { return 104; } if (s == 1) { return 103; }
+    if (s == 2) { return 117; } if (s == 3) { return 97; }
+    if (s == 4) { return 115; } return 121;
+}
+fn high_tag(s: u32) -> u32 {
+    // A is the UART loader acknowledgement, so wide a uses J for its high half.
+    if (s == 3) { return 74; } return stage_tag(s)-32;
+}
+fn trit_sum(a: u64, x: u64, code: u64) -> u64 {
+    if (code == 1) { return a+x; } if (code == 2) { return a-x; } return a;
+}
+var s_idle: bool;
+var rounded0: u64 = 0;
+var rounded1: u64 = 0;
+var rounded2: u64 = 0;
+var inc: u64 = 0;
+var shifted0: u64;
+var shifted1: u64;
+var sinc: u64;
+var scaled0: u64 = 0;
+var scaled1: u64 = 0;
+var value32: u32 = 0;
+var value64: u64 = 0;
+var eps0: u64 = 0;
+var eps1: u64 = 0;
+var eps_carry: u64 = 0;
+var add1: u64 = 0;
+var accum1: u64 = 0;
+var sum_carry0: u64 = 0;
+var sum_carry1: u64 = 0;
+var done1: bool = false;
+var done2: bool = false;
+var done3: bool = false;
+var done4: bool = false;
+var result_ready: bool = false;
+var vec_addr: u32;
+vec_addr = pick32(state == 33 || state == 34,col,index);
+s_idle = !sbuf;
+shifted0 = (q0 >> 16) | (q1 << 48);
+shifted1 = (q1 >> 16) | (q2 << 48);
+sinc = pick((q0 & 65535) > 32768 || ((q0 & 65535) == 32768 && (shifted0 & 1) != 0),1,0);
+
+fn on_clock(calib: bool, stall: bool, ack: bool, rdata_lo: u64, rdata_hi: u64,
+            hidden: u32, inner: u32, output_rows: u32,
+            math_done: bool, math_fault: bool, q0: u64, q1: u64, q2: u64, r0: u64, r1: u64,
+            line_idle: bool, s_go: bool, s_tag: u32, s_a: u32, s_b: u64) {
+    // Explicit registered RAM reads keep all vector stores in block RAM.
+    vr = vec[vec_addr]; wr = wide[index];
+    // Five clocks drain the registered round/carry/clamp paths after math_done.
+    // The wide unit holds q/r until the next start, so every stage sees the
+    // same exact value. No arithmetic rounding boundary changes.
+    done1 = math_done; done2 = done1; done3 = done2; done4 = done3; result_ready = done4;
+    inc = rne_up(q0,r0,r1,b0,b1);
+    rounded0 = q0 + inc;
+    rounded1 = q1 + pick(q0 == (0 as u64)-1 && inc != 0,1,0);
+    rounded2 = q2 + pick(q0 == (0 as u64)-1 && q1 == (0 as u64)-1 && inc != 0,1,0);
+    scaled0 = shifted0 + sinc;
+    scaled1 = shifted1 + pick(shifted0 == (0 as u64)-1 && sinc != 0,1,0);
+    value32 = clamp32(pick(state == 23,rounded0,scaled0),pick(state == 23,rounded1 | rounded2,scaled1),product_neg);
+    value64 = clamp64(scaled0,scaled1,product_neg);
+    eps_carry = carry(rounded0,pick(stage == 0,EPS32,EPS64));
+    eps0 = rounded0 + pick(stage == 0,EPS32,EPS64);
+    eps1 = rounded1 + eps_carry;
+    sum_carry0 = carry(sum0,q0);
+    add1 = sum1 + q1;
+    accum1 = add1 + sum_carry0;
+    sum_carry1 = carry(sum1,q1) + carry(add1,sum_carry0);
+    math_start = false;
+    if (active) { cycles = cycles + 1; }
+    // Classify by the state this clock executes: waiting for the report line
+    // (run start and value emits) or for a DDR3 read (request and response).
+    // The flags are registered so the state decode does not drive the 64-bit
+    // counter enables (58.81 MHz at seed 6 without this). Each counter lags
+    // one clock; the last active clock is compute (state 37), so both are
+    // complete before state 600 reports them.
+    if (report_wait) { report_cycles = report_cycles + 1; }
+    if (memory_wait) { memory_cycles = memory_cycles + 1; }
+    report_wait = active && (state == 8 || state == 300 || state == 301 || state == 302);
+    memory_wait = active && (state == 200 || state == 201);
+    if (state == 0) {
+        if (calib) {
+            wb_cyc = true; ptag = 70; pa = hidden; pb = inner as u64; pending = true;
+            state = 1;
+        }
+    } else if (state == 1) {
+        if (poll == 0 && !pending) {
+            wb_addr = 64; wb_stb = true; response = 2; state = 200; quiet = 0;
+        } else if (poll != 0) { poll = poll - 1; }
+    } else if (state == 2) {
+        state = 1; poll = 8192;
+        if ((read0 >> 32) == 1179012657 && (read0 & MASK32) != 0 && (read0 & MASK32) != last_run) {
+            last_run = read0 as u32; run_id = read0 as u32; index = 0;
+            cycles = 0; report_cycles = 0; memory_cycles = 0; active = true; error_code = 0;
+            state = 8;
+            if (hidden == 0 || inner == 0 || output_rows == 0 || hidden > 2560 || inner > 6912 || output_rows > 2560) {
+                error_code = 1; state = 900;
+            }
+        }
+    } else if (state == 3) {
+        sats[index] = 0;
+        if (index == 5) { index = 0; state = 4; } else { index = index + 1; }
+    } else if (state == 4) {
+        wb_addr = 80 + index; wb_stb = true; response = 5; state = 200; quiet = 0;
+    } else if (state == 5) {
+        if (index == 0) { scale_g = read0 as u32; }
+        if (index == 1) { scale_u = read0 as u32; }
+        if (index == 2) { scale_d = read0 as u32; index = 0; state = 6; }
+        else { index = index+1; state = 4; }
+    } else if (state == 6) {
+        wb_addr = 4096+index; wb_stb = true; response = 7; state = 200; quiet = 0;
+    } else if (state == 7) {
+        vec[index] = read0 as u32;
+        if (index == hidden-1) { stage = 0; length = hidden; state = 10; }
+        else { index = index+1; state = 6; }
+    } else if (state == 8) {
+        if (!pending) { ptag = 100; pa = run_id; pb = 0; pending = true; state = 3; }
+    } else if (state == 9) {
+        state = 11;
+    } else if (state == 10) {
+        sum0 = 0; sum1 = 0; sum2 = 0; index = 0; state = 9;
+    } else if (state == 11) {
+        sample = pick(stage == 0,sx32(vr),wr); state = 12;
+    } else if (state == 12) {
+        math_mode = 1; a0 = magnitude(sample); b0 = magnitude(sample);
+        a1 = 0; a2 = 0; b1 = 0; math_start = true; state = 13;
+    } else if (state == 13) {
+        if (result_ready) {
+            sum0 = sum0 + q0; sum1 = accum1;
+            sum2 = sum2 + (sum_carry1 as u32);
+            if (index == length-1) { state = 14; }
+            else { index = index+1; state = 9; }
+        }
+    } else if (state == 14) {
+        math_mode = 2; a0 = sum0; a1 = sum1; a2 = sum2 as u64;
+        b0 = length as u64; b1 = 0; math_start = true; state = 15;
+    } else if (state == 15) {
+        if (result_ready) {
+            math_mode = 3;
+            if (stage == 0) { a0 = eps0 << 32; a1 = (eps1 << 32) | (eps0 >> 32); a2 = eps1 >> 32; }
+            else { a0 = 0; a1 = eps0; a2 = eps1; }
+            math_start = true; state = 17;
+        }
+    } else if (state == 17) {
+        if (result_ready) { root0 = q0; root1 = q1; index = 0; state = 18; }
+    } else if (state == 18) {
+        wb_addr = pick32(stage == 0,8192,12288)+index;
+        wb_stb = true; response = 19; state = 200; quiet = 0;
+    } else if (state == 19) {
+        gamma = sx32(read0 as u32); sample = pick(stage == 0,sx32(vr),wr); state = 20;
+    } else if (state == 20) {
+        product_neg = ((sample ^ gamma) >> 63) != 0;
+        math_mode = 1; a0 = magnitude(sample); b0 = magnitude(gamma);
+        a1 = 0; a2 = 0; b1 = 0; math_start = true; state = 21;
+    } else if (state == 21) {
+        if (result_ready) {
+            math_mode = 2;
+            if (stage == 0) { a0 = q0 << 16; a1 = (q1 << 16) | (q0 >> 48); a2 = q1 >> 48; }
+            else { a0 = q0 << 32; a1 = (q1 << 32) | (q0 >> 32); a2 = q1 >> 32; }
+            b0 = root0; b1 = root1; math_start = true; state = 23;
+        }
+    } else if (state == 23) {
+        if (result_ready) {
+            vec[index] = value32; emit_value = sx32(value32); emit_index = index;
+            if (sat32(rounded0,rounded1 | rounded2,product_neg)) { sats[stage] = sats[stage]+1; }
+            after_emit = 24; state = 300;
+        }
+    } else if (state == 24) {
+        if (index == length-1) { stage = pick32(stage == 0,1,5); state = 30; }
+        else { index = index+1; state = 18; }
+    } else if (state == 30) {
+        row = 0; col = 0; acc = 0;
+        ncols = pick32(stage == 5,inner,hidden); nrows = pick32(stage == 5,output_rows,inner);
+        weight_addr = pick32(stage == 1,65536,pick32(stage == 2,393216,720896)); state = 31;
+    } else if (state == 31) {
+        wb_addr = weight_addr; wb_stb = true; response = 32; state = 200; quiet = 0;
+    } else if (state == 32) {
+        weight0 = read0; weight1 = read1; state = 33;
+    } else if (state == 33) {
+        state = 34;
+    } else if (state == 34) {
+        acc = trit_sum(acc,sx32(vr),weight0 & 3);
+        weight0 = (weight0 >> 2) | (weight1 << 62); weight1 = weight1 >> 2;
+        col = col+1;
+        if (col == ncols-1) { weight_addr = weight_addr+1; state = 35; }
+        else if ((col & 63) == 63) { weight_addr = weight_addr+1; state = 31; }
+        else { state = 33; }
+        if ((weight0 & 3) == 3) { error_code = 3; state = 900; }
+    } else if (state == 35) {
+        gamma = sx32(pick32(stage == 1,scale_g,pick32(stage == 2,scale_u,scale_d)));
+        state = 38;
+    } else if (state == 38) {
+        product_neg = ((acc ^ gamma) >> 63) != 0;
+        math_mode = 1; a0 = magnitude(acc); b0 = magnitude(gamma);
+        a1 = 0; a2 = 0; b1 = 0; math_start = true; state = 36;
+    } else if (state == 36) {
+        if (result_ready) {
+            if (stage == 1) { gate[row] = value32; }
+            if (stage == 2) { up[row] = value32; }
+            if (sat32(scaled0,scaled1,product_neg)) { sats[stage] = sats[stage]+1; }
+            emit_value = sx32(value32); emit_index = row; after_emit = 37; state = 300;
+        }
+    } else if (state == 37) {
+        col = 0; acc = 0;
+        if (row == nrows-1) {
+            if (stage == 1) { stage = 2; state = 30; }
+            else if (stage == 2) { stage = 3; index = 0; state = 40; }
+            else { active = false; index = 0; state = 600; }
+        } else { row = row+1; state = 31; }
+    } else if (state == 40) {
+        gr = gate[index]; ur = up[index]; state = 41;
+    } else if (state == 41) {
+        math_mode = 1; a0 = pick((gr & 2147483648) == 0,gr as u64,0);
+        b0 = pick((gr & 2147483648) == 0,gr as u64,0);
+        a1 = 0; a2 = 0; b1 = 0; math_start = true; state = 42;
+    } else if (state == 42) {
+        if (result_ready) {
+            a0 = q0; b0 = magnitude(sx32(ur)); math_start = true;
+            product_neg = (ur & 2147483648) != 0; state = 43;
+        }
+    } else if (state == 43) {
+        if (result_ready) {
+            wide[index] = value64;
+            if (sat64(scaled0,scaled1,product_neg)) { sats[3] = sats[3]+1; }
+            emit_value = value64; emit_index = index; after_emit = 44; state = 300;
+        }
+    } else if (state == 44) {
+        if (index == inner-1) { stage = 4; length = inner; state = 10; }
+        else { index = index+1; state = 40; }
+    } else if (state == 200) {
+        quiet = quiet+1;
+        if (!stall) { wb_stb = false; state = 201; }
+        if (ack) { read0 = rdata_lo; read1 = rdata_hi; wb_stb = false; state = response; }
+        if (quiet >= 16777216) { error_code = 4; wb_stb = false; state = 900; }
+    } else if (state == 201) {
+        quiet = quiet+1;
+        if (ack) { read0 = rdata_lo; read1 = rdata_hi; state = response; }
+        if (quiet >= 16777216) { error_code = 4; state = 900; }
+    } else if (state == 300) {
+        if (!pending) { ptag = stage_tag(stage); pa = emit_index; pb = emit_value & MASK32; pending = true; state = 301; }
+    } else if (state == 301) {
+        if (!pending) { ptag = high_tag(stage); pa = emit_index; pb = emit_value >> 32; pending = true; state = 302; }
+    } else if (state == 302) {
+        if (!pending) { state = after_emit; }
+    } else if (state == 600) {
+        if (!pending) { ptag = 99; pa = run_id; pb = cycles; pending = true; state = 603; }
+    } else if (state == 603) {
+        if (!pending) { ptag = 107; pa = 0; pb = report_cycles; pending = true; state = 604; }
+    } else if (state == 604) {
+        if (!pending) { ptag = 107; pa = 1; pb = memory_cycles; pending = true; state = 601; }
+    } else if (state == 601) {
+        if (!pending) { ptag = 116; pa = index; pb = sats[index] as u64; pending = true;
+            if (index == 5) { state = 602; } else { index = index+1; }
+        }
+    } else if (state == 602) {
+        if (!pending) { ptag = 122; pa = run_id; pb = 0; pending = true; state = 1; poll = 8192; }
+    } else if (state == 900) {
+        active = false; wb_cyc = false; wb_stb = false;
+        if (!pending) { ptag = 69; pa = error_code; pb = run_id as u64; pending = true; state = 901; }
+    }
+    if (active && (!calib || math_fault)) { error_code = 2; state = 900; }
+    if (ack && state != 200 && state != 201) { error_code = 5; state = 900; }
+
+    // Existing loader line arbitration policy: one parked line per producer.
+    line_go = false;
+    if (s_go) { sbuf = true; sb_tag = s_tag; sb_a = s_a; sb_b = s_b; }
+    if (arb == 0) {
+        if (line_idle && sbuf) {
+            line_go = true; line_tag = sb_tag; line_a = sb_a; line_b = sb_b;
+            sbuf = false; arb = 1;
+        } else if (line_idle && pending) {
+            line_go = true; line_tag = ptag; line_a = pa; line_b = pb; pending = false; arb = 1;
+        }
+    } else if (arb == 1) { arb = 2; }
+    else if (line_idle) { arb = 0; }
+}
+
+test signed_magnitudes { assert_eq(magnitude(9223372036854775808),9223372036854775808); assert_eq(sx32(4294967295),18446744073709551615); }
+test rounding_ties { assert_eq(rne_up(2,1,0,2,0),0); assert_eq(rne_up(3,1,0,2,0),1); }
+test saturation_edges { assert_eq(clamp32(2147483648,0,true),2147483648); assert_eq(clamp32(2147483648,0,false),2147483647); assert_eq(sat64(9223372036854775808,0,true),false); assert_eq(sat64(0,1,false),true); }
+test negative_trit { assert_eq(trit_sum(5,3,2),2); assert_eq(stage_tag(3),97); assert_eq(high_tag(3),74); }
