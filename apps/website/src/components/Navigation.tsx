@@ -180,6 +180,8 @@ export default memo(function Navigation() {
     }
   }, [pagesOpen])
 
+  // Framed by the /ru/ HUD with embed=1, or any page opened inside its frame (lessons keep it): its rail is the one menu, so this page shows none (owner, 2026-11-21).
+  if (window.self !== window.top || new URLSearchParams(window.location.hash.split('?')[1] ?? '').get('embed') === '1') return null
   return (
     <>
       {/* Desktop dock nav */}
