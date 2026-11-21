@@ -47,7 +47,7 @@ const COPY: Record<'en' | 'ru', { eyebrow: string; title: string; lede: string; 
       },
       {
         who: 'I bring hardware',
-        body: 'Run a lane on your own machine, under your own provider account: the key never leaves it. An accepted spec your lane carried on its CPU, FPGA or GPU counts as proof of compute.',
+        body: 'Run a lane on your own machine, under your own provider account: the key never leaves it. A lane does not earn TRI; only .t27 specs do, to their author by GitHub login. Proof of compute is a planned road.',
         cta: 'Create a runner',
         href: CABINET_HOME,
         external: true,
@@ -90,7 +90,7 @@ const COPY: Record<'en' | 'ru', { eyebrow: string; title: string; lede: string; 
       },
       {
         who: 'У меня есть железо',
-        body: 'Запустите полосу на своей машине, под своим аккаунтом провайдера: ключ её не покидает. Принятая спека, которую ваша полоса вынесла на своих CPU, FPGA или GPU, засчитывается как proof of compute.',
+        body: 'Запустите полосу на своей машине, под своим аккаунтом провайдера: ключ её не покидает. Полоса не зарабатывает TRI: сегодня TRI зарабатывают только спеки .t27 — автору по логину GitHub. Proof of compute — дорога в планах.',
         cta: 'Создать раннер',
         href: CABINET_HOME,
         external: true,
