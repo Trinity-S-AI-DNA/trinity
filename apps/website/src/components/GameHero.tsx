@@ -23,12 +23,14 @@ const COPY = {
     play: 'How to play',
     map: 'Open the map',
     number: 'The number behind it →',
+    hud: 'Course HUD (in Russian) →',
   },
   ru: {
     lede: 'Каждая сота на карте — спека .t27 или задача GitHub, которая за неё платит. Возьмите одну, напишите спеку, которая её порождает, скомпилируйте настоящим компилятором, отправьте. Это весь процесс контрибуции — и вся игра.',
     play: 'Как играть',
     map: 'Открыть карту',
     number: 'Число за этим →',
+    hud: 'Курс в HUD →',
   },
 } as const
 
@@ -67,6 +69,11 @@ export default function GameHero() {
           </a>
           <a className="game-hero-quiet" href="#/trinity">
             {t.number}
+          </a>
+          {/* The course HUD is the static /ru/ page (specs/site/landing_ru.t27),
+              Russian only for now, so the link is absolute and leaves the app. */}
+          <a className="game-hero-secondary" href="/ru/#lessons">
+            {t.hud}
           </a>
         </div>
       </div>
