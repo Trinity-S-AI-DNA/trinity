@@ -177,7 +177,8 @@ function pageHtml(C, lang, lesson, cardUrl, all = []) {
   const body = lesson
     ? `<div class="hd"><h1>${esc(t.title)}</h1><p class="lab">${esc(say.GOAL)}</p><p class="goal">${esc(t.goal)}</p></div>
 <div class="txt"><p>${esc(t.text)}</p></div>
-<div class="ft"><aside class="try"><h2>${esc(say.TRY)}</h2><p>${esc(t.task)}</p></aside><a class="cta" href="${appOf(C, id)}">${esc(say.OPEN_LESSON)} →</a></div>`
+<div class="ft"><aside class="try"><h2>${esc(say.TRY)}</h2><p>${esc(t.task)}</p></aside><a class="cta" href="${appOf(C, id)}">${esc(say.OPEN_LESSON)} →</a></div>
+<nav class="pager">${back}${fwd}</nav>`
     : `<div class="hd"><p class="lab">${esc(say.KICKER)}</p><h1>${esc(say.TITLE)}</h1><p class="goal">${esc(say.LEAD)}</p></div>
 <div class="txt"><p>${esc(say.DESCRIPTION)}</p>${catalog}${courses}</div>
 <div class="ft"><a class="cta" href="${appOf(C)}">${esc(say.OPEN_COURSE)} →</a></div>`
