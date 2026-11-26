@@ -16,7 +16,6 @@
 import { readFileSync, writeFileSync, readdirSync, statSync } from 'node:fs'
 import { join, dirname, extname } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { execFileSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { loadCompiler } from './agents-from-specs.mjs'
 
@@ -166,7 +165,6 @@ const relations = [...uniqueRelations].map((key) => {
 const index = {
   provenance: {
     compiler: { path: manifest.path, sha256: manifest.sha256, commit: manifest.commit },
-    commit: execFileSync('git', ['rev-parse', 'HEAD'], { cwd: SITE, encoding: 'utf8' }).trim(),
     extractor: 'specs/widgets/second_brain_index_law.t27 via scripts/gen/second_brain_index_law.gen.js (t27c gen-js of the pinned compiler)',
     law_spec_sha256: createHash('sha256').update(readFileSync(new URL('./gen/second_brain_index_law.gen.js', import.meta.url))).digest('hex'),
     root: 'apps/website/specs',
