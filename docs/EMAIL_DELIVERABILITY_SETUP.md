@@ -283,7 +283,6 @@ tri outreach send --batch=day1  # Actually send
 
 ## References
 
-- [Zoho DKIM Setup](https://inboxgreen.email/guides/zoho-mail/dkim)
 - [Zoho MX Setup](https://hackmd.io/@VeZd7WLKSNimxK_Val9mFA/how-to-set-up-zoho-mail-for-my-custom-business-domain)
 - [UD DNS Explained](https://support.unstoppabledomains.com/support/solutions/articles/48001273539-dns-records-explained)
 - [Domain Warmup Guide](https://leadsmonky.com/warm-up-your-email-domain-for-cold-outreach/)
