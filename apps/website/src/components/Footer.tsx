@@ -83,6 +83,8 @@ export default function Footer({ promo = true }: { promo?: boolean } = {}) {
      нет, и на русской странице там висело английское «Invest». */
   const { t, lang } = useI18n()
 
+  // Framed by the /ru/ HUD with embed=1, or any page opened inside its frame (lessons keep it): the HUD carries the footer links once (owner, 2026-11-21).
+  if (window.self !== window.top || new URLSearchParams(window.location.hash.split('?')[1] ?? '').get('embed') === '1') return null
   return (
     <footer
       style={{

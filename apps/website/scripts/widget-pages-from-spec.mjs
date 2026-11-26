@@ -331,10 +331,10 @@ async function main() {
   const json = process.argv.includes('--json')
   const analyze = await loadCompiler(readFileSync(join(SITE, WASM)))
   const { problems, tools } = await buildAll({ analyze })
-  // The app-level theme templates: specs/widgets/themes.t27 owns the token values; this emits
+  // The app-level theme templates: specs/theme/themes.t27 owns the token values; this emits
   // public/widgets/theme.css from them and --check guards it like every generated file. A missing
   // constant or a failing test in the spec fails the run here, not in a hand-edited stylesheet.
-  const themeFile = 'specs/widgets/themes.t27'
+  const themeFile = 'specs/theme/themes.t27'
   const themeConsts = Object.fromEntries(Object.entries(constsOf(analyze(readFileSync(join(SITE, themeFile), 'utf8')))).map(([k, v]) => [k, v.value]))
   const SUFFIXES = ['BG', 'PANEL', 'LINE', 'GREEN', 'GOLD', 'RED', 'TEXT', 'MUTED', 'SUBTLE']
   const tokenNames = themeConsts.SAY_TOKEN_NAMES
@@ -358,10 +358,10 @@ async function main() {
   // The module itself is emitted by `t27c gen-js` over the logic spec; this is
   // the check that keeps a partial artifact out of the tree.
   const logicArtifacts = [
-    ['public/widgets/second-brain/second-brain-logic.js', 'specs/widgets/second-brain-view-logic.t27'],
-    ['public/widgets/second-brain/second-brain-view.js', 'specs/widgets/second-brain-view.t27'],
-    ['public/widgets/second-brain/second-brain-kit.js', 'specs/widgets/second-brain-kit.t27'],
-    ['public/widgets/second-brain/second-brain-flow.js', 'specs/widgets/second-brain-flow.t27'],
+    ['public/widgets/second-brain/second-brain-logic.js', 'specs/second-brain/second-brain-view-logic.t27'],
+    ['public/widgets/second-brain/second-brain-view.js', 'specs/second-brain/second-brain-view.t27'],
+    ['public/widgets/second-brain/second-brain-kit.js', 'specs/second-brain/second-brain-kit.t27'],
+    ['public/widgets/second-brain/second-brain-flow.js', 'specs/second-brain/second-brain-flow.t27'],
   ]
   const { execFileSync } = await import('node:child_process')
   const { createHash } = await import('node:crypto')

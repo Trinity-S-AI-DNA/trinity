@@ -786,7 +786,7 @@ export default function Course() {
           </>
         )}
         {/* Hand-written TSX mount of the course helper chat (trinity#1813, label owner-approved-foreign on PR 1815): words, limits and styles come from specs/chat/course-chat.t27. */}
-        <CourseChat course={C.id} lesson={lesson?.id} title={lesson?.[lang].title} ckey={ladder.reportKey} />
+        <CourseChat course={C.id} lesson={lesson?.id} title={lesson?.[lang].title} goal={lesson?.[lang].goal} lessonText={lesson?.[lang].text} ckey={ladder.reportKey} />
         {/* Other courses at the foot of every course page (owner, 2026-10-13). */}
         <CourseShelf lang={lang} placement={`course:${C.route}`} exclude={C.id} />
       </main>

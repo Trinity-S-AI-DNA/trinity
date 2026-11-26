@@ -39,7 +39,7 @@ if (obj.exists) {
 // ---- The flow side: one extracted flow per targeted function ---------------------
 const flows = []
 for (const target of TARGETS.functions) {
-  const specPath = join(SITE, 'specs/widgets', target.spec)
+  const specPath = join(SITE, 'specs/second-brain', target.spec)
   const ast = analyze(readFileSync(specPath, 'utf8')).ast
   const fn = ast.children.find((n) => n.kind === 'FnDecl' && n.name === target.fn)
   if (!fn) { flows.push({ fn: target.fn, spec: target.spec, unknown: ['function not in AST'] }); continue }

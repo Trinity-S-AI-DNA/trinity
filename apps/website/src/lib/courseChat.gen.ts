@@ -8,7 +8,7 @@ export const CHAT_COURSES = ["vibecoding"] as const satisfies readonly [string];
 export const CHAT_MSG_MAX = 600 satisfies number;
 export const CHAT_TITLE_MAX = 120 satisfies number;
 export const CHAT_ANSWER_MAX = 1200 satisfies number;
-export const CHAT_PER_IP_HOUR = 20 satisfies number;
+export const CHAT_PER_IP_HOUR = 50 satisfies number;
 export const CHAT_PER_KEY_DAY = 60 satisfies number;
 export const CHAT_TIMEOUT_MS = 20000 satisfies number;
 export const CHAT_GLOBAL_DAY = 500 satisfies number;
@@ -33,6 +33,7 @@ export const CHAT_CLOSE = "Close" satisfies string;
 export const CHAT_WORKING = "The helper is thinking." satisfies string;
 export const CHAT_OFFLINE = "The assistant is offline." satisfies string;
 export const CHAT_OFFLINE_LIMIT = "The assistant is offline for now: the question limit is reached. Try again later." satisfies string;
+export const CHAT_OFFLINE_TURN_LIMIT = "You have reached the turn limit for this lesson. Open the lesson page to start a new conversation." satisfies string;
 export const CHAT_OFFLINE_BAD = "The assistant is offline: this question cannot be sent. Shorten it and try again." satisfies string;
 export const CHAT_OFFLINE_BUSY = "The assistant is busy right now. Try again in a moment." satisfies string;
 export const CHAT_UNANSWERED = "The helper is offline, so your message was not answered. Try again later." satisfies string;
@@ -46,7 +47,9 @@ export const ACT_WAIT = 3 satisfies number;
 export const ACT_LIMIT = 4 satisfies number;
 export const CHAT_PROMPT_HEAD = "You are the course helper on t27.ai for the course \"" satisfies string;
 export const CHAT_PROMPT_LESSON = "\", open at the lesson \"" satisfies string;
-export const CHAT_PROMPT_TAIL = "\". Answer the reader's question about this course and lesson in at most five short sentences, in the language the reader writes in. If you do not know, say \"I do not know\" and do not guess or invent facts. Never ask for or repeat a key, a token or a password. You have no tools: you cannot run code, open links or remember earlier chats." satisfies string;
+export const CHAT_PROMPT_BODY = "\". Lesson text: \"" satisfies string;
+export const CHAT_PROMPT_TAIL = "\". Answer the reader's question about this course and lesson in at most five short sentences, in the language the reader writes in. If you do not know, say \"I do not know\" and do not guess or invent facts. Never ask for or repeat an API key, an authentication token, or an account password. You have no tools: you cannot run code, open links or remember earlier chats." satisfies string;
+export const CHAT_BODY_MAX = 1500 satisfies number;
 export const CHAT_WIDE_MIN = 1000 satisfies number;
 export const CHAT_GUTTER = 20 satisfies number;
 export const CHAT_DOCK_PAD = 360 satisfies number;
@@ -139,10 +142,13 @@ export const CHAT_CSS_GLASS = ".cc{background:#000000d1;-webkit-backdrop-filter:
 // t27c gen-ts: a TestBlock was not emitted -- it is checked by the compiler, not by the artifact.
 // t27c gen-ts: a TestBlock was not emitted -- it is checked by the compiler, not by the artifact.
 // t27c gen-ts: a TestBlock was not emitted -- it is checked by the compiler, not by the artifact.
+// t27c gen-ts: a TestBlock was not emitted -- it is checked by the compiler, not by the artifact.
+// t27c gen-ts: a TestBlock was not emitted -- it is checked by the compiler, not by the artifact.
+// t27c gen-ts: a TestBlock was not emitted -- it is checked by the compiler, not by the artifact.
 
 // Declaration order, which the spec's own laws depend on.
 export const __STRUCT_ORDER__ = [] as const;
-export const __DECL_ORDER__ = ["CHAT_ROUTE", "CHAT_COURSES", "CHAT_MSG_MAX", "CHAT_TITLE_MAX", "CHAT_ANSWER_MAX", "CHAT_PER_IP_HOUR", "CHAT_PER_KEY_DAY", "CHAT_TIMEOUT_MS", "CHAT_GLOBAL_DAY", "CHAT_TURNS_MAX", "CHAT_PROBE_RETRY_MS", "CHAT_PAID_FALLBACK", "REASON_NONE", "REASON_UNREACHABLE", "REASON_TIMEOUT", "REASON_STATUS", "REASON_EMPTY", "REASON_LIMIT", "REASON_OFF", "REASON_BAD_REQUEST", "REASON_BUSY", "CHAT_TITLE", "CHAT_HINT", "CHAT_PLACEHOLDER", "CHAT_SEND", "CHAT_OPEN", "CHAT_CLOSE", "CHAT_WORKING", "CHAT_OFFLINE", "CHAT_OFFLINE_LIMIT", "CHAT_OFFLINE_BAD", "CHAT_OFFLINE_BUSY", "CHAT_UNANSWERED", "CHAT_UNANSWERED_RU", "CHAT_WAIT_NOTE", "CHAT_WAIT_NOTE_RU", "ACT_IGNORE", "ACT_SEND", "ACT_REPROBE", "ACT_WAIT", "ACT_LIMIT", "CHAT_PROMPT_HEAD", "CHAT_PROMPT_LESSON", "CHAT_PROMPT_TAIL", "CHAT_WIDE_MIN", "CHAT_GUTTER", "CHAT_DOCK_PAD", "CHAT_COLUMN_MIN", "CHAT_AVATAR", "CHAT_AVATAR_PX", "CHAT_HEAD_AVATAR_PX", "CHAT_TAP_MIN", "CHAT_SHEET_MAX", "CHAT_TABLET_MIN", "CHAT_LANDSCAPE_MAX_H", "CHAT_CSS", "CHAT_CSS_SHEET", "CHAT_CSS_MOTION", "CHAT_GLASS_ALPHA", "CHAT_GLASS_ALPHA_MIN", "CHAT_GLASS_ALPHA_MAX", "CHAT_GLASS_BLUR_PX", "CHAT_GLASS_BLUR_MIN", "CHAT_GLASS_BLUR_MAX", "CHAT_CSS_GLASS"] as const;
+export const __DECL_ORDER__ = ["CHAT_ROUTE", "CHAT_COURSES", "CHAT_MSG_MAX", "CHAT_TITLE_MAX", "CHAT_ANSWER_MAX", "CHAT_PER_IP_HOUR", "CHAT_PER_KEY_DAY", "CHAT_TIMEOUT_MS", "CHAT_GLOBAL_DAY", "CHAT_TURNS_MAX", "CHAT_PROBE_RETRY_MS", "CHAT_PAID_FALLBACK", "REASON_NONE", "REASON_UNREACHABLE", "REASON_TIMEOUT", "REASON_STATUS", "REASON_EMPTY", "REASON_LIMIT", "REASON_OFF", "REASON_BAD_REQUEST", "REASON_BUSY", "CHAT_TITLE", "CHAT_HINT", "CHAT_PLACEHOLDER", "CHAT_SEND", "CHAT_OPEN", "CHAT_CLOSE", "CHAT_WORKING", "CHAT_OFFLINE", "CHAT_OFFLINE_LIMIT", "CHAT_OFFLINE_TURN_LIMIT", "CHAT_OFFLINE_BAD", "CHAT_OFFLINE_BUSY", "CHAT_UNANSWERED", "CHAT_UNANSWERED_RU", "CHAT_WAIT_NOTE", "CHAT_WAIT_NOTE_RU", "ACT_IGNORE", "ACT_SEND", "ACT_REPROBE", "ACT_WAIT", "ACT_LIMIT", "CHAT_PROMPT_HEAD", "CHAT_PROMPT_LESSON", "CHAT_PROMPT_BODY", "CHAT_PROMPT_TAIL", "CHAT_BODY_MAX", "CHAT_WIDE_MIN", "CHAT_GUTTER", "CHAT_DOCK_PAD", "CHAT_COLUMN_MIN", "CHAT_AVATAR", "CHAT_AVATAR_PX", "CHAT_HEAD_AVATAR_PX", "CHAT_TAP_MIN", "CHAT_SHEET_MAX", "CHAT_TABLET_MIN", "CHAT_LANDSCAPE_MAX_H", "CHAT_CSS", "CHAT_CSS_SHEET", "CHAT_CSS_MOTION", "CHAT_GLASS_ALPHA", "CHAT_GLASS_ALPHA_MIN", "CHAT_GLASS_ALPHA_MAX", "CHAT_GLASS_BLUR_PX", "CHAT_GLASS_BLUR_MIN", "CHAT_GLASS_BLUR_MAX", "CHAT_CSS_GLASS"] as const;
 
 // What this spec holds and this backend did not print. Empty is the whole
 // story most of the time; an entry here is a promise the artifact does not

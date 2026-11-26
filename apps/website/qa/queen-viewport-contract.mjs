@@ -303,13 +303,23 @@ const FIXTURE_FEED = (() => {
   });
   return { at: FIXTURE_AT, tasks, bees, truncated: false, cursor: null };
 })();
+// The sector rows draw GET /queen/public-board; its default host is gone, so it is a fixture too.
+const BOARD_COLUMNS = ['backlog', 'blocked', 'running', 'review', 'done', 'dropped'];
+const FIXTURE_BOARD = {
+  repo: FIXTURE_REPO,
+  columns: BOARD_COLUMNS.map(key => ({ key, title: key, blurb: '' })),
+  cards: FIXTURE_FEED.tasks.filter(t => BOARD_COLUMNS.includes(t.state))
+    .map(t => ({ number: t.number, title: t.title, column: t.state, criteria: t.criteria ?? 0, needs: t.needs })),
+  pulse: { rounds: 0, bees: FIXTURE_FEED.bees.length, verdicts: 0, lastRoundAt: FIXTURE_AT, roundSeconds: null },
+};
 if (!DEAD) {
-  await call('Fetch.enable', { patterns: [{ urlPattern: '*/queen/public-tasks*', requestStage: 'Request' }] });
+  await call('Fetch.enable', { patterns: ['*/queen/public-tasks*', '*/queen/public-board*'].map(urlPattern => ({ urlPattern, requestStage: 'Request' })) });
   listeners.push(msg => {
     if (msg.sessionId !== sessionId || msg.method !== 'Fetch.requestPaused') return;
     const url = new URL(msg.params.request.url);
     const running = url.searchParams.get('state') === 'running';
-    const feed = running ? { ...FIXTURE_FEED, tasks: FIXTURE_FEED.tasks.filter(t => t.state === 'running') } : FIXTURE_FEED;
+    const feed = url.pathname.endsWith('/queen/public-board') ? FIXTURE_BOARD
+      : running ? { ...FIXTURE_FEED, tasks: FIXTURE_FEED.tasks.filter(t => t.state === 'running') } : FIXTURE_FEED;
     call('Fetch.fulfillRequest', {
       requestId: msg.params.requestId,
       responseCode: 200,
@@ -625,7 +635,7 @@ for (const [w, h] of (DEAD ? SIZES.filter(([w]) => w === 1440 || w === 390) : SI
       const live = !!document.querySelector('#stat-status.is-live');
       const dead = !!document.querySelector('#stat-status.is-cold');
       const rows = document.querySelectorAll('.queen27-sectors-row').length;
-      const data = ${DEAD} ? dead : (live || rows === 6);
+      const data = ${DEAD} ? dead : rows === 6;
       const rail = document.querySelector('.queen27-hud-command');
       const declared = rail ? Number(rail.getAttribute('data-views')) : 0;
       // the rail declares its own count (data-views from commandItems); the gate follows it rather than a hardcoded eight
