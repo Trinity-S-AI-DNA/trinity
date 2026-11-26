@@ -242,7 +242,7 @@ export function graphView(rootEl, { nodes: initialNodes, edges: initialEdges, st
   // positions from a previous graph are how explorer nodes ended up undefined.
   let POS = []
   let VIEW = null // the fit-to-content camera; null until first layout
-  // Layout gaps are theme parameters from specs/widgets/themes.t27 (SB2_LAYOUT_GAP_*,
+  // Layout gaps are theme parameters from specs/theme/themes.t27 (SB2_LAYOUT_GAP_*,
   // generated into theme.css as --sb2-layout-gap-*). They arrive here as numbers passed by
   // the tool; reading them back out of computed styles is not a host op yet, so the tool
   // restates them with a comment naming the spec -- the only duplication allowed, and the
