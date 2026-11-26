@@ -72,7 +72,7 @@ export default function GameHero() {
           </a>
           {/* The course HUD is the static /ru/ page (specs/site/landing_ru.t27),
               Russian only for now, so the link is absolute and leaves the app. */}
-          <a className="game-hero-secondary" href="/ru/#lessons">
+          <a className="game-hero-secondary" href="https://t27.ai/ru/#lessons">
             {t.hud}
           </a>
         </div>
