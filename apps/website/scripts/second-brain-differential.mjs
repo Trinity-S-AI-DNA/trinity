@@ -24,7 +24,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 const SITE = join(dirname(fileURLToPath(import.meta.url)), '..')
 const manifest = JSON.parse(readFileSync(new URL('./t27c-manifest.json', import.meta.url), 'utf8'))
 const T27C = manifest.path
-const SPEC = join(SITE, 'specs/widgets/second-brain-view-logic.t27')
+const SPEC = join(SITE, 'specs/second-brain/second-brain-view-logic.t27')
 const LOGIC = join(SITE, 'public/widgets/second-brain/second-brain-logic.js')
 
 const FN = 'view_zoom_in'
