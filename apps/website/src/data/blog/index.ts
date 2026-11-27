@@ -3,6 +3,37 @@ import type { PostMeta } from './types'
 /** Индекс блога: список и метаданные без тяжёлых тел публикаций. */
 export const postsIndex: PostMeta[] = [
   {
+    slug: "golden-ruler-a-calibration-ruler-for-numeric-formats",
+    title: "Golden Ruler: a calibration ruler for numeric formats",
+    summary: "[software vectors, not hardware measurements; the ml_dtypes cross-validation is as reported in the paper] Golden Ruler (arXiv:2606.09686) is a catalogue of 109 numeric formats in 13 clusters and six bit-exact conformance packs: GF16, MXFP4 element, BF16, FP8 E4M3, FP8 E5M2 and E8M0 block scale. Each pack is a self-contained JSON document with a SHA-256 fingerprint, a single row schema and an anchor vector that encodes 3.0 through the identity phi^2 + 1/phi^2 = 3 as a cross-pack sanity check. The ml_dtypes 0.5.4 cross-validation as reported in the paper covers element-level rounding of the float formats; the block-scale formats were checked separately, their divergences documented as permitted interpretation gaps, not hidden.",
+    date: "2026-11-27",
+    readingMinutes: 6,
+    tags: ["Number formats", "Verification", "GF16", "Open source"],
+    receipts: [
+      { label: "The paper: arXiv:2606.09686", href: "https://arxiv.org/abs/2606.09686" },
+      { label: "The packs, the tools and the catalogue: github.com/gHashTag/t27", href: "https://github.com/gHashTag/t27" },
+      { label: "The cross-validation reference: ml_dtypes 0.5.4 (Google/JAX)", href: "https://github.com/jax-ml/ml_dtypes" },
+      { label: "Earlier: the golden ratio in this format is a scale factor, not information", href: "https://t27.ai/blog/phi-is-a-scale-not-information/" },
+    ],
+    openQuestions: [
+      "This is a catalogue and a methodology, not a superiority claim about any format.",
+      "The IEEE P3109 cross-walk is version v3.2.0; the standard is still moving.",
+      "No hardware measurements were made for Golden Ruler — these are software vectors, not silicon results.",
+      "The ml_dtypes cross-validation is as reported in the paper; the block-scale formats carry documented interpretation gaps.",
+    ],
+    published: true,
+    ru: {
+      title: "Golden Ruler: калибровочная линейка для численных форматов AI-железа",
+      summary: "[каталог и методология; замеры на железе не проводились — это программные векторы; кросс-валидация ml_dtypes — как заявлено в статье] Golden Ruler (arXiv:2606.09686) — каталог 109 численных форматов в 13 кластерах и шесть бит-точных conformance-паков: GF16, MXFP4 element, BF16, FP8 E4M3, FP8 E5M2 и E8M0 block scale. Каждый пак — самодостаточный JSON-документ с SHA-256-отпечатком, единой схемой строк и якорным вектором, кодирующим 3.0 через тождество phi^2 + 1/phi^2 = 3 как межпакетную sanity-проверку. Кросс-валидация против ml_dtypes 0.5.4, как заявлено в статье, покрывает поэлементное округление float-форматов; block-scale форматы проверены отдельно, их расхождения задокументированы как допустимый разрыв интерпретации спецификации, а не спрятаны.",
+      openQuestions: [
+        "Это каталог и методология, не claim о superiority какого-либо формата.",
+        "IEEE P3109 cross-walk — версии v3.2.0, стандарт в движении.",
+        "Железные замеры по Golden Ruler не проводились — это программные векторы, а не результаты на кремнии.",
+        "Кросс-валидация ml_dtypes — как заявлено в статье; у block-scale форматов документированные разрывы интерпретации.",
+      ],
+    },
+  },
+  {
     slug: "five-backends-single-source-verification",
     title: "What five backends teach about single-source verification",
     summary: "[numbers are from docs/reports/t27b-bench-2026-10.md and the receipts it cites; not rerun for this publication] Five backends, one spec source: the whole-corpus differential run compares t27b against the reference test by test - 0 of 8,344 tests disagree - while Zig, clang and gcc pipelines disagree with themselves across optimization levels. The article also states what the zero does not prove: no independent front end exists, the fuzzer still finds 7 disagreements per 1,000 programs, and only 12% of the code t27b runs is generated.",
