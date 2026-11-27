@@ -54,6 +54,7 @@ import { body as body_one_regional_clock_twelve_pull_requests, ruBody as ruBody_
 import { body as body_tri_mined_not_sold, ruBody as ruBody_tri_mined_not_sold } from './bodies/tri-mined-not-sold'
 import { body as body_trained_weights_ran_receipts_were_not_checked, ruBody as ruBody_trained_weights_ran_receipts_were_not_checked } from './bodies/trained-weights-ran-receipts-were-not-checked'
 import { body as body_golden_ratio_weights_ran_on_the_board, ruBody as ruBody_golden_ratio_weights_ran_on_the_board } from './bodies/golden-ratio-weights-ran-on-the-board'
+import { body as body_golden_ruler_a_calibration_ruler_for_numeric_formats, ruBody as ruBody_golden_ruler_a_calibration_ruler_for_numeric_formats } from './bodies/golden-ruler-a-calibration-ruler-for-numeric-formats'
 import { body as body_the_only_stable_speed_belonged_to_the_tool, ruBody as ruBody_the_only_stable_speed_belonged_to_the_tool } from './bodies/the-only-stable-speed-belonged-to-the-tool'
 import { body as body_queen_review_lifecycle_queues, ruBody as ruBody_queen_review_lifecycle_queues } from './bodies/queen-review-lifecycle-queues'
 import { body as body_physical_width_changed_the_question, ruBody as ruBody_physical_width_changed_the_question } from './bodies/physical-width-changed-the-question'
@@ -235,6 +236,7 @@ const bodies: Record<string, PostBody> = {
   'a-small-agent-needs-an-exact-judge': { body: body_a_small_agent_needs_an_exact_judge, ruBody: ruBody_a_small_agent_needs_an_exact_judge },
   'trained-weights-ran-receipts-were-not-checked': { body: body_trained_weights_ran_receipts_were_not_checked, ruBody: ruBody_trained_weights_ran_receipts_were_not_checked },
   'golden-ratio-weights-ran-on-the-board': { body: body_golden_ratio_weights_ran_on_the_board, ruBody: ruBody_golden_ratio_weights_ran_on_the_board },
+  'golden-ruler-a-calibration-ruler-for-numeric-formats': { body: body_golden_ruler_a_calibration_ruler_for_numeric_formats, ruBody: ruBody_golden_ruler_a_calibration_ruler_for_numeric_formats },
   'mask-over-scale-ternary-drafts-that-compile': { body: body_mask_over_scale_ternary_drafts_that_compile, ruBody: ruBody_mask_over_scale_ternary_drafts_that_compile },
   'the-seed-moved-it-the-pins-moved-it-more': { body: body_the_seed_moved_it_the_pins_moved_it_more, ruBody: ruBody_the_seed_moved_it_the_pins_moved_it_more },
   'one-regional-clock-twelve-pull-requests': { body: body_one_regional_clock_twelve_pull_requests, ruBody: ruBody_one_regional_clock_twelve_pull_requests },
