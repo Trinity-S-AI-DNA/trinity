@@ -1,0 +1,369 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/fpga/dsp/cordic.t27 -- functions in hardware: CORDIC rotation and vectoring, and a sine table
+// Host: gHashTag/trinity apps/website public/widgets/{cordic,cordic-vector,sine-table}/ (module 4
+//       of the course arithmetic-and-dsp): each widget's logic.js is these fn bodies compiled to
+//       wasm (scripts/t27-logic.mjs in gHashTag/999-multibots-telegraf, types stripped); the
+//       pages write no formula of their own.
+//
+// CORDIC (J. E. Volder, "The CORDIC trigonometric computing technique", IRE Trans. Electronic
+// Computers EC-8(3), 1959; J. S. Walther, "A unified algorithm for elementary functions",
+// AFIPS 1971). Rotate a vector by a sequence of fixed angles atan(2^-i), each one either way,
+// so every step is two shifts and two adds:
+//     x(i+1) = x(i) - d(i) y(i) 2^-i,   y(i+1) = y(i) + d(i) x(i) 2^-i,   z(i+1) = z(i) - d(i) atan(2^-i)
+// ROTATION mode picks d(i) = sign(z(i)) and drives the angle left z to 0: starting from
+// (K(n), 0, theta) it ends at (cos theta, sin theta). Every step stretches the vector by
+// sqrt(1 + 2^-2i); starting at K(n) = prod 1 / sqrt(1 + 2^-2i) cancels the stretch, and K(n)
+// tends to 0.6072529350088812 (1/K = 1.6467602581210656). VECTORING mode picks d(i) = -sign(y(i))
+// and drives y to 0: the angle collects in z (atan2) and x grows to |v| / K(n). A vector in the
+// left half-plane is first turned by 90 degrees, so every angle in (-180, 180] converges.
+// atan(2^-i) is computed here from its series; sqrt by Newton's method.
+//
+// A SINE TABLE. n entries per quarter wave of b-bit words, entry k = round(sin(k h) S) / S with
+// h = (pi/2) / n and S = 2^(b-1) - 1. Taking the nearest entry costs up to about h / 2; linear
+// interpolation between two entries cuts that to h^2 / 8 (max |sin''| = 1), until the b-bit
+// rounding of the entries, 1 / (2 S), is what is left. The reference sine is this file's own
+// CORDIC run for REF_STEPS steps (error below 1e-13), so no second sine is written here.
+//
+// WHAT IT DOES NOT CLAIM: the iterations run in f64, not in a fixed-point datapath; a b-bit
+// CORDIC adds its own rounding per step. Throughput, pipelining and area are not modelled.
+// Claim status: checked by the tests below -- K(16) = 0.6072529351, cos/sin 30 degrees after 16
+// steps 0.866018 / 0.500013, atan2(4, 3) and |(3, 4)| = 5 by vectoring, the table errors
+// 4.8958e-2 nearest and 1.2064e-3 interpolated for 16 entries of 16 bits.
+// phi^2 + 1/phi^2 = 3 | TRINITY
+
+module fpga::dsp::cordic {
+
+    pub const KIND : str = "widget-logic";
+    pub const ID : str = "cordic";
+    pub const VERSION : u8 = 1;
+    pub const PI : f64 = 3.141592653589793;
+    pub const HALF_PI : f64 = 1.5707963267948966;
+    pub const K_LIMIT : f64 = 0.6072529350088812;
+    pub const REF_STEPS : u8 = 50;
+    pub const MAX_STEPS : u8 = 60;
+    pub const X_OUT : u8 = 0;
+    pub const Y_OUT : u8 = 1;
+    pub const Z_OUT : u8 = 2;
+
+    // atan(2^-i): pi/4 for i = 0, otherwise the series x - x^3/3 + x^5/5 - ... with x <= 1/2.
+    fn atan_pow2(i: u8) -> f64 {
+        if (i == 0) {
+            return PI / 4.0;
+        }
+        var x : f64 = 1.0;
+        var k : u8 = 0;
+        while (k < i) {
+            x = x / 2.0;
+            k = k + 1;
+        }
+        const x2 = x * x;
+        var power : f64 = x;
+        var sum : f64 = 0.0;
+        var sign : f64 = 1.0;
+        var odd : f64 = 1.0;
+        while (power > 0.00000000000000001) {
+            sum = sum + sign * power / odd;
+            power = power * x2;
+            sign = 0.0 - sign;
+            odd = odd + 2.0;
+        }
+        return sum;
+    }
+
+    // sqrt(v) for v >= 0 by Newton's method, until the guess stops moving (at most 80 steps).
+    fn sqrt_newton(v: f64) -> f64 {
+        if (v <= 0.0) {
+            return 0.0;
+        }
+        var g : f64 = 1.0;
+        if (v > 1.0) {
+            g = v;
+        }
+        var last : f64 = 0.0;
+        var k : u8 = 0;
+        while (k < 80 && g != last) {
+            last = g;
+            g = (g + v / g) / 2.0;
+            k = k + 1;
+        }
+        return g;
+    }
+
+    // K(n) = prod over i < n of 1 / sqrt(1 + 2^-2i).
+    fn gain(n: u8) -> f64 {
+        var kk : f64 = 1.0;
+        var p : f64 = 1.0;
+        var i : u8 = 0;
+        while (i < n) {
+            kk = kk / sqrt_newton(1.0 + p * p);
+            p = p / 2.0;
+            i = i + 1;
+        }
+        return kk;
+    }
+
+    // Rotation mode: x, y or z (which = X_OUT, Y_OUT, Z_OUT) after `step` steps of a run
+    // that starts at (K(total), 0, theta). |theta| <= 1.74 rad converges.
+    fn rot_state(theta: f64, total: u8, step: u8, which: u8) -> f64 {
+        var x : f64 = gain(total);
+        var y : f64 = 0.0;
+        var z : f64 = theta;
+        var p : f64 = 1.0;
+        var i : u8 = 0;
+        while (i < step && i < MAX_STEPS) {
+            var d : f64 = 1.0;
+            if (z < 0.0) {
+                d = -1.0;
+            }
+            const nx = x - d * y * p;
+            y = y + d * x * p;
+            x = nx;
+            z = z - d * atan_pow2(i);
+            p = p / 2.0;
+            i = i + 1;
+        }
+        if (which == X_OUT) {
+            return x;
+        }
+        if (which == Y_OUT) {
+            return y;
+        }
+        return z;
+    }
+
+    // The direction step i takes in rotation mode: +1 or -1.
+    fn rot_dir(theta: f64, total: u8, i: u8) -> i8 {
+        if (rot_state(theta, total, i, Z_OUT) < 0.0) {
+            return -1;
+        }
+        return 1;
+    }
+
+    // Vectoring mode: x, y or z after `step` steps from (x0, y0, 0); a left-half-plane
+    // vector is turned by 90 degrees first and z starts at +-pi/2.
+    fn vec_state(x0: f64, y0: f64, step: u8, which: u8) -> f64 {
+        var x : f64 = x0;
+        var y : f64 = y0;
+        var z : f64 = 0.0;
+        if (x0 < 0.0) {
+            if (y0 >= 0.0) {
+                x = y0;
+                y = 0.0 - x0;
+                z = HALF_PI;
+            } else {
+                x = 0.0 - y0;
+                y = x0;
+                z = 0.0 - HALF_PI;
+            }
+        }
+        var p : f64 = 1.0;
+        var i : u8 = 0;
+        while (i < step && i < MAX_STEPS) {
+            var d : f64 = 1.0;
+            if (y >= 0.0) {
+                d = -1.0;
+            }
+            const nx = x - d * y * p;
+            y = y + d * x * p;
+            x = nx;
+            z = z - d * atan_pow2(i);
+            p = p / 2.0;
+            i = i + 1;
+        }
+        if (which == X_OUT) {
+            return x;
+        }
+        if (which == Y_OUT) {
+            return y;
+        }
+        return z;
+    }
+
+    // atan2(y0, x0) after n vectoring steps.
+    fn vec_angle(x0: f64, y0: f64, n: u8) -> f64 {
+        return vec_state(x0, y0, n, Z_OUT);
+    }
+
+    // |(x0, y0)| after n vectoring steps: x grown by 1/K(n), scaled back by K(n).
+    fn vec_magnitude(x0: f64, y0: f64, n: u8) -> f64 {
+        return vec_state(x0, y0, n, X_OUT) * gain(n);
+    }
+
+    // The exact magnitude, for the error.
+    fn magnitude(x0: f64, y0: f64) -> f64 {
+        return sqrt_newton(x0 * x0 + y0 * y0);
+    }
+
+    // The reference sine and cosine for |x| <= pi/2: this CORDIC, REF_STEPS steps.
+    fn ref_sin(x: f64) -> f64 {
+        return rot_state(x, REF_STEPS, REF_STEPS, Y_OUT);
+    }
+
+    fn ref_cos(x: f64) -> f64 {
+        return rot_state(x, REF_STEPS, REF_STEPS, X_OUT);
+    }
+
+    // Entry k of an n-entry, b-bit quarter-wave table: round(sin(k h) S) / S.
+    fn table_entry(k: u16, n: u16, bits: u8) -> f64 {
+        const h = HALF_PI / (n as f64);
+        const scale = ((1 as i32) << (bits - 1)) - 1;
+        const s = (scale as f64);
+        const v : f64 = ref_sin((k as f64) * h) * s + 0.5;
+        var t : f64 = (v as i32) as f64;
+        if (t > v) {
+            t = t - 1.0;
+        }
+        return t / s;
+    }
+
+    // The table's sine of x in [0, pi/2]: the nearest entry, or the line between two.
+    fn table_sin(x: f64, n: u16, bits: u8, interp: bool) -> f64 {
+        const h = HALF_PI / (n as f64);
+        const u : f64 = x / h;
+        if (interp) {
+            var i : u16 = u as u16;
+            if (i >= n) {
+                i = n - 1;
+            }
+            const frac = u - (i as f64);
+            const a = table_entry(i, n, bits);
+            return a + (table_entry(i + 1, n, bits) - a) * frac;
+        }
+        var j : u16 = (u + 0.5) as u16;
+        if (j > n) {
+            j = n;
+        }
+        return table_entry(j, n, bits);
+    }
+
+    // The largest |table - sine| over 8 points per entry across the quarter wave.
+    fn table_max_err(n: u16, bits: u8, interp: bool) -> f64 {
+        var e : [1025]f64 = [0.0; 1025];
+        var k : u16 = 0;
+        while (k <= n) {
+            e[k] = table_entry(k, n, bits);
+            k = k + 1;
+        }
+        const h = HALF_PI / (n as f64);
+        var worst : f64 = 0.0;
+        var j : u32 = 0;
+        const top = (n as u32) * 8;
+        while (j <= top) {
+            const x = (j as f64) * h / 8.0;
+            const u : f64 = x / h;
+            var got : f64 = 0.0;
+            if (interp) {
+                var i : u16 = u as u16;
+                if (i >= n) {
+                    i = n - 1;
+                }
+                got = e[i] + (e[i + 1] - e[i]) * (u - (i as f64));
+            } else {
+                var m : u16 = (u + 0.5) as u16;
+                if (m > n) {
+                    m = n;
+                }
+                got = e[m];
+            }
+            const err = error_of(got, ref_sin(x));
+            if (err > worst) {
+                worst = err;
+            }
+            j = j + 1;
+        }
+        return worst;
+    }
+
+    // The interpolation bound h^2 / 8 and the word bound 1 / (2 S).
+    fn interp_bound(n: u16) -> f64 {
+        const h = HALF_PI / (n as f64);
+        return h * h / 8.0;
+    }
+
+    fn word_bound(bits: u8) -> f64 {
+        const scale = ((1 as i32) << (bits - 1)) - 1;
+        return 0.5 / (scale as f64);
+    }
+
+    // Bits of memory the table takes: n + 1 entries of b bits.
+    fn table_bits(n: u16, bits: u8) -> u32 {
+        return ((n as u32) + 1) * (bits as u32);
+    }
+
+    // Degrees to radians and back, for the pages that speak in degrees.
+    fn radians(deg: f64) -> f64 {
+        return deg * PI / 180.0;
+    }
+
+    fn degrees(rad: f64) -> f64 {
+        return rad * 180.0 / PI;
+    }
+
+    // |got - want|: the error the pages print.
+    fn error_of(got: f64, want: f64) -> f64 {
+        if (got > want) {
+            return got - want;
+        }
+        return want - got;
+    }
+
+    // ---- Tests -----------------------------------------------------------------------------
+
+    test "the angles and the gain" {
+        assert(error_of(atan_pow2(0), 0.7853981634) < 0.0000000001);
+        assert(error_of(atan_pow2(1), 0.4636476090) < 0.0000000001);
+        assert(error_of(atan_pow2(3), 0.1243549945) < 0.0000000001);
+        assert(error_of(gain(1), 0.7071067812) < 0.0000000001);
+        assert(error_of(gain(16), 0.6072529351) < 0.0000000001);
+        assert(error_of(gain(MAX_STEPS), K_LIMIT) < 0.000000000001);
+        assert(error_of(1.0 / gain(MAX_STEPS), 1.6467602581) < 0.0000000001);
+    }
+
+    test "rotation mode gives cos and sin of 30 degrees" {
+        const t = PI / 6.0;
+        assert(error_of(rot_state(t, 16, 16, X_OUT), 0.8660181182) < 0.0000000001);
+        assert(error_of(rot_state(t, 16, 16, Y_OUT), 0.5000126188) < 0.0000000001);
+        assert(error_of(rot_state(t, 8, 8, Y_OUT), 0.5039980218) < 0.0000000001);
+        assert(error_of(rot_state(PI / 4.0, 1, 1, X_OUT), 0.7071067812) < 0.0000000001);
+        assert(error_of(rot_state(0.0 - PI / 3.0, 20, 20, Y_OUT), -0.8660247940) < 0.0000000001);
+        assert(rot_dir(t, 16, 0) == 1);
+        assert(rot_dir(t, 16, 1) == -1);
+        assert(rot_dir(0.0, 16, 0) == 1);
+        assert(error_of(rot_state(0.0, 1, 1, Y_OUT), 0.7071067812) < 0.0000000001);
+    }
+
+    test "vectoring mode gives the angle and the magnitude" {
+        assert(error_of(vec_angle(3.0, 4.0, 24), 0.9272951469) < 0.0000000001);
+        assert(error_of(vec_magnitude(3.0, 4.0, 16), 5.0) < 0.000000001);
+        assert(error_of(vec_magnitude(3.0, 4.0, 8), 4.9998763800) < 0.0000000001);
+        assert(error_of(vec_angle(0.0 - 1.0, 1.0, 20), 2.3561928526) < 0.0000000001);
+        assert(error_of(vec_angle(0.0 - 1.0, 0.0 - 2.0, 20), -2.0344457950) < 0.0000000001);
+        assert(error_of(magnitude(3.0, 4.0), 5.0) < 0.000000000001);
+        assert(error_of(radians(30.0), PI / 6.0) < 0.000000000001);
+        assert(error_of(degrees(vec_angle(1.0, 1.0, 40)), 45.0) < 0.000000001);
+    }
+
+    test "the reference sine is exact to the last digits" {
+        assert(error_of(ref_sin(PI / 6.0), 0.5) < 0.0000000000001);
+        assert(error_of(ref_cos(PI / 3.0), 0.5) < 0.0000000000001);
+        assert(error_of(ref_sin(HALF_PI), 1.0) < 0.0000000000001);
+    }
+
+    test "a table: nearest entry against interpolation" {
+        assert(error_of(table_max_err(16, 16, false), 0.04895778) < 0.0000001);
+        assert(error_of(table_max_err(16, 16, true), 0.001206418) < 0.000000001);
+        assert(error_of(table_max_err(64, 16, true), 0.0000816481) < 0.000000001);
+        assert(error_of(table_max_err(256, 12, true), 0.0002441433) < 0.000000001);
+        assert(table_max_err(1024, 16, true) < table_max_err(256, 16, true));
+        assert(error_of(interp_bound(16), 0.001204786) < 0.000000001);
+        assert(error_of(word_bound(16), 0.00001525925) < 0.0000000001);
+        assert(table_bits(256, 16) == 4112);
+        assert(table_entry(16, 16, 16) == 1.0);
+    }
+
+    test "VERSION says what the header says" {
+        assert(VERSION == 1);
+        assert(error_of(gain(REF_STEPS), K_LIMIT) < 0.000000000001);
+    }
+}
+// phi^2 + 1/phi^2 = 3 | TRINITY

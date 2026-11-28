@@ -1,0 +1,227 @@
+// TRI-NET compute bond escrow: the shared collateral that settle + challenge act
+// on. tri_compute_settle credits rewards and tri_compute_challenge slashes wrong
+// results, but each moved a bare balance. This spec gives one bonded lifecycle:
+// FREE -> post (lock collateral out of balance) -> LOCKED -> resolve ->
+// RELEASED (honest, bond returns) or SLASHED (wrong, bond forfeited). Locking is
+// guarded against underflow (you cannot post more than you hold).
+//
+// Wiring (generated Rust / src): `outcome` comes from
+// tri_compute_challenge.resolve (0 = HONEST, 1 = SLASH).
+
+module TriComputeBond {
+    use base::types;
+
+    const ST_FREE: u32 = 0;
+    const ST_LOCKED: u32 = 1;
+    const ST_RELEASED: u32 = 2;
+    const ST_SLASHED: u32 = 3;
+
+    // You can only lock collateral you actually hold.
+    fn can_post(balance: u32, amount: u32) -> bool {
+        return amount <= balance;
+    }
+
+    // Balance after locking a bond -- guarded: an over-post is a no-op (holds
+    // the balance) rather than underflowing.
+    fn balance_after_post(balance: u32, amount: u32) -> u32 {
+        if (amount <= balance) {
+            return balance - amount;
+        } else {
+            return balance;
+        }
+    }
+
+    // The locked bond amount actually taken (0 if the post was invalid).
+    fn locked_amount(balance: u32, amount: u32) -> u32 {
+        if (amount <= balance) {
+            return amount;
+        } else {
+            return 0;
+        }
+    }
+
+    // Bond state after a dispute resolution (outcome: 0 = honest, else slash).
+    // Bond state after a dispute resolution. Written when only HONEST(0)/SLASH(1)
+    // existed, this slashed EVERY non-honest outcome -- but tri_compute_challenge
+    // grew non-terminal outcomes that prove NO fraud (RESOLVE_MALFORMED=2,
+    // RESOLVE_STALE=3, RESOLVE_FAMILY_MISMATCH=4, RESOLVE_INDETERMINATE=5). Marking
+    // those SLASHED would let a griefer forfeit an honest executor's bond with a
+    // malformed/stale/split dispute. Only a PROVEN slash (1) forfeits; an honest
+    // (0) releases; everything else leaves the bond LOCKED (still escrowed, the
+    // dispute unresolved) -- consistent with challenge.executor_bond_after, which
+    // already keeps the bond on any outcome but RESOLVE_SLASH.
+    fn bond_state_after(outcome: u32) -> u32 {
+        if (outcome == 0) {
+            return ST_RELEASED;
+        } else {
+            if (outcome == 1) {
+                return ST_SLASHED;
+            } else {
+                return ST_LOCKED;
+            }
+        }
+    }
+
+    // Balance after resolution: an honest executor gets the bond back; a slashed
+    // one does not (the bond goes to the challenger, see tri_compute_challenge).
+    // SATURATING release: balance and bond are both full u32 collateral, so a bare
+    // balance + bond WRAPS a near-max balance to near-zero -- and this is the HONEST
+    // path, so a correct executor would silently LOSE funds exactly when it should be
+    // made whole (worse than any error path). Cap at u32 max, the same crediting
+    // discipline as tri_compute_pool.balance_after_pool_settle / settle.balance_add.
+    // Non-terminal / slash outcomes never add, so they cannot overflow.
+    fn balance_after_resolve(balance: u32, bond: u32, outcome: u32) -> u32 {
+        if (outcome == 0) {
+            let sum: u32 = balance +% bond;
+            if (sum < balance) {
+                return 0xFFFFFFFF;
+            } else {
+                return sum;
+            }
+        } else {
+            return balance;
+        }
+    }
+
+    // ---- Collateralization: the bond must scale with value at risk ----
+    //
+    // The bond is posted ONCE, but a node takes many tasks and escrows a reward on
+    // each. A single fixed bond is toothless once the node handles more value than
+    // the bond: a fraudster with bond=1 across 1000 tasks loses ~nothing to a
+    // slash. Require the bond to cover a minimum fraction of the node's OUTSTANDING
+    // escrowed value before it may take on more (EigenLayer restaking caps / Aave
+    // collateral ratio). min_bps is policy: 10000 = 100% (bond >= outstanding),
+    // 2000 = 20%, 15000 = over-collateralized 1.5x. Zero outstanding needs no bond.
+    const BOND_BPS_UNIT: u32 = 10000;
+
+    // The minimum bond for a given outstanding escrow at a given ratio. u64-widened:
+    // outstanding * min_bps overflows u32 at realistic scale (mulDiv discipline,
+    // as tri_compute_pool.pool_share), then floor-divided back.
+    fn required_bond(outstanding: u32, min_bps: u32) -> u32 {
+        let need: u64 = (outstanding as u64) * (min_bps as u64);
+        return (need / (BOND_BPS_UNIT as u64)) as u32;
+    }
+
+    // Does the posted bond cover the required collateral for the outstanding risk?
+    fn bond_covers(bond: u32, outstanding: u32, min_bps: u32) -> bool {
+        return bond >= required_bond(outstanding, min_bps);
+    }
+
+    // Rung-aware collateral: a wider ladder rung carries more risk -- its result is
+    // higher-precision (more valuable) and more expensive to recompute -- so it demands
+    // a higher collateralization ratio. The base min_bps is raised by BOND_BPS_PER_TRIT
+    // for each exponent trit above the flagship GF-T16 (Et4); at/below GF-T16 the base
+    // applies unchanged. gf_et is the ladder Et (tri_a2a.skill_et). Mirrors the rung-aware
+    // challenge window (tri_compute_optimistic.window_for_rung): higher rung -> bigger
+    // bond AND longer window.
+    const GFT16_ET: u32 = 4;
+    const BOND_BPS_PER_TRIT: u32 = 500;  // +5% collateral per exponent trit above GF-T16
+
+    fn rung_min_bps(min_bps: u32, gf_et: u32) -> u32 {
+        if (gf_et <= GFT16_ET) {
+            return min_bps;
+        } else {
+            return min_bps + (gf_et - GFT16_ET) * BOND_BPS_PER_TRIT;
+        }
+    }
+
+    fn required_bond_rung(outstanding: u32, min_bps: u32, gf_et: u32) -> u32 {
+        return required_bond(outstanding, rung_min_bps(min_bps, gf_et));
+    }
+
+    fn bond_covers_rung(bond: u32, outstanding: u32, min_bps: u32, gf_et: u32) -> bool {
+        return bond >= required_bond_rung(outstanding, min_bps, gf_et);
+    }
+
+    // ---- Tests / invariants ----
+
+    // You cannot post more collateral than you hold; a valid post reduces balance.
+    test post_is_guarded {
+        assert(can_post(1000, 200) == true, "can lock within balance");
+        assert(can_post(1000, 2000) == false, "cannot over-post");
+        assert(balance_after_post(1000, 200) == 800, "valid post reduces balance");
+        assert(balance_after_post(1000, 2000) == 1000, "over-post is a no-op (no underflow)");
+        assert(locked_amount(1000, 200) == 200, "locks the requested amount");
+        assert(locked_amount(1000, 2000) == 0, "invalid post locks nothing");
+    }
+
+    // Honest resolution releases the bond back into the balance (round-trip whole).
+    test honest_round_trips_the_bond {
+        after_post = balance_after_post(1000, 200);
+        bond = locked_amount(1000, 200);
+        assert(bond_state_after(0) == ST_RELEASED, "honest -> released");
+        assert(balance_after_resolve(after_post, bond, 0) == 1000, "bond returns; balance whole");
+    }
+
+    // The honest release saturates instead of wrapping at the u32 ceiling: a near-max
+    // balance getting its bond back caps at u32 max rather than wrapping to a tiny
+    // value (which would rob a CORRECT executor). Slash/non-terminal never add.
+    test honest_release_saturates {
+        assert(balance_after_resolve(500, 200, 0) == 700, "normal release exact (regression)");
+        assert(balance_after_resolve(0xFFFFFFF0, 200, 0) == 0xFFFFFFFF, "release that would overflow saturates to u32 max, not wrap to ~184");
+        assert(balance_after_resolve(0xFFFFFFF0, 200, 1) == 0xFFFFFFF0, "slash never adds -> no overflow, balance unchanged");
+    }
+
+    // A slash keeps the bond out of the executor's balance and marks it SLASHED.
+    test slash_forfeits_the_bond {
+        after_post = balance_after_post(1000, 200);
+        bond = locked_amount(1000, 200);
+        assert(bond_state_after(1) == ST_SLASHED, "slash -> slashed");
+        assert(balance_after_resolve(after_post, bond, 1) == 800, "bond forfeited; balance stays reduced");
+    }
+
+    // A NON-TERMINAL dispute outcome proves no fraud and must NOT slash: the bond
+    // stays LOCKED (still escrowed, dispute unresolved), so a griefer's malformed/
+    // stale/family/split dispute cannot forfeit an honest executor's bond.
+    // 2=MALFORMED, 3=STALE, 4=FAMILY_MISMATCH, 5=INDETERMINATE.
+    test non_terminal_outcomes_keep_the_bond_locked {
+        assert(bond_state_after(2) == ST_LOCKED, "MALFORMED -> bond stays locked, not slashed");
+        assert(bond_state_after(3) == ST_LOCKED, "STALE -> bond stays locked");
+        assert(bond_state_after(4) == ST_LOCKED, "FAMILY_MISMATCH -> bond stays locked");
+        assert(bond_state_after(5) == ST_LOCKED, "INDETERMINATE -> bond stays locked");
+        // Only a proven slash forfeits; only honest releases.
+        assert(bond_state_after(0) == ST_RELEASED, "HONEST -> released");
+        assert(bond_state_after(1) == ST_SLASHED, "SLASH -> slashed");
+        // The locked bond is not returned to spendable balance (still escrowed) and
+        // not forfeited either -- balance is unchanged for a non-terminal outcome.
+        after_post = balance_after_post(1000, 200);
+        assert(balance_after_resolve(after_post, 200, 2) == 800, "malformed: bond neither returned nor added to balance");
+        assert(balance_after_resolve(after_post, 200, 5) == 800, "indeterminate: bond stays escrowed");
+    }
+
+    // Collateralization: the required bond scales with outstanding risk and ratio.
+    test required_bond_scales {
+        assert(required_bond(1000, 2000) == 200, "20% of 1000 outstanding = 200");
+        assert(required_bond(1000, BOND_BPS_UNIT) == 1000, "100% ratio -> bond must equal outstanding");
+        assert(required_bond(1000, 15000) == 1500, "150% ratio -> over-collateralized");
+        assert(required_bond(0, 15000) == 0, "no outstanding risk needs no bond");
+        assert(required_bond(1000000, 20000) == 2000000, "1e6 * 20000 / 10000 = 2e6 (u64, no u32 overflow)");
+    }
+
+    // The required bond grows with the ladder rung: a GF-T64 result demands more
+    // collateral than a GF-T16 one at the same outstanding + base ratio.
+    test required_bond_scales_with_rung {
+        assert(rung_min_bps(2000, 4) == 2000, "GF-T16 (Et4) uses the base ratio");
+        assert(rung_min_bps(2000, 6) == 3000, "GF-T32 (Et6) +2 trits -> +10%");
+        assert(rung_min_bps(2000, 9) == 4500, "GF-T64 (Et9) +5 trits -> +25%");
+        assert(rung_min_bps(2000, 14) == 7000, "GF-T128 (Et14) +10 trits -> +50%");
+        assert(rung_min_bps(2000, 3) == 2000, "sub-flagship GF-T8 uses the base (never shrinks)");
+        // required bond at outstanding 1000, base 20%:
+        assert(required_bond_rung(1000, 2000, 4) == 200, "GF-T16 needs 200");
+        assert(required_bond_rung(1000, 2000, 9) == 450, "GF-T64 needs 450 -- more collateral");
+        assert(required_bond_rung(1000, 2000, 9) > required_bond_rung(1000, 2000, 4), "wider rung -> bigger bond");
+        // coverage gate at the rung: a bond sized for GF-T16 does NOT cover GF-T64.
+        assert(bond_covers_rung(450, 1000, 2000, 9) == true, "450 covers GF-T64");
+        assert(bond_covers_rung(200, 1000, 2000, 9) == false, "a GF-T16-sized bond underfunds GF-T64");
+    }
+
+    // The coverage gate: a bond below the required collateral does not cover, at or
+    // above does. A tiny bond against large outstanding value is rejected.
+    test bond_coverage_gate {
+        assert(bond_covers(200, 1000, 2000) == true, "200 covers 20% of 1000");
+        assert(bond_covers(199, 1000, 2000) == false, "199 is one short of the 200 required");
+        assert(bond_covers(1, 1000, 2000) == false, "a nominal bond does NOT cover 1000 of outstanding risk");
+        assert(bond_covers(1000, 1000, BOND_BPS_UNIT) == true, "a full 100% bond covers");
+        assert(bond_covers(0, 0, 20000) == true, "a fresh node with no outstanding risk is covered by a zero bond");
+    }
+}

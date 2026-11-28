@@ -1,0 +1,259 @@
+// SPDX-License-Identifier: Apache-2.0
+// t27/specs/fpga/reset_sync.t27
+// Reset synchronizer model for Trinity T27 FPGA HIR
+// Three reset kinds, a shift-register model of the release path
+// phi^2 + 1/phi^2 = 3 | TRINITY
+//
+// THE RULE THIS FILE TEACHES. A reset may assert asynchronously (the board
+// does not wait for your clock) but must release synchronously: the release
+// edge is captured by the destination clock and walked through a small shift
+// register of 2 or more flops. A reset that releases asynchronously races the
+// clock at every flip-flop it feeds and violates recovery/removal timing, so
+// kind 2 below (async assert, async release) is legal hardware but not a
+// recommended reset. The flop count is capped at 4 because the shift register
+// is drawn one flop per field (d0..d3), and 2 to 4 stages covers the range a
+// real design chooses from.
+
+module ResetSync {
+
+    // === Reset kinds ===
+
+    pub const ResetKind = enum(i8) {
+        sync = 0,                    // assert and release both through the clock
+        async_assert_sync_release = 1, // assert immediate, release through the pipe
+        async_assert_async_release = 2, // assert and release both immediate: races
+    }
+
+    // === Reset synchronizer configuration ===
+
+    pub struct ResetSyncConfig {
+        name : &str,
+        kind : i8,
+        stages : u32,
+    }
+
+    fn reset_sync(name: &str, kind: i8, stages: u32) -> ResetSyncConfig {
+        return ResetSyncConfig{
+            .name = name,
+            .kind = kind,
+            .stages = stages,
+        };
+    }
+
+    // === Shift-register state (one bool per flop, d0 nearest the input) ===
+
+    pub struct SyncState {
+        d0 : bool,
+        d1 : bool,
+        d2 : bool,
+        d3 : bool,
+    }
+
+    fn asserted_state() -> SyncState {
+        return SyncState{ .d0 = true, .d1 = true, .d2 = true, .d3 = true };
+    }
+
+    fn released_state() -> SyncState {
+        return SyncState{ .d0 = false, .d1 = false, .d2 = false, .d3 = false };
+    }
+
+    // One destination clock: every flop takes its neighbour's value
+    fn step(s: SyncState, din: bool) -> SyncState {
+        return SyncState{
+            .d0 = din,
+            .d1 = s.d0,
+            .d2 = s.d1,
+            .d3 = s.d2,
+        };
+    }
+
+    // Run the pipe with the input released, as a clean reset release does
+    fn after_clocks(s: SyncState, clocks: u32) -> SyncState {
+        var r : SyncState = s;
+        var i : u32 = 0;
+        while i < clocks {
+            r = step(r, false);
+            i = i + 1;
+        }
+        return r;
+    }
+
+    fn settled(s: SyncState) -> bool {
+        return (s.d0 or s.d1 or s.d2 or s.d3) == false;
+    }
+
+    // === Kind and timing queries ===
+
+    fn asserts_async(cfg: ResetSyncConfig) -> bool {
+        return (cfg.kind == 1) or (cfg.kind == 2);
+    }
+
+    fn releases_async(cfg: ResetSyncConfig) -> bool {
+        return cfg.kind == 2;
+    }
+
+    // The flop the sync path reads: stage 1 is d0, stage 2 is d1, and so on
+    fn pipe_output(s: SyncState, cfg: ResetSyncConfig) -> bool {
+        if cfg.stages == 1 {
+            return s.d0;
+        }
+        if cfg.stages == 2 {
+            return s.d1;
+        }
+        if cfg.stages == 3 {
+            return s.d2;
+        }
+        return s.d3;
+    }
+
+    // The reset seen by the logic, given the pipe state and the raw input
+    fn reset_out(cfg: ResetSyncConfig, s: SyncState, raw_in: bool) -> bool {
+        if cfg.kind == 2 {
+            // Async release: the raw wire is the reset, glitches and all
+            return raw_in;
+        }
+        if cfg.kind == 1 {
+            // Async assert: the raw wire asserts at once; the pipe releases
+            return raw_in or pipe_output(s, cfg);
+        }
+        // Sync reset: the pipe alone decides, assert and release both clocked
+        return pipe_output(s, cfg);
+    }
+
+    // Cycles from a released input to a released output
+    fn release_latency_cycles(cfg: ResetSyncConfig) -> u32 {
+        return cfg.stages;
+    }
+
+    // === Validation ===
+
+    fn validate_rst(cfg: ResetSyncConfig) -> u32 {
+        var errors : u32 = 0;
+
+        if cfg.name == "" {
+            errors = errors + 1;
+        }
+        if cfg.kind < 0 or cfg.kind > 2 {
+            errors = errors + 1;
+        }
+        if cfg.stages < 1 or cfg.stages > 4 {
+            errors = errors + 1;
+        }
+
+        return errors;
+    }
+
+    // The shape the course recommends: release through at least two flops
+    fn is_recommended(cfg: ResetSyncConfig) -> bool {
+        return (cfg.kind == 0 or cfg.kind == 1) and cfg.stages >= 2;
+    }
+
+    // === Tests ===
+
+    test the_pipe_shifts_one_flop_per_clock
+        given s1 = step(released_state(), true)
+        then s1.d0 == true
+        and s1.d1 == false
+        and s1.d2 == false
+
+    test the_pipe_carries_the_release_downstream
+        given s1 = step(asserted_state(), false)
+        and s2 = step(s1, false)
+        then s1.d0 == false
+        and s1.d1 == true
+        and s2.d0 == false
+        and s2.d1 == false
+
+    test a_two_stage_release_takes_two_clocks
+        given cfg = reset_sync("sys_rst", 1, 2)
+        and one = after_clocks(asserted_state(), 1)
+        and two = after_clocks(asserted_state(), 2)
+        then reset_out(cfg, one, false) == true
+        and reset_out(cfg, two, false) == false
+
+    test release_latency_counts_the_flops
+        given cfg2 = reset_sync("two", 1, 2)
+        and cfg3 = reset_sync("three", 1, 3)
+        then release_latency_cycles(cfg2) == 2
+        and release_latency_cycles(cfg3) == 3
+
+    test async_assert_reaches_the_output_without_a_clock
+        given cfg = reset_sync("sys_rst", 1, 2)
+        then reset_out(cfg, released_state(), true) == true
+        and asserts_async(cfg) == true
+
+    test sync_assert_waits_for_the_clock
+        given cfg = reset_sync("sys_rst", 0, 2)
+        then reset_out(cfg, released_state(), true) == false
+        and asserts_async(cfg) == false
+
+    test async_release_follows_the_raw_wire
+        given cfg = reset_sync("racy", 2, 2)
+        then reset_out(cfg, asserted_state(), false) == false
+        and reset_out(cfg, released_state(), true) == true
+        and releases_async(cfg) == true
+
+    test a_short_deassert_does_not_release_the_pipe
+        given cfg = reset_sync("sys_rst", 1, 2)
+        and glitch = step(asserted_state(), false)
+        then reset_out(cfg, glitch, false) == true
+
+    test the_pipe_settles_completely
+        given s = after_clocks(asserted_state(), 4)
+        then settled(s) == true
+
+    test three_stages_use_the_third_flop
+        given cfg = reset_sync("three", 0, 3)
+        and s1 = step(step(step(released_state(), true), false), false)
+        then pipe_output(s1, cfg) == true
+        and reset_out(cfg, s1, false) == true
+
+    test validate_accepts_a_two_stage_synchronizer
+        given cfg = reset_sync("sys_rst", 1, 2)
+        then validate_rst(cfg) == 0
+        and is_recommended(cfg) == true
+
+    test zero_stages_is_an_error
+        given cfg = reset_sync("zero", 1, 0)
+        then validate_rst(cfg) > 0
+
+    test five_stages_is_an_error
+        given cfg = reset_sync("five", 1, 5)
+        then validate_rst(cfg) > 0
+
+    test an_unknown_kind_is_an_error
+        given cfg = reset_sync("weird", 3, 2)
+        then validate_rst(cfg) > 0
+
+    test one_stage_is_legal_but_not_recommended
+        given cfg = reset_sync("thin", 1, 1)
+        then validate_rst(cfg) == 0
+        and is_recommended(cfg) == false
+
+    test async_release_is_not_recommended
+        given cfg = reset_sync("racy", 2, 2)
+        then is_recommended(cfg) == false
+
+    // === Invariants ===
+
+    invariant the_release_always_settles
+        given s = after_clocks(asserted_state(), 4)
+        assert settled(s) == true
+
+    invariant the_pipe_holds_the_reset_while_it_shifts
+        given cfg = reset_sync("inv", 1, 2)
+        and s = after_clocks(asserted_state(), 1)
+        assert reset_out(cfg, s, false) == true
+
+    invariant sync_reset_cannot_jump_the_pipe
+        given cfg = reset_sync("inv", 0, 2)
+        assert reset_out(cfg, released_state(), true) == false
+
+    // === Benchmarks ===
+
+    bench step_latency
+        measure: nanoseconds to step(asserted_state(), true)
+        target: < 10ns
+}
+
+// phi^2 + 1/phi^2 = 3 | TRINITY

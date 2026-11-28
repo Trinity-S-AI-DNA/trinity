@@ -1,0 +1,1 @@
+import{a$ as e}from"./QueenComb-DG8-i2mW.js";const r="kernelBlurVaryingDeclaration",a="varying sampleCoord{X}: vec2f;";e.IncludesShadersStoreWGSL[r]||(e.IncludesShadersStoreWGSL[r]=a);const o={name:r,shader:a};export{o as k};

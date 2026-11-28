@@ -1,0 +1,1222 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/queen/actors.t27 -- the actor model under the Queen's agents, taken from the BEAM (Erlang/OTP):
+; every agent runtime is a process with a pid and a mailbox; processes share nothing and talk only by
+; message; a failure travels as an exit signal along links, or as a DOWN message along monitors; and a
+; tree of supervisors restarts what failed, by restart type and strategy, until too many restarts in
+; a period escalate to the parent. One home of these rules; nobody restates them.
+; Where it sits: specs/queen/control.t27 (gHashTag/t27#6657) owns events, fenced task leases and the
+; domain agents' life cycle; specs/queen/dispatch.t27 owns the canonical task machine. This file is
+; the layer below both: how one runtime addresses another, what it receives and in which order, what
+; happens to the others when it dies, and who brings it back. Nothing here is a second lease, queue or
+; registry -- a pid generation does for a process what control.t27's fence does for a lease.
+; What the BEAM gives, as adopted here (Erlang reference manual "Processes", OTP design principles
+; "Supervisor Behaviour"):
+;   identity      a pid names one incarnation; a restart is a new pid, never the old one revived
+;   send          asynchronous, never blocks, never acknowledged; to a dead pid it is dropped silently
+;   order         guaranteed only between one sender and one receiver
+;   receive       selective: the oldest message that matches; the rest stay queued in order; `after`
+;                 bounds the wait and `after 0` polls
+;   links         bidirectional; a death sends its reason to every linked process; a trapping process
+;                 gets it as a message, a non-trapping one ignores `normal` and dies of anything else
+;   kill          untrappable; the victim dies with `killed`, which its own links see as an ordinary
+;                 reason, so a trapping neighbour survives it
+;   monitors      one-way; one DOWN message per monitor; a DOWN never kills the watcher
+;   supervisors   permanent / transient / temporary children; one_for_one / one_for_all /
+;                 rest_for_one; stop in reverse start order; more than MaxR restarts in MaxT seconds
+;                 and the supervisor stops its children and exits with `shutdown`
+; What is deliberately not the BEAM, and why, is section 7.
+; Not here: the wiring. The supervisor is TypeScript in gHashTag/BrowserOS; its open slice of #6657
+; (BrowserOS#537, not merged) has leases, an event log and a heartbeat, and no mailbox, link, monitor
+; or restart. `t27c gen-js` lowers this file's constants and none of its function bodies, so the
+; supervisor can import the numbers and must mirror the functions, as it does for control.t27. Until
+; it does, every rule below is a contract with tests, not a measured runtime behaviour. ASCII only (L3).
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module QueenActors;
+
+; --- 1. Identity: a pid is a slot and a generation -------------------------------------------------
+
+/// A pid packs the runtime's slot (high 32 bits) and its generation (low 32 bits). Slot 0 is nobody,
+/// so pid 0 is NO_PID and no real process has it, whatever its generation.
+pub const NO_PID : u64 = 0;
+pub const GEN_MASK : u64 = 4294967295;
+
+pub fn pid_of(slot: u64, gen: u64) -> u64 {
+    if (slot == 0) { return NO_PID; }
+    if (slot > GEN_MASK) { return NO_PID; }
+    return (slot << 32) | (gen & GEN_MASK);
+}
+
+pub fn slot_of(pid: u64) -> u64 {
+    return pid >> 32;
+}
+
+pub fn gen_of(pid: u64) -> u64 {
+    return pid & GEN_MASK;
+}
+
+/// A restart reuses the slot with the next generation. A generation wraps after 2^32 restarts of one
+/// slot; the restart intensity of section 5 stops a slot long before that.
+pub fn next_gen(gen: u64) -> u64 {
+    return (gen + 1) & GEN_MASK;
+}
+
+/// A message, a link or a monitor addressed to a pid reaches only that incarnation. Whatever was sent
+/// to the runtime before its restart reaches nobody, as a write with an old fence lands nowhere.
+pub fn reaches(addressed: u64, live: u64) -> bool {
+    if (addressed == NO_PID) { return false; }
+    return addressed == live;
+}
+
+; --- 2. Mailbox: send never blocks, receive is selective -------------------------------------------
+
+/// What happens to one sent message. The sender learns none of it: a send returns at once and is not
+/// acknowledged. Whoever needs an answer asks for a reply and waits with `after` (a call).
+pub const D_QUEUED : u8 = 0;
+pub const D_DROPPED_DEAD : u8 = 1;
+pub const D_DROPPED_FULL : u8 = 2;
+
+pub const SEND_BLOCKS : bool = false;
+pub const SEND_ACKNOWLEDGED : bool = false;
+
+/// Bounded, unlike the BEAM (section 7). A runtime takes one task at a time, so a full mailbox means a
+/// stuck runtime, which its missed heartbeat already reports; the dropped message is repaired like a
+/// lost event, by control.t27's reconciler. Chosen, not measured.
+pub const MAILBOX_CAP : u32 = 256;
+
+pub fn deliver(target_reached: bool, queued: u32, cap: u32) -> u8 {
+    if (target_reached == false) { return D_DROPPED_DEAD; }
+    if (queued >= cap) { return D_DROPPED_FULL; }
+    return D_QUEUED;
+}
+
+/// Order is guaranteed between one sender and one receiver only. Two senders' messages interleave in
+/// any order; nothing orders A -> C against A -> B -> C.
+pub fn ordered(same_sender: bool, same_receiver: bool) -> bool {
+    return same_sender && same_receiver;
+}
+
+/// A reference model of one mailbox, small enough to test every backend: 8 one-byte message tags in a
+/// u64, the oldest in the low byte, tag 0 = an empty slot. Tags 1..255 are message kinds. A full model
+/// box refuses a push and returns itself unchanged; pushing tag 0 adds nothing.
+pub const MBOX_SLOTS : u64 = 8;
+pub const SLOT_BITS : u64 = 8;
+pub const TAG_MASK : u64 = 255;
+pub const NO_MATCH : u64 = 8;
+
+pub fn mbox_tag(box: u64, i: u64) -> u64 {
+    if (i >= MBOX_SLOTS) { return 0; }
+    return (box >> (i * SLOT_BITS)) & TAG_MASK;
+}
+
+pub fn mbox_len(box: u64) -> u64 {
+    var n : u64 = 0;
+    while (n < MBOX_SLOTS) {
+        if (mbox_tag(box, n) == 0) { return n; }
+        n = n + 1;
+    }
+    return MBOX_SLOTS;
+}
+
+pub fn mbox_push(box: u64, tag: u64) -> u64 {
+    if (tag > TAG_MASK) { return box; }
+    var n : u64 = mbox_len(box);
+    if (n == MBOX_SLOTS) { return box; }
+    return box | (tag << (n * SLOT_BITS));
+}
+
+/// The oldest queued message with this tag, or NO_MATCH.
+pub fn mbox_find(box: u64, want: u64) -> u64 {
+    var i : u64 = 0;
+    while (i < MBOX_SLOTS) {
+        if (mbox_tag(box, i) == 0) { return NO_MATCH; }
+        if (mbox_tag(box, i) == want) { return i; }
+        i = i + 1;
+    }
+    return NO_MATCH;
+}
+
+/// Take slot i out and close the gap: older messages stay where they are, newer ones move down one
+/// slot, so the order of everything left is the order it arrived in. The last slot is cut without a
+/// shift (a u64 shifted by 64 is undefined).
+pub fn mbox_remove(box: u64, i: u64) -> u64 {
+    if (i >= MBOX_SLOTS) { return box; }
+    var s : u64 = i * SLOT_BITS;
+    var below : u64 = box - ((box >> s) << s);
+    if (i == MBOX_SLOTS - 1) { return below; }
+    var above : u64 = box >> (s + SLOT_BITS);
+    return below | (above << s);
+}
+
+/// Selective receive: the oldest match leaves the box; with no match the box is unchanged and the
+/// receiver keeps waiting.
+pub fn receive(box: u64, want: u64) -> u64 {
+    return mbox_remove(box, mbox_find(box, want));
+}
+
+/// `receive ... after T`. A match wins whenever it comes; with none, the wait ends at T. `after 0` is a
+/// poll: it returns at once. AFTER_INFINITY never times out.
+pub const RCV_MATCH : u8 = 0;
+pub const RCV_WAIT : u8 = 1;
+pub const RCV_TIMEOUT : u8 = 2;
+pub const AFTER_INFINITY : u32 = 4294967295;
+
+pub fn receive_outcome(found: bool, waited_ms: u32, after_ms: u32) -> u8 {
+    if (found) { return RCV_MATCH; }
+    if (after_ms == AFTER_INFINITY) { return RCV_WAIT; }
+    if (waited_ms >= after_ms) { return RCV_TIMEOUT; }
+    return RCV_WAIT;
+}
+
+/// Two lanes per runtime. The BEAM keeps exit signals out of the mailbox and Akka keeps system messages
+/// in a queue of their own, so a mailbox full of work never costs the message that stops the work. The
+/// data lane is the bounded mailbox above. The control lane carries what changes what the runtime is
+/// doing (section 6 names the kinds) and holds at most one pending message per kind: a second message of
+/// a kind already pending coalesces into it -- a second cancel of the same task adds nothing -- so the
+/// lane is bounded by the number of kinds, is never full, and never drops for space. A pending control
+/// message is taken before any data message, whichever arrived first, so order per pair (`ordered`)
+/// holds within a lane and not across the two: a cancel sent after an offer is taken before it. That is
+/// Akka's rule for system messages, not the BEAM's, which orders every signal per pair.
+pub const LANE_DATA : u8 = 0;
+pub const LANE_CONTROL : u8 = 1;
+pub const LANE_NONE : u8 = 2;
+pub const D_COALESCED : u8 = 3;
+
+pub fn deliver_control(target_reached: bool, kind_pending: bool) -> u8 {
+    if (target_reached == false) { return D_DROPPED_DEAD; }
+    if (kind_pending) { return D_COALESCED; }
+    return D_QUEUED;
+}
+
+/// A dead letter is a message that was sent and reaches nobody: to a dead pid or into a full mailbox.
+/// Each one is counted where the reconciler reads it, so a loss is seen and repaired, never silent.
+/// A coalesced control message is not a loss -- the pending one carries it.
+pub fn is_dead_letter(outcome: u8) -> bool {
+    if (outcome == D_DROPPED_DEAD) { return true; }
+    return outcome == D_DROPPED_FULL;
+}
+
+pub fn next_lane(control_pending: bool, data_pending: bool) -> u8 {
+    if (control_pending) { return LANE_CONTROL; }
+    if (data_pending) { return LANE_DATA; }
+    return LANE_NONE;
+}
+
+/// A reference model of the control lane: one bit per kind in a u64, bit k for tag k (tags 1..63). The
+/// lowest pending tag is taken first, so the kinds' numbering is their priority.
+pub const CTL_TAGS : u64 = 64;
+// a typed one: `zig` lowers a bare literal 1 in a shift as u32, which cannot reach bit 32 and up
+pub const CTL_BIT : u64 = 1;
+
+pub fn ctl_pending(lane: u64, tag: u64) -> bool {
+    if (tag >= CTL_TAGS) { return false; }
+    return ((lane >> tag) & 1) == 1;
+}
+
+pub fn ctl_post(lane: u64, tag: u64) -> u64 {
+    if (tag == 0) { return lane; }
+    if (tag >= CTL_TAGS) { return lane; }
+    return lane | (CTL_BIT << tag);
+}
+
+pub fn ctl_next(lane: u64) -> u64 {
+    var t : u64 = 1;
+    while (t < CTL_TAGS) {
+        if (ctl_pending(lane, t)) { return t; }
+        t = t + 1;
+    }
+    return 0;
+}
+
+pub fn ctl_take(lane: u64) -> u64 {
+    var t : u64 = ctl_next(lane);
+    if (t == 0) { return lane; }
+    return lane - (CTL_BIT << t);
+}
+
+/// A call is a request that wants an answer: the caller sends it with a fresh alias, monitors the
+/// callee and waits with `after`. The first of three ends it -- the reply, the callee's DOWN (the reply
+/// will never come) or the timeout. The callee's reply is sent before its DOWN and order holds per pair,
+/// so a reply that is queued wins over a DOWN that is queued. When the call ends the caller deactivates
+/// the alias and demonitors with flush, so a reply that arrives late is addressed to a dead alias and is
+/// dropped like a send to a dead pid. That is OTP 24's process alias, and the same move as a pid
+/// generation. Without it a late reply sits in the bounded mailbox for good, matching nothing.
+pub const CALL_PENDING : u8 = 0;
+pub const CALL_REPLY : u8 = 1;
+pub const CALL_DOWN : u8 = 2;
+pub const CALL_TIMEOUT : u8 = 3;
+
+pub fn call_outcome(reply_queued: bool, down_queued: bool, waited_ms: u32, after_ms: u32) -> u8 {
+    if (reply_queued) { return CALL_REPLY; }
+    if (down_queued) { return CALL_DOWN; }
+    if (receive_outcome(false, waited_ms, after_ms) == RCV_TIMEOUT) { return CALL_TIMEOUT; }
+    return CALL_PENDING;
+}
+
+/// The address a reply still reaches: the alias while the call is pending, nobody once it has ended.
+pub fn live_alias(alias: u64, outcome: u8) -> u64 {
+    if (outcome == CALL_PENDING) { return alias; }
+    return NO_PID;
+}
+
+/// A call cycle. A runtime runs one turn at a time and a caller blocks, so A calling B while B calls A
+/// leaves both waiting for the other: each waits out its own timeout and looks like a hung turn. Erlang
+/// refuses only the shortest cycle (gen_server:call to self exits calling_self at once) and leaves the
+/// rest to the timeout; Orleans deadlocks a non-reentrant cycle until the call times out; Dapr refuses a
+/// call back into the chain unless reentrancy is on, and bounds the chain at maxStackDepth 32.
+/// Here every call carries its chain: the set of slots whose runtimes are blocked on it, this caller
+/// included, as one bit per slot, and its depth, the number of those callers. A runtime that calls while
+/// it serves a call passes on chain_add(chain, its slot) and depth + 1; a top-level call starts from
+/// chain_add(0, its slot) and depth 1. A call whose callee is on the chain is refused at once with
+/// CALL_CYCLE, before any send, alias or monitor, so nothing is left to clean up. A send carries no chain:
+/// it waits for nothing, so it closes no cycle.
+/// The slot, not the pid, is on the chain: a runtime blocked on a chain is alive, so its slot is not
+/// reused while the chain lasts. If a caller on the chain dies and its slot is reused, a call to the new
+/// owner reads as a cycle; the refusal loses nothing, since that chain's reply goes to a dead alias.
+pub const CALL_CYCLE : u8 = 4;
+pub const CALL_TOO_DEEP : u8 = 5;
+
+/// The model tracks slots 0..63, one u64. A slot past it is never on the chain, so a call to it is
+/// admitted unchecked and a cycle through it waits out the timeout, as every longer cycle does in
+/// Erlang. The Queen's 23 processes fit (invariant below) when the runtime hands out the lowest free slot.
+pub const CHAIN_SLOTS : u64 = 64;
+
+/// Chosen, not measured: a chain holds every caller on it blocked, and 8 keeps one request from
+/// blocking more than 8 of the Queen's 23 processes. Dapr's 32 is for a reentrant chain.
+pub const CALL_MAX_DEPTH : u32 = 8;
+
+pub fn chain_has(chain: u64, slot: u64) -> bool {
+    if (slot >= CHAIN_SLOTS) { return false; }
+    return (chain & (CTL_BIT << slot)) != 0;
+}
+
+pub fn chain_add(chain: u64, slot: u64) -> u64 {
+    if (slot >= CHAIN_SLOTS) { return chain; }
+    return chain | (CTL_BIT << slot);
+}
+
+/// CALL_PENDING admits the call; call_outcome takes it from there. A cycle is named before the depth.
+pub fn call_admit(chain: u64, depth: u32, callee_slot: u64) -> u8 {
+    if (chain_has(chain, callee_slot)) { return CALL_CYCLE; }
+    if (depth > CALL_MAX_DEPTH) { return CALL_TOO_DEEP; }
+    return CALL_PENDING;
+}
+
+; --- 3. Exit signals and links ----------------------------------------------------------------------
+
+/// Exit reasons. X_KILL exists only as a signal sent by a supervisor or an operator; nobody dies of
+/// it -- the victim dies of X_KILLED. X_NONE is "no signal". In Erlang a process may also exit with
+/// reason kill by itself, and its links then receive a kill that is trappable and is not turned into
+/// killed; here nobody dies of X_KILL, so a link never carries it and that case does not arise.
+pub const X_NORMAL : u8 = 0;
+pub const X_SHUTDOWN : u8 = 1;
+pub const X_KILL : u8 = 2;
+pub const X_KILLED : u8 = 3;
+pub const X_CRASH : u8 = 4;
+pub const X_NOPROC : u8 = 5;
+pub const X_NOCONNECTION : u8 = 6;
+pub const X_NONE : u8 = 99;
+
+/// What an exit signal does to its receiver.
+pub const ACT_IGNORE : u8 = 0;
+pub const ACT_DIE : u8 = 1;
+pub const ACT_MESSAGE : u8 = 2;
+
+pub fn on_exit_signal(reason: u8, trapping: bool) -> u8 {
+    if (reason == X_KILL) { return ACT_DIE; }
+    if (trapping) { return ACT_MESSAGE; }
+    if (reason == X_NORMAL) { return ACT_IGNORE; }
+    return ACT_DIE;
+}
+
+/// The reason a receiver that died of a signal dies with, which is what its own links then see.
+pub fn death_reason(signal: u8) -> u8 {
+    if (signal == X_KILL) { return X_KILLED; }
+    return signal;
+}
+
+/// A link is one bit between two processes: linking twice is linking once, and a death sends one exit
+/// signal per linked process.
+pub fn links_after_link(already_linked: bool, links: u32) -> u32 {
+    if (already_linked) { return links; }
+    return links + 1;
+}
+
+/// Linking to or monitoring a pid that is already dead does not fail silently: the caller gets
+/// X_NOPROC at once -- as an exit signal through a link (so a non-trapping caller dies of it), as a
+/// DOWN message through a monitor. X_NONE: the target is alive and the link or monitor is made.
+pub fn attach_answer(target_alive: bool) -> u8 {
+    if (target_alive) { return X_NONE; }
+    return X_NOPROC;
+}
+
+; --- 4. Monitors -------------------------------------------------------------------------------------
+
+/// A monitor is one-way and is never a link: the watcher gets a DOWN message with the reason and
+/// nothing else happens to it. Each monitor call makes a new reference, so two monitors on one target
+/// mean two DOWN messages.
+pub const MONITOR_KILLS_WATCHER : bool = false;
+
+pub fn monitors_after_monitor(monitors: u32) -> u32 {
+    return monitors + 1;
+}
+
+/// Demonitor with flush also removes a DOWN already queued for that monitor; without flush a DOWN that
+/// arrived first stays in the mailbox.
+pub fn down_left_after_demonitor(flush: bool, down_queued: bool) -> bool {
+    if (flush) { return false; }
+    return down_queued;
+}
+
+; --- 5. Supervisors ----------------------------------------------------------------------------------
+
+/// Restart types. Permanent: always restarted. Transient: restarted unless it ended with X_NORMAL or
+/// X_SHUTDOWN. Temporary: never restarted.
+pub const RESTART_PERMANENT : u8 = 0;
+pub const RESTART_TRANSIENT : u8 = 1;
+pub const RESTART_TEMPORARY : u8 = 2;
+
+pub fn should_restart(rtype: u8, reason: u8) -> bool {
+    if (rtype == RESTART_PERMANENT) { return true; }
+    if (rtype == RESTART_TEMPORARY) { return false; }
+    if (reason == X_NORMAL) { return false; }
+    if (reason == X_SHUTDOWN) { return false; }
+    return true;
+}
+
+/// Strategies, over children indexed in start order. one_for_one: only the failed child.
+/// one_for_all: every child. rest_for_one: the failed child and every child started after it.
+pub const STRAT_ONE_FOR_ONE : u8 = 0;
+pub const STRAT_ONE_FOR_ALL : u8 = 1;
+pub const STRAT_REST_FOR_ONE : u8 = 2;
+
+pub fn affected(strategy: u8, failed: u32, child: u32) -> bool {
+    if (strategy == STRAT_ONE_FOR_ALL) { return true; }
+    if (strategy == STRAT_REST_FOR_ONE) { return child >= failed; }
+    return child == failed;
+}
+
+/// A sibling is stopped only when the failed child is going to be restarted: a failure that is not
+/// restarted touches nobody. The failed child itself is already dead and is not stopped.
+pub fn stopped_by_restart(strategy: u8, failed: u32, child: u32, failed_restarts: bool) -> bool {
+    if (child == failed) { return false; }
+    if (failed_restarts == false) { return false; }
+    return affected(strategy, failed, child);
+}
+
+/// Who starts again: the failed child, and each affected sibling except a temporary one, which was
+/// stopped and stays down. The failed child needs no case of its own: it restarts, so it is not
+/// temporary.
+pub fn restarted(strategy: u8, failed: u32, child: u32, child_rtype: u8, failed_restarts: bool) -> bool {
+    if (failed_restarts == false) { return false; }
+    if (affected(strategy, failed, child) == false) { return false; }
+    return child_rtype != RESTART_TEMPORARY;
+}
+
+/// Children stop in reverse start order (rank 0 stops first) and start again in start order.
+pub fn stop_rank(i: u32, count: u32) -> u32 {
+    if (i >= count) { return count; }
+    return count - 1 - i;
+}
+
+/// Restart intensity: a restart counts while it is younger than the period; when the restarts in the
+/// period, this one included, exceed the maximum, the supervisor gives up -- it stops its children and
+/// exits with GIVE_UP_REASON, and its own parent decides by the supervisor's restart type.
+pub const SUP_NOTHING : u8 = 0;
+pub const SUP_RESTART : u8 = 1;
+pub const SUP_GIVE_UP : u8 = 2;
+pub const GIVE_UP_REASON : u8 = X_SHUTDOWN;
+
+pub fn in_period(age_seconds: u32, period_seconds: u32) -> bool {
+    return age_seconds < period_seconds;
+}
+
+pub fn intensity_exceeded(restarts_in_period: u32, max_restarts: u32) -> bool {
+    return restarts_in_period > max_restarts;
+}
+
+pub fn on_child_exit(rtype: u8, reason: u8, earlier_restarts: u32, max_restarts: u32) -> u8 {
+    if (should_restart(rtype, reason) == false) { return SUP_NOTHING; }
+    if (intensity_exceeded(earlier_restarts + 1, max_restarts)) { return SUP_GIVE_UP; }
+    return SUP_RESTART;
+}
+
+/// Backoff. OTP restarts at once and counts restarts inside a window, so a child that crashes a little
+/// slower than the window allows -- every 101 s against 3 in 300 s -- never trips the count and
+/// restarts forever, each restart a fresh agent turn paid for. Akka's BackoffSupervisor and Kubernetes'
+/// CrashLoopBackOff wait longer after each crash instead. Here a run shorter than STABLE_SECONDS extends
+/// the unstable streak and a longer one resets it; the wait before restart number n of a streak is
+/// BACKOFF_BASE_SECONDS doubled n - 1 times, never more than BACKOFF_CAP_SECONDS; and a streak longer
+/// than UNSTABLE_GIVE_UP gives up as the intensity does, so the slow loop also reaches the parent.
+pub const BACKOFF_BASE_SECONDS : u32 = 10;
+pub const BACKOFF_CAP_SECONDS : u32 = 300;
+pub const STABLE_SECONDS : u32 = 600;
+pub const UNSTABLE_GIVE_UP : u32 = 6;
+
+pub fn unstable_streak(streak: u32, ran_seconds: u32) -> u32 {
+    if (ran_seconds >= STABLE_SECONDS) { return 0; }
+    return streak + 1;
+}
+
+pub fn backoff_seconds(streak: u32) -> u32 {
+    if (streak == 0) { return 0; }
+    var wait : u32 = BACKOFF_BASE_SECONDS;
+    var n : u32 = 1;
+    while (n < streak) {
+        if (wait >= BACKOFF_CAP_SECONDS) { return BACKOFF_CAP_SECONDS; }
+        wait = wait * 2;
+        n = n + 1;
+    }
+    if (wait > BACKOFF_CAP_SECONDS) { return BACKOFF_CAP_SECONDS; }
+    return wait;
+}
+
+pub fn with_backoff(decision: u8, streak: u32) -> u8 {
+    if (decision != SUP_RESTART) { return decision; }
+    if (streak > UNSTABLE_GIVE_UP) { return SUP_GIVE_UP; }
+    return SUP_RESTART;
+}
+
+/// Jitter. backoff_seconds is the same for every agent of a domain, so agents that crashed on one
+/// provider outage restart in the same second and meet the same rate limit again. The wait is pulled
+/// DOWN by up to JITTER_PERCENT, never pushed up: a long outage leaves every agent at the cap, and a
+/// jitter that may not cross the cap spreads nobody there. Akka's randomFactor and gRPC's +-20% push
+/// past their maximum instead; AWS's "equal jitter" pulls down by half. The draw is a pure function
+/// of a seed the host supplies (the pid's slot), so every backend computes the same second. The seed
+/// goes through Knuth's multiplicative hash with floor(2^32 / phi) first: a plain `seed % range` puts
+/// slots taken at a stride equal to the range in the same second again.
+pub const JITTER_PERCENT : u32 = 20;
+pub const PHI_HASH : u64 = 2654435769;
+
+pub fn seed_hash(seed: u64) -> u64 {
+    return (((seed % 4294967296) * PHI_HASH) % 4294967296) >> 16;
+}
+
+pub fn jittered_seconds(wait: u32, seed: u64) -> u32 {
+    var spread : u64 = ((wait as u64) * (JITTER_PERCENT as u64)) / 100;
+    return wait - ((seed_hash(seed) % (spread + 1)) as u32);
+}
+
+/// Stopping one child. Brutal kill: X_KILL at once. Otherwise X_SHUTDOWN first, which a trapping
+/// child may use to clean up, then X_KILL when the timeout passes; X_NONE means keep waiting. A child
+/// that is itself a supervisor gets SHUTDOWN_INFINITY, so its own children stop first.
+pub const SHUTDOWN_BRUTAL : u32 = 0;
+pub const SHUTDOWN_INFINITY : u32 = 4294967295;
+
+pub fn stop_signal(waited_ms: u32, timeout_ms: u32) -> u8 {
+    if (timeout_ms == SHUTDOWN_BRUTAL) { return X_KILL; }
+    if (waited_ms == 0) { return X_SHUTDOWN; }
+    if (timeout_ms == SHUTDOWN_INFINITY) { return X_NONE; }
+    if (waited_ms >= timeout_ms) { return X_KILL; }
+    return X_NONE;
+}
+
+/// Significant children and auto_shutdown (OTP 24 supervisor flags). A supervisor may end itself when
+/// its significant children are done: AUTO_ANY_SIGNIFICANT when any one of them ends, and
+/// AUTO_ALL_SIGNIFICANT when the last active one does. A child counts only when it is not restarted
+/// (a transient one ending X_NORMAL or X_SHUTDOWN, a temporary one on any reason) and only when it ends
+/// on its own: a child its supervisor stopped (terminate_child, or a sibling's one_for_all or
+/// rest_for_one restart) never ends the supervisor. The supervisor then exits with X_SHUTDOWN. A
+/// permanent child cannot be significant, since it is always restarted and so never done, and under
+/// AUTO_NEVER, the default, no child is significant. Temporal's ParentClosePolicy runs the other way
+/// (a parent's close ends its children); Akka has no built-in form.
+pub const AUTO_NEVER : u8 = 0;
+pub const AUTO_ANY_SIGNIFICANT : u8 = 1;
+pub const AUTO_ALL_SIGNIFICANT : u8 = 2;
+pub const AUTO_SHUTDOWN_REASON : u8 = X_SHUTDOWN;
+
+pub fn child_spec_valid(rtype: u8, significant: bool, auto_mode: u8) -> bool {
+    if (auto_mode > AUTO_ALL_SIGNIFICANT) { return false; }
+    if (significant == false) { return true; }
+    if (rtype == RESTART_PERMANENT) { return false; }
+    return auto_mode != AUTO_NEVER;
+}
+
+/// Does this child's exit end its supervisor? `by_supervisor` is true when the supervisor itself
+/// stopped the child; `significant_left` counts the significant children still active after it.
+pub fn auto_shutdown_after_exit(mode: u8, significant: bool, rtype: u8, reason: u8, by_supervisor: bool, significant_left: u32) -> bool {
+    if (by_supervisor) { return false; }
+    if (significant == false) { return false; }
+    if (should_restart(rtype, reason)) { return false; }
+    if (mode == AUTO_ANY_SIGNIFICANT) { return true; }
+    if (mode == AUTO_ALL_SIGNIFICANT) { return significant_left == 0; }
+    return false;
+}
+
+/// OTP's warning as a rule: a supervisor with auto_shutdown must not be a permanent child of its own
+/// parent, or the parent restarts it at once, the shutdown it chose is undone, and every such restart
+/// counts toward the parent's intensity. Its restart type must let AUTO_SHUTDOWN_REASON stay down.
+pub fn auto_shutdown_sticks(sup_rtype: u8) -> bool {
+    return should_restart(sup_rtype, AUTO_SHUTDOWN_REASON) == false;
+}
+
+/// max_children, as Elixir's DynamicSupervisor: a start past the bound is refused with its own answer,
+/// START_MAX_CHILDREN, never a silent drop. The check runs inside the supervisor's own turn, and a
+/// supervisor runs one turn at a time, so two starts decided on the same stale count cannot both pass:
+/// the second one is refused. That is the point of checking here and not only where the start is
+/// decided (control.t27 `placement` reads a count, and one wake places every free slot's offer in
+/// parallel, `offers_per_wake`, so each of them can read the same count).
+/// The bound is a parameter, not a constant of this spec: the Queen passes control.t27's DOMAIN_CAP,
+/// which owns it, and a cap lowered at a wake only refuses new starts; it stops nobody.
+/// A child being stopped still counts until its EXIT arrives, since it holds its runner until then
+/// (DynamicSupervisor deletes a terminated child only after its exit is confirmed). A restart is not a
+/// start: it replaces the child in its own slot, never asks the bound and is never refused by it
+/// (DynamicSupervisor's restart path does not check max_children either), so a crashed agent of a full
+/// domain comes back. What a refused start leaves behind is control.t27's P_WAIT: the task stays
+/// unleased and is offered again when a child ends, as a Temporal worker with no free slot stops
+/// polling and leaves the task on the queue.
+pub const START_OK : u8 = 0;
+pub const START_MAX_CHILDREN : u8 = 1;
+
+pub fn start_answer(live: u32, stopping: u32, max_children: u32) -> u8 {
+    if (live + stopping >= max_children) { return START_MAX_CHILDREN; }
+    return START_OK;
+}
+
+/// The count after a child's EXIT: a restarted child keeps its place, any other frees one.
+pub fn children_after_exit(children: u32, restarted: bool) -> u32 {
+    if (restarted) { return children; }
+    return children - 1;
+}
+
+; --- 6. The Queen's tree -----------------------------------------------------------------------------
+
+/// Root: one_for_one over, in start order, the event intake, the reconciler, then one supervisor per
+/// control.t27 domain. Each domain supervisor: one_for_one over that domain's agent runtimes.
+/// one_for_one at both levels because no child holds state another needs: the store is canonical, a
+/// lost event is repaired by the reconciler rather than by a restart cascade, and one agent's crash
+/// must not interrupt its siblings' tasks.
+pub const QK_INTAKE : u8 = 0;
+pub const QK_RECONCILER : u8 = 1;
+pub const QK_DOMAIN_SUP : u8 = 2;
+pub const QK_AGENT : u8 = 3;
+pub const QK_NONE : u8 = 99;
+
+pub const QUEEN_ROOT_STRATEGY : u8 = STRAT_ONE_FOR_ONE;
+pub const QUEEN_DOMAIN_STRATEGY : u8 = STRAT_ONE_FOR_ONE;
+
+/// No supervisor in the Queen's tree ends itself. A domain has no lead child whose end should end the
+/// domain: a domain with no agent left stays up, ready for the next agent. And a domain
+/// supervisor is a permanent child of the root, so a shutdown it chose would be undone at once (see
+/// auto_shutdown_sticks). A one_for_all team under a lead task is where AUTO_ANY_SIGNIFICANT belongs.
+pub const QUEEN_AUTO_SHUTDOWN : u8 = AUTO_NEVER;
+
+pub fn root_children(domain_count: u32) -> u32 {
+    return 2 + domain_count;
+}
+
+pub fn root_child_kind(i: u32, domain_count: u32) -> u8 {
+    if (i == 0) { return QK_INTAKE; }
+    if (i == 1) { return QK_RECONCILER; }
+    if (i < root_children(domain_count)) { return QK_DOMAIN_SUP; }
+    return QK_NONE;
+}
+
+/// Agent runtimes are transient: a retired runtime (control.t27's AE_RETIRE) ends with X_NORMAL and
+/// stays down; a crashed one comes back in the same slot with the next generation, which is a new pid
+/// and so a new lease holder that must claim at the fence it reads. Everything else is permanent.
+pub fn queen_restart_type(kind: u8) -> u8 {
+    if (kind == QK_AGENT) { return RESTART_TRANSIENT; }
+    return RESTART_PERMANENT;
+}
+
+/// Intensities and shutdown times. Chosen, not measured. A domain whose agents crash four times in
+/// five minutes is broken (a dead provider key, a broken build), not unlucky: it gives up and the root
+/// restarts it; a root that gives up ends the process and the host restarts the container, the last
+/// level. An agent gets 30 s to push its evidence and release its lease before X_KILL.
+pub const DOMAIN_MAX_RESTARTS : u32 = 3;
+pub const DOMAIN_PERIOD_SECONDS : u32 = 300;
+pub const ROOT_MAX_RESTARTS : u32 = 2;
+pub const ROOT_PERIOD_SECONDS : u32 = 900;
+pub const WORKER_SHUTDOWN_MS : u32 = 5000;
+pub const AGENT_SHUTDOWN_MS : u32 = 30000;
+
+pub fn queen_shutdown_ms(kind: u8) -> u32 {
+    if (kind == QK_DOMAIN_SUP) { return SHUTDOWN_INFINITY; }
+    if (kind == QK_AGENT) { return AGENT_SHUTDOWN_MS; }
+    return WORKER_SHUTDOWN_MS;
+}
+
+/// An agent stopped by its supervisor is gone before its lease would expire, so the lease is released
+/// by the agent or reclaimed on its DOWN, never left to run out.
+pub fn stops_inside_the_lease(shutdown_ms: u32, ttl_seconds: u32) -> bool {
+    return shutdown_ms < ttl_seconds * 1000;
+}
+
+/// Message tags an agent runtime receives. A cancel (control.t27 CANCEL_RULE) is a message, not an exit
+/// signal: the runtime survives it and moves BUSY -> COMPACT as control.t27 says. A cancel and a due
+/// heartbeat ride the control lane (section 2), so a mailbox full of offers can neither drop them nor
+/// put them behind the offers. Coalescing loses nothing: an agent holds one task at a time (control.t27
+/// assigns only to an idle agent), so a second cancel names the same task or a task the fence already
+/// took away, and one due heartbeat renews as well as two. An offer is work and rides the data lane.
+pub const M_TASK_OFFER : u64 = 1;
+pub const M_CANCEL : u64 = 2;
+pub const M_HEARTBEAT_DUE : u64 = 3;
+
+pub fn lane_of(tag: u64) -> u8 {
+    if (tag == M_CANCEL) { return LANE_CONTROL; }
+    if (tag == M_HEARTBEAT_DUE) { return LANE_CONTROL; }
+    return LANE_DATA;
+}
+
+/// A hung turn. A link or a monitor fires only on a death, and the heartbeat comes from the runtime,
+/// not from the model turn (control.t27 section 2), so a model call that never returns and never dies
+/// would keep its lease for good. Temporal bounds an activity by its start-to-close timeout for this
+/// reason. Here the domain supervisor kills a runtime whose turn has run TURN_MAX_SECONDS: X_KILL is
+/// untrappable, the runtime dies of X_KILLED, and the DOWN reclaims the task at once. The bound is
+/// chosen, not measured: twice the reviewer bee's 1800 s per review.
+pub const TURN_MAX_SECONDS : u32 = 3600;
+
+pub fn hung_turn_signal(turn_age_seconds: u32) -> u8 {
+    if (turn_age_seconds >= TURN_MAX_SECONDS) { return X_KILL; }
+    return X_NONE;
+}
+
+/// How long the Queen waits before reclaiming a task whose holder she monitors. A DOWN for the holder
+/// proves it dead: reclaim at once instead of waiting out the TTL. A DOWN with X_NOCONNECTION proves
+/// nothing -- the holder may be alive across a partition -- so it waits like no DOWN at all. An early
+/// reclaim stays safe either way: the claim bumps the fence and the old holder writes nothing.
+/// The fence stops writes, not what the old holder already did outside (a push, a pull request, a
+/// comment): the new holder reads control.t27 section 7's effects journal (`effect_action`) before
+/// its first effect, and after a DOWN waits `look_wait_seconds` before it looks one up.
+pub fn reclaim_wait_seconds(down_reason: u8, since_renewal: u32, ttl_seconds: u32) -> u32 {
+    if (since_renewal >= ttl_seconds) { return 0; }
+    if (down_reason == X_NONE) { return ttl_seconds - since_renewal; }
+    if (down_reason == X_NOCONNECTION) { return ttl_seconds - since_renewal; }
+    return 0;
+}
+
+; --- 7. Deliberately not the BEAM ---------------------------------------------------------------------
+
+; Bounded mailboxes: an unbounded one hides a stuck runtime until memory runs out (section 2).
+; No hot code swap: a new build is a retired runtime and a fresh one (control.t27 RETIRED).
+; No transparent distribution: a pid is local to one host; across hosts liveness is the lease and its
+;   heartbeat, and a cross-host DOWN is only ever X_NOCONNECTION (section 6).
+; No reductions scheduler: fairness is the host's; a runtime is an OS process or a container.
+; No global name registry: the store is the only directory of who holds what.
+; No exit(self, normal) quirk: the BEAM kills a non-trapping process that sends itself a normal exit
+;   signal, for backward compatibility; here a normal signal is ignored by a non-trapping receiver
+;   whoever sent it (section 3).
+pub const MAILBOX_BOUNDED : bool = true;
+pub const HOT_CODE_SWAP : bool = false;
+pub const TRANSPARENT_DISTRIBUTION : bool = false;
+pub const PREEMPTIVE_REDUCTIONS : bool = false;
+pub const GLOBAL_NAME_REGISTRY : bool = false;
+
+invariant a_model_box_is_one_u64 { assert MBOX_SLOTS * SLOT_BITS == 64 and NO_MATCH == MBOX_SLOTS; }
+invariant a_tag_fills_one_slot { assert TAG_MASK + 1 == 1 << SLOT_BITS; }
+invariant section_7_departs_from_the_beam { assert MAILBOX_BOUNDED and HOT_CODE_SWAP == false and TRANSPARENT_DISTRIBUTION == false and PREEMPTIVE_REDUCTIONS == false and GLOBAL_NAME_REGISTRY == false; }
+invariant the_control_lane_is_one_u64 { assert CTL_TAGS == 64 and CTL_BIT == 1 and UNSTABLE_GIVE_UP > DOMAIN_MAX_RESTARTS; }
+invariant kill_is_a_signal_and_killed_a_reason { assert X_KILL != X_KILLED; }
+invariant none_is_outside_every_reason { assert X_NONE > X_NOCONNECTION; }
+invariant giving_up_is_a_clean_exit { assert GIVE_UP_REASON == X_SHUTDOWN; }
+invariant a_domain_restarts_at_least_once { assert DOMAIN_MAX_RESTARTS >= 1 and ROOT_MAX_RESTARTS >= 1; }
+invariant the_root_counts_over_a_longer_period { assert ROOT_PERIOD_SECONDS > DOMAIN_PERIOD_SECONDS; }
+invariant auto_shutdown_defaults_to_never_and_exits_clean { assert AUTO_NEVER == 0 and QUEEN_AUTO_SHUTDOWN == AUTO_NEVER and AUTO_SHUTDOWN_REASON == X_SHUTDOWN; }
+/// The three modes are 0, 1, 2 and nothing else, so child_spec_valid's `> AUTO_ALL_SIGNIFICANT` admits exactly them.
+invariant the_auto_shutdown_modes_are_contiguous { assert AUTO_ANY_SIGNIFICANT == AUTO_NEVER + 1 and AUTO_ALL_SIGNIFICANT == AUTO_ANY_SIGNIFICANT + 1; }
+/// A refusal is never read as an admit or as a timeout.
+invariant the_call_outcomes_are_contiguous { assert CALL_PENDING == 0 and CALL_REPLY == 1 and CALL_DOWN == 2 and CALL_TIMEOUT == 3 and CALL_CYCLE == 4 and CALL_TOO_DEEP == 5; }
+/// A refused start is never read as a start.
+invariant a_refused_start_is_its_own_answer { assert START_OK == 0 and START_MAX_CHILDREN == 1; }
+/// root, intake, reconciler, 4 domain supervisors (control.t27 DOMAIN_COUNT) and 4 x 4 agents (DOMAIN_CAP,
+/// held by start_answer) take slots 1..23; slot 0 is nobody. The depth bound must be reachable inside the model.
+invariant the_queens_tree_fits_the_call_chain { assert 1 + root_children(4) + 4 * 4 < CHAIN_SLOTS and CALL_MAX_DEPTH + 1 < CHAIN_SLOTS; }
+
+test a_restart_gives_a_new_pid_and_the_old_one_reaches_nobody {
+    var old : u64 = pid_of(5, 7);
+    assert slot_of(old) == 5;
+    assert gen_of(old) == 7;
+    var fresh : u64 = pid_of(slot_of(old), next_gen(gen_of(old)));
+    assert slot_of(fresh) == 5;
+    assert gen_of(fresh) == 8;
+    assert reaches(old, fresh) == false;
+    assert reaches(fresh, fresh) == true;
+    // slot 0 is nobody, and so is a slot that does not fit in 32 bits
+    assert pid_of(0, 3) == NO_PID;
+    assert pid_of(4294967296, 1) == NO_PID;
+    // the largest slot that fits is still a real slot
+    assert pid_of(GEN_MASK, 7) != NO_PID;
+    assert slot_of(pid_of(GEN_MASK, 7)) == GEN_MASK;
+    // a generation past 32 bits never spills into the slot
+    assert slot_of(pid_of(2, 4294967301)) == 2;
+    assert gen_of(pid_of(2, 4294967301)) == 5;
+    assert reaches(NO_PID, NO_PID) == false;
+    // a real slot at generation 0 is still a real pid
+    assert pid_of(1, 0) == 4294967296;
+    assert next_gen(GEN_MASK) == 0;
+}
+
+test a_send_never_blocks_and_a_dead_pid_drops_it {
+    assert SEND_BLOCKS == false;
+    assert SEND_ACKNOWLEDGED == false;
+    assert deliver(true, 0, MAILBOX_CAP) == D_QUEUED;
+    assert deliver(true, 255, MAILBOX_CAP) == D_QUEUED;
+    assert deliver(true, 256, MAILBOX_CAP) == D_DROPPED_FULL;
+    assert deliver(false, 0, MAILBOX_CAP) == D_DROPPED_DEAD;
+    assert deliver(false, 256, MAILBOX_CAP) == D_DROPPED_DEAD;
+}
+
+test order_holds_per_sender_pair_only {
+    assert ordered(true, true) == true;
+    assert ordered(false, true) == false;
+    assert ordered(true, false) == false;
+    // A sends 1 then 2; B's 3 lands between them; A's two stay in A's order
+    var box : u64 = mbox_push(mbox_push(mbox_push(0, 1), 3), 2);
+    assert mbox_len(box) == 3;
+    assert mbox_find(box, 1) == 0;
+    assert mbox_find(box, 3) == 1;
+    assert mbox_find(box, 2) == 2;
+}
+
+test selective_receive_takes_the_oldest_match_and_keeps_the_rest_in_order {
+    // three offers and then a cancel: the cancel is taken first, the offers stay in order
+    var queued : u64 = mbox_push(mbox_push(mbox_push(mbox_push(0, M_TASK_OFFER), M_HEARTBEAT_DUE), M_TASK_OFFER), M_CANCEL);
+    assert mbox_len(queued) == 4;
+    assert mbox_find(queued, M_CANCEL) == 3;
+    var after_cancel : u64 = receive(queued, M_CANCEL);
+    assert mbox_len(after_cancel) == 3;
+    assert mbox_tag(after_cancel, 0) == M_TASK_OFFER;
+    assert mbox_tag(after_cancel, 1) == M_HEARTBEAT_DUE;
+    assert mbox_tag(after_cancel, 2) == M_TASK_OFFER;
+    // a tag nobody sent: no match and the box is unchanged
+    assert mbox_find(after_cancel, 9) == NO_MATCH;
+    // an empty slot is not a message: nothing matches tag 0
+    assert mbox_find(after_cancel, 0) == NO_MATCH;
+    assert receive(after_cancel, 9) == after_cancel;
+    // two offers queued: the older one leaves, the heartbeat moves to the front
+    var after_offer : u64 = receive(after_cancel, M_TASK_OFFER);
+    assert mbox_len(after_offer) == 2;
+    assert mbox_tag(after_offer, 0) == M_HEARTBEAT_DUE;
+    assert mbox_tag(after_offer, 1) == M_TASK_OFFER;
+    assert receive(0, M_TASK_OFFER) == 0;
+}
+
+test a_full_model_box_refuses_and_every_slot_is_removable {
+    var full : u64 = mbox_push(mbox_push(mbox_push(mbox_push(mbox_push(mbox_push(mbox_push(mbox_push(0, 1), 2), 3), 4), 5), 6), 7), 8);
+    assert mbox_len(full) == 8;
+    assert mbox_push(full, 9) == full;
+    assert mbox_tag(full, 8) == 0;
+    // the newest, in the last slot
+    assert mbox_find(full, 8) == 7;
+    var no_last : u64 = receive(full, 8);
+    assert mbox_len(no_last) == 7;
+    assert mbox_tag(no_last, 6) == 7;
+    // the oldest: everything moves down one slot
+    var no_first : u64 = receive(full, 1);
+    assert mbox_len(no_first) == 7;
+    assert mbox_tag(no_first, 0) == 2;
+    assert mbox_tag(no_first, 6) == 8;
+    // one from the middle
+    var no_mid : u64 = receive(full, 4);
+    assert mbox_tag(no_mid, 2) == 3;
+    assert mbox_tag(no_mid, 3) == 5;
+    assert mbox_tag(no_mid, 6) == 8;
+    // tag 0 and tags past one byte are not messages
+    assert mbox_push(0, 0) == 0;
+    assert mbox_push(0, 256) == 0;
+    // the largest tag that fits one byte is a message
+    assert mbox_tag(mbox_push(0, TAG_MASK), 0) == TAG_MASK;
+    assert mbox_remove(full, 8) == full;
+}
+
+test receive_after_times_out_and_after_zero_polls {
+    assert receive_outcome(false, 0, 0) == RCV_TIMEOUT;
+    assert receive_outcome(true, 0, 0) == RCV_MATCH;
+    assert receive_outcome(false, 4999, 5000) == RCV_WAIT;
+    assert receive_outcome(false, 5000, 5000) == RCV_TIMEOUT;
+    assert receive_outcome(true, 9000, 5000) == RCV_MATCH;
+    assert receive_outcome(false, AFTER_INFINITY, AFTER_INFINITY) == RCV_WAIT;
+}
+
+test the_exit_signal_table {
+    assert on_exit_signal(X_NORMAL, false) == ACT_IGNORE;
+    assert on_exit_signal(X_NORMAL, true) == ACT_MESSAGE;
+    assert on_exit_signal(X_CRASH, false) == ACT_DIE;
+    assert on_exit_signal(X_CRASH, true) == ACT_MESSAGE;
+    assert on_exit_signal(X_SHUTDOWN, false) == ACT_DIE;
+    assert on_exit_signal(X_SHUTDOWN, true) == ACT_MESSAGE;
+    assert death_reason(X_CRASH) == X_CRASH;
+    assert death_reason(X_SHUTDOWN) == X_SHUTDOWN;
+    assert links_after_link(false, 1) == 2;
+    assert links_after_link(true, 1) == 1;
+}
+
+test kill_is_untrappable_and_its_victims_links_see_killed {
+    // the supervisor kills A, even though A traps exits
+    assert on_exit_signal(X_KILL, true) == ACT_DIE;
+    var a_dies : u8 = death_reason(X_KILL);
+    assert a_dies == X_KILLED;
+    // B is linked to A and does not trap: B dies of the same reason
+    assert on_exit_signal(a_dies, false) == ACT_DIE;
+    var b_dies : u8 = death_reason(a_dies);
+    assert b_dies == X_KILLED;
+    // C is linked to B and traps: killed is an ordinary reason, so C gets a message and lives
+    assert on_exit_signal(b_dies, true) == ACT_MESSAGE;
+}
+
+test linking_or_monitoring_a_dead_pid_answers_noproc_at_once {
+    assert attach_answer(true) == X_NONE;
+    assert attach_answer(false) == X_NOPROC;
+    // through a link: a non-trapping caller dies of it, a trapping one is told
+    assert on_exit_signal(attach_answer(false), false) == ACT_DIE;
+    assert on_exit_signal(attach_answer(false), true) == ACT_MESSAGE;
+}
+
+test a_monitor_is_one_way_one_down_each_and_flushable {
+    assert MONITOR_KILLS_WATCHER == false;
+    assert monitors_after_monitor(1) == 2;
+    assert down_left_after_demonitor(true, true) == false;
+    assert down_left_after_demonitor(false, true) == true;
+    assert down_left_after_demonitor(false, false) == false;
+}
+
+test restart_types_follow_otp {
+    assert should_restart(RESTART_PERMANENT, X_NORMAL) == true;
+    assert should_restart(RESTART_PERMANENT, X_CRASH) == true;
+    assert should_restart(RESTART_TRANSIENT, X_NORMAL) == false;
+    assert should_restart(RESTART_TRANSIENT, X_SHUTDOWN) == false;
+    assert should_restart(RESTART_TRANSIENT, X_CRASH) == true;
+    assert should_restart(RESTART_TRANSIENT, X_KILLED) == true;
+    assert should_restart(RESTART_TEMPORARY, X_CRASH) == false;
+}
+
+test strategies_choose_who_stops_and_who_starts_again {
+    // children 0..3 in start order; child 1 fails and will be restarted
+    assert stopped_by_restart(STRAT_ONE_FOR_ONE, 1, 2, true) == false;
+    assert restarted(STRAT_ONE_FOR_ONE, 1, 1, RESTART_PERMANENT, true) == true;
+    assert restarted(STRAT_ONE_FOR_ONE, 1, 2, RESTART_PERMANENT, true) == false;
+    assert stopped_by_restart(STRAT_ONE_FOR_ALL, 1, 0, true) == true;
+    assert restarted(STRAT_ONE_FOR_ALL, 1, 0, RESTART_PERMANENT, true) == true;
+    assert restarted(STRAT_ONE_FOR_ALL, 1, 3, RESTART_TRANSIENT, true) == true;
+    // a temporary sibling is stopped and stays down
+    assert stopped_by_restart(STRAT_ONE_FOR_ALL, 1, 3, true) == true;
+    assert restarted(STRAT_ONE_FOR_ALL, 1, 3, RESTART_TEMPORARY, true) == false;
+    assert stopped_by_restart(STRAT_REST_FOR_ONE, 1, 0, true) == false;
+    assert stopped_by_restart(STRAT_REST_FOR_ONE, 1, 2, true) == true;
+    assert restarted(STRAT_REST_FOR_ONE, 1, 0, RESTART_PERMANENT, true) == false;
+    assert restarted(STRAT_REST_FOR_ONE, 1, 3, RESTART_PERMANENT, true) == true;
+    assert restarted(STRAT_REST_FOR_ONE, 1, 1, RESTART_TRANSIENT, true) == true;
+    // a failure that is not restarted touches nobody, under any strategy
+    assert stopped_by_restart(STRAT_ONE_FOR_ALL, 1, 0, false) == false;
+    assert restarted(STRAT_ONE_FOR_ALL, 1, 1, RESTART_PERMANENT, false) == false;
+    // the failed child is already dead: it is not stopped again
+    assert stopped_by_restart(STRAT_ONE_FOR_ALL, 1, 1, true) == false;
+}
+
+test children_stop_in_reverse_order_shutdown_first_then_kill {
+    assert stop_rank(3, 4) == 0;
+    assert stop_rank(0, 4) == 3;
+    assert stop_rank(4, 4) == 4;
+    assert stop_signal(0, SHUTDOWN_BRUTAL) == X_KILL;
+    assert stop_signal(0, 5000) == X_SHUTDOWN;
+    assert stop_signal(4999, 5000) == X_NONE;
+    assert stop_signal(5000, 5000) == X_KILL;
+    assert stop_signal(0, SHUTDOWN_INFINITY) == X_SHUTDOWN;
+    assert stop_signal(4294967295, SHUTDOWN_INFINITY) == X_NONE;
+    // a child that does not trap dies of the shutdown, and a transient one is not restarted for it
+    assert on_exit_signal(stop_signal(0, 5000), false) == ACT_DIE;
+    assert should_restart(RESTART_TRANSIENT, stop_signal(0, 5000)) == false;
+}
+
+test too_many_restarts_in_a_period_escalate_to_the_parent {
+    assert in_period(299, DOMAIN_PERIOD_SECONDS) == true;
+    assert in_period(300, DOMAIN_PERIOD_SECONDS) == false;
+    assert intensity_exceeded(3, 3) == false;
+    assert intensity_exceeded(4, 3) == true;
+    // a domain's fourth agent crash in the period: the domain supervisor gives up
+    assert on_child_exit(RESTART_TRANSIENT, X_CRASH, 2, DOMAIN_MAX_RESTARTS) == SUP_RESTART;
+    assert on_child_exit(RESTART_TRANSIENT, X_CRASH, 3, DOMAIN_MAX_RESTARTS) == SUP_GIVE_UP;
+    assert on_child_exit(RESTART_TRANSIENT, X_NORMAL, 3, DOMAIN_MAX_RESTARTS) == SUP_NOTHING;
+    assert on_child_exit(RESTART_PERMANENT, X_CRASH, 0, 0) == SUP_GIVE_UP;
+    // it exits with shutdown; the root restarts it because a domain supervisor is permanent
+    assert on_child_exit(queen_restart_type(QK_DOMAIN_SUP), GIVE_UP_REASON, 0, ROOT_MAX_RESTARTS) == SUP_RESTART;
+    assert on_child_exit(queen_restart_type(QK_DOMAIN_SUP), GIVE_UP_REASON, 2, ROOT_MAX_RESTARTS) == SUP_GIVE_UP;
+    // a transient supervisor that gave up would stay down
+    assert on_child_exit(RESTART_TRANSIENT, GIVE_UP_REASON, 0, 9) == SUP_NOTHING;
+}
+
+test the_queens_tree_restarts_a_crashed_agent_and_lets_a_retired_one_go {
+    // four domains, as control.t27 has at the time of writing
+    assert root_children(4) == 6;
+    assert root_child_kind(0, 4) == QK_INTAKE;
+    assert root_child_kind(1, 4) == QK_RECONCILER;
+    assert root_child_kind(2, 4) == QK_DOMAIN_SUP;
+    assert root_child_kind(5, 4) == QK_DOMAIN_SUP;
+    assert root_child_kind(6, 4) == QK_NONE;
+    assert QUEEN_ROOT_STRATEGY == STRAT_ONE_FOR_ONE;
+    assert QUEEN_DOMAIN_STRATEGY == STRAT_ONE_FOR_ONE;
+    assert queen_restart_type(QK_INTAKE) == RESTART_PERMANENT;
+    assert queen_restart_type(QK_RECONCILER) == RESTART_PERMANENT;
+    assert queen_restart_type(QK_DOMAIN_SUP) == RESTART_PERMANENT;
+    assert queen_restart_type(QK_AGENT) == RESTART_TRANSIENT;
+    // retired: normal exit, stays down; crashed: restarted, and no sibling is stopped
+    assert should_restart(queen_restart_type(QK_AGENT), X_NORMAL) == false;
+    assert on_child_exit(queen_restart_type(QK_AGENT), X_CRASH, 0, DOMAIN_MAX_RESTARTS) == SUP_RESTART;
+    assert stopped_by_restart(QUEEN_DOMAIN_STRATEGY, 1, 2, true) == false;
+    assert queen_shutdown_ms(QK_DOMAIN_SUP) == SHUTDOWN_INFINITY;
+    assert queen_shutdown_ms(QK_AGENT) == AGENT_SHUTDOWN_MS;
+    assert queen_shutdown_ms(QK_INTAKE) == WORKER_SHUTDOWN_MS;
+    assert queen_shutdown_ms(QK_RECONCILER) == WORKER_SHUTDOWN_MS;
+    // 180 s is control.t27's TASK_LEASE_TTL_SECONDS at the time of writing
+    assert stops_inside_the_lease(AGENT_SHUTDOWN_MS, 180) == true;
+    assert stops_inside_the_lease(180000, 180) == false;
+}
+
+test a_down_from_the_holder_reclaims_at_once_and_noconnection_waits_the_lease {
+    assert reclaim_wait_seconds(X_CRASH, 30, 180) == 0;
+    assert reclaim_wait_seconds(X_KILLED, 30, 180) == 0;
+    assert reclaim_wait_seconds(X_NORMAL, 30, 180) == 0;
+    assert reclaim_wait_seconds(X_NONE, 30, 180) == 150;
+    assert reclaim_wait_seconds(X_NOCONNECTION, 30, 180) == 150;
+    assert reclaim_wait_seconds(X_NONE, 200, 180) == 0;
+    assert reclaim_wait_seconds(X_NOCONNECTION, 180, 180) == 0;
+}
+
+test the_control_lane_survives_a_full_mailbox_and_is_taken_first {
+    // a mailbox full of offers drops the next offer, never a cancel
+    assert deliver(true, MAILBOX_CAP, MAILBOX_CAP) == D_DROPPED_FULL;
+    assert deliver_control(true, false) == D_QUEUED;
+    assert deliver_control(true, true) == D_COALESCED;
+    assert deliver_control(false, false) == D_DROPPED_DEAD;
+    assert deliver_control(false, true) == D_DROPPED_DEAD;
+    assert lane_of(M_CANCEL) == LANE_CONTROL;
+    assert lane_of(M_HEARTBEAT_DUE) == LANE_CONTROL;
+    assert lane_of(M_TASK_OFFER) == LANE_DATA;
+    assert next_lane(true, true) == LANE_CONTROL;
+    assert next_lane(true, false) == LANE_CONTROL;
+    assert next_lane(false, true) == LANE_DATA;
+    assert next_lane(false, false) == LANE_NONE;
+    // the model: a heartbeat, a cancel, then both again; each kind is held once and the cancel goes first
+    var lane : u64 = ctl_post(ctl_post(ctl_post(ctl_post(0, M_HEARTBEAT_DUE), M_CANCEL), M_HEARTBEAT_DUE), M_CANCEL);
+    assert lane == 12;
+    assert ctl_pending(lane, M_CANCEL) == true;
+    assert ctl_pending(lane, M_TASK_OFFER) == false;
+    assert ctl_next(lane) == M_CANCEL;
+    var after_cancel : u64 = ctl_take(lane);
+    assert ctl_pending(after_cancel, M_CANCEL) == false;
+    assert ctl_next(after_cancel) == M_HEARTBEAT_DUE;
+    assert ctl_take(after_cancel) == 0;
+    assert ctl_next(0) == 0;
+    assert ctl_take(0) == 0;
+    // bit 0 is no kind: a lane that carries it anyway still yields its real kinds
+    assert ctl_next(5) == M_CANCEL;
+    // tag 0 is no kind and tags past 63 do not fit: posting either adds nothing
+    assert ctl_post(0, 0) == 0;
+    assert ctl_post(0, 64) == 0;
+    assert ctl_pending(18446744073709551615, 64) == false;
+    assert ctl_post(0, 63) == 9223372036854775808;
+    assert ctl_next(9223372036854775808) == 63;
+    assert ctl_take(9223372036854775808) == 0;
+}
+
+test a_call_ends_on_the_reply_the_down_or_the_timeout_and_a_late_reply_reaches_nobody {
+    assert call_outcome(false, false, 100, 5000) == CALL_PENDING;
+    assert call_outcome(true, false, 100, 5000) == CALL_REPLY;
+    // the callee replied before it died and order holds per pair, so a queued reply wins
+    assert call_outcome(true, true, 100, 5000) == CALL_REPLY;
+    assert call_outcome(false, true, 100, 5000) == CALL_DOWN;
+    assert call_outcome(false, true, 5000, 5000) == CALL_DOWN;
+    assert call_outcome(false, false, 5000, 5000) == CALL_TIMEOUT;
+    assert call_outcome(false, false, 4999, 5000) == CALL_PENDING;
+    assert call_outcome(false, false, 4294967294, AFTER_INFINITY) == CALL_PENDING;
+    var alias : u64 = pid_of(9, 4);
+    assert live_alias(alias, CALL_PENDING) == alias;
+    assert live_alias(alias, CALL_REPLY) == NO_PID;
+    assert live_alias(alias, CALL_DOWN) == NO_PID;
+    assert live_alias(alias, CALL_TIMEOUT) == NO_PID;
+    // a reply that comes after the timeout is addressed to a dead alias and dropped like a send to a dead pid
+    assert deliver(reaches(alias, live_alias(alias, CALL_TIMEOUT)), 0, MAILBOX_CAP) == D_DROPPED_DEAD;
+    assert deliver(reaches(alias, live_alias(alias, CALL_PENDING)), 0, MAILBOX_CAP) == D_QUEUED;
+}
+
+test a_slow_crash_loop_backs_off_and_then_reaches_the_parent {
+    // a crash every 101 s never puts a fourth restart in 300 s, so the intensity alone restarts forever
+    assert on_child_exit(RESTART_TRANSIENT, X_CRASH, 2, DOMAIN_MAX_RESTARTS) == SUP_RESTART;
+    assert unstable_streak(0, 101) == 1;
+    assert unstable_streak(5, 101) == 6;
+    assert unstable_streak(5, STABLE_SECONDS - 1) == 6;
+    assert unstable_streak(5, STABLE_SECONDS) == 0;
+    assert backoff_seconds(0) == 0;
+    assert backoff_seconds(1) == BACKOFF_BASE_SECONDS;
+    assert backoff_seconds(2) == 20;
+    assert backoff_seconds(5) == 160;
+    assert backoff_seconds(6) == 300;
+    assert backoff_seconds(7) == BACKOFF_CAP_SECONDS;
+    assert backoff_seconds(4294967295) == 300;
+    // the seventh unstable restart in a row gives up, as a fourth restart in the period would
+    assert with_backoff(on_child_exit(RESTART_TRANSIENT, X_CRASH, 2, DOMAIN_MAX_RESTARTS), 6) == SUP_RESTART;
+    assert with_backoff(on_child_exit(RESTART_TRANSIENT, X_CRASH, 2, DOMAIN_MAX_RESTARTS), 7) == SUP_GIVE_UP;
+    assert with_backoff(SUP_NOTHING, 7) == SUP_NOTHING;
+    assert with_backoff(SUP_GIVE_UP, 0) == SUP_GIVE_UP;
+}
+
+test jitter_spreads_one_domain_and_never_crosses_the_cap {
+    // no wait, no jitter; a wait too short for one second of spread is kept as it is
+    assert jittered_seconds(0, 7) == 0;
+    assert jittered_seconds(4, 7) == 4;
+    assert jittered_seconds(BACKOFF_CAP_SECONDS, 0) == BACKOFF_CAP_SECONDS;
+    // slot 1 draws the whole 20 per cent: the hash is pinned, so every backend picks this second
+    assert jittered_seconds(BACKOFF_CAP_SECONDS, 1) == 240;
+    // and slot 61 tells floor(2^32 / phi) = 2654435769 from Knuth's prime 2654435761, which gives 293
+    assert jittered_seconds(BACKOFF_CAP_SECONDS, 61) == 292;
+    // every streak and slot: never above the wait, never more than JITTER_PERCENT below it
+    var streak : u32 = 0;
+    while (streak < 9) {
+        var wait : u32 = backoff_seconds(streak);
+        var slot : u64 = 0;
+        while (slot < 64) {
+            var j : u32 = jittered_seconds(wait, slot);
+            assert j <= wait;
+            assert j <= BACKOFF_CAP_SECONDS;
+            assert j >= wait - (wait * JITTER_PERCENT) / 100;
+            // below the cap the jittered wait still grows with the streak
+            if (streak >= 1 and streak < 6) {
+                assert jittered_seconds(backoff_seconds(streak + 1), slot) > wait;
+            }
+            slot = slot + 1;
+        }
+        streak = streak + 1;
+    }
+    // ten agents at the cap restart in nine different seconds; the control-lane model is
+    // the set here, tag 1 + (cap - wait), and ctl_take counts it
+    var seen : u64 = 0;
+    var s : u64 = 0;
+    while (s < 10) {
+        seen = ctl_post(seen, 1 + ((BACKOFF_CAP_SECONDS - jittered_seconds(BACKOFF_CAP_SECONDS, s)) as u64));
+        s = s + 1;
+    }
+    var distinct : u32 = 0;
+    while (ctl_next(seen) != 0) {
+        seen = ctl_take(seen);
+        distinct = distinct + 1;
+    }
+    assert distinct >= 9;
+    // ten slots at a stride of 3, at the shortest wait, use all three possible seconds; a plain
+    // `seed % 3` would give all ten the same second
+    var stride : u64 = 0;
+    var k : u64 = 0;
+    while (k < 10) {
+        stride = ctl_post(stride, 1 + ((BACKOFF_BASE_SECONDS - jittered_seconds(BACKOFF_BASE_SECONDS, k * 3)) as u64));
+        k = k + 1;
+    }
+    var seconds : u32 = 0;
+    while (ctl_next(stride) != 0) {
+        stride = ctl_take(stride);
+        seconds = seconds + 1;
+    }
+    assert seconds == 3;
+}
+
+test each_strategy_picks_its_own_children {
+    assert affected(STRAT_ONE_FOR_ONE, 1, 1) == true;
+    assert affected(STRAT_ONE_FOR_ONE, 1, 0) == false;
+    assert affected(STRAT_ONE_FOR_ONE, 1, 2) == false;
+    assert affected(STRAT_ONE_FOR_ALL, 1, 0) == true;
+    assert affected(STRAT_ONE_FOR_ALL, 1, 2) == true;
+    assert affected(STRAT_REST_FOR_ONE, 1, 0) == false;
+    assert affected(STRAT_REST_FOR_ONE, 1, 1) == true;
+    assert affected(STRAT_REST_FOR_ONE, 1, 2) == true;
+}
+
+test a_hung_turn_is_killed_and_its_task_reclaimed_at_once {
+    assert hung_turn_signal(0) == X_NONE;
+    assert hung_turn_signal(TURN_MAX_SECONDS - 1) == X_NONE;
+    assert hung_turn_signal(TURN_MAX_SECONDS) == X_KILL;
+    // the kill cannot be trapped, the runtime dies of killed, and its DOWN reclaims without the TTL
+    assert on_exit_signal(hung_turn_signal(TURN_MAX_SECONDS), true) == ACT_DIE;
+    assert reclaim_wait_seconds(death_reason(hung_turn_signal(TURN_MAX_SECONDS)), 30, 180) == 0;
+    // a turn under the bound keeps its lease (180 s is control.t27 TASK_LEASE_TTL_SECONDS): longer turns are allowed
+    assert TURN_MAX_SECONDS > 180;
+}
+
+test every_lost_message_is_a_dead_letter_and_a_coalesced_one_is_not {
+    assert is_dead_letter(deliver(false, 0, MAILBOX_CAP)) == true;
+    assert is_dead_letter(deliver(true, MAILBOX_CAP, MAILBOX_CAP)) == true;
+    assert is_dead_letter(deliver(true, 0, MAILBOX_CAP)) == false;
+    assert is_dead_letter(deliver_control(true, true)) == false;
+    assert is_dead_letter(deliver_control(false, true)) == true;
+}
+
+test significant_children_end_their_supervisor_only_by_their_own_exit {
+    // OTP's restriction: only a transient or temporary child may be significant, and only when a mode is set
+    assert child_spec_valid(RESTART_PERMANENT, false, AUTO_NEVER) == true;
+    assert child_spec_valid(RESTART_PERMANENT, false, AUTO_ALL_SIGNIFICANT) == true;
+    assert child_spec_valid(RESTART_TRANSIENT, false, AUTO_ALL_SIGNIFICANT + 1) == false;
+    assert child_spec_valid(RESTART_PERMANENT, true, AUTO_ANY_SIGNIFICANT) == false;
+    assert child_spec_valid(RESTART_TRANSIENT, true, AUTO_ANY_SIGNIFICANT) == true;
+    assert child_spec_valid(RESTART_TEMPORARY, true, AUTO_ALL_SIGNIFICANT) == true;
+    assert child_spec_valid(RESTART_TEMPORARY, true, AUTO_NEVER) == false;
+    // a transient significant child: a normal or shutdown end counts; a crash restarts it instead
+    assert auto_shutdown_after_exit(AUTO_ANY_SIGNIFICANT, true, RESTART_TRANSIENT, X_NORMAL, false, 1) == true;
+    assert auto_shutdown_after_exit(AUTO_ANY_SIGNIFICANT, true, RESTART_TRANSIENT, X_SHUTDOWN, false, 1) == true;
+    assert auto_shutdown_after_exit(AUTO_ANY_SIGNIFICANT, true, RESTART_TRANSIENT, X_CRASH, false, 0) == false;
+    // a temporary significant child counts on any reason, a crash included
+    assert auto_shutdown_after_exit(AUTO_ANY_SIGNIFICANT, true, RESTART_TEMPORARY, X_CRASH, false, 1) == true;
+    // stopped by its supervisor, or not significant: never
+    assert auto_shutdown_after_exit(AUTO_ANY_SIGNIFICANT, true, RESTART_TEMPORARY, X_SHUTDOWN, true, 0) == false;
+    assert auto_shutdown_after_exit(AUTO_ANY_SIGNIFICANT, false, RESTART_TEMPORARY, X_NORMAL, false, 0) == false;
+    // all_significant waits for the last active one; never, the default, waits for nothing
+    assert auto_shutdown_after_exit(AUTO_ALL_SIGNIFICANT, true, RESTART_TEMPORARY, X_NORMAL, false, 1) == false;
+    assert auto_shutdown_after_exit(AUTO_ALL_SIGNIFICANT, true, RESTART_TEMPORARY, X_NORMAL, false, 0) == true;
+    assert auto_shutdown_after_exit(AUTO_NEVER, true, RESTART_TEMPORARY, X_NORMAL, false, 0) == false;
+    // the shutdown sticks only under a parent that lets X_SHUTDOWN stay down
+    assert auto_shutdown_sticks(RESTART_TRANSIENT) == true;
+    assert auto_shutdown_sticks(RESTART_TEMPORARY) == true;
+    assert auto_shutdown_sticks(RESTART_PERMANENT) == false;
+    // the Queen's domains: permanent under the root, so never is the only mode that is not undone
+    assert auto_shutdown_sticks(queen_restart_type(QK_DOMAIN_SUP)) == false;
+    assert child_spec_valid(queen_restart_type(QK_AGENT), true, QUEEN_AUTO_SHUTDOWN) == false;
+}
+
+test a_call_into_its_own_chain_is_refused_at_once_and_the_chain_is_bounded {
+    // A (slot 3) calls itself: Erlang's calling_self
+    assert call_admit(chain_add(0, 3), 1, 3) == CALL_CYCLE;
+    // A calls B (slot 5): admitted; B serves it and calls A back: A -> B -> A
+    assert call_admit(chain_add(0, 3), 1, 5) == CALL_PENDING;
+    assert call_admit(chain_add(chain_add(0, 3), 5), 2, 3) == CALL_CYCLE;
+    assert call_admit(chain_add(chain_add(0, 3), 5), 2, 5) == CALL_CYCLE;
+    // B calls C (slot 7): no cycle
+    assert call_admit(chain_add(chain_add(0, 3), 5), 2, 7) == CALL_PENDING;
+    // one bit per slot, and adding a slot twice adds it once
+    assert chain_add(chain_add(0, 3), 5) == 40;
+    assert chain_add(chain_add(chain_add(0, 3), 5), 5) == 40;
+    assert chain_has(40, 3) and chain_has(40, 5);
+    assert chain_has(40, 4) == false;
+    assert chain_has(0, 0) == false;
+    // the last slot of the model is tracked; the first past it is not, and never shifts by 64
+    assert chain_add(0, 63) == 9223372036854775808;
+    assert chain_has(9223372036854775808, 63);
+    assert chain_has(18446744073709551615, 64) == false;
+    assert chain_add(40, 64) == 40;
+    assert call_admit(18446744073709551615, 1, 64) == CALL_PENDING;
+    // depth: 8 callers blocked is the most; the ninth call is refused
+    assert call_admit(40, 8, 9) == CALL_PENDING;
+    assert call_admit(40, 9, 9) == CALL_TOO_DEEP;
+    assert call_admit(40, CALL_MAX_DEPTH + 1, 9) == CALL_TOO_DEEP;
+    // a cycle is named before the depth
+    assert call_admit(40, 9, 5) == CALL_CYCLE;
+}
+
+test a_full_domain_refuses_a_new_start_and_still_restarts_a_crashed_agent {
+    // control.t27 DOMAIN_CAP is 4. Two wakes read 3 of 4 and both clone; the supervisor takes the
+    // starts one turn at a time, so the first is admitted and the second refused
+    assert start_answer(3, 0, 4) == START_OK;
+    assert start_answer(4, 0, 4) == START_MAX_CHILDREN;
+    assert start_answer(5, 0, 4) == START_MAX_CHILDREN;
+    // a child being stopped holds its runner until its EXIT
+    assert start_answer(3, 1, 4) == START_MAX_CHILDREN;
+    assert start_answer(2, 1, 4) == START_OK;
+    // a crashed agent of the full domain comes back in place: the count stays, a new start is still refused
+    var after_crash : u32 = children_after_exit(4, should_restart(queen_restart_type(QK_AGENT), X_CRASH));
+    assert after_crash == 4;
+    assert start_answer(after_crash, 0, 4) == START_MAX_CHILDREN;
+    // a retired agent (transient, X_NORMAL) stays down and frees its place
+    var after_retire : u32 = children_after_exit(after_crash, should_restart(queen_restart_type(QK_AGENT), X_NORMAL));
+    assert after_retire == 3;
+    assert start_answer(after_retire, 0, 4) == START_OK;
+    // a cap lowered at a wake refuses new starts; a cap of 0 drains the domain
+    assert start_answer(3, 0, 2) == START_MAX_CHILDREN;
+    assert start_answer(0, 0, 0) == START_MAX_CHILDREN;
+    assert start_answer(0, 0, 1) == START_OK;
+}

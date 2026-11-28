@@ -1,0 +1,638 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/t27f/ui_plan.t27 -- the T27F UI plan: a renderer-neutral IR and the trusted widget catalog
+; it may name (gHashTag/trinity#1648, MVP gHashTag/trinity#1652, tracked in gHashTag/t27#9962).
+; The T27F path is intent -> versioned system description -> solver -> UI plan (this file) ->
+; trusted renderer -> verification loop. A plan is data: widget ids from an allowlist, prop and
+; action ids, data bindings, a grid layout, a theme, accessibility labels and provenance. No field
+; of a plan holds code, markup or a script, so a renderer never evaluates anything a model wrote.
+; Labels, titles and source refs are plain text, drawn as text.
+; What this file decides, deterministically and without a language model:
+;   - the catalog: which widgets exist, which props and actions each accepts, which capabilities
+;     each needs, and which data source kind each binds to;
+;   - validation: validate_plan() returns PLAN_OK or the first rule a plan breaks, and
+;     first_bad_slot() names the widget that broke it;
+;   - that a plan proposed by a model (SOLVER_MODEL) is judged by exactly the same rules as one
+;     built by rules (SOLVER_RULES).
+; Not claimed here: no renderer draws a plan yet (React is the first target), nothing streams, no
+; solver turns an intent into a plan, and nothing is measured against other generative-UI stacks.
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module t27f_ui_plan;
+
+/// Versions. A plan names the IR and catalog it was solved against; any other version is refused.
+pub const IR_VERSION : u32 = 1;
+pub const CATALOG_VERSION : u32 = 1;
+
+/// The widget catalog, an allowlist. Id 0 is an empty slot; 1..WIDGET_KINDS-1 are the trusted
+/// widgets a renderer implements. Every other id, and every name not listed, is unknown.
+pub const WIDGET_EMPTY : u8 = 0;
+pub const WIDGET_HONEYCOMB_CARD : u8 = 1;
+pub const WIDGET_FORMULA_VIEW : u8 = 2;
+pub const WIDGET_METRICS_TABLE : u8 = 3;
+pub const WIDGET_RUN_BUTTON : u8 = 4;
+pub const WIDGET_TEXT_BLOCK : u8 = 5;
+pub const WIDGET_KINDS : u8 = 6;
+pub const WIDGET_UNKNOWN : u8 = 255;
+pub const WIDGET_NAMES : [6]str = ["empty", "honeycomb_card", "formula_view", "metrics_table", "run_button", "text_block"];
+
+/// Names a planner may ask for that no trusted renderer implements, ever: each one would run or
+/// inject code the model wrote. The catalog must never contain them (invariant below).
+pub const FORBIDDEN_NAMES : [6]str = ["script", "eval", "html", "iframe", "raw_js", "function"];
+
+/// Props, as bit positions in a widget's prop mask.
+pub const PROP_TITLE : u8 = 0;
+pub const PROP_SPEC_PATH : u8 = 1;
+pub const PROP_FORMULA_ID : u8 = 2;
+pub const PROP_COLUMNS : u8 = 3;
+pub const PROP_UNITS : u8 = 4;
+pub const PROP_CAPTION : u8 = 5;
+pub const PROP_KINDS : u8 = 6;
+
+/// Actions. ACTION_NONE is always allowed; every other action must be in the widget's action mask
+/// and needs its capability granted. RUN_TESTS runs the bound spec's own tests on the lab through
+/// t27c; it never runs text the model wrote.
+pub const ACTION_NONE : u8 = 0;
+pub const ACTION_OPEN_SPEC : u8 = 1;
+pub const ACTION_RUN_TESTS : u8 = 2;
+pub const ACTION_EXPORT_CSV : u8 = 3;
+pub const ACTION_COPY_FORMULA : u8 = 4;
+pub const ACTION_KINDS : u8 = 5;
+
+/// Capabilities, as bit positions in a mask the host grants for one session.
+pub const CAP_READ_SPECS : u8 = 0;
+pub const CAP_READ_METRICS : u8 = 1;
+pub const CAP_RUN_LAB : u8 = 2;
+pub const CAP_EXPORT_LOCAL : u8 = 3;
+pub const CAP_CLIPBOARD : u8 = 4;
+pub const CAP_KINDS : u8 = 5;
+
+/// Data source kinds a plan may declare. A widget binds to one source of its own kind.
+pub const SOURCE_NONE : u8 = 0;
+pub const SOURCE_SPEC : u8 = 1;
+pub const SOURCE_FORMULA : u8 = 2;
+pub const SOURCE_METRICS : u8 = 3;
+pub const SOURCE_KINDS : u8 = 4;
+
+/// Catalog tables, indexed by widget id. Masks are spelled as numbers; the invariant
+/// catalog_masks_are_spelled_right rebuilds each one from the named bits.
+/// Props: card title+spec_path, formula title+formula_id+caption, table title+columns+units+caption,
+/// button title+spec_path, text title+caption.
+pub const WIDGET_PROPS : [6]u32 = [0, 3, 37, 57, 3, 33];
+/// Actions: card open_spec, formula copy_formula, table export_csv, button run_tests, text none.
+pub const WIDGET_ACTIONS : [6]u32 = [0, 2, 16, 8, 4, 0];
+/// Capabilities to show the widget at all: card, formula and button read specs, table reads metrics.
+pub const WIDGET_CAPS : [6]u32 = [0, 1, 1, 2, 1, 0];
+/// The source kind each widget binds to; SOURCE_NONE means it takes no binding.
+pub const WIDGET_SOURCE : [6]u8 = [SOURCE_NONE, SOURCE_SPEC, SOURCE_FORMULA, SOURCE_METRICS, SOURCE_SPEC, SOURCE_NONE];
+/// Capability each action needs, indexed by action id: none, read_specs, run_lab, export_local,
+/// clipboard.
+pub const ACTION_CAPS : [5]u32 = [0, 1, 4, 8, 16];
+
+/// Who produced the plan. Both kinds pass through validate_plan; neither is trusted on its own.
+pub const SOLVER_RULES : u8 = 0;
+pub const SOLVER_MODEL : u8 = 1;
+pub const SOLVER_KINDS : u8 = 2;
+
+pub const THEME_LIGHT : u8 = 0;
+pub const THEME_DARK : u8 = 1;
+pub const THEME_HIGH_CONTRAST : u8 = 2;
+pub const THEME_KINDS : u8 = 3;
+
+/// Layout: a grid of GRID_COLUMNS columns and at most GRID_ROWS rows.
+pub const GRID_COLUMNS : u8 = 12;
+pub const GRID_ROWS : u8 = 8;
+
+/// Plan capacity. Binding 0 means "no binding"; binding k names declared source k (1-based).
+pub const MAX_WIDGETS : u32 = 8;
+pub const MAX_SOURCES : u32 = 4;
+pub const BINDING_NONE : u8 = 0;
+pub const NO_SLOT : u32 = 255;
+
+/// Validation verdicts. validate_plan checks plan-level rules in this order, then each widget slot
+/// in slot order, and returns the first rule broken.
+pub const PLAN_OK : u8 = 0;
+pub const ERR_IR_VERSION : u8 = 1;
+pub const ERR_CATALOG_VERSION : u8 = 2;
+pub const ERR_PROVENANCE : u8 = 3;
+pub const ERR_THEME : u8 = 4;
+pub const ERR_SOURCE : u8 = 5;
+pub const ERR_EMPTY_PLAN : u8 = 6;
+pub const ERR_TOO_MANY_WIDGETS : u8 = 7;
+pub const ERR_UNKNOWN_WIDGET : u8 = 8;
+pub const ERR_PROP_NOT_ALLOWED : u8 = 9;
+pub const ERR_BINDING_MISSING : u8 = 10;
+pub const ERR_BINDING_DANGLING : u8 = 11;
+pub const ERR_BINDING_KIND : u8 = 12;
+pub const ERR_ACTION_NOT_ALLOWED : u8 = 13;
+pub const ERR_CAPABILITY_NOT_GRANTED : u8 = 14;
+pub const ERR_A11Y_LABEL_MISSING : u8 = 15;
+pub const ERR_LAYOUT : u8 = 16;
+
+/// One UI plan. Arrays are indexed by slot (widgets) or by source number minus one (sources); slots
+/// at or past widget_count, and sources at or past source_count, are not read.
+pub struct UiPlan {
+    ir_version: u32,
+    catalog_version: u32,
+    intent: str,
+    solver: u8,
+    theme: u8,
+    title: str,
+    granted: u32,
+    source_count: u32,
+    source_kind: [4]u8,
+    source_ref: [4]str,
+    widget_count: u32,
+    widget: [8]u8,
+    props: [8]u32,
+    binding: [8]u8,
+    action: [8]u8,
+    row: [8]u8,
+    col: [8]u8,
+    span: [8]u8,
+    label: [8]str,
+}
+
+pub fn bit(b: u8) -> u32 {
+    return (1 as u32) << (b as u32);
+}
+
+pub fn has_bit(mask: u32, b: u8) -> bool {
+    return ((mask >> (b as u32)) & 1) == 1;
+}
+
+/// A trusted widget a renderer can draw: in the catalog and not the empty slot.
+pub fn catalog_widget(w: u8) -> bool {
+    return w > WIDGET_EMPTY and w < WIDGET_KINDS;
+}
+
+/// The id of a widget asked for by name, or WIDGET_UNKNOWN. The empty slot cannot be asked for.
+pub fn widget_id(name: str) -> u8 {
+    var i : u32 = 1;
+    while (i < (WIDGET_KINDS as u32)) {
+        if (WIDGET_NAMES[i as usize] == name) { return i as u8; }
+        i = i + 1;
+    }
+    return WIDGET_UNKNOWN;
+}
+
+/// How many forbidden names resolve to a catalog widget. Zero, by invariant.
+pub fn forbidden_in_catalog() -> u32 {
+    var n : u32 = 0;
+    var j : u32 = 0;
+    while (j < 6) {
+        if (widget_id(FORBIDDEN_NAMES[j as usize]) != WIDGET_UNKNOWN) { n = n + 1; }
+        j = j + 1;
+    }
+    return n;
+}
+
+/// A widget is interactive when the catalog gives it any action; it then needs an accessible label.
+pub fn is_interactive(w: u8) -> bool {
+    if (catalog_widget(w) == false) { return false; }
+    return WIDGET_ACTIONS[w as usize] != 0;
+}
+
+/// Every set prop bit is one the widget allows.
+pub fn props_allowed(w: u8, props: u32) -> bool {
+    return (props & WIDGET_PROPS[w as usize]) == props;
+}
+
+pub fn action_in_catalog(w: u8, a: u8) -> bool {
+    if (a == ACTION_NONE) { return true; }
+    if (a >= ACTION_KINDS) { return false; }
+    return has_bit(WIDGET_ACTIONS[w as usize], a);
+}
+
+/// Every capability in `need` is in `granted`.
+pub fn caps_granted(granted: u32, need: u32) -> bool {
+    return (need & granted) == need;
+}
+
+/// Two spans [c1, c1 + s1) and [c2, c2 + s2) on one row share a column.
+pub fn spans_overlap(c1: u8, s1: u8, c2: u8, s2: u8) -> bool {
+    return (c1 as u32) < (c2 as u32) + (s2 as u32) and (c2 as u32) < (c1 as u32) + (s1 as u32);
+}
+
+/// The rules one widget slot must meet, in order: known widget, allowed props, a binding of its
+/// own kind to a declared source, an allowed and granted action, its own capabilities, a label
+/// when it is interactive, and a place on the grid that no earlier slot holds.
+pub fn validate_widget(p: UiPlan, slot: u32) -> u8 {
+    let k : usize = slot as usize;
+    let w : u8 = p.widget[k];
+    if (catalog_widget(w) == false) { return ERR_UNKNOWN_WIDGET; }
+    if (props_allowed(w, p.props[k]) == false) { return ERR_PROP_NOT_ALLOWED; }
+    let want : u8 = WIDGET_SOURCE[w as usize];
+    let b : u8 = p.binding[k];
+    if (want == SOURCE_NONE) {
+        if (b != BINDING_NONE) { return ERR_BINDING_KIND; }
+    } else {
+        if (b == BINDING_NONE) { return ERR_BINDING_MISSING; }
+        if ((b as u32) > p.source_count) { return ERR_BINDING_DANGLING; }
+        if (p.source_kind[(b - 1) as usize] != want) { return ERR_BINDING_KIND; }
+    }
+    let a : u8 = p.action[k];
+    if (action_in_catalog(w, a) == false) { return ERR_ACTION_NOT_ALLOWED; }
+    if (caps_granted(p.granted, ACTION_CAPS[a as usize]) == false) { return ERR_CAPABILITY_NOT_GRANTED; }
+    if (caps_granted(p.granted, WIDGET_CAPS[w as usize]) == false) { return ERR_CAPABILITY_NOT_GRANTED; }
+    if (is_interactive(w) and p.label[k] == "") { return ERR_A11Y_LABEL_MISSING; }
+    if (p.span[k] == 0) { return ERR_LAYOUT; }
+    if ((p.col[k] as u32) + (p.span[k] as u32) > (GRID_COLUMNS as u32)) { return ERR_LAYOUT; }
+    if (p.row[k] >= GRID_ROWS) { return ERR_LAYOUT; }
+    var j : u32 = 0;
+    while (j < slot) {
+        let m : usize = j as usize;
+        if (p.row[m] == p.row[k] and spans_overlap(p.col[m], p.span[m], p.col[k], p.span[k])) { return ERR_LAYOUT; }
+        j = j + 1;
+    }
+    return PLAN_OK;
+}
+
+/// Plan-level rules, before any widget is read.
+pub fn validate_header(p: UiPlan) -> u8 {
+    if (p.ir_version != IR_VERSION) { return ERR_IR_VERSION; }
+    if (p.catalog_version != CATALOG_VERSION) { return ERR_CATALOG_VERSION; }
+    if (p.intent == "" or p.solver >= SOLVER_KINDS) { return ERR_PROVENANCE; }
+    if (p.theme >= THEME_KINDS) { return ERR_THEME; }
+    if (p.source_count > MAX_SOURCES) { return ERR_SOURCE; }
+    var i : u32 = 0;
+    while (i < p.source_count and i < MAX_SOURCES) {
+        let s : u8 = p.source_kind[i as usize];
+        if (s == SOURCE_NONE or s >= SOURCE_KINDS or p.source_ref[i as usize] == "") { return ERR_SOURCE; }
+        i = i + 1;
+    }
+    if (p.widget_count == 0) { return ERR_EMPTY_PLAN; }
+    if (p.widget_count > MAX_WIDGETS) { return ERR_TOO_MANY_WIDGETS; }
+    // the workspace itself is a landmark and needs an accessible name
+    if (p.title == "") { return ERR_A11Y_LABEL_MISSING; }
+    return PLAN_OK;
+}
+
+/// PLAN_OK, or the first rule the plan breaks.
+pub fn validate_plan(p: UiPlan) -> u8 {
+    let h : u8 = validate_header(p);
+    if (h != PLAN_OK) { return h; }
+    var i : u32 = 0;
+    while (i < p.widget_count and i < MAX_WIDGETS) {
+        let e : u8 = validate_widget(p, i);
+        if (e != PLAN_OK) { return e; }
+        i = i + 1;
+    }
+    return PLAN_OK;
+}
+
+/// The slot of the first widget that breaks a rule, or NO_SLOT when the header fails or nothing does.
+pub fn first_bad_slot(p: UiPlan) -> u32 {
+    if (validate_header(p) != PLAN_OK) { return NO_SLOT; }
+    var i : u32 = 0;
+    while (i < p.widget_count and i < MAX_WIDGETS) {
+        if (validate_widget(p, i) != PLAN_OK) { return i; }
+        i = i + 1;
+    }
+    return NO_SLOT;
+}
+
+pub fn interactive_count(p: UiPlan) -> u32 {
+    var n : u32 = 0;
+    var i : u32 = 0;
+    while (i < p.widget_count and i < MAX_WIDGETS) {
+        if (is_interactive(p.widget[i as usize])) { n = n + 1; }
+        i = i + 1;
+    }
+    return n;
+}
+
+/// An empty plan of the current versions: no sources, no widgets, nothing granted.
+pub fn blank_plan() -> UiPlan {
+    return UiPlan { ir_version: IR_VERSION, catalog_version: CATALOG_VERSION, intent: "", solver: SOLVER_RULES, theme: THEME_LIGHT, title: "", granted: 0, source_count: 0, source_kind: [0; 4], source_ref: ["", "", "", ""], widget_count: 0, widget: [0; 8], props: [0; 8], binding: [0; 8], action: [0; 8], row: [0; 8], col: [0; 8], span: [0; 8], label: ["", "", "", "", "", "", "", ""] };
+}
+
+/// The fixture: a GF16 research workspace. Row 0 holds the spec honeycomb card and the formula
+/// view side by side; row 1 the metrics table and the run button. Every source ref is a file in
+/// this repository.
+pub fn gf16_workspace() -> UiPlan {
+    var p : UiPlan = blank_plan();
+    p.intent = "Compare GF16 against bf16 on the conformance vectors";
+    p.theme = THEME_DARK;
+    p.title = "GF16 research workspace";
+    p.granted = bit(CAP_READ_SPECS) | bit(CAP_READ_METRICS) | bit(CAP_RUN_LAB) | bit(CAP_CLIPBOARD);
+    p.source_count = 3;
+    p.source_kind[0] = SOURCE_SPEC;
+    p.source_ref[0] = "specs/numeric/gf16.t27";
+    p.source_kind[1] = SOURCE_FORMULA;
+    p.source_ref[1] = "specs/numeric/gf16.t27#gf16_decode_to_f32";
+    p.source_kind[2] = SOURCE_METRICS;
+    p.source_ref[2] = "conformance/gf16_bench_results.json";
+    p.widget_count = 4;
+    // slot 0: the spec honeycomb card, bound to the spec, opens it
+    p.widget[0] = WIDGET_HONEYCOMB_CARD;
+    p.props[0] = bit(PROP_TITLE) | bit(PROP_SPEC_PATH);
+    p.binding[0] = 1;
+    p.action[0] = ACTION_OPEN_SPEC;
+    p.row[0] = 0;
+    p.col[0] = 0;
+    p.span[0] = 6;
+    p.label[0] = "GF16 spec card";
+    // slot 1: the formula view, bound to the decode formula, copies it
+    p.widget[1] = WIDGET_FORMULA_VIEW;
+    p.props[1] = bit(PROP_TITLE) | bit(PROP_FORMULA_ID) | bit(PROP_CAPTION);
+    p.binding[1] = 2;
+    p.action[1] = ACTION_COPY_FORMULA;
+    p.row[1] = 0;
+    p.col[1] = 6;
+    p.span[1] = 6;
+    p.label[1] = "GF16 decode formula";
+    // slot 2: the metrics table, bound to the bench results, read only here
+    p.widget[2] = WIDGET_METRICS_TABLE;
+    p.props[2] = bit(PROP_TITLE) | bit(PROP_COLUMNS) | bit(PROP_UNITS);
+    p.binding[2] = 3;
+    p.action[2] = ACTION_NONE;
+    p.row[2] = 1;
+    p.col[2] = 0;
+    p.span[2] = 9;
+    p.label[2] = "GF16 versus bf16 metrics";
+    // slot 3: the run button, bound to the spec, runs its tests on the lab
+    p.widget[3] = WIDGET_RUN_BUTTON;
+    p.props[3] = bit(PROP_TITLE) | bit(PROP_SPEC_PATH);
+    p.binding[3] = 1;
+    p.action[3] = ACTION_RUN_TESTS;
+    p.row[3] = 1;
+    p.col[3] = 9;
+    p.span[3] = 3;
+    p.label[3] = "Run GF16 spec tests";
+    return p;
+}
+
+/// Malformed plans. Each changes the fixture in one place and must be rejected for that reason.
+pub fn bad_unknown_widget() -> UiPlan {
+    var p : UiPlan = gf16_workspace();
+    p.widget[1] = 200;
+    return p;
+}
+
+/// A planner asks for an "eval" widget by name; the name resolves to WIDGET_UNKNOWN.
+pub fn bad_eval_widget() -> UiPlan {
+    var p : UiPlan = gf16_workspace();
+    p.widget[3] = widget_id("eval");
+    return p;
+}
+
+pub fn bad_dangling_binding() -> UiPlan {
+    var p : UiPlan = gf16_workspace();
+    p.binding[2] = 4;
+    return p;
+}
+
+pub fn bad_binding_kind() -> UiPlan {
+    var p : UiPlan = gf16_workspace();
+    p.binding[2] = 2;
+    return p;
+}
+
+pub fn bad_missing_binding() -> UiPlan {
+    var p : UiPlan = gf16_workspace();
+    p.binding[0] = BINDING_NONE;
+    return p;
+}
+
+pub fn bad_action_not_allowed() -> UiPlan {
+    var p : UiPlan = gf16_workspace();
+    p.action[1] = ACTION_RUN_TESTS;
+    return p;
+}
+
+pub fn bad_run_without_lab() -> UiPlan {
+    var p : UiPlan = gf16_workspace();
+    p.granted = bit(CAP_READ_SPECS) | bit(CAP_READ_METRICS) | bit(CAP_CLIPBOARD);
+    return p;
+}
+
+pub fn bad_unlabelled_button() -> UiPlan {
+    var p : UiPlan = gf16_workspace();
+    p.label[3] = "";
+    return p;
+}
+
+pub fn bad_prop_not_allowed() -> UiPlan {
+    var p : UiPlan = gf16_workspace();
+    p.props[3] = p.props[3] | bit(PROP_COLUMNS);
+    return p;
+}
+
+pub fn bad_overlap() -> UiPlan {
+    var p : UiPlan = gf16_workspace();
+    p.col[3] = 8;
+    return p;
+}
+
+test catalog_is_an_allowlist {
+    assert widget_id("honeycomb_card") == WIDGET_HONEYCOMB_CARD;
+    assert widget_id("formula_view") == WIDGET_FORMULA_VIEW;
+    assert widget_id("metrics_table") == WIDGET_METRICS_TABLE;
+    assert widget_id("run_button") == WIDGET_RUN_BUTTON;
+    assert widget_id("text_block") == WIDGET_TEXT_BLOCK;
+    // the empty slot is not a widget anyone can ask for
+    assert widget_id("empty") == WIDGET_UNKNOWN;
+    assert widget_id("script") == WIDGET_UNKNOWN;
+    assert widget_id("eval") == WIDGET_UNKNOWN;
+    assert widget_id("iframe") == WIDGET_UNKNOWN;
+    assert widget_id("Run_Button") == WIDGET_UNKNOWN;
+    assert catalog_widget(WIDGET_EMPTY) == false;
+    assert catalog_widget(WIDGET_TEXT_BLOCK);
+    assert catalog_widget(WIDGET_KINDS) == false;
+    assert catalog_widget(WIDGET_UNKNOWN) == false;
+}
+
+test gf16_workspace_is_valid {
+    let p : UiPlan = gf16_workspace();
+    assert validate_plan(p) == PLAN_OK;
+    assert first_bad_slot(p) == NO_SLOT;
+    assert p.widget_count == 4;
+    assert interactive_count(p) == 4;
+    assert p.source_kind[(p.binding[0] - 1) as usize] == SOURCE_SPEC;
+    assert p.source_kind[(p.binding[1] - 1) as usize] == SOURCE_FORMULA;
+    assert p.source_kind[(p.binding[2] - 1) as usize] == SOURCE_METRICS;
+    assert p.source_kind[(p.binding[3] - 1) as usize] == SOURCE_SPEC;
+    // a model-proposed plan passes the same gate, no more and no less
+    var m : UiPlan = gf16_workspace();
+    m.solver = SOLVER_MODEL;
+    assert validate_plan(m) == PLAN_OK;
+}
+
+test unknown_widget_is_rejected {
+    assert validate_plan(bad_unknown_widget()) == ERR_UNKNOWN_WIDGET;
+    assert first_bad_slot(bad_unknown_widget()) == 1;
+    assert validate_plan(bad_eval_widget()) == ERR_UNKNOWN_WIDGET;
+    assert first_bad_slot(bad_eval_widget()) == 3;
+    // an empty slot inside widget_count is a hole, not a widget
+    var p : UiPlan = gf16_workspace();
+    p.widget[2] = WIDGET_EMPTY;
+    assert validate_plan(p) == ERR_UNKNOWN_WIDGET;
+    assert first_bad_slot(p) == 2;
+}
+
+test binding_must_name_a_declared_source {
+    assert validate_plan(bad_dangling_binding()) == ERR_BINDING_DANGLING;
+    assert first_bad_slot(bad_dangling_binding()) == 2;
+    assert validate_plan(bad_binding_kind()) == ERR_BINDING_KIND;
+    assert validate_plan(bad_missing_binding()) == ERR_BINDING_MISSING;
+    assert first_bad_slot(bad_missing_binding()) == 0;
+    // a source slot past source_count is not declared, even if it is filled in
+    var p : UiPlan = gf16_workspace();
+    p.source_count = 2;
+    assert validate_plan(p) == ERR_BINDING_DANGLING;
+    // a widget that takes no binding may not carry one
+    var t : UiPlan = gf16_workspace();
+    t.widget_count = 5;
+    t.widget[4] = WIDGET_TEXT_BLOCK;
+    t.row[4] = 2;
+    t.span[4] = 12;
+    assert validate_plan(t) == PLAN_OK;
+    t.binding[4] = 1;
+    assert validate_plan(t) == ERR_BINDING_KIND;
+    // a declared source with no ref is refused before any widget is read
+    var s : UiPlan = gf16_workspace();
+    s.source_ref[2] = "";
+    assert validate_plan(s) == ERR_SOURCE;
+    assert first_bad_slot(s) == NO_SLOT;
+}
+
+test action_must_be_allowed_and_granted {
+    assert validate_plan(bad_action_not_allowed()) == ERR_ACTION_NOT_ALLOWED;
+    assert first_bad_slot(bad_action_not_allowed()) == 1;
+    assert validate_plan(bad_run_without_lab()) == ERR_CAPABILITY_NOT_GRANTED;
+    assert first_bad_slot(bad_run_without_lab()) == 3;
+    // export is in the table's catalog entry, but its capability is not granted in the fixture
+    var e : UiPlan = gf16_workspace();
+    e.action[2] = ACTION_EXPORT_CSV;
+    assert validate_plan(e) == ERR_CAPABILITY_NOT_GRANTED;
+    e.granted = e.granted | bit(CAP_EXPORT_LOCAL);
+    assert validate_plan(e) == PLAN_OK;
+    // an action id past the catalog is not allowed anywhere
+    var x : UiPlan = gf16_workspace();
+    x.action[0] = ACTION_KINDS;
+    assert validate_plan(x) == ERR_ACTION_NOT_ALLOWED;
+    // showing the metrics table at all needs read_metrics
+    var r : UiPlan = gf16_workspace();
+    r.granted = bit(CAP_READ_SPECS) | bit(CAP_RUN_LAB) | bit(CAP_CLIPBOARD);
+    assert validate_plan(r) == ERR_CAPABILITY_NOT_GRANTED;
+    assert first_bad_slot(r) == 2;
+}
+
+test interactive_widgets_need_a_label {
+    assert validate_plan(bad_unlabelled_button()) == ERR_A11Y_LABEL_MISSING;
+    assert first_bad_slot(bad_unlabelled_button()) == 3;
+    assert is_interactive(WIDGET_RUN_BUTTON);
+    assert is_interactive(WIDGET_TEXT_BLOCK) == false;
+    assert is_interactive(WIDGET_UNKNOWN) == false;
+    // a text block is not interactive and may go without a label
+    var t : UiPlan = gf16_workspace();
+    t.widget_count = 5;
+    t.widget[4] = WIDGET_TEXT_BLOCK;
+    t.props[4] = bit(PROP_CAPTION);
+    t.row[4] = 2;
+    t.span[4] = 12;
+    assert validate_plan(t) == PLAN_OK;
+    assert interactive_count(t) == 4;
+    // the workspace itself needs an accessible name
+    var w : UiPlan = gf16_workspace();
+    w.title = "";
+    assert validate_plan(w) == ERR_A11Y_LABEL_MISSING;
+    assert first_bad_slot(w) == NO_SLOT;
+}
+
+test props_are_allowlisted {
+    assert validate_plan(bad_prop_not_allowed()) == ERR_PROP_NOT_ALLOWED;
+    assert first_bad_slot(bad_prop_not_allowed()) == 3;
+    assert props_allowed(WIDGET_METRICS_TABLE, bit(PROP_COLUMNS));
+    assert props_allowed(WIDGET_RUN_BUTTON, bit(PROP_COLUMNS)) == false;
+    // a bit past the last prop is never allowed
+    assert props_allowed(WIDGET_METRICS_TABLE, bit(PROP_KINDS)) == false;
+    assert props_allowed(WIDGET_EMPTY, 0);
+}
+
+test layout_fits_the_grid {
+    assert validate_plan(bad_overlap()) == ERR_LAYOUT;
+    assert first_bad_slot(bad_overlap()) == 3;
+    var o : UiPlan = gf16_workspace();
+    o.span[3] = 4;
+    assert validate_plan(o) == ERR_LAYOUT;
+    var z : UiPlan = gf16_workspace();
+    z.span[0] = 0;
+    assert validate_plan(z) == ERR_LAYOUT;
+    var r : UiPlan = gf16_workspace();
+    r.row[3] = GRID_ROWS;
+    assert validate_plan(r) == ERR_LAYOUT;
+    // touching spans do not overlap; one column more does
+    assert spans_overlap(0, 6, 6, 6) == false;
+    assert spans_overlap(0, 7, 6, 6);
+    assert spans_overlap(9, 3, 0, 9) == false;
+}
+
+test header_rules_come_first {
+    var v : UiPlan = gf16_workspace();
+    v.ir_version = IR_VERSION + 1;
+    assert validate_plan(v) == ERR_IR_VERSION;
+    var c : UiPlan = gf16_workspace();
+    c.catalog_version = 0;
+    assert validate_plan(c) == ERR_CATALOG_VERSION;
+    var i : UiPlan = gf16_workspace();
+    i.intent = "";
+    assert validate_plan(i) == ERR_PROVENANCE;
+    var s : UiPlan = gf16_workspace();
+    s.solver = SOLVER_KINDS;
+    assert validate_plan(s) == ERR_PROVENANCE;
+    var t : UiPlan = gf16_workspace();
+    t.theme = THEME_KINDS;
+    assert validate_plan(t) == ERR_THEME;
+    assert validate_plan(blank_plan()) == ERR_PROVENANCE;
+    var e : UiPlan = gf16_workspace();
+    e.widget_count = 0;
+    assert validate_plan(e) == ERR_EMPTY_PLAN;
+    e.widget_count = MAX_WIDGETS + 1;
+    assert validate_plan(e) == ERR_TOO_MANY_WIDGETS;
+    // two defects: the header one is reported, then the earlier slot
+    var d : UiPlan = bad_unlabelled_button();
+    d.widget[1] = 200;
+    assert validate_plan(d) == ERR_UNKNOWN_WIDGET;
+    assert first_bad_slot(d) == 1;
+    d.theme = THEME_KINDS;
+    assert validate_plan(d) == ERR_THEME;
+}
+
+invariant no_script_widget_in_catalog {
+    assert forbidden_in_catalog() == 0;
+}
+
+invariant catalog_masks_are_spelled_right {
+    assert WIDGET_PROPS[1] == bit(PROP_TITLE) | bit(PROP_SPEC_PATH);
+    assert WIDGET_PROPS[2] == bit(PROP_TITLE) | bit(PROP_FORMULA_ID) | bit(PROP_CAPTION);
+    assert WIDGET_PROPS[3] == bit(PROP_TITLE) | bit(PROP_COLUMNS) | bit(PROP_UNITS) | bit(PROP_CAPTION);
+    assert WIDGET_PROPS[4] == bit(PROP_TITLE) | bit(PROP_SPEC_PATH);
+    assert WIDGET_PROPS[5] == bit(PROP_TITLE) | bit(PROP_CAPTION);
+    assert WIDGET_ACTIONS[1] == bit(ACTION_OPEN_SPEC);
+    assert WIDGET_ACTIONS[2] == bit(ACTION_COPY_FORMULA);
+    assert WIDGET_ACTIONS[3] == bit(ACTION_EXPORT_CSV);
+    assert WIDGET_ACTIONS[4] == bit(ACTION_RUN_TESTS);
+    assert WIDGET_CAPS[1] == bit(CAP_READ_SPECS);
+    assert WIDGET_CAPS[3] == bit(CAP_READ_METRICS);
+    assert ACTION_CAPS[ACTION_OPEN_SPEC] == bit(CAP_READ_SPECS);
+    assert ACTION_CAPS[ACTION_RUN_TESTS] == bit(CAP_RUN_LAB);
+    assert ACTION_CAPS[ACTION_EXPORT_CSV] == bit(CAP_EXPORT_LOCAL);
+    assert ACTION_CAPS[ACTION_COPY_FORMULA] == bit(CAP_CLIPBOARD);
+}
+
+invariant empty_slot_is_inert {
+    assert WIDGET_PROPS[WIDGET_EMPTY] == 0;
+    assert WIDGET_ACTIONS[WIDGET_EMPTY] == 0;
+    assert WIDGET_CAPS[WIDGET_EMPTY] == 0;
+    assert WIDGET_SOURCE[WIDGET_EMPTY] == SOURCE_NONE;
+    assert ACTION_CAPS[ACTION_NONE] == 0;
+}
+
+invariant reserved_ids_stay_outside {
+    assert WIDGET_UNKNOWN >= WIDGET_KINDS;
+    assert MAX_WIDGETS <= 8;
+    assert MAX_SOURCES <= 4;
+    assert (PROP_KINDS as u32) < 32;
+    assert (CAP_KINDS as u32) < 32;
+}

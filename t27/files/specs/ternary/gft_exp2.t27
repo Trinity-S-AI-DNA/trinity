@@ -1,0 +1,67 @@
+module GftExp2;
+// #1764 + GF-T: a GF-T exp2 primitive -- 2^x for a signed GF-T16 input x, result
+// a positive GF-T16. This is the missing building block for a GF-T softmax
+// (softmax(l) = 2^l / sum 2^l, in base-2). Approach, all integer / hardware-shaped:
+//   1. |x| -> Q16.16 fixed-point (positive shifts only -> no signed-shift ambiguity).
+//   2. split into integer k = floor(x) and fraction f in [0,1) (sign-aware floor).
+//   3. 2^x = 2^k * 2^f. 2^k is an exact GF-T offset (k+40); 2^f-1 gives the mantissa
+//      via a Q16 quartic with rounded Horner shifts (<=1 ULP vs the exact mantissa).
+//   4. clamp/saturate the offset to [1,80]; sign is always + (2^x > 0).
+// Accuracy: <=1 ULP vs the true round_to_GFT(2^x) over the logit range (measured in
+// the prototype). Bit-exact to the committed integer oracle over the vector file.
+//
+// Input: x signed GF-T16 (u32). Output: 2^x as a positive GF-T16 (u32).
+
+// mant(f) = round(512*(2^(f/65536) - 1)), f in [0,65536), via a Q16 quartic with
+// rounded Horner shifts. Coefficients fit + local-searched to <=1 ULP.
+fn pow2_frac(f: i32) -> i32 {
+    var p : i32 = 6;
+    p = (((p * f) + 32768) >> 16) + 29;
+    p = (((p * f) + 32768) >> 16) + 123;
+    p = (((p * f) + 32768) >> 16) + 354;
+    p = ((p * f) + 32768) >> 16;
+    if (p > 511) { p = 511; }
+    return p;
+}
+
+fn on_comb(x: u32) -> u32 {
+    if (x == 0) { return 20480; }                 // 2^0 = +1.0
+    var neg : i32 = 0;
+    if ((x >> 16) == 1) { neg = 1; }              // sign bit set -> x is negative
+    var off_in : i32 = ((x >> 9) & 127) as i32;
+    var mant_in : i32 = (x & 511) as i32;
+    // absurd-magnitude guard (keeps intermediates in i32; |x| >= 2^8 -> sat/underflow).
+    if (off_in >= 48) {
+        if (neg == 1) { return 512; }             // underflow -> smallest normal (2^-39)
+        return ((80 << 9) | 511) as u32;          // saturate -> max magnitude
+    }
+    // |x| in Q16.16 (positive shifts only).
+    var num : i32 = 512 + mant_in;
+    var sh : i32 = off_in - 33;
+    var mq : i32 = num;
+    if (sh >= 0) { mq = num << sh; } else { mq = num >> (0 - sh); }
+    var ki : i32 = mq >> 16;
+    var ff : i32 = mq & 65535;
+    // sign-aware floor: k = floor(x), f = x - k in [0,1).
+    var k : i32 = ki;
+    var f : i32 = ff;
+    if (neg == 1) {
+        if (ff == 0) { k = 0 - ki; f = 0; }
+        else { k = 0 - (ki + 1); f = 65536 - ff; }
+    }
+    var mant : i32 = pow2_frac(f);
+    var off : i32 = k + 40;
+    if (off < 1) { return 512; }                  // underflow -> smallest normal
+    if (off > 80) { return ((80 << 9) | 511) as u32; }
+    return ((off << 9) | mant) as u32;
+}
+
+// 2^0 = 1.0 (0x5000).
+test e0 { assert_eq(on_comb(0), 20480); }
+// 2^(+1.0) = 2.0 : x=+1.0=0x5000|... actually x encodes the exponent value 1.0 -> 20480.
+test e1 { assert_eq(on_comb(20480), 20992); }        // 2.0 = offset41
+// 2^(-1.0) = 0.5 = offset39 (0x4e00).
+test em1 { assert_eq(on_comb(86016), 19968); }       // 0x4e00
+// 2^(+2.0) = 4.0 = offset42 (0x5400).
+test e2 { assert_eq(on_comb(20992), 21504); }        // 0x5400
+endmodule

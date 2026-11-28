@@ -1,0 +1,499 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/automation/browser-pod-restart.t27 -- why a browser that answers HTTP can have
+// stopped being a browser, and what a restart of it has to prove before it is reported.
+// Host: 999-multibots-telegraf apps/vibee-editor/render/src/browser/health.ts
+//       (browserAnswers, waitForBrowser), pod-driver.ts (fixedDriver, railwayRestart,
+//       driverFromEnv), routes.ts (restartBrowserAsAgent), agent/rounds.ts
+//       (everythingWasBlank, the sentence the person gets when a restart is impossible).
+// WHY this spec exists: from 2026-09-24 to 2026-09-26 the owner could not be signed into any
+// social network through the agent, and nothing anywhere said why. Chromium in the pod
+// answered GET /json/version and PUT /json/new perfectly while Runtime.evaluate timed out
+// after 21 s and Page.captureScreenshot returned "Internal error" -- the agent could neither
+// read a page nor photograph one, so no sign-in could ever be completed. browser_status said
+// { running: true, pages: 17 } for three days. The round DID detect the blankness and DID
+// call the one cure; the cure was a lie, because on the driver production runs stop() is a
+// documented no-op, so stop-then-start handed the same broken Chromium back and returned
+// true. The pod had not actually restarted since 2026-09-23T11:21:26Z.
+// WHY the profile was never at risk: it is on a 50 GB volume mounted at the pod's profile
+// path, so stop, start and restart all keep the person's logins; only an explicit profile
+// delete wipes them. The code used to claim the opposite, and that stale line is why the one
+// cure looked expensive and was avoided.
+// WHY there is a version 2: the fix above shipped and STILL could not restart anything. Its
+// query asked the platform for status: "SUCCESS", and the live API answers that with HTTP 400,
+// because the status field is not a value but a filter of in/notIn lists -- so the document was
+// never even valid, and no combination of service variables could have made the restart work.
+// Nothing caught it because the test's double answers every query alike. Two leaks named as
+// unfixed in version 1 are fixed in version 2, and the missing token now exists.
+// WHY there is a version 3: version 2 would not claim that the pod had restarted itself, and the
+// owner asked whether it had. It had not, and nothing had asked it to -- the trigger only fires on
+// a dead browser. So the path was run on purpose from inside the service, with the service's own
+// variables: the pod went down and came up (PID 1 aged 02:19:34 before, 01:33 after), the browser
+// answered, and all 194 cookies with all six logins were still there. The mechanism is proven; the
+// trigger is still the thing nobody has watched fire.
+// WHY there is a version 4: version 3 said the trigger was the half nobody had watched, so it was
+// made to fire. Chromium was stopped inside the pod while the CDP bridge was left running, which
+// reproduces the exact lie this spec is named after -- the pod kept answering HTTP with no browser
+// behind it. Nobody asked for a restart. The round walked, found every site blank, reached for the
+// restart on its own, waited for a live answer before reporting it (PID 1 aged 01:32:30 before,
+// 01:22 after), and then re-walked and read live pages on seven sites. 197 cookies and the same six
+// logins survived. What is left unobserved is now only the CLOCK: this round was asked for, not
+// started by the 180-minute interval. Version 4 also records why a restart asked for outside the
+// server process refuses in under a second -- it reads its dependencies from a process-local slot
+// that only render-server.ts fills -- so a fast false is a missing wire, not a failed restart.
+// WHY there is a version 5: version 4 named the clock as the one piece nobody had watched, and
+// watching it showed there was nothing to watch. The pace lived in the interval itself, and
+// setInterval counts the PROCESS, not the work -- so the wait was three hours of one process, on a
+// service whose longest life in 3.5 hours was 45 minutes (13 deployments, zero windows over 180).
+// The first tick was not late, it was unreachable, and no `[rounds]` line exists in any of those
+// logs while the same filter finds `browser` lines in nearly all of them. The cure was one screen
+// below in the same file: the daily check learned this on 2026-09-24 and asks its own table whether
+// a run is due. Rounds now do too (roundIsDue, `rounds:last-run` in the existing agent_strategies,
+// a 10-minute tick with a 3-minute first look, mark written BEFORE the walk so a deploy mid-round
+// does not double it). Then it was watched: deployment 087a01cf of commit 1d910c6a1 came up at
+// 18:25:05Z and printed its first `[rounds]` line at 18:31:33Z, seven minutes in, with nobody
+// asking -- and that round found every page blank, restarted the browser on its own, and re-walked
+// five sites live. The clock and the trigger both fired unasked, in the same round.
+// Claim status: the probe, the real restart, the query's accepted SHAPE, the refusal to claim an
+// unconfigured restart and the broker's false-on-failure are unit-tested with doubles
+// (a-restart-that-did-not-happen.test.ts, 11 tests; a-browser-that-tidies-up.test.ts, 11). The
+// live restart, the corrected query's live answer, and both leak measurements are observations
+// of the owner's own pod on 2026-09-26, quoted below, as are the deliberate restart and the
+// cookies that survived it. The UNATTENDED restart is an observation too, of 2026-09-27: a round
+// on a deliberately killed browser reached for the restart with no hand on it. The CLOCK is an
+// observation of the same day, quoted below with its deployment and timestamps. Nothing in this
+// spec is left unclaimed; the numbers about the old interval are measurements, not estimates.
+// phi^2 + 1/phi^2 = 3 | TRINITY
+
+module automation::browser_pod_restart {
+
+    pub const KIND : str = "automation";
+    pub const ID : str = "browser-pod-restart";
+    pub const REPO : str = "999-multibots-telegraf";
+    pub const VERSION : u8 = 5;
+
+    // ---- HTTP liveness is not liveness ---------------------------------------------------
+    // The pair of calls that failed is the pair the probe asks: open a blank tab, run
+    // something in it, read the answer back. A browser that cannot do that is not a browser,
+    // whatever its HTTP endpoints say.
+    pub const PROBE_OPENS_A_PAGE_AND_RUNS_SOMETHING : bool = true;
+    pub const HTTP_ANSWERING_IS_ENOUGH : bool = false;
+    pub const PROBE_EXPR : str = "(() => 1 + 1)()";
+    pub const PROBE_ANSWER : u8 = 2;
+    pub const PROBE_TIMEOUT_MS : u32 = 15000;   // a degraded pod answers by not answering
+    pub const READY_TIMEOUT_MS : u32 = 150000;  // a restarted pod is given this long to come back
+    pub const PROBE_EVERY_MS : u32 = 5000;
+    pub const PROBE_CLOSES_ITS_TAB_EVEN_WHEN_IT_FAILS : bool = true;  // a leaking probe feeds the state it looks for
+    pub const A_HUNG_PROBE_IS_A_FAILED_PROBE : bool = true;           // never a hang of the caller
+
+    // ---- The degraded state, as measured -------------------------------------------------
+    pub const OBSERVED_FROM : str = "2026-09-24";
+    pub const OBSERVED_UNTIL : str = "2026-09-26";
+    pub const DAYS_UNUSABLE : u8 = 3;
+    pub const EVALUATE_TIMED_OUT_AFTER_S : u8 = 21;
+    pub const SCREENSHOT_ERROR : str = "Internal error";
+    pub const STATUS_SAID_RUNNING : bool = true;
+    pub const TABS_AT_THE_END : u8 = 19;   // 13 on 09-24: agent browser_open never closes its tabs
+    pub const TABS_AT_THE_START : u8 = 13;
+    pub const LAST_REAL_RESTART_BEFORE : str = "2026-09-23T11:21:26Z";
+
+    // ---- A restart is a restart, or it is false ------------------------------------------
+    // The driver production runs hands out ONE provisioned service: its stop() cannot stop
+    // anything, so a real restart goes to the platform's own API, which keeps the volume and
+    // rebuilds nothing. Unconfigured, it returns false instead of lying.
+    pub const DRIVER : str = "fixed";
+    pub const DRIVER_STOP_IS_A_NO_OP : bool = true;
+    pub const STOP_THEN_START_IS_A_RESTART : bool = false;
+    pub const RESTART_GOES_TO_THE_PLATFORM_API : bool = true;
+    pub const RESTART_REBUILDS_NOTHING : bool = true;
+    pub const RESTART_KEEPS_THE_PROFILE : bool = true;
+    pub const UNCONFIGURED_RESTART_RETURNS_FALSE : bool = true;
+    pub const ENV_TOKEN : str = "RAILWAY_API_TOKEN";
+    pub const ENV_SERVICE : str = "BROWSER_POD_SERVICE_ID";
+    pub const ENV_ENVIRONMENT : str = "RAILWAY_ENVIRONMENT_ID";
+    pub const RESTART_NEEDS_ALL_THREE : bool = true;
+    // The two token kinds are indistinguishable by shape, so a refusal of the first header is
+    // retried as the other rather than reported as a broken token.
+    pub const TWO_TOKEN_KINDS_ARE_TRIED : bool = true;
+    pub const DEPLOYMENT_ID_IS_LOOKED_UP_FIRST : bool = true;  // it changes on every deploy
+
+    // ---- The status field is a filter, not a value (found 2026-09-26) --------------------
+    // The lookup above asked for status: "SUCCESS" and got HTTP 400 "Problem processing
+    // request" every time. The field's type is an object of in/notIn lists, so a bare enum is
+    // not a wrong answer to the query -- it is not a query. This is why version 1 could not
+    // have restarted the pod even with all three variables set, and why the variables were
+    // wrongly suspected first. The corrected query was run against the pod's own service the
+    // same day and named the deployment below, whose creation time is exactly the last real
+    // restart recorded in version 1.
+    pub const STATUS_IS_A_FILTER_OF_LISTS : bool = true;
+    pub const STATUS_AS_A_BARE_VALUE_IS_REJECTED : bool = true;
+    pub const REJECTED_WITH_HTTP : u16 = 400;
+    pub const QUERY_SHAPE_IS_PINNED_BY_A_TEST : bool = true;
+    // The old test could not fail on this: its double replied to any query with a deployment,
+    // so the only thing that ever refused the malformed document was the live API.
+    pub const A_DOUBLE_THAT_ANSWERS_ANY_QUERY_PROVES_NO_SHAPE : bool = true;
+    pub const CORRECTED_QUERY_ANSWERED_LIVE : bool = true;
+    pub const CORRECTED_QUERY_NAMED_DEPLOYMENT : str = "4c99ba3f";
+    pub const CORRECTED_QUERY_DEPLOYMENT_CREATED : str = "2026-09-23T11:21:26Z";
+
+    // ---- What the person is told ----------------------------------------------------------
+    // A restart that did not happen must not be reported as one: the broker returns false and
+    // starts nothing, and the round then says, in the person's own language, to press Close
+    // and then Open in the Browser tab -- which their logins survive.
+    pub const FALSE_RESTART_STARTS_NOTHING : bool = true;
+    pub const RESTART_IS_REPORTED_ONLY_AFTER_THE_BROWSER_ANSWERS : bool = true;
+    pub const BLANKNESS_WAS_ALREADY_DETECTED : bool = true;  // a thrown look() reads as not-ok; no new detector was needed
+    pub const THE_ONLY_LIE_WAS_THE_RESTART : bool = true;
+    pub const PERSON_IS_TOLD_WHAT_TO_PRESS : bool = true;
+
+    // ---- The two things that piled up ----------------------------------------------------
+    // Both were measured on the owner's pod on 2026-09-26 and neither had a test. They are in
+    // this spec and not the sign-in one because what they degrade is the pod, not a procedure.
+    //
+    // TABS: 16 pages behind 40 CDP targets -- one subreddit six times over, each with its own
+    // recaptcha iframe. browser_open opened them; a tool to close them exists and was never
+    // reached, because an agent that got what it came for goes on, and a model with a small
+    // window has forgotten the tab it opened four steps ago. So the budget is kept by the
+    // server at the place a tab is created, not by a reminder in a prompt. Only tabs THIS
+    // server opened are ever closed, and the oldest of ours go first; a tab the person opened
+    // is not ours at any count.
+    pub const TAB_LEAK_FIXED : bool = true;
+    pub const TAB_BUDGET : u8 = 6;
+    pub const BUDGET_IS_ENFORCED_WHERE_THE_TAB_IS_OPENED : bool = true;
+    pub const ONLY_OUR_OWN_TABS_ARE_CLOSED : bool = true;
+    pub const OLDEST_OF_OURS_GO_FIRST : bool = true;
+    pub const A_TAB_THE_PERSON_CLOSED_IS_FORGOTTEN_NOT_CLOSED_AGAIN : bool = true;
+    pub const AN_UNREACHABLE_POD_STILL_RETURNS_THE_TAB : bool = true;  // tidying is not the errand
+    pub const TARGETS_MEASURED : u8 = 40;
+    pub const PAGES_MEASURED : u8 = 16;
+    //
+    // ADMIN SESSIONS: 35 of them in the pod's own UI, all named admin, not one connected --
+    // one per screenshot, per screen resize, per mouse handover since 2026-09-23. The waste
+    // was not only memory: the list that answers "is a person watching this browser?" was
+    // being read through 35 of our own ghosts. One session per errand now, handed back in the
+    // finally branch, and a failed handback does not fail the errand -- the picture was taken.
+    pub const ADMIN_SESSION_LEAK_FIXED : bool = true;
+    pub const GHOST_SESSIONS_MEASURED : u8 = 35;
+    pub const ONE_ADMIN_SESSION_PER_ERRAND : bool = true;
+    pub const SESSION_IS_GIVEN_BACK_EVEN_WHEN_THE_ERRAND_THROWS : bool = true;
+    pub const A_FAILED_LOGOUT_DOES_NOT_FAIL_THE_ERRAND : bool = true;
+
+    // ---- Live evidence -------------------------------------------------------------------
+    // 2026-09-26: the pod's own supervisor log, after a restart triggered by hand through the
+    // platform: "13:08:27,026 INFO success: chromium entered RUNNING state". The profile row
+    // was intact on the other side of it, last used 2026-09-26 11:18:55, on the 50 GB volume.
+    pub const RESTART_WORKS_LIVE : bool = true;
+    pub const RESTART_WORKS_LIVE_EVIDENCE : str = "chromium entered RUNNING state 2026-09-26 13:08:27";
+    pub const PROFILE_SURVIVED_THE_RESTART : bool = true;
+    // And the probe itself, run from inside the platform against the restarted pod: the pair
+    // of calls that hung for 21 s three days earlier came back in a fifth of a second. This is
+    // the measurement that says the browser is a browser again, and the only one that does.
+    pub const PROBE_ANSWERED_LIVE : bool = true;
+    pub const PROBE_ANSWERED_LIVE_IN_MS : u16 = 173;
+    // The leaks were also cleared by hand on the running pod, so the numbers above are a
+    // history and not the present state: the one session that could not be deleted was the
+    // deleting session's own.
+    pub const SESSIONS_AFTER_THE_SWEEP : u8 = 1;
+    pub const TARGETS_AFTER_THE_SWEEP : u8 = 33;
+    // The token the owner alone could issue now exists, scoped to the one project, and lives
+    // in the service's own variables. Its value appears in no file of any repository: a secret
+    // that reaches a tracked file is revoked, not deleted.
+    pub const TOKEN_EXISTS : bool = true;
+    pub const TOKEN_IS_SCOPED_TO_ONE_PROJECT : bool = true;
+    pub const TOKEN_VALUE_IS_IN_NO_REPOSITORY_FILE : bool = true;
+
+    // ---- The service restarted the pod, and the logins survived (found 2026-09-26) --------
+    // Version 2 left one line unclaimed and the owner asked the obvious question of it: did the
+    // pod restart ITSELF? It had not, and nothing had asked it to -- the browser was healthy,
+    // and the restart only fires when a round finds a dead one. So the path was exercised on
+    // purpose, from inside the service, with the service's OWN variables and the corrected
+    // query: the token was present in the process, the API accepted the lookup, and the
+    // mutation answered true. The pod then went down and came up -- PID 1 aged 02:19:34 before
+    // and 01:33 after, which no HTTP sensor could have told us.
+    pub const SERVICE_RESTARTED_THE_POD_WITH_ITS_OWN_VARIABLES : bool = true;
+    pub const TOKEN_REACHED_THE_PROCESS : bool = true;
+    pub const MUTATION_ANSWERED_TRUE : bool = true;
+    pub const PID1_AGE_SECONDS_BEFORE : u32 = 8374;
+    pub const PID1_AGE_SECONDS_AFTER : u32 = 93;
+    // A restart is only cheap if it keeps the logins. It did: the profile volume came back with
+    // its cookies, and the same six doors are still open. Nothing had to be signed in again.
+    pub const BROWSER_ANSWERED_AFTER_THE_RESTART : bool = true;
+    pub const COOKIES_AFTER_THE_RESTART : u8 = 194;
+    pub const NETWORKS_STILL_SIGNED_IN_AFTER_THE_RESTART : u8 = 6;
+
+    // ---- The trigger fired, on a browser that was killed on purpose (found 2026-09-26) ----
+    // Version 3 said the trigger was the unobserved half, so the browser was killed to see it:
+    // Chromium stopped inside the pod while the CDP bridge was left running, which is the exact
+    // lie this spec is named after -- the pod still answered on its port with no browser behind
+    // it. Nobody asked for a restart. A round was asked for, and the round decided: every walked
+    // site came back blank, it reached for the cure once, the pod went down and came up, the
+    // browser answered, and it walked the whole list again and read live pages. The person was
+    // told, in one message, which of the two had happened.
+    pub const BROWSER_WAS_KILLED_ON_PURPOSE : bool = true;
+    pub const KILLED_BY_STOPPING_CHROMIUM_NOT_THE_POD : bool = true;
+    pub const CDP_BRIDGE_STAYED_UP_WITH_NO_BROWSER_BEHIND_IT : bool = true;
+    pub const NOBODY_ASKED_FOR_A_RESTART : bool = true;
+    pub const THE_ROUND_DECIDED_ON_ITS_OWN : bool = true;
+    pub const ROUND_SAID : str = "browser was blank; restarted";
+    pub const TRIGGER_PID1_AGE_SECONDS_BEFORE : u32 = 5550;
+    pub const TRIGGER_PID1_AGE_SECONDS_AFTER : u32 = 82;
+    pub const RESTART_WAS_REPORTED_ONLY_AFTER_THE_BROWSER_ANSWERED_LIVE : bool = true;
+    // The proof a restart CURED something, rather than merely happening: the same round that
+    // saw nothing anywhere walked the list again afterwards and read real pages.
+    pub const SITES_WALKED_AFTER_THE_RESTART : u8 = 12;
+    pub const SITES_THAT_READ_LIVE_PAGES_AFTER_THE_RESTART : u8 = 7;
+    pub const SITES_NAMED_NOT_WALKED_BECAUSE_NOT_SIGNED_IN : u8 = 5;
+    pub const COOKIES_AFTER_THE_TRIGGER : u8 = 197;
+    pub const NETWORKS_STILL_SIGNED_IN_AFTER_THE_TRIGGER : u8 = 6;
+    // A pod that comes back restores the person's own tabs from the profile, so the target count
+    // does not fall to zero after a restart. That is session restore, not a leak.
+    pub const A_RESTARTED_POD_RESTORES_THE_PERSONS_TABS : bool = true;
+
+    // ---- A restart only exists inside the server process (found 2026-09-26) ---------------
+    // The first attempt at the above returned "restart failed" in 803 ms, before it could have
+    // asked the platform anything. The reason is not the token or the query: the restart reads
+    // its dependencies from a module-local slot that only the server's own startup line fills,
+    // so in any process that did not start the server it refuses first and asks nothing. That is
+    // right for production, where the round runs inside the server -- and it is a trap for
+    // anything that ever calls this from a script, a job runner or a test harness, because the
+    // refusal looks exactly like a restart that was tried and failed.
+    pub const RESTART_READS_ITS_DEPS_FROM_A_PROCESS_LOCAL_SLOT : bool = true;
+    pub const OUTSIDE_THE_SERVER_IT_REFUSES_BEFORE_ASKING : bool = true;
+    pub const REFUSED_IN_MS : u16 = 803;
+    pub const A_FAST_FALSE_IS_A_MISSING_WIRE_NOT_A_FAILED_RESTART : bool = true;
+
+    // ---- Nothing left unclaimed ----------------------------------------------------------
+    // All three halves are now observed: the mechanism, the round reaching for it unasked, and
+    // the CLOCK starting a round with nobody's hand on it. The last one had to be repaired
+    // before it could be watched -- see the clock section below.
+    pub const AUTOMATIC_RESTART_CONFIGURED_LIVE : bool = true;
+    pub const MISSING_VARIABLES : u8 = 0;
+    pub const RESTART_ON_PURPOSE_OBSERVED : bool = true;
+    pub const UNATTENDED_RESTART_OBSERVED : bool = true;
+    pub const WHAT_IS_UNOBSERVED_IS_THE_TRIGGER_NOT_THE_MECHANISM : bool = false;
+    pub const THE_ROUND_WAS_ASKED_FOR_NOT_STARTED_BY_THE_CLOCK : bool = false;
+    pub const CLOCK_STARTED_ROUND_OBSERVED : bool = true;
+    pub const ROUND_RAN_OUTSIDE_THE_SERVER_PROCESS : bool = false;
+
+    // ---- A CLOCK THAT COUNTED THE PROCESS, NOT THE WORK -----------------------------------
+    // The pace lived in the interval itself:
+    //   setInterval(..., Math.max(30, Number(env.ROUNDS_EVERY_MIN) || 180) * 60 * 1000)
+    // and setInterval starts counting at process start. So the wait was not three hours of
+    // clock, it was three hours of ONE PROCESS -- and this service does not live that long.
+    // Measured on the render on 2026-09-26: 13 successful deployments in 3.5 hours, longest
+    // process life 45 minutes of the 180 needed, ZERO of the 13 windows over 180. The first
+    // tick was not late; it was unreachable. Three further resets were watched live while the
+    // fix was being written: processes that lived 4, 30 and 17 minutes.
+    // The absence is evidence and not a broken search: the same log filter finds between 1 and
+    // 364 `browser` lines in nearly every one of those deployments, and `rounds` in none.
+    pub const PACE_USED_TO_LIVE_IN_THE_INTERVAL : bool = true;
+    pub const SETINTERVAL_COUNTS_THE_PROCESS_NOT_THE_WORK : bool = true;
+    pub const DEPLOYS_MEASURED_IN_35_HOURS : u8 = 13;
+    pub const LONGEST_PROCESS_LIFE_MIN : u8 = 45;
+    pub const PACE_MIN : u8 = 180;
+    pub const WINDOWS_THAT_REACHED_THE_PACE : u8 = 0;
+    pub const ROUNDS_LINES_FOUND_BEFORE_THE_FIX : u8 = 0;
+    pub const SAME_FILTER_FOUND_BROWSER_LINES : bool = true;
+    pub const CLOCK_RESETS_WATCHED_LIVE : u8 = 3;
+
+    // The cure was already in the same file, one screen below: the daily check hit this wall on
+    // 2026-09-24 and was fixed by asking its own durable table whether a run was due. The rule
+    // lived in one tick and not in its neighbour -- the recorded defect of this codebase family.
+    pub const THE_CURE_ALREADY_EXISTED_IN_THE_SAME_FILE : bool = true;
+    pub const TICK_IS_NOT_THE_PACE : bool = true;
+    pub const TICK_MIN : u8 = 10;
+    pub const FIRST_LOOK_MIN : u8 = 3;   // a settling deploy is not what should be walked
+    pub const DUE_IS_ASKED_OF_THE_DATABASE : bool = true;
+    pub const MARK_IS_WRITTEN_BEFORE_THE_WALK : bool = true;  // a deploy mid-round must not double it
+    pub const MIGRATION_NEEDED : bool = false;                // agent_strategies already exists
+    pub const PACE_STILL_COMES_FROM_A_ROW_NOT_A_DEPLOY : bool = true;
+
+    // ---- The clock, observed --------------------------------------------------------------
+    // Deployment 087a01cf of commit 1d910c6a1 came up at 18:25:05 UTC on 2026-09-26. At
+    // 18:31:33 -- seven minutes into the process, nobody asking -- it printed its first
+    // `[rounds]` line. Both desks walked; the round found every page blank, restarted the
+    // browser ON ITS OWN, and re-walked: hh.ru 16 unread with 5 rows, LinkedIn 4 rows,
+    // X 5 rows, Reddit 4 rows, YouTube 7 unread with 5 rows. So the clock fired, and the
+    // trigger fired inside the round the clock started -- unasked, twice over.
+    pub const CLOCK_FIRED_AT_PROCESS_AGE_MIN : u8 = 7;
+    pub const CLOCK_FIRED_WITH_NOBODY_ASKING : bool = true;
+    pub const FIRST_ROUND_IS_DUE_AT_ONCE : bool = true;   // nothing recorded means nothing to wait for
+    pub const CLOCK_STARTED_ROUND_ALSO_RESTARTED_THE_BROWSER : bool = true;
+    pub const SITES_READ_LIVE_IN_THE_CLOCK_STARTED_ROUND : u8 = 5;
+    pub const ROUND_RAN_INSIDE_THE_SERVER_PROCESS : bool = true;
+
+    // Every one of the three variables, or the restart does not exist.
+    fn can_restart(token: bool, service: bool, environment: bool) -> bool {
+        return token && service && environment;
+    }
+
+    // A browser is healthy when a page it just opened answers.
+    fn healthy(answered: u8) -> bool {
+        return answered == PROBE_ANSWER;
+    }
+
+    test "a browser is healthy only when a page RUNS something and answers"
+        assert(PROBE_OPENS_A_PAGE_AND_RUNS_SOMETHING);
+        assert(!HTTP_ANSWERING_IS_ENOUGH);
+        assert(healthy(PROBE_ANSWER));
+        assert(!healthy(0));
+        assert(A_HUNG_PROBE_IS_A_FAILED_PROBE);
+        assert(PROBE_CLOSES_ITS_TAB_EVEN_WHEN_IT_FAILS);
+        assert(PROBE_TIMEOUT_MS < READY_TIMEOUT_MS);
+
+    test "stop-then-start was never a restart on this driver"
+        assert(DRIVER_STOP_IS_A_NO_OP);
+        assert(!STOP_THEN_START_IS_A_RESTART);
+        assert(RESTART_GOES_TO_THE_PLATFORM_API);
+        assert(RESTART_REBUILDS_NOTHING);
+        assert(RESTART_KEEPS_THE_PROFILE);
+        assert(DEPLOYMENT_ID_IS_LOOKED_UP_FIRST);
+        assert(TWO_TOKEN_KINDS_ARE_TRIED);
+
+    test "an impossible restart is refused, not reported"
+        assert(RESTART_NEEDS_ALL_THREE);
+        assert(can_restart(true, true, true));
+        assert(!can_restart(true, false, true));
+        assert(!can_restart(false, true, true));
+        assert(UNCONFIGURED_RESTART_RETURNS_FALSE);
+        assert(FALSE_RESTART_STARTS_NOTHING);
+        assert(RESTART_IS_REPORTED_ONLY_AFTER_THE_BROWSER_ANSWERS);
+        assert(PERSON_IS_TOLD_WHAT_TO_PRESS);
+
+    test "the detector was never the defect; the restart was"
+        assert(BLANKNESS_WAS_ALREADY_DETECTED);
+        assert(THE_ONLY_LIE_WAS_THE_RESTART);
+        assert(DAYS_UNUSABLE == 3);
+        assert(STATUS_SAID_RUNNING);
+        assert(TABS_AT_THE_END > TABS_AT_THE_START);
+
+    test "the query was never valid, so no variable could have saved it"
+        assert(STATUS_IS_A_FILTER_OF_LISTS);
+        assert(STATUS_AS_A_BARE_VALUE_IS_REJECTED);
+        assert(REJECTED_WITH_HTTP == 400);
+        assert(A_DOUBLE_THAT_ANSWERS_ANY_QUERY_PROVES_NO_SHAPE);
+        assert(QUERY_SHAPE_IS_PINNED_BY_A_TEST);
+        assert(CORRECTED_QUERY_ANSWERED_LIVE);
+        // The deployment the corrected query names was created at the last real restart.
+        assert(std.mem.eql(u8, CORRECTED_QUERY_DEPLOYMENT_CREATED, LAST_REAL_RESTART_BEFORE));
+
+    test "the tabs it opens are the only tabs it closes"
+        assert(TAB_LEAK_FIXED);
+        assert(TAB_BUDGET == 6);
+        assert(BUDGET_IS_ENFORCED_WHERE_THE_TAB_IS_OPENED);
+        assert(ONLY_OUR_OWN_TABS_ARE_CLOSED);
+        assert(OLDEST_OF_OURS_GO_FIRST);
+        assert(A_TAB_THE_PERSON_CLOSED_IS_FORGOTTEN_NOT_CLOSED_AGAIN);
+        assert(AN_UNREACHABLE_POD_STILL_RETURNS_THE_TAB);
+        // More targets than pages is the leak's own signature: iframes of tabs left open.
+        assert(TARGETS_MEASURED > PAGES_MEASURED);
+        assert(TARGETS_AFTER_THE_SWEEP < TARGETS_MEASURED);
+
+    test "one admin session per errand, and it is handed back"
+        assert(ADMIN_SESSION_LEAK_FIXED);
+        assert(ONE_ADMIN_SESSION_PER_ERRAND);
+        assert(SESSION_IS_GIVEN_BACK_EVEN_WHEN_THE_ERRAND_THROWS);
+        assert(A_FAILED_LOGOUT_DOES_NOT_FAIL_THE_ERRAND);
+        assert(GHOST_SESSIONS_MEASURED == 35);
+        assert(SESSIONS_AFTER_THE_SWEEP == 1);  // the sweep could not delete its own
+
+    test "nothing makes an unattended restart impossible now, and none has been seen"
+        assert(RESTART_WORKS_LIVE);
+        assert(PROFILE_SURVIVED_THE_RESTART);
+        assert(PROBE_ANSWERED_LIVE);
+        // A fifth of a second, against 21 s three days earlier.
+        assert(PROBE_ANSWERED_LIVE_IN_MS < PROBE_TIMEOUT_MS);
+        assert(TOKEN_EXISTS);
+        assert(TOKEN_IS_SCOPED_TO_ONE_PROJECT);
+        assert(TOKEN_VALUE_IS_IN_NO_REPOSITORY_FILE);
+        assert(AUTOMATIC_RESTART_CONFIGURED_LIVE);
+        assert(MISSING_VARIABLES == 0);
+        assert(can_restart(TOKEN_EXISTS, true, true));
+        assert(UNATTENDED_RESTART_OBSERVED);
+
+    test "the service restarted the pod with its own variables, and PID 1 proves it"
+        assert(SERVICE_RESTARTED_THE_POD_WITH_ITS_OWN_VARIABLES);
+        assert(TOKEN_REACHED_THE_PROCESS);
+        assert(MUTATION_ANSWERED_TRUE);
+        // The only proof a restart happened: PID 1 is younger than it was.
+        assert(PID1_AGE_SECONDS_AFTER < PID1_AGE_SECONDS_BEFORE);
+        // And younger than the gap between the two readings, so it cannot be the same process.
+        assert(PID1_AGE_SECONDS_AFTER < 300);
+        assert(RESTART_ON_PURPOSE_OBSERVED);
+
+    test "the restart kept every login it found"
+        assert(BROWSER_ANSWERED_AFTER_THE_RESTART);
+        assert(healthy(PROBE_ANSWER));
+        // A profile that lost its cookies would hold fewer than the census counted.
+        assert(COOKIES_AFTER_THE_RESTART > 191);
+        assert(NETWORKS_STILL_SIGNED_IN_AFTER_THE_RESTART == 6);
+        assert(PROFILE_SURVIVED_THE_RESTART);
+
+    test "a killed browser made the round reach for the restart, unasked"
+        assert(BROWSER_WAS_KILLED_ON_PURPOSE);
+        // Stopping Chromium and leaving the bridge up reproduces the original lie exactly.
+        assert(KILLED_BY_STOPPING_CHROMIUM_NOT_THE_POD);
+        assert(CDP_BRIDGE_STAYED_UP_WITH_NO_BROWSER_BEHIND_IT);
+        assert(!HTTP_ANSWERING_IS_ENOUGH);
+        assert(NOBODY_ASKED_FOR_A_RESTART);
+        assert(THE_ROUND_DECIDED_ON_ITS_OWN);
+        assert(TRIGGER_PID1_AGE_SECONDS_AFTER < TRIGGER_PID1_AGE_SECONDS_BEFORE);
+        assert(TRIGGER_PID1_AGE_SECONDS_AFTER < 300);
+        assert(RESTART_WAS_REPORTED_ONLY_AFTER_THE_BROWSER_ANSWERED_LIVE);
+        assert(RESTART_IS_REPORTED_ONLY_AFTER_THE_BROWSER_ANSWERS);
+        assert(UNATTENDED_RESTART_OBSERVED);
+        assert(!WHAT_IS_UNOBSERVED_IS_THE_TRIGGER_NOT_THE_MECHANISM);
+
+    test "the restart cured the round, not just the pod"
+        // A restart that happened but healed nothing would leave the second walk blank too.
+        assert(SITES_THAT_READ_LIVE_PAGES_AFTER_THE_RESTART > 1);
+        assert(SITES_THAT_READ_LIVE_PAGES_AFTER_THE_RESTART + SITES_NAMED_NOT_WALKED_BECAUSE_NOT_SIGNED_IN == SITES_WALKED_AFTER_THE_RESTART);
+        assert(COOKIES_AFTER_THE_TRIGGER > COOKIES_AFTER_THE_RESTART);
+        assert(NETWORKS_STILL_SIGNED_IN_AFTER_THE_TRIGGER == 6);
+        assert(A_RESTARTED_POD_RESTORES_THE_PERSONS_TABS);
+
+    test "a restart asked for outside the server process is refused, not attempted"
+        assert(RESTART_READS_ITS_DEPS_FROM_A_PROCESS_LOCAL_SLOT);
+        assert(OUTSIDE_THE_SERVER_IT_REFUSES_BEFORE_ASKING);
+        // Too fast to have reached the platform, which is the tell.
+        assert(REFUSED_IN_MS < 1000);
+        assert(A_FAST_FALSE_IS_A_MISSING_WIRE_NOT_A_FAILED_RESTART);
+        assert(UNCONFIGURED_RESTART_RETURNS_FALSE);
+
+    test "a three-hour interval on a service that lives 45 minutes never ticks"
+        assert(PACE_USED_TO_LIVE_IN_THE_INTERVAL);
+        assert(SETINTERVAL_COUNTS_THE_PROCESS_NOT_THE_WORK);
+        assert(LONGEST_PROCESS_LIFE_MIN < PACE_MIN);
+        assert(WINDOWS_THAT_REACHED_THE_PACE == 0);
+        assert(DEPLOYS_MEASURED_IN_35_HOURS > 1);
+        assert(CLOCK_RESETS_WATCHED_LIVE > 1);
+
+    test "the silence was evidence, not a broken search"
+        assert(ROUNDS_LINES_FOUND_BEFORE_THE_FIX == 0);
+        assert(SAME_FILTER_FOUND_BROWSER_LINES);
+
+    test "the cure was one screen below, in a tick that had already learned it"
+        assert(THE_CURE_ALREADY_EXISTED_IN_THE_SAME_FILE);
+        assert(TICK_IS_NOT_THE_PACE);
+        assert(TICK_MIN < PACE_MIN);
+        assert(FIRST_LOOK_MIN < TICK_MIN);
+        assert(DUE_IS_ASKED_OF_THE_DATABASE);
+        assert(MARK_IS_WRITTEN_BEFORE_THE_WALK);
+        assert(!MIGRATION_NEEDED);
+        assert(PACE_STILL_COMES_FROM_A_ROW_NOT_A_DEPLOY);
+
+    test "the clock started a round with nobody's hand on it"
+        assert(!THE_ROUND_WAS_ASKED_FOR_NOT_STARTED_BY_THE_CLOCK);
+        assert(CLOCK_STARTED_ROUND_OBSERVED);
+        assert(CLOCK_FIRED_WITH_NOBODY_ASKING);
+        assert(FIRST_ROUND_IS_DUE_AT_ONCE);
+        assert(CLOCK_FIRED_AT_PROCESS_AGE_MIN > FIRST_LOOK_MIN);
+        assert(CLOCK_FIRED_AT_PROCESS_AGE_MIN < LONGEST_PROCESS_LIFE_MIN);
+        assert(ROUND_RAN_INSIDE_THE_SERVER_PROCESS);
+        assert(!ROUND_RAN_OUTSIDE_THE_SERVER_PROCESS);
+
+    test "the trigger fired inside the round the clock started"
+        assert(CLOCK_STARTED_ROUND_ALSO_RESTARTED_THE_BROWSER);
+        assert(SITES_READ_LIVE_IN_THE_CLOCK_STARTED_ROUND > 1);
+        assert(UNATTENDED_RESTART_OBSERVED);
+        assert(!WHAT_IS_UNOBSERVED_IS_THE_TRIGGER_NOT_THE_MECHANISM);
+}

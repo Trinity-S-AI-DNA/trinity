@@ -1,0 +1,315 @@
+// RTL packet preparation, observed-output validation and actual Icarus runner.
+// The runner invokes a generic OS process ABI and checks both child exits.
+// Parsing a fixture alone is not simulation evidence; no software fallback.
+// Buffers must be live/nonoverlapping. Prepared outputs commit after validation;
+// observed results are scratch on failure, summary commits only on success.
+module TrinityMemoryRTLDriver {
+    const TM_RTL_ERR_ARGUMENT: i32 = -80;
+    const TM_RTL_ERR_CAPACITY: i32 = -81;
+    const TM_RTL_ERR_OVERFLOW: i32 = -82;
+    const TM_RTL_ERR_OUTPUT: i32 = -83;
+    const TM_RTL_ERR_MISMATCH: i32 = -84;
+    struct TMRtlExpected { result: i64, error: bool, }
+    struct TMRtlObserved { index: u64, result: i64, error: bool, cycles: u64, }
+    struct TMRtlSummary {
+        cycles: u64, groups: u64, input_stalls: u64, output_stalls: u64,
+        source_bubbles: u64, resets: u64, result_count: usize,
+    }
+    struct TMRtlCursor { data: []u8, size: usize, pos: usize, valid: bool, }
+    fn tm_rtl_packet_count(count: usize) -> i64 {
+        var groups: usize = count / 5;
+        if (count % 5 != 0) { groups = groups + 1; }
+        if (groups == 0) { groups = 1; }
+        if ((groups as u64) > 0x7fffffffffffffff) { return TM_RTL_ERR_CAPACITY as i64; }
+        return groups as i64;
+    }
+    // Five activations, encoded weights within ten bits; permits reserved
+    // codes/masks for adversarial simulator fixtures, but no reserved high bits.
+    fn tm_rtl_packet(code: u32, activations: []i32, mask: u32, last: bool, output: []u64) -> i32 {
+        if (code > 1023 || mask > 31) { return TM_RTL_ERR_ARGUMENT; }
+        var lane: usize = 0; var word: u64 = code as u64;
+        while (lane < 5) {
+            var value: i32 = activations[lane];
+            if (value < -128 || value > 127) { return TM_RTL_ERR_ARGUMENT; }
+            word = word | (((value as u32) as u8 as u64) << (10 + lane * 8)); lane = lane + 1;
+        }
+        word = word | ((mask as u64) << 50);
+        if (last) { word = word | ((1 as u64) << 55); } output[0] = word; return 0;
+    }
+    fn tm_rtl_prepare_dot(codec: i32, weights: []i32, activations: []i32, count: usize,
+                          packets: []u64, capacity: usize, expected: *TMRtlExpected) -> i64 {
+        if (codec != 0 && codec != 1) { return TM_RTL_ERR_ARGUMENT as i64; }
+        var packet_count: i64 = tm_rtl_packet_count(count);
+        if (packet_count < 0 || (packet_count as u64) > (capacity as u64)) { return TM_RTL_ERR_CAPACITY as i64; }
+        var total: i64 = 0; var index: usize = 0;
+        while (index < count) {
+            var weight: i32 = weights[index]; var activation: i32 = activations[index];
+            if (weight < -1 || weight > 1 || activation < -128 || activation > 127) { return TM_RTL_ERR_ARGUMENT as i64; }
+            total = total + (weight as i64) * (activation as i64); index = index + 1;
+            if (index % 5 == 0 || index == count) {
+                if (total < -2147483648 || total > 2147483647) { return TM_RTL_ERR_OVERFLOW as i64; }
+            }
+        }
+        var packet: usize = 0; index = 0;
+        while (packet < (packet_count as usize)) {
+            var lanes: usize = count - index; if (lanes > 5) { lanes = 5; }
+            var lane: usize = 0; var code: u64 = 0; var power: u64 = 1; var word: u64 = 0;
+            while (lane < 5) {
+                var weight: i32 = 0; var activation: i32 = 0;
+                if (lane < lanes) { weight = weights[index + lane]; activation = activations[index + lane]; }
+                if (codec == 1) { code = code + ((weight + 1) as u64) * power; power = power * 3; }
+                else {
+                    var digit: u64 = weight as u64; if (weight < 0) { digit = 2; }
+                    code = code | (digit << (lane * 2));
+                }
+                word = word | (((activation as u32) as u8 as u64) << (10 + lane * 8)); lane = lane + 1;
+            }
+            word = word | code | ((((1 as u64) << lanes) - 1) << 50);
+            if (packet + 1 == (packet_count as usize)) { word = word | ((1 as u64) << 55); }
+            packets[packet] = word; index = index + lanes; packet = packet + 1;
+        }
+        expected.result = total; expected.error = false; return packet_count;
+    }
+    fn tm_rtl_expected_words(expected: []TMRtlExpected, count: usize, words: []u64, capacity: usize) -> i32 {
+        if (count > capacity) { return TM_RTL_ERR_CAPACITY; }
+        var i: usize = 0;
+        while (i < count) {
+            if (expected[i].result < -2147483648 || expected[i].result > 2147483647) { return TM_RTL_ERR_ARGUMENT; }
+            i = i + 1;
+        }
+        i = 0;
+        while (i < count) {
+            var word: u64 = (expected[i].result as u32) as u64;
+            if (expected[i].error) { word = word | ((1 as u64) << 32); }
+            words[i] = word; i = i + 1;
+        }
+        return 0;
+    }
+    fn tm_rtl_write_mem(words: []u64, count: usize, out: []u8, capacity: usize) -> i64 {
+        if (count > capacity / 17 || (count as u64) > 0x7fffffffffffffff / 17) { return TM_RTL_ERR_CAPACITY as i64; }
+        var i: usize = 0;
+        while (i < count) {
+            var digit: usize = 0;
+            while (digit < 16) {
+                var value: u8 = ((words[i] >> ((15 - digit) * 4)) & 15) as u8;
+                if (value < 10) { out[i * 17 + digit] = 48 + value; } else { out[i * 17 + digit] = 87 + value; }
+                digit = digit + 1;
+            }
+            out[i * 17 + 16] = 10; i = i + 1;
+        }
+        return (count * 17) as i64;
+    }
+    fn tm_rtl_take(c: *TMRtlCursor, text: str, size: usize) -> bool {
+        if (!c.valid || c.pos > c.size || size > c.size - c.pos) { c.valid = false; return false; }
+        var i: usize = 0;
+        while (i < size) { if (c.data[c.pos + i] != (text[i] as u8)) { c.valid = false; return false; } i = i + 1; }
+        c.pos = c.pos + size; return true;
+    }
+    fn tm_rtl_unsigned(c: *TMRtlCursor) -> u64 {
+        if (!c.valid || c.pos >= c.size || c.data[c.pos] < 48 || c.data[c.pos] > 57) { c.valid = false; return 0; }
+        var first: usize = c.pos; var value: u64 = 0;
+        while (c.pos < c.size && c.data[c.pos] >= 48 && c.data[c.pos] <= 57) {
+            var digit: u64 = (c.data[c.pos] - 48) as u64;
+            if (value > (0xffffffffffffffff - digit) / 10) { c.valid = false; return 0; }
+            value = value * 10 + digit; c.pos = c.pos + 1;
+        }
+        if (c.pos - first > 1 && c.data[first] == 48) { c.valid = false; }
+        return value;
+    }
+    fn tm_rtl_signed(c: *TMRtlCursor) -> i64 {
+        var negative: bool = false;
+        if (c.pos < c.size && c.data[c.pos] == 45) { c.pos = c.pos + 1; negative = true; }
+        var value: u64 = tm_rtl_unsigned(c);
+        if (negative) {
+            if (value == 0 || value > 2147483648) { c.valid = false; return 0; } return -(value as i64);
+        }
+        if (value > 2147483647) { c.valid = false; return 0; } return value as i64;
+    }
+    fn tm_rtl_line_prefix(data: []u8, size: usize, prefix: str, length: usize) -> bool {
+        if (size < length) { return false; }
+        var i: usize = 0;
+        while (i < length) { if (data[i] != (prefix[i] as u8)) { return false; } i = i + 1; } return true;
+    }
+    // Accept unrelated simulator diagnostic lines, but every DOT_ record must
+    // be exact and all scored values are checked against independent expected.
+    fn tm_rtl_parse_output(data: []u8, size: usize, expected: []TMRtlExpected, expected_count: usize,
+                           observed: []TMRtlObserved, capacity: usize, summary: *TMRtlSummary) -> i32 {
+        if (expected_count == 0) { return TM_RTL_ERR_ARGUMENT; }
+        if (expected_count > capacity) { return TM_RTL_ERR_CAPACITY; }
+        var i: usize = 0;
+        while (i < expected_count) {
+            if (expected[i].result < -2147483648 || expected[i].result > 2147483647) { return TM_RTL_ERR_ARGUMENT; } i = i + 1;
+        }
+        var pos: usize = 0; var received: usize = 0; var summary_seen: bool = false; var previous_cycle: u64 = 0;
+        var metrics: TMRtlSummary = TMRtlSummary{ .cycles = 0, .groups = 0, .input_stalls = 0,
+            .output_stalls = 0, .source_bubbles = 0, .resets = 0, .result_count = 0 };
+        while (pos < size) {
+            var start: usize = pos;
+            while (pos < size && data[pos] != 10) { pos = pos + 1; }
+            var length: usize = pos - start;
+            if (length > 0 && data[start + length - 1] == 13) { length = length - 1; }
+            if (pos < size) { pos = pos + 1; }
+            var c: TMRtlCursor = TMRtlCursor{ .data = &data[start], .size = length, .pos = 0, .valid = true };
+            if (tm_rtl_line_prefix(c.data, length, "DOT_RESULT", 10)) {
+                if (summary_seen || received >= expected_count) { return TM_RTL_ERR_OUTPUT; }
+                tm_rtl_take(&c, "DOT_RESULT index=", 17); var index: u64 = tm_rtl_unsigned(&c);
+                tm_rtl_take(&c, " result=", 8); var result: i64 = tm_rtl_signed(&c);
+                tm_rtl_take(&c, " error=", 7); var error: u64 = tm_rtl_unsigned(&c);
+                tm_rtl_take(&c, " cycles=", 8); var cycles: u64 = tm_rtl_unsigned(&c);
+                if (!c.valid || c.pos != c.size || error > 1 || cycles == 0 || cycles > 2147483647 || cycles <= previous_cycle) { return TM_RTL_ERR_OUTPUT; }
+                if (index != (received as u64) || result != expected[received].result || (error == 1) != expected[received].error) { return TM_RTL_ERR_MISMATCH; }
+                observed[received].index = index; observed[received].result = result;
+                observed[received].error = error == 1; observed[received].cycles = cycles;
+                previous_cycle = cycles; received = received + 1;
+            } else {
+                if (tm_rtl_line_prefix(c.data, length, "DOT_SUMMARY", 11)) {
+                    if (summary_seen || received != expected_count) { return TM_RTL_ERR_OUTPUT; }
+                    tm_rtl_take(&c, "DOT_SUMMARY cycles=", 19); metrics.cycles = tm_rtl_unsigned(&c);
+                    tm_rtl_take(&c, " groups=", 8); metrics.groups = tm_rtl_unsigned(&c);
+                    tm_rtl_take(&c, " input_stalls=", 14); metrics.input_stalls = tm_rtl_unsigned(&c);
+                    tm_rtl_take(&c, " output_stalls=", 15); metrics.output_stalls = tm_rtl_unsigned(&c);
+                    tm_rtl_take(&c, " source_bubbles=", 16); metrics.source_bubbles = tm_rtl_unsigned(&c);
+                    tm_rtl_take(&c, " resets=", 8); metrics.resets = tm_rtl_unsigned(&c);
+                    if (!c.valid || c.pos != c.size || metrics.cycles > 2147483647 || metrics.cycles < previous_cycle ||
+                        metrics.groups < (expected_count as u64) || metrics.groups > metrics.cycles || metrics.input_stalls > metrics.cycles ||
+                        metrics.output_stalls > metrics.cycles || metrics.source_bubbles > metrics.cycles || metrics.resets > metrics.cycles) { return TM_RTL_ERR_OUTPUT; }
+                    summary_seen = true;
+                } else {
+                    if (tm_rtl_line_prefix(c.data, length, "DOT_", 4)) { return TM_RTL_ERR_OUTPUT; }
+                }
+            }
+        }
+        if (!summary_seen || received != expected_count) { return TM_RTL_ERR_OUTPUT; }
+        metrics.result_count = received; summary[0] = metrics; return 0;
+    }
+
+    const TM_RTL_ERR_PROCESS: i32 = -85;
+    const TM_RTL_ERR_RESOURCE: i32 = -86;
+    struct TMRtlWitness {
+        result: i64, error: bool, cycles: u64, groups: u64,
+        input_stalls: u64, output_stalls: u64, source_bubbles: u64,
+        resets: u64, result_cycle: u64, weight_count: usize, encoded_weight_bits: u64,
+    }
+    fn tm_rtl_process_literal(context: *u8, text: str, size: usize) -> i32 {
+        if (size > 96) { return TM_RTL_ERR_ARGUMENT; }
+        var bytes: [96]u8 = [0]; var i: usize = 0;
+        while (i < size) { bytes[i] = text[i] as u8; i = i + 1; }
+        if (tm_process_arg(context, bytes, size) != 0) { return TM_RTL_ERR_PROCESS; } return 0;
+    }
+    fn tm_rtl_process_number(context: *u8, prefix: str, prefix_size: usize, value: u64) -> i32 {
+        if (prefix_size > 64) { return TM_RTL_ERR_ARGUMENT; }
+        var bytes: [96]u8 = [0]; var used: usize = 0;
+        while (used < prefix_size) { bytes[used] = prefix[used] as u8; used = used + 1; }
+        var divisor: u64 = 1;
+        while (value / divisor >= 10) { divisor = divisor * 10; }
+        var remainder: u64 = value;
+        while (divisor > 0) {
+            bytes[used] = (48 + remainder / divisor) as u8; used = used + 1;
+            remainder = remainder % divisor; divisor = divisor / 10;
+        }
+        if (tm_process_arg(context, bytes, used) != 0) { return TM_RTL_ERR_PROCESS; } return 0;
+    }
+    fn tm_rtl_frame_parameters(packet_count: usize, expected_count: usize, codec: i32, seed: i64, accumulator_bits: u32) -> bool {
+        if (codec != 0 && codec != 1) { return false; }
+        if (seed < 0 || seed > 4294967295 || accumulator_bits < 12 || accumulator_bits > 32) { return false; }
+        // tb_dot_stream timeout uses signed32 arithmetic: 100*(p+r)+1000.
+        if (packet_count == 0 || expected_count == 0 || packet_count > 21474826 || expected_count > 21474826) { return false; }
+        return packet_count + expected_count <= 21474826;
+    }
+    fn tm_rtl_run_frames_context(context: *u8, packets: []u64, packet_count: usize,
+                                 expected: []TMRtlExpected, expected_count: usize, codec: i32,
+                                 seed: i64, accumulator_bits: u32, observed: []TMRtlObserved,
+                                 capacity: usize, summary: *TMRtlSummary) -> i32 {
+        if (!tm_rtl_frame_parameters(packet_count, expected_count, codec, seed, accumulator_bits)) { return TM_RTL_ERR_ARGUMENT; }
+        if (capacity < expected_count) { return TM_RTL_ERR_CAPACITY; }
+        var packet_text: *u8 = tm_process_buffer(context, packet_count * 17);
+        var expected_words: *u64 = tm_process_buffer(context, expected_count * 8);
+        var expected_text: *u8 = tm_process_buffer(context, expected_count * 17);
+        var stdout_capacity: usize = expected_count * 160 + 65536;
+        var stdout_data: *u8 = tm_process_buffer(context, stdout_capacity);
+        if (packet_text == 0 || expected_words == 0 || expected_text == 0 || stdout_data == 0) { return TM_RTL_ERR_CAPACITY; }
+        var status: i32 = tm_rtl_expected_words(expected, expected_count, expected_words, expected_count);
+        if (status != 0) { return status; }
+        var packet_bytes: i64 = tm_rtl_write_mem(packets, packet_count, packet_text, packet_count * 17);
+        var expected_bytes: i64 = tm_rtl_write_mem(expected_words, expected_count, expected_text, expected_count * 17);
+        if (packet_bytes < 0 || expected_bytes < 0) { return TM_RTL_ERR_CAPACITY; }
+        if (tm_process_write(context, "packets.mem", packet_text, packet_bytes as usize) != 0 ||
+            tm_process_write(context, "expected.mem", expected_text, expected_bytes as usize) != 0 ||
+            tm_process_output(context, "dot.vvp") != 0) { return TM_RTL_ERR_PROCESS; }
+        tm_process_reset(context);
+        if (tm_rtl_process_literal(context, "-g2012", 6) != 0 || tm_rtl_process_literal(context, "-Wall", 5) != 0 ||
+            tm_rtl_process_literal(context, "-s", 2) != 0 || tm_rtl_process_literal(context, "tb_dot_stream", 13) != 0 ||
+            tm_rtl_process_number(context, "-Ptb_dot_stream.DENSE5=", 23, codec as u64) != 0 ||
+            tm_rtl_process_number(context, "-Ptb_dot_stream.ACC_WIDTH=", 26, accumulator_bits as u64) != 0 ||
+            tm_rtl_process_number(context, "-Ptb_dot_stream.MAX_PACKETS=", 28, packet_count as u64) != 0 ||
+            tm_rtl_process_number(context, "-Ptb_dot_stream.MAX_RESULTS=", 28, expected_count as u64) != 0 ||
+            tm_rtl_process_literal(context, "-o", 2) != 0 || tm_rtl_process_literal(context, "dot.vvp", 7) != 0) { return TM_RTL_ERR_PROCESS; }
+        var path: [4096]u8 = [0]; var i: usize = 0;
+        while (i < 4) {
+            var resource: str = "trinity_dot_stream.v";
+            if (i == 1) { resource = "tb_dot_stream.v"; }
+            if (i == 2) { resource = "generated/ternary_dense5_decoder.v"; }
+            if (i == 3) { resource = "ternary_baseline5_decoder.v"; }
+            var path_size: i64 = tm_process_resource(resource, path, 4096);
+            if (path_size <= 0 || path_size > 4096) { return TM_RTL_ERR_RESOURCE; }
+            if (tm_process_arg(context, path, path_size as usize) != 0) { return TM_RTL_ERR_PROCESS; } i = i + 1;
+        }
+        var output_size: i64 = tm_process_run(context, "iverilog", stdout_data, stdout_capacity, 180000);
+        if (output_size < 0) { return TM_RTL_ERR_PROCESS; }
+        tm_process_reset(context);
+        if (tm_rtl_process_literal(context, "dot.vvp", 7) != 0 ||
+            tm_rtl_process_literal(context, "+packets=packets.mem", 20) != 0 ||
+            tm_rtl_process_literal(context, "+expected=expected.mem", 22) != 0 ||
+            tm_rtl_process_number(context, "+packet_count=", 14, packet_count as u64) != 0 ||
+            tm_rtl_process_number(context, "+result_count=", 14, expected_count as u64) != 0 ||
+            tm_rtl_process_number(context, "+seed=", 6, seed as u64) != 0) { return TM_RTL_ERR_PROCESS; }
+        output_size = tm_process_run(context, "vvp", stdout_data, stdout_capacity, 180000);
+        if (output_size < 0 || (output_size as u64) > (stdout_capacity as u64)) { return TM_RTL_ERR_PROCESS; }
+        var metrics: TMRtlSummary = TMRtlSummary{ .cycles = 0, .groups = 0, .input_stalls = 0,
+            .output_stalls = 0, .source_bubbles = 0, .resets = 0, .result_count = 0 };
+        status = tm_rtl_parse_output(stdout_data, output_size as usize, expected, expected_count, observed, capacity, &metrics);
+        if (status != 0) { return status; }
+        var groups: u64 = 0; var resets: u64 = 0; i = 0;
+        while (i < packet_count) {
+            if ((packets[i] & ((3 as u64) << 56)) != 0) { resets = resets + 1; }
+            else { groups = groups + 1; } i = i + 1;
+        }
+        if (metrics.groups != groups || metrics.resets != resets) { return TM_RTL_ERR_MISMATCH; }
+        summary[0] = metrics; return 0;
+    }
+    // Actual Icarus compile/run; observes and verifies caller-supplied frames.
+    // Useful for malformed protocol/reset/narrow-accumulator regression fixtures.
+    fn tm_rtl_run_frames(packets: []u64, packet_count: usize, expected: []TMRtlExpected,
+                         expected_count: usize, codec: i32, seed: i64, accumulator_bits: u32,
+                         observed: []TMRtlObserved, capacity: usize, summary: *TMRtlSummary) -> i32 {
+        if (!tm_rtl_frame_parameters(packet_count, expected_count, codec, seed, accumulator_bits)) { return TM_RTL_ERR_ARGUMENT; }
+        if (capacity < expected_count) { return TM_RTL_ERR_CAPACITY; }
+        var context: *u8 = tm_process_new(); if (context == 0) { return TM_RTL_ERR_PROCESS; }
+        var status: i32 = tm_rtl_run_frames_context(context, packets, packet_count, expected,
+            expected_count, codec, seed, accumulator_bits, observed, capacity, summary);
+        tm_process_free(context); return status;
+    }
+    fn tm_rtl_run_dot(weights: []i32, activations: []i32, count: usize, codec: i32, seed: i64,
+                      witness: *TMRtlWitness) -> i32 {
+        var packet_count: i64 = tm_rtl_packet_count(count);
+        if (packet_count < 0 || !tm_rtl_frame_parameters(packet_count as usize, 1, codec, seed, 32)) { return TM_RTL_ERR_ARGUMENT; }
+        var context: *u8 = tm_process_new(); if (context == 0) { return TM_RTL_ERR_PROCESS; }
+        var packets: *u64 = tm_process_buffer(context, (packet_count as usize) * 8);
+        if (packets == 0) { tm_process_free(context); return TM_RTL_ERR_CAPACITY; }
+        var expected: TMRtlExpected = TMRtlExpected{ .result = 0, .error = false };
+        var prepared: i64 = tm_rtl_prepare_dot(codec, weights, activations, count, packets, packet_count as usize, &expected);
+        if (prepared < 0) { tm_process_free(context); return prepared as i32; }
+        var observed: TMRtlObserved = TMRtlObserved{ .index = 0, .result = 0, .error = false, .cycles = 0 };
+        var metrics: TMRtlSummary = TMRtlSummary{ .cycles = 0, .groups = 0, .input_stalls = 0,
+            .output_stalls = 0, .source_bubbles = 0, .resets = 0, .result_count = 0 };
+        var status: i32 = tm_rtl_run_frames_context(context, packets, packet_count as usize, &expected, 1, codec, seed, 32, &observed, 1, &metrics);
+        tm_process_free(context);
+        if (status != 0) { return status; }
+        witness.result = observed.result; witness.error = observed.error; witness.cycles = metrics.cycles;
+        witness.groups = metrics.groups; witness.input_stalls = metrics.input_stalls; witness.output_stalls = metrics.output_stalls;
+        witness.source_bubbles = metrics.source_bubbles; witness.resets = metrics.resets;
+        witness.result_cycle = observed.cycles; witness.weight_count = count;
+        if (codec == 1) { witness.encoded_weight_bits = metrics.groups * 8; }
+        else { witness.encoded_weight_bits = metrics.groups * 10; } return 0;
+    }
+}

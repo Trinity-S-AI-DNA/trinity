@@ -1,0 +1,318 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/api/tri_api_session.t27 -- what gHashTag/trinity's tri-api keeps between runs, at the pin
+; S08 of gHashTag/trinity#988 (gHashTag/t27#4827, re-filed from #3570). tri-api keeps four things on
+; disk: a session record per run, an index of records, a memory file it reads into the system prompt,
+; and git stash entries it makes before a write. This file states what src/tri-api/{session_store,
+; memory,claude_md,checkpoint,context,main}.zig do with them -- format, write discipline, resume and
+; recovery, retention, provenance, compaction, privacy -- and how the existing designs map onto them:
+; specs/organism/dna.tri and mozg.tri (declaration-only, they do not parse), specs/brain/unified_state.t27
+; (persisted by nothing) and specs/memory/tmem/session.t27 (the TMSS record of an optional tmem adapter,
+; implemented by nothing). The decisions are functions the C backend executes. Evidence, kept apart
+; (tools/trinity_tri_api_session.py, conformance/trinity/tri_api_session_*.json):
+;   model   a Python reading of save, load, loadLatest and Memory.load, compared with the compiled Zig
+;   zig     session_store.zig and memory.zig compiled and run with generated fixtures in four optimize
+;           modes: save/load round trips, every prefix of a saved record loaded back, the memory caps
+;   binary  the real tri-api built from the pinned main.zig, driven against a scripted provider in a
+;           private HOME: twelve scenarios, real files, real exit codes, a fake key
+; Not measured: a real provider, a real model writing the compaction summary, a host other than macOS
+; arm64 (file modes are measured under umask 022), a filesystem that reorders writes after power loss.
+; ASCII only (L3).
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module TriApiSession;
+
+pub const KIND : str = "agent-session";
+pub const ID : str = "api/tri_api_session";
+pub const NAME : str = "What the pinned tri-api keeps between runs";
+pub const CONSUMER_REPO : str = "gHashTag/trinity";
+pub const PINNED_REVISION : str = "afc9d38435ad01c48af6c33c311da422c38f046e";
+pub const ISSUE_BASELINE : str = "03ae2f93f5af2fd4fa23e4c613a3c0e19ac51530";
+pub const SOURCE_LINES : str = "session_store.zig: paths :7-9, save :29-100, load :103-113, loadLatest :116-143, listSessions :146-194, writeFileAbs :205-209; memory.zig: caps :6-7, load :28-63, append :66-98; claude_md.zig: loadSystemPrompt :11-34, appendMemory :37-44; checkpoint.zig: createBeforeWrite :19-35, restoreLatest :43-75, list :78-109; context.zig: truncateOldToolOutputs :63-165, applySummary :193-233; main.zig: flags :38-56, system prompt :132-151, interactive save :205-210, resume :222-259, batch save :267-269";
+; --- Where things live ----------------------------------------------------------------------------
+pub const SESSIONS_DIR : str = "$HOME/.trinity/api/sessions (/tmp/.trinity/api/sessions when HOME is unset); the header comment of session_store.zig says ~/.tri-api/sessions, which is not read";
+pub const INDEX_FILE : str = "index.json";
+pub const MEMORY_FILE : str = "$HOME/.tri-api/MEMORY.md";
+pub const SYSTEM_PROMPT_SOURCES : [4]str = ["$HOME/.claude/CLAUDE.md", "./CLAUDE.md", "./.claude/CLAUDE.md", "$HOME/.tri-api/MEMORY.md (first 200 lines, under a # Memory heading)"];
+pub const AUDIT_FILE : str = "$HOME/.tri-api/audit.jsonl (or AUDIT_LOG_PATH)";
+pub const CHECKPOINT_STORE : str = "the git stash of the repository the working directory is in, message tri-api checkpoint: <path>";
+; --- The record ---------------------------------------------------------------------------------------
+pub const RECORD_FIELDS : [3]str = ["id", "ts", "messages"];
+pub const INDEX_FIELDS : [3]str = ["id", "ts", "preview"];
+pub const RECORD_RULE : str = "{\"id\":\"<8 hex digits>\",\"ts\":<unix seconds>,\"messages\":\"<the conversation as a JSON array, escaped into one string>\"}; no magic, no version, no sequence, no hash, no checksum, no model, no system prompt, no permission table, no revision of anything";
+pub const ID_RULE : str = "the id is the low 32 bits of the unix second, as 8 lower-case hex digits; two saves in one second get one id and one file";
+pub const ID_HEX_DIGITS : u32 = 8;
+pub const ID_MODULUS : u64 = 4294967296;
+pub const PREVIEW_MAX_BYTES : u32 = 80;
+pub const PREVIEW_RULE : str = "the index entry keeps the first 80 BYTES of the prompt, so a multi-byte UTF-8 character can be cut in half and index.json stops being valid UTF-8";
+pub const SESSION_MAX_BYTES : u32 = 10485760;
+pub const SAVE_POINTS : str = "batch mode saves once, after the loop; interactive mode saves after every prompt, each time a new record holding the whole conversation so far; nothing is saved when the process is killed";
+; --- Write discipline ------------------------------------------------------------------------------------
+pub const WRITE_RULE : str = "createFileAbsolute (truncate) then writeAll, for the record and then for the index; no temporary file, no rename, no fsync, no lock; the index is read, extended and rewritten whole, so concurrent saves can lose index entries";
+pub const WRITE_FAILURE_RULE : str = "a failed record write returns before the index is touched and prints nothing: the partial record stays, the run exits 0, and the Session saved line is simply missing";
+pub const FILE_MODE : u32 = 420;
+pub const DIR_MODE : u32 = 493;
+pub const MODE_NOTE : str = "0644 records and index, 0755 directories, measured under umask 022: every local user can read every transcript";
+; --- Resume and recovery ------------------------------------------------------------------------------------
+pub const RESUME_FLAGS : [2]str = ["--continue: the record named by the LAST id in index.json", "--resume <id>: <sessions>/<id>.json, any id the caller writes, including one with ../ in it"];
+pub const RESUME_NOTHING : u32 = 0;
+pub const RESUME_ANNOUNCED_DROPPED : u32 = 1;
+pub const RESUME_HISTORY : u32 = 2;
+pub const RESUME_RULE : str = "the record is read, the messages string is cut out with extractField (which returns the rest of the file for an unterminated string) and unescaped; no value at all -> No session found to resume and a fresh conversation; any value -> Resuming session, after which a value that does not end in ] is silently replaced by a fresh conversation and a value that does is prepended unchecked, valid JSON or not";
+pub const RECOVERY_RULE : str = "no fallback: when the last index entry cannot be loaded, no older record is tried; a newer record missing from the index (a crash between the two writes) is never found by --continue";
+pub const VERSION_RULE : str = "there is no version: unknown fields are ignored (a record carrying version 99 resumes), and a record of another format (a TMSS header) reads as no record";
+; --- Retention, memory, checkpoint ---------------------------------------------------------------------------
+pub const RETENTION_RULE : str = "none: no record, index entry or stash entry is ever deleted; interactive mode writes a new record per prompt, each holding everything before it";
+pub const MEMORY_MAX_LINES : u32 = 200;
+pub const MEMORY_MAX_BYTES : u32 = 262144;
+pub const MEMORY_RULE : str = "MEMORY.md is only read: Memory.append exists and nothing calls it, so tri-api never writes a memory; the first 200 lines enter the system prompt; a file over 256 KiB fails readToEndAlloc and the whole memory is dropped without a word";
+pub const CHECKPOINT_NONE : u32 = 0;
+pub const CHECKPOINT_STASHED : u32 = 1;
+pub const CHECKPOINT_FAILED_THEN_WRITTEN : u32 = 2;
+pub const CHECKPOINT_RULE : str = "before a permitted write_file of an existing file inside a git work tree: git stash push -- <path>; a tracked file with local edits is stashed (the edits leave the work tree), a tracked clean file gives no entry, an untracked file makes the stash fail, prints checkpoint: stash failed and is overwritten anyway, a file outside a repository gets nothing";
+pub const RESTORE_RULE : str = "restoreFile, restoreLatest and list have no caller: no flag and no slash command reaches them (--undo is taken as the prompt)";
+; --- Compaction and the record ---------------------------------------------------------------------------------
+pub const TRUNCATE_KEEP_BYTES : u32 = 200;
+pub const TRUNCATE_KEPT : u32 = 0;
+pub const TRUNCATE_MARKER : u32 = 1;
+pub const TRUNCATE_CORRUPT : u32 = 2;
+pub const TRUNCATE_RULE : str = "older tool_result contents over 200 bytes become [truncated N bytes]; short ones (a Permission denied answer), the is_error flag, the tool_use/tool_result pairing and the user's prompts survive; the end of a content string is found by looking one byte back for a backslash, so a content over 200 bytes that ends in a backslash is cut across the following messages and the history stops being JSON";
+pub const SUMMARY_RULE : str = "when truncation is not enough the provider is asked for a summary, and the summary replaces everything before the third-last assistant turn as ONE USER MESSAGE beginning [Previous context summary]; nothing checks it against the history it replaces";
+pub const RECORD_AFTER_COMPACTION : str = "the record saved after a compacted run holds the compacted history: the original turns, a denial among them, are gone from disk too";
+; --- Provenance and privacy ---------------------------------------------------------------------------------------
+pub const PROVENANCE_FIELDS : [8]str = ["model", "system prompt", "memory content", "permission table", "tri-api source revision", "compiler", "parent record", "content hash"];
+pub const PROVENANCE_RECORDED : u32 = 0;
+pub const PROVENANCE_RULE : str = "none of the eight is recorded; --continue sends the old conversation under the CURRENT model flag (default unless given again), the CURRENT CLAUDE.md files and the CURRENT memory";
+pub const ARTIFACTS : [6]str = ["session record", "index preview", "memory file", "CLAUDE.md files", "audit log", "git stash entry"];
+pub const ARTIFACT_PRIVATE_LOCAL : u32 = 0;
+pub const ARTIFACT_SENT_TO_PROVIDER : u32 = 1;
+pub const ARTIFACT_EVIDENCE_SAFE : u32 = 2;
+pub const PRIVACY_RULE : str = "the record is the full transcript: prompts, model text, and the CONTENT of every file a tool read, in plaintext, 0644; everything in it, the memory and the three CLAUDE.md files was also sent to ANTHROPIC_BASE_URL, which may be a proxy; the audit log keeps tool, path and verdict, redacted, and no content";
+pub const QUEEN_EVIDENCE : str = "what may leave the machine for Queen without the owner reading it: counts (records, turns, tool calls by name and verdict from the audit log), timestamps, the measured flags of this file, and hashes computed at publication; never a record, a preview, a path, the memory or a CLAUDE.md";
+; --- How the existing designs map onto what is kept ----------------------------------------------------------------
+pub const MAPPING_COUNT : u32 = 16;
+pub const MAPPING : [16]str = [
+    "dna.DnaRecord.magic (TRI3) -> none: a record has no magic",
+    "dna.DnaRecord.kind -> none",
+    "dna.DnaRecord.ring_id -> none; the record id is 8 hex digits of the unix second",
+    "dna.DnaRecord.payload_sha256 -> none: no hash is stored or checked anywhere",
+    "dna.DnaRecord.payload_len -> none; only the file length",
+    "dna.DnaRecord.timestamp_epoch -> ts of the record and of its index entry (unix seconds)",
+    "dna.dna_write -> SessionStore.save: truncate-and-write, not atomic",
+    "dna.dna_read(sha256) -> SessionStore.load(id): by id, never by content",
+    "dna.dna_gc -> none: nothing is deleted",
+    "mozg.MozgState.cycle -> the loop's turn counter, at most 20 per run, never persisted",
+    "mozg.activations, law_priority_bits, Transition -> none",
+    "unified_state.BrainState -> none: nothing in gHashTag/trinity persists it",
+    "tmem.TMSS sequence and action_count -> none; message order is implicit in the array",
+    "tmem.TMSS spec_hash, compiler_rev, parent_sha256, payload_sha256, crc -> none",
+    "tmem.TMSS field classes -> ARTIFACTS above: the record as a whole is private",
+    "compaction (context.zig) -> rewrites the history in memory before it is saved"
+];
+pub const TMEM_ADAPTER : str = "optional and NOT enabled: no code reads or writes a TMSS record (GitHub code search, gHashTag and dmitrii-f-t27, 2026-09-30); enabling it would mean a writer that fills magic, version, sequence, action_count, spec_hash, compiler_rev, parent_sha256, payload_sha256 and crc, and a reader that refuses what tms_session_header_status, _ancestry_status and _chain_status refuse";
+pub const TMSS_HEADER_BYTES : u64 = 176;
+pub const TMSS_OK : i32 = 0;
+pub const TMSS_ERR_TRUNCATED : i32 = -1;
+pub const TMSS_ERR_MAGIC : i32 = -2;
+; --- Findings: measured, the tag names the evidence -------------------------------------------------------------------
+pub const FINDINGS_COUNT : u32 = 20;
+pub const FINDINGS : [20]str = [
+    "f30 two saves in one second share an id: eight runs started together left one record, in each of ten trials; the index, rewritten without a lock, lost entries in some of them [s03; s11]",
+    "f31 the record write is not atomic: a write cut by a file-size limit left a partial record, no index entry, no message, exit 0 [s04; zig prefix sweep]",
+    "f32 a record has no version, magic or checksum: version 99 resumes, a TMSS header reads as no record [s05]",
+    "f33 a partial or non-array record prints Resuming session and drops the history; a record ending in ] is prepended unchecked and an invalid one becomes an invalid request [s05; zig prefix sweep]",
+    "f34 recovery has no fallback: a missing last entry resumes nothing, and a newer record left out of the index is never found [s05]",
+    "f35 the index preview is cut at 80 bytes and leaves index.json invalid UTF-8 [s01]",
+    "f36 nothing is ever deleted: one record per run, one per prompt in interactive mode, each holding all before it [s02; s11]",
+    "f37 the record holds no provenance: --continue runs the old conversation under the current model flag, CLAUDE.md files and memory [s02; s07]",
+    "f38 transcripts, with the content of every file a tool read, are stored in plaintext 0644 and were sent to the provider; the audit log keeps only the path [s08]",
+    "f39 tri-api never writes MEMORY.md; it reads 200 lines of it and drops all of it past 256 KiB [s06; zig memory caps]",
+    "f40 no checkpoint can be restored; an untracked file is overwritten after stash failed; outside a repository nothing is kept; entries pile up [s10]",
+    "f41 truncation keeps prompts, denials, flags and pairs, but a tool output over 200 bytes ending in a backslash breaks the history for good: invalid request, invalid record, invalid on every --continue [s09]",
+    "f42 a summary replaces a denial with model text in the user role: a summary claiming write_file(secret.txt) completed was sent and saved, the denial was not [s09]",
+    "f43 the record saved after compaction is the compacted history; the original prompt is gone from disk [s09]",
+    "f44 SIGTERM before the save leaves a tool's side effect in the world and in no record [s12]",
+    "f45 tmem/session.t27 compiled in neither backend, at master or at its merge commit 8bde3bb7a with the command its docs/now entry records as passing; fixed here, 24 of 24 in C and Zig [tmem]",
+    "f46 conformance/tmem_session.json recorded the TMSS magic as 0x534C83C4; the spec says 0x53534D54; fixed here [tmem]",
+    "f47 dna.tri and mozg.tri do not parse under t27c and nothing implements DnaRecord, mozg_step or TMSS [code search]",
+    "f48 unified_state.t27 does not compile in C at master (the enum literal .rest lowers to an undeclared REST) and nothing persists BrainState [source]",
+    "f49 interactive mode with stdout on a pipe panics in Debug and ReleaseSafe (fsync EINVAL is unreachable) before the first prompt; through a terminal it runs [s11]"
+];
+pub const ENABLED : bool = true;
+
+; --- Rules --------------------------------------------------------------------------------------------------------
+
+pub fn session_id(ts: u64) -> u64 {
+    return ts % ID_MODULUS;
+}
+
+pub fn records_after_same_second(saves: u32) -> u32 {
+    if (saves == 0) { return 0; }
+    return 1;
+}
+
+pub fn index_entries_after(saves: u32) -> u32 {
+    return saves;
+}
+
+pub fn preview_bytes(prompt_bytes: u32) -> u32 {
+    if (prompt_bytes > PREVIEW_MAX_BYTES) { return PREVIEW_MAX_BYTES; }
+    return prompt_bytes;
+}
+
+pub fn resume_outcome(value_found: bool, ends_with_bracket: bool) -> u32 {
+    if (value_found == false) { return RESUME_NOTHING; }
+    if (ends_with_bracket) { return RESUME_HISTORY; }
+    return RESUME_ANNOUNCED_DROPPED;
+}
+
+pub fn resume_announced(outcome: u32) -> bool {
+    return outcome != RESUME_NOTHING;
+}
+
+pub fn continue_tries_older(last_entry_loadable: bool) -> bool {
+    return false;
+}
+
+pub fn write_is_atomic() -> bool {
+    return false;
+}
+
+pub fn index_written_after_failed_record() -> bool {
+    return false;
+}
+
+pub fn records_deleted() -> u32 {
+    return 0;
+}
+
+pub fn memory_lines_loaded(lines: u32, bytes: u32) -> u32 {
+    if (bytes > MEMORY_MAX_BYTES) { return 0; }
+    if (lines > MEMORY_MAX_LINES) { return MEMORY_MAX_LINES; }
+    return lines;
+}
+
+pub fn memory_written() -> bool {
+    return false;
+}
+
+pub fn checkpoint_outcome(exists: bool, in_repo: bool, tracked: bool, modified: bool) -> u32 {
+    if (exists == false) { return CHECKPOINT_NONE; }
+    if (in_repo == false) { return CHECKPOINT_NONE; }
+    if (tracked == false) { return CHECKPOINT_FAILED_THEN_WRITTEN; }
+    if (modified) { return CHECKPOINT_STASHED; }
+    return CHECKPOINT_NONE;
+}
+
+pub fn restore_reachable() -> bool {
+    return false;
+}
+
+pub fn truncation(content_bytes: u32, ends_with_backslash: bool) -> u32 {
+    if (content_bytes <= TRUNCATE_KEEP_BYTES) { return TRUNCATE_KEPT; }
+    if (ends_with_backslash) { return TRUNCATE_CORRUPT; }
+    return TRUNCATE_MARKER;
+}
+
+pub fn summary_keeps_denial() -> bool {
+    return false;
+}
+
+pub fn summary_checked() -> bool {
+    return false;
+}
+
+pub fn provenance_recorded() -> u32 {
+    return PROVENANCE_RECORDED;
+}
+
+; Whether an artifact's content was in a request to the provider (measured by looking for it in the
+; requests of scenario s08): the record, the preview, the memory and the CLAUDE.md files were; the audit
+; log and a stash entry were not. No stored artifact is evidence-safe as it stands.
+pub fn artifact_class(artifact: u32) -> u32 {
+    if (artifact <= 3) { return ARTIFACT_SENT_TO_PROVIDER; }
+    return ARTIFACT_PRIVATE_LOCAL;
+}
+
+pub fn tmss_status_of_record(record_bytes: u64) -> i32 {
+    if (record_bytes < TMSS_HEADER_BYTES) { return TMSS_ERR_TRUNCATED; }
+    return TMSS_ERR_MAGIC;
+}
+
+pub fn interactive_pipe_panics(safe_build: bool) -> bool {
+    return safe_build;
+}
+
+invariant the_id_is_eight_hex_digits { assert ID_MODULUS == 4294967296 and ID_HEX_DIGITS == 8; }
+invariant nothing_of_provenance_is_kept { assert PROVENANCE_RECORDED == 0; }
+invariant the_memory_caps { assert MEMORY_MAX_LINES == 200 and MEMORY_MAX_BYTES == 262144; }
+invariant a_tmss_header_is_larger_than_a_short_record { assert TMSS_HEADER_BYTES == 176; }
+
+test two_saves_in_one_second_share_one_record {
+    assert session_id(1790819080) == 1790819080;
+    assert session_id(4294967296 + 5) == 5;
+    assert records_after_same_second(8) == 1;
+    assert index_entries_after(8) == 8;
+    assert records_after_same_second(0) == 0;
+}
+
+test the_preview_is_eighty_bytes {
+    assert preview_bytes(91) == 80;
+    assert preview_bytes(12) == 12;
+}
+
+test a_record_resumes_in_three_ways {
+    assert resume_outcome(false, false) == RESUME_NOTHING;
+    assert resume_outcome(true, false) == RESUME_ANNOUNCED_DROPPED;
+    assert resume_outcome(true, true) == RESUME_HISTORY;
+    assert resume_announced(RESUME_ANNOUNCED_DROPPED) == true;
+    assert resume_announced(RESUME_NOTHING) == false;
+    assert continue_tries_older(false) == false;
+}
+
+test writes_are_plain_and_nothing_is_deleted {
+    assert write_is_atomic() == false;
+    assert index_written_after_failed_record() == false;
+    assert records_deleted() == 0;
+}
+
+test the_memory_is_read_and_capped_and_never_written {
+    assert memory_lines_loaded(250, 3140) == 200;
+    assert memory_lines_loaded(10, 300001) == 0;
+    assert memory_lines_loaded(1, 12) == 1;
+    assert memory_written() == false;
+}
+
+test a_checkpoint_depends_on_git_and_cannot_be_restored {
+    assert checkpoint_outcome(true, true, true, true) == CHECKPOINT_STASHED;
+    assert checkpoint_outcome(true, true, true, false) == CHECKPOINT_NONE;
+    assert checkpoint_outcome(true, true, false, false) == CHECKPOINT_FAILED_THEN_WRITTEN;
+    assert checkpoint_outcome(true, false, false, false) == CHECKPOINT_NONE;
+    assert checkpoint_outcome(false, true, true, true) == CHECKPOINT_NONE;
+    assert restore_reachable() == false;
+}
+
+test truncation_keeps_short_results_and_breaks_on_a_trailing_backslash {
+    assert truncation(40, false) == TRUNCATE_KEPT;
+    assert truncation(200, true) == TRUNCATE_KEPT;
+    assert truncation(300, false) == TRUNCATE_MARKER;
+    assert truncation(301, true) == TRUNCATE_CORRUPT;
+    assert summary_keeps_denial() == false;
+    assert summary_checked() == false;
+}
+
+test no_provenance_and_most_artifacts_leave_the_machine {
+    assert provenance_recorded() == 0;
+    assert artifact_class(0) == ARTIFACT_SENT_TO_PROVIDER;
+    assert artifact_class(1) == ARTIFACT_SENT_TO_PROVIDER;
+    assert artifact_class(3) == ARTIFACT_SENT_TO_PROVIDER;
+    assert artifact_class(4) == ARTIFACT_PRIVATE_LOCAL;
+    assert artifact_class(5) == ARTIFACT_PRIVATE_LOCAL;
+    assert artifact_class(5) != ARTIFACT_EVIDENCE_SAFE;
+}
+
+test a_tri_api_record_fails_the_tmss_header {
+    assert tmss_status_of_record(165) == TMSS_ERR_TRUNCATED;
+    assert tmss_status_of_record(251) == TMSS_ERR_MAGIC;
+    assert interactive_pipe_panics(true) == true;
+    assert interactive_pipe_panics(false) == false;
+}

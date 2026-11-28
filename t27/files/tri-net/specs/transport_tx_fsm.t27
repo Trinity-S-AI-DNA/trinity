@@ -1,0 +1,241 @@
+// Transport TX FSM for mesh data frame transmission
+// Port from trios-mesh/src/daemon.rs Node::seal_data()
+// Simplified: no crypto, FSM-based retry logic
+
+module TransportTxFsm {
+    use base::types;
+
+    // --- FSM States ---
+    const ST_IDLE: u8 = 0;
+    const ST_ENQUEUE: u8 = 1;
+    const ST_BUILD_HDR: u8 = 2;
+    const ST_TX_WAIT: u8 = 3;
+    const ST_ACKED: u8 = 4;
+    const ST_FAILED: u8 = 5;
+
+    // --- Constants ---
+    const MAX_RETRIES: u8 = 5;
+    const BASE_RETRY_MS: u16 = 10;
+    const KIND_DATA: u8 = 1;  // From wire.t27
+    const VERSION: u8 = 1;     // From wire.t27
+
+    // --- State transition logic ---
+    fn next_state(state: u8, frame_ready: bool, ack_received: bool, retries_exceeded: bool) -> u8 {
+        if (state == ST_IDLE) {
+            if (frame_ready) {
+                return ST_ENQUEUE;
+            } else {
+                return ST_IDLE;
+            }
+        } else if (state == ST_ENQUEUE) {
+            return ST_BUILD_HDR;
+        } else if (state == ST_BUILD_HDR) {
+            return ST_TX_WAIT;
+        } else if (state == ST_TX_WAIT) {
+            if (ack_received) {
+                return ST_ACKED;
+            } else if (retries_exceeded) {
+                return ST_FAILED;
+            } else {
+                return ST_TX_WAIT;  // Continue waiting
+            }
+        } else if (state == ST_ACKED) {
+            return ST_IDLE;  // Ready for next frame
+        } else if (state == ST_FAILED) {
+            return ST_IDLE;  // Give up, return to idle
+        } else {
+            return ST_IDLE;  // Default fallback
+        }
+    }
+
+    // --- Retry logic ---
+    // Exponential backoff: delay = base_ms * 2^retry_count
+    fn retry_delay_ms(retry_count: u8, base_ms: u16) -> u16 {
+        if (retry_count == 0) {
+            return base_ms;
+        } else if (retry_count == 1) {
+            return base_ms * 2;
+        } else if (retry_count == 2) {
+            return base_ms * 4;
+        } else if (retry_count == 3) {
+            return base_ms * 8;
+        } else if (retry_count >= 4) {
+            return base_ms * 16;
+        } else {
+            return base_ms;
+        }
+    }
+
+    // Check if retries exceeded
+    fn is_retries_exceeded(retry_count: u8) -> bool {
+        return retry_count >= MAX_RETRIES;
+    }
+
+    // Increment retry counter (with saturation)
+    fn increment_retry(retry_count: u8) -> u8 {
+        if (retry_count >= MAX_RETRIES) {
+            return MAX_RETRIES;
+        } else {
+            return retry_count + 1;
+        }
+    }
+
+    // --- Frame construction (reuses wire.t27 patterns) ---
+    // Build header bytes: [ver:1][kind:1][src:4 BE][dst:4 BE][ttl:1]
+    fn header_byte(kind: u8, src: u32, dst: u32, ttl: u8, idx: usize) -> u8 {
+        if (idx == 0) {
+            return VERSION;
+        } else if (idx == 1) {
+            return kind;
+        } else if (idx == 2) {
+            return ((src >> 24) & 255) as u8;
+        } else if (idx == 3) {
+            return ((src >> 16) & 255) as u8;
+        } else if (idx == 4) {
+            return ((src >> 8) & 255) as u8;
+        } else if (idx == 5) {
+            return (src & 255) as u8;
+        } else if (idx == 6) {
+            return ((dst >> 24) & 255) as u8;
+        } else if (idx == 7) {
+            return ((dst >> 16) & 255) as u8;
+        } else if (idx == 8) {
+            return ((dst >> 8) & 255) as u8;
+        } else if (idx == 9) {
+            return (dst & 255) as u8;
+        } else if (idx == 10) {
+            return ttl;
+        } else {
+            return 0;
+        }
+    }
+
+    // ---- Tests ----
+
+    // idle_to_enqueue_on_frame_ready
+    test idle_to_enqueue_on_frame {
+        next = next_state(ST_IDLE, true, false, false);
+        assert(next == ST_ENQUEUE, "should transition to ENQUEUE");
+    }
+
+    // idle_stays_idle_when_no_frame
+    test idle_stays_idle_when_no_frame {
+        next = next_state(ST_IDLE, false, false, false);
+        assert(next == ST_IDLE, "should stay IDLE");
+    }
+
+    // enqueue_to_build_hdr
+    test enqueue_to_build_hdr {
+        next = next_state(ST_ENQUEUE, false, false, false);
+        assert(next == ST_BUILD_HDR, "should transition to BUILD_HDR");
+    }
+
+    // build_hdr_to_tx_wait
+    test build_hdr_to_tx_wait {
+        next = next_state(ST_BUILD_HDR, false, false, false);
+        assert(next == ST_TX_WAIT, "should transition to TX_WAIT");
+    }
+
+    // tx_wait_to_acked_on_success
+    test tx_wait_to_acked_on_success {
+        next = next_state(ST_TX_WAIT, false, true, false);
+        assert(next == ST_ACKED, "should transition to ACKED");
+    }
+
+    // tx_wait_stays_waiting_when_no_ack
+    test tx_wait_stays_waiting_when_no_ack {
+        next = next_state(ST_TX_WAIT, false, false, false);
+        assert(next == ST_TX_WAIT, "should stay in TX_WAIT");
+    }
+
+    // tx_wait_to_failed_on_retry_exceeded
+    test tx_wait_to_failed_on_retry_exceeded {
+        next = next_state(ST_TX_WAIT, false, false, true);
+        assert(next == ST_FAILED, "should transition to FAILED");
+    }
+
+    // acked_returns_to_idle
+    test acked_returns_to_idle {
+        next = next_state(ST_ACKED, false, false, false);
+        assert(next == ST_IDLE, "should return to IDLE");
+    }
+
+    // failed_returns_to_idle
+    test failed_returns_to_idle {
+        next = next_state(ST_FAILED, false, false, false);
+        assert(next == ST_IDLE, "should return to IDLE");
+    }
+
+    // retry_exponential_backoff
+    test retry_exponential_backoff {
+        delay0 = retry_delay_ms(0, 10);
+        delay1 = retry_delay_ms(1, 10);
+        delay2 = retry_delay_ms(2, 10);
+        delay3 = retry_delay_ms(3, 10);
+        delay4 = retry_delay_ms(4, 10);
+        
+        assert(delay0 == 10, "retry 0 should be 10ms");
+        assert(delay1 == 20, "retry 1 should be 20ms");
+        assert(delay2 == 40, "retry 2 should be 40ms");
+        assert(delay3 == 80, "retry 3 should be 80ms");
+        assert(delay4 == 160, "retry 4 should be 160ms");
+    }
+
+    // is_retries_exceeded_check
+    test is_retries_exceeded_check {
+        exceeded = is_retries_exceeded(5);
+        not_exceeded = is_retries_exceeded(4);
+        
+        assert(exceeded, "5 retries should be exceeded");
+        assert(not_exceeded == false, "4 retries should not be exceeded");
+    }
+
+    // increment_retry_saturates
+    test increment_retry_saturates {
+        r0 = increment_retry(0);
+        r1 = increment_retry(1);
+        r4 = increment_retry(4);
+        r5 = increment_retry(5);
+        
+        assert(r0 == 1, "0→1");
+        assert(r1 == 2, "1→2");
+        assert(r4 == 5, "4→5");
+        assert(r5 == 5, "5 should saturate at 5");
+    }
+
+    // header_byte_correctness_version
+    test header_byte_correctness_version {
+        b0 = header_byte(KIND_DATA, 0x01020304, 0x05060708, 8, 0);
+        assert(b0 == VERSION, "byte 0 should be VERSION");
+    }
+
+    // header_byte_correctness_kind
+    test header_byte_correctness_kind {
+        b1 = header_byte(KIND_DATA, 0x01020304, 0x05060708, 8, 1);
+        assert(b1 == KIND_DATA, "byte 1 should be KIND_DATA");
+    }
+
+    // header_byte_correctness_src
+    test header_byte_correctness_src {
+        b2 = header_byte(KIND_DATA, 0x01020304, 0x05060708, 8, 2);
+        b5 = header_byte(KIND_DATA, 0x01020304, 0x05060708, 8, 5);
+        
+        assert(b2 == 1, "src byte 0 should be 0x01");
+        assert(b5 == 4, "src byte 3 should be 0x04");
+    }
+
+    // header_byte_correctness_dst
+    test header_byte_correctness_dst {
+        b6 = header_byte(KIND_DATA, 0x01020304, 0x05060708, 8, 6);
+        b9 = header_byte(KIND_DATA, 0x01020304, 0x05060708, 8, 9);
+        
+        assert(b6 == 5, "dst byte 0 should be 0x05");
+        assert(b9 == 8, "dst byte 3 should be 0x08");
+    }
+
+    // header_byte_correctness_ttl
+    test header_byte_correctness_ttl {
+        b10 = header_byte(KIND_DATA, 0x01020304, 0x05060708, 8, 10);
+        assert(b10 == 8, "byte 10 should be TTL");
+    }
+}

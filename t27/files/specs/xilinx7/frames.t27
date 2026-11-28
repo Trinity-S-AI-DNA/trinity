@@ -1,0 +1,302 @@
+// SPDX-License-Identifier: Apache-2.0
+; frames.t27 -- what a 7-series configuration frame carries besides configuration: its ECC.
+; A frame is 101 words. Word 50 holds a 13-bit ECC in its low bits (12 Hamming bits and an
+; overall parity bit); the device checks it on readback, and a writer must produce it.
+; ----
+; SOURCE (prjxray c9f02d857):
+;   lib/xilinx/xc7series/ecc.cc:18-60     icap_ecc, calculateECC, updateECC
+;   lib/include/prjxray/xilinx/frames.h:99   the frames reader re-computes it for every frame
+; ORACLE: the ECC Vivado wrote into every frame of its bitstreams (driver: bitwalk --ecc);
+; the in-spec test `ecc_matches_vivado_frame` folds one such frame, copied from a Vivado file.
+; prjxray-written (openXC7) bitstreams are not an independent oracle for this rule: their
+; ECC comes from the code this spec is read from.
+; ----
+; Driver: bitwalk.rs beside this file.
+;   t27c gen-rust specs/xilinx7/frames.t27 > specs/xilinx7/frames.rs
+
+module xilinx7_frames;
+
+pub const FRAME_WORDS : u32 = 101;
+pub const ECC_WORD : u32 = 0x32;
+pub const LAST_WORD : u32 = 0x64;
+pub const ECC_BITS : u32 = 0x1FFF;
+pub const ECC_KEEP : u32 = 0xFFFFE000;
+
+// ============================================================================
+// ECC (ecc.cc:20-48). Every set bit of the frame XORs one 13-bit code into the running
+// value: the bit's offset in the frame (word * 32 + bit) moved past the code points with a
+// single bit set or that are too low -- 0x1320 for words 0..6, 0x1340 for 7..37, 0x1360
+// from 38. Word 50's own ECC bits do not count. After word 100 the overall parity of the
+// low 12 bits goes into bit 12.
+// ============================================================================
+
+pub fn ecc_base(idx: u32) u32 {
+    const off = idx * 32;
+    const past_800 = idx > 0x25;
+    if (past_800) {
+        return off + 0x1360;
+    }
+    const past_400 = idx > 0x6;
+    if (past_400) {
+        return off + 0x1340;
+    }
+    return off + 0x1320;
+}
+
+pub fn ecc_data(idx: u32, data: u32) u32 {
+    const is_ecc_word = idx == ECC_WORD;
+    if (is_ecc_word) {
+        return data & ECC_KEEP;
+    }
+    return data;
+}
+
+pub fn parity(v: u32) u32 {
+    var x : u32 = v;
+    x = x ^ (x >> 16);
+    x = x ^ (x >> 8);
+    x = x ^ (x >> 4);
+    x = x ^ (x >> 2);
+    x = x ^ (x >> 1);
+    return x & 1;
+}
+
+// Fold word idx of a frame into the running ECC.
+pub fn ecc_after(idx: u32, data: u32, ecc: u32) u32 {
+    const d = ecc_data(idx, data);
+    const base = ecc_base(idx);
+    var e : u32 = ecc;
+    var i : u32 = 0;
+    while i < 32 {
+        const set = ((d >> i) & 1) == 1;
+        if (set) {
+            e = e ^ (base + i);
+        }
+        i = i + 1;
+    }
+    const is_last = idx == LAST_WORD;
+    if (is_last) {
+        return e ^ (parity(e & 0xFFF) << 12);
+    }
+    return e;
+}
+
+pub fn ecc_stored(word50: u32) u32 {
+    return word50 & ECC_BITS;
+}
+
+pub fn ecc_ok(word50: u32, computed: u32) bool {
+    return (word50 & ECC_BITS) == (computed & ECC_BITS);
+}
+
+// Word 50 with its ECC replaced (updateECC, ecc.cc:55-60).
+pub fn with_ecc(word50: u32, ecc: u32) u32 {
+    return (word50 & ECC_KEEP) | (ecc & ECC_BITS);
+}
+
+// ============================================================================
+// Where a segbit lands (fasm2frames; prjxray tile_segbits.py:161-167,
+// tile_segbits_alias.py:34-41, fasm_assembler.py:79-137). A tile's segbit names a minor and
+// a bit counted from the tile's first word; the tile sits `off` words into the frame. An
+// aliased tile (*_SING IO tiles borrow the full IO tile's segbits) starts `shift` bits into
+// the borrowed table, so the bit lands at off*32 + bit - shift.
+// That can fall outside the frame on both sides. Above the frame (word >= 101) fasm2frames
+// prints an error and drops the bit. Below it -- the bottom *_SING tiles have off 0 and
+// shift 64 -- Python's floor division gives a negative word, and frames[addr][-1] is the
+// LAST word of the frame: the bit wraps to words 99..100. These functions reproduce both,
+// so a driver can count them; neither is a rule of the device.
+// ============================================================================
+
+pub const SEG_BITS : u32 = 3232;
+
+pub fn seg_below(off: u32, bit: u32, shift: u32) bool {
+    return off * 32 + bit < shift;
+}
+
+// A tile can also start below its frame: the kintex7 tilegrid gives the four
+// GTX_INT_INTERFACE_X89Y{150,200,250,300} tiles offset -2. prjxray computes
+// offset * 32 + bit (tile_segbits.py:165), so a negative offset subtracts the same way an
+// alias shift does, and the bit wraps as above. A driver keeps `off` unsigned and passes the
+// words below the frame here; the tile's own window still uses the alias shift alone.
+pub fn seg_shift(below_words: u32, shift: u32) u32 {
+    return below_words * 32 + shift;
+}
+
+pub fn seg_pos(off: u32, bit: u32, shift: u32) u32 {
+    const below = off * 32 + bit < shift;
+    if (below) {
+        return off * 32 + bit + SEG_BITS - shift;
+    }
+    return off * 32 + bit - shift;
+}
+
+pub fn pos_word(p: u32) u32 {
+    return p >> 5;
+}
+
+pub fn pos_bit(p: u32) u32 {
+    return p & 31;
+}
+
+pub fn pos_in_frame(p: u32) bool {
+    return p < SEG_BITS;
+}
+
+// The other direction (naming the bits of a bitstream): a segbit of the borrowed table
+// belongs to the tile only if it falls inside the tile's own `words`.
+pub fn seg_in_window(bit: u32, shift: u32, words: u32) bool {
+    return bit >= shift && bit < shift + words * 32;
+}
+
+// One bit asked for by several FASM lines (frame_set / frame_clear): asking twice for the
+// same value is fine, asking for both is FasmInconsistentBits.
+pub const BIT_NONE : u32 = 0;
+pub const BIT_SET : u32 = 1;
+pub const BIT_CLEAR : u32 = 2;
+pub const BIT_CONFLICT : u32 = 3;
+
+pub fn bit_merge(prev: u32, want: u32) u32 {
+    const fresh = prev == BIT_NONE;
+    if (fresh) {
+        return want;
+    }
+    const agrees = prev == want;
+    if (agrees) {
+        return prev;
+    }
+    return BIT_CONFLICT;
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+test ecc_codes_skip_single_bit_points {
+    assert ecc_base(0) == 0x1320;
+    assert ecc_base(6) == 6 * 32 + 0x1320;
+    assert ecc_base(7) == 7 * 32 + 0x1340;
+    assert ecc_base(0x25) == 0x25 * 32 + 0x1340;
+    assert ecc_base(0x26) == 0x26 * 32 + 0x1360;
+    assert ecc_base(LAST_WORD) + 31 <= ECC_BITS;
+}
+
+test ecc_ignores_its_own_bits {
+    assert ecc_after(ECC_WORD, ECC_BITS, 0) == 0;
+    assert ecc_after(ECC_WORD, 0x2000, 0) == ecc_base(ECC_WORD) + 13;
+}
+
+test ecc_parity_lands_in_bit_12 {
+    assert parity(0x320) == 1;
+    assert parity(0x321) == 0;
+    assert ecc_after(LAST_WORD, 0, 0x0320) == 0x1320;
+    assert ecc_after(LAST_WORD, 0, 0x0321) == 0x0321;
+}
+
+test with_ecc_keeps_the_high_bits {
+    assert with_ecc(0xABCDFFFF, 0x0123) == 0xABCDE123;
+    assert ecc_ok(with_ecc(0x12340000, 0x1ABC), 0x1ABC) == true;
+    assert ecc_stored(0xFFFFE001) == 1;
+}
+
+; The two frames below are copied word for word from a Vivado bitstream
+; (vivado/vendor/A_direct_top.bit, frames 833 and 1528 of its FDRI stream; every word not
+; listed is 0). Their ECC is the one Vivado wrote, not one this spec computed. Found with
+; `bitwalk --frame A_direct_top.bit 4` and `... 6`. Between them they set bits in all three
+; code ranges (words 0..6, 7..37, 38..100), and one stored ECC has bit 12 set and one not.
+test ecc_matches_vivado_frame_833 {
+    assert ecc_after(LAST_WORD, 0,
+           ecc_after(73, 0x00001005,
+           ecc_after(ECC_WORD, 0x00000ACC,
+           ecc_after(24, 0x00001005,
+           ecc_after(0, 0x0000D00D, 0))))) == 0x0ACC;
+}
+
+test ecc_matches_vivado_frame_1528 {
+    assert ecc_after(LAST_WORD, 0,
+           ecc_after(54, 0x00400000,
+           ecc_after(53, 0x40400000,
+           ecc_after(ECC_WORD, 0x00001AE2,
+           ecc_after(3, 0x40000000,
+           ecc_after(2, 0x00440005,
+           ecc_after(1, 0x40004400,
+           ecc_after(0, 0x40000001, 0)))))))) == 0x1AE2;
+}
+
+; Frame 1605 of the same file: word 50 is the only nonzero word, and it carries data above
+; its ECC bits (bit 26). The low 12 bits fold to odd parity, so this is the frame that fails
+; when the parity step is dropped -- the two frames above do not.
+test ecc_matches_vivado_frame_1605 {
+    assert ecc_after(LAST_WORD, 0, ecc_after(ECC_WORD, 0x040009BA, 0)) == 0x09BA;
+}
+
+; The six vectors fpga-assembler pins for the same function (lromor/fpga-assembler,
+; fpga/xilinx/arch-xc7-frame_test.cc:31-44, read 2026-10-02). They are computed from the rule,
+; not taken from a device, so they say "agrees with that implementation", nothing more.
+test ecc_agrees_with_fpga_assembler_vectors {
+    assert ecc_after(0, 0, 0) == 0;
+    assert ecc_after(0, 1, 0) == 0x1320;
+    assert ecc_after(0x7, 1, 0) == 0x1420;
+    assert ecc_after(0x26, 1, 0) == 0x1820;
+    assert ecc_after(ECC_WORD, 0xFFFFFFFF, 0) == 0x19AC;
+    assert ecc_after(LAST_WORD, 0, 1) == 0x1001;
+}
+
+; Positions, with the offsets of real xc7a100t tiles (prjxray-db 517d66a tilegrid):
+; CLBLM_R_X3Y0 sits at word 0, LIOB33_SING_X0Y0 at word 0 with alias start_offset 2
+; (shift 64), LIOB33_SING_X0Y149 at word 99 with no shift.
+test seg_positions_inside_the_frame {
+    assert seg_pos(0, 5, 0) == 5;
+    assert seg_pos(50, 13, 0) == 1613;
+    assert pos_word(1613) == 50;
+    assert pos_bit(1613) == 13;
+    assert seg_pos(0, 64, 64) == 0;
+    assert seg_pos(0, 127, 64) == 63;
+    assert seg_below(0, 64, 64) == false;
+}
+
+test seg_positions_below_the_frame_wrap_to_its_end {
+    assert seg_below(0, 2, 64) == true;
+    assert seg_pos(0, 2, 64) == 3170;
+    assert pos_word(3170) == 99;
+    assert pos_bit(3170) == 2;
+    assert seg_pos(0, 63, 64) == 3231;
+    assert pos_word(3231) == 100;
+    assert pos_in_frame(3231) == true;
+}
+
+test seg_positions_above_the_frame_are_dropped {
+    assert seg_pos(99, 63, 0) == 3231;
+    assert pos_in_frame(seg_pos(99, 63, 0)) == true;
+    assert pos_in_frame(seg_pos(99, 64, 0)) == false;
+    assert seg_pos(99, 64, 0) == 3232;
+}
+
+; GTX_INT_INTERFACE_X89Y150 on xc7k325t: offset -2, no alias, 2 words. Its bit 5 is
+; word -2 to Python, which reads it as word 99.
+test seg_positions_of_a_tile_below_its_frame {
+    assert seg_shift(2, 0) == 64;
+    assert seg_shift(0, 64) == 64;
+    assert seg_below(0, 5, seg_shift(2, 0)) == true;
+    assert seg_pos(0, 5, seg_shift(2, 0)) == 3173;
+    assert pos_word(3173) == 99;
+    assert pos_bit(3173) == 5;
+    assert seg_pos(0, 63, seg_shift(2, 0)) == 3231;
+    assert seg_in_window(5, 0, 2) == true;
+}
+
+test seg_window_is_the_tiles_own_words {
+    assert seg_in_window(64, 64, 2) == true;
+    assert seg_in_window(127, 64, 2) == true;
+    assert seg_in_window(63, 64, 2) == false;
+    assert seg_in_window(128, 64, 2) == false;
+    assert seg_in_window(0, 0, 2) == true;
+}
+
+test bit_merge_flags_set_and_clear {
+    assert bit_merge(0, 1) == 1;
+    assert bit_merge(0, 2) == 2;
+    assert bit_merge(1, 1) == 1;
+    assert bit_merge(2, 2) == 2;
+    assert bit_merge(1, 2) == 3;
+    assert bit_merge(2, 1) == 3;
+}

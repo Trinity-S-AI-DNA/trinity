@@ -1,0 +1,1746 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/turbobaby/events_booking.t27 -- the event booking machine: seats, the waitlist, and the
+; day an event belongs to.
+; One boundary, drawn twice. Sideways: between a seat that is HELD and a place in a line that
+; holds nothing, and the arithmetic that decides which door a customer walks through. Downward:
+; between an instant stored in UTC and the DATE a customer reads off a calendar, which is the
+; only collision rule this surface actually has. This file owns capacity and the exact-capacity
+; case, the three booking states, the waitlist's admission and promotion rules, the cancel-refund
+; shape, and the month arithmetic's boundary cases. It owns no person, no money vocabulary, no
+; clock and no proof of identity: who a request is belongs to turbobaby/request-identity, the wall
+; clock and the offset belong to turbobaby/market, what an unpublished locale renders belongs to
+; turbobaby/locale-policy, the distinction between a hidden row and a live surface belongs to
+; turbobaby/legacy-retirement, a queued outbound message belongs to turbobaby/notification-queue,
+; and what a sold-out event is WORTH to the promo sweeper belongs to turbobaby/promo-broadcast, and
+; whether an attempt is admitted inside a window belongs to turbobaby/rate-limit. Seven edges,
+; named here and below by ID and by declaration name, and not one of them restated. (The seven were
+; spelled as FILE NAMES in this paragraph until 2026-09-21; a file name is not a contract's name,
+; and the edge block below always used the IDs. Aligned so both halves of the file say the same.)
+; --
+; WHY (measured 2026-09-21). The number that forces this file is a ZERO, and it is a zero over
+; src/, not over specs/. src/api/events.rs is 2496 lines -- it was 1959 when this file was written
+; earlier the same day and 2290 after the delete refusal and the waitlist scan; the 206 lines since
+; are the delete's escape hatch, its tests and the comments that say why. Its routes() at :29-53
+; declares 11 HTTP
+; paths carrying 14 method bindings into 14 handlers, and src/api/mod.rs:90 merges them into the
+; public router unconditionally; src/ui/routes.rs:39-42 routes two screens onto them. Against all
+; of that, migration 085 retired exactly NONE: its only touch on this surface is one visibility
+; UPDATE at migrations/085_unpublish_woody_catalog.sql:25, which carries `WHERE is_public = TRUE`
+; and therefore cannot reach a row that does not exist yet. migrations/043_events_booking.sql:17
+; gives the column NOT NULL DEFAULT TRUE and the create handler defaults the same way at
+; src/api/events.rs:211. So the first TurboBaby event the owner inserts is public the instant it
+; lands, on a machine whose capacity rule, waitlist rule and promotion rule had no contract.
+; CORRECTED 2026-09-24, and the paragraph above is kept as the reading it was. Two of its sentences
+; stopped being true that day, one of them was never quite true, and the numbers are pinned below
+; under their own names with the old values kept beside them. "Routes two screens onto them" was
+; short by one: src/ui/routes.rs declared THREE client paths onto this surface -- /events and
+; /events/:id at :39-42, and /my-bookings at :43-44, whose handler mounted this module's
+; MyBookingsScreen -- and since the owner's ruling of 2026-09-24 (rental only, Phuket only;
+; turbobaby/legacy-retirement records it) all three render the live catalog instead, as /sets does.
+; And "public the instant it lands" is over: the admin API now stores an event's flag ANDed with
+; EVENTS_PUBLISHABLE, which is false, so no event it creates or edits is public; every customer
+; read below filters on that flag; and migrations/088_unpublish_events.sql hides, in 085's shape,
+; any row still public when it runs. The HTTP router did not move -- it is still merged, and
+; neither hide became a retirement of it.
+; --
+; THE SHARPEST SINGLE MEASUREMENT is the pair of comparisons that decide which door opens.
+; src/api/events.rs:626 refuses a booking on `taken + seats > cap`; src/api/events.rs:1359 refuses
+; a waitlist join on `taken < cap`. Equality belongs to the booking side: at taken + seats == cap
+; the seat is SOLD, not refused. The two predicates are exact complements for a one-seat booking,
+; so for any cap of one or more there is never a state where both doors are open and never a state
+; where both are shut -- except cap == 0, where both ARE shut, and that state is reachable because
+; migrations/043_events_booking.sql:20 permits max_seats = 0 and src/api/events.rs:196-200 admits
+; it. That exception is declared below rather than smoothed over.
+; --
+; WHERE THE BRIEF IS REFUTED. Five corrections, each measured 2026-09-21.
+;   1. "About 8 routes" undercounts. src/api/events.rs:29-53 has 11 `.route(` paths and 14 method
+;      bindings (:42 binds two, :43-46 binds three), resolving to 14 distinct handlers. The eight
+;      in the survey is the count turbobaby/legacy-retirement measured for LEGACY SCREEN routes and
+;      declares in LEGACY_LIVE_ROUTE_COUNT -- re-opened 2026-09-21 and still 8 -- a different
+;      surface; the events screens are two of them, at src/ui/routes.rs:39-42.
+;   2. "An attendee reachout is a queue row" is refuted at both of the tree's two reachouts.
+;      send_event_reminders sends directly at src/api/events.rs:2130 and send_event_bookings sends
+;      directly at :2026. A grep for `notification` over src/api/events.rs returns 0, and
+;      src/db/notifications.rs declared exactly three enqueue functions (:16, :38, :52), all three
+;      referral; since 2026-09-26 (R3) it declares one (:16), and the other two are dated comments
+;      where they stood. The consequence is not cosmetic: the queue retries three times
+;      (src/notification_queue.rs:21, was :20) and a direct send has one attempt and a `continue`
+;      (src/api/events.rs:2134-2142). The edge to notification-queue is still taken below, as the
+;      owner of the shape these two reachouts do NOT use.
+;   3. "The waitlist migration (survey says 045 - confirm)" -- confirmed exactly.
+;      migrations/045_events_waitlist_status.sql:4-9 drops the two-value CHECK and re-adds it with
+;      three. That is the whole of the waitlist's storage: no separate table, no position column,
+;      no joined_at beyond created_at.
+;   4. "What happens at exactly capacity" has TWO answers, not one, and the survey implies one.
+;      The last seat is sold (:626, strict `>`), and the same instant opens the waitlist (:1359,
+;      strict `<`). Both are pinned below, and the complementarity is an invariant.
+;   5. The same-day question has no limit to find. migrations/043 declares no unique key over
+;      `events` beyond the primary key at :6, and src/api/events.rs:1454-1477 is a plain INSERT
+;      with no ON CONFLICT arm. tests/integration_events_same_day.rs designs four events onto one
+;      date through the admin handler (:279-375) -- but all four of its tests are `#[ignore]`d
+;      (:134, :210, :237, :278) and return early without a database, so the test is a named case
+;      and not a proof, and the schema is what carries the verdict. The real rule
+;      the test names at :68-72 is a GROUPING rule, and it is a timezone rule: the date comes from
+;      the market-local instant (src/ui/screens/events_screen.rs:73-77 over :63-67), so two events
+;      can share a calendar day while their UTC days differ.
+; CORRECTED 2026-09-24, refutation 1's last sentence: "the events screens are two of them" was
+; false when written. The events paths were never members of turbobaby/legacy-retirement's
+; LEGACY_LIVE_ROUTES, whose members and count are that file's to state; which is why that set did
+; not change when the owner's ruling repointed the three event paths on 2026-09-24.
+; --
+; WHAT THIS FILE NEVER DOES. It carries no attendee: no telegram id, no handle, no first name, no
+; booking id, no event fixture standing for a real evening. The guest-list formatter's own
+; identifiers are named by path and never by value. It invents no capacity: the tree defines no
+; event TYPE at all -- no column in migrations 043, 045, 051, 052, 055 or 070, no variant in
+; src/db/entities/event.rs -- so a per-type seat count would be a number this repository has never
+; held, and the refusal is declared instead. It quotes no Cyrillic shipped string: the reminder
+; body, the guest-list header and the empty-list line are cited by path and line, never by
+; wording. It states no price and no currency; a Stars amount appears only as the abstract
+; quantity a promotion must clear. It declares no HTTP numeral a sibling already owns. Nothing
+; from D14 -- no renter, handle, phone, key code, plate, debt, purchase price or personal note --
+; in a constant, a comment or a test.
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module turbobaby-events-booking;
+
+pub const KIND : str = "booking-contract";
+pub const ID : str = "turbobaby/events-booking";
+pub const NAME : str = "TurboBaby event booking, waitlist and calendar day";
+pub const WORLD : str = "gHashTag/turbobaby-user-bot";
+pub const MEASURED_AT : str = "2026-09-21";
+
+; --- Sources ------------------------------------------------------------------------------------
+pub const HTTP_SOURCE : str = "src/api/events.rs";
+pub const CALENDAR_SOURCE : str = "src/trios/calendar.rs";
+pub const ATTENDEE_SOURCE : str = "src/trios/attendees.rs";
+pub const SCREEN_SOURCE : str = "src/ui/screens/events_screen.rs";
+pub const EVENT_ENTITY : str = "src/db/entities/event.rs";
+pub const PHOTO_ENTITY : str = "src/db/entities/event_photo.rs";
+pub const BASE_MIGRATION : str = "migrations/043_events_booking.sql";
+pub const WAITLIST_MIGRATION : str = "migrations/045_events_waitlist_status.sql";
+pub const STARS_MIGRATION : str = "migrations/051_events_stars_price.sql";
+pub const REMINDER_MIGRATION : str = "migrations/052_event_reminders.sql";
+pub const GALLERY_MIGRATION : str = "migrations/055_event_photos_video.sql";
+pub const IDENTITY_MIGRATION : str = "migrations/070_event_bookings_username.sql";
+pub const SAME_DAY_WITNESS : str = "tests/integration_events_same_day.rs";
+; wc -l over the tracked sources, so "the whole file" is a measurement and not a mood. RE-MEASURED
+; 2026-09-21 after the delete refusal, the waitlist scan and the shared seat subtraction landed:
+; src/api/events.rs read 1959 and src/trios/calendar.rs 405 earlier the same day, and both numbers
+; below are the ones after that change. RE-MEASURED AGAIN the same day, after the delete's escape
+; hatch: src/api/events.rs read 2290 between the two and reads 2496 now, so every citation into it
+; past the delete moved by 140 and is written below at its new address; the calendar, attendee and
+; witness files that change did not touch keep the earlier reading. Every src/api/events.rs line this file cites IN ITS OWN
+; VOICE is likewise the line AFTER it, and where a citation moved far enough to matter the old
+; number is named beside the new one. The exception is deliberate and is the only one: inside a
+; QUOTED superseded paragraph -- the blocks below that begin "This paragraph read:" -- the line
+; numbers are the ones the quoted text carried, i.e. the pre-change file, and they do not point
+; at today's source. Quoting a measurement means quoting its addresses too; re-pointing them
+; would make the quote say something it never said. Corrected 2026-09-21 by this file's
+; adversarial review, which found the sentence above claiming ALL citations were post-change
+; while four quoted ones were not.
+; CORRECTED 2026-09-26: 2545 until that day's reversal of the reminder (REMINDER_REVERSED_AT), which
+; changed the reminder's join and doc comment in place and appended one database test at the end of
+; the test module, below every line this file cites; no citation moved.
+pub const HTTP_SOURCE_LINES : u16 = 2680;
+pub const HTTP_SOURCE_LINES_BEFORE_2026_09_26 : u16 = 2545;
+; CORRECTED 2026-09-24: HTTP_SOURCE_LINES was 2496. The owner's ruling of that day added 49 lines to
+; src/api/events.rs, every one of them BELOW the last line this file cites -- the EVENTS_PUBLISHABLE
+; constant, the storable_public_flag gate and one test, all after spawn_event_reminder_loop -- and
+; changed two lines in place, the create default at :211 and the edit's flag at :312. So no citation
+; into the file moved, and none is re-pointed here.
+pub const HTTP_SOURCE_LINES_BEFORE_2026_09_24 : u16 = 2496;
+pub const CALENDAR_SOURCE_LINES : u16 = 482;
+pub const ATTENDEE_SOURCE_LINES : u16 = 357;
+pub const SAME_DAY_WITNESS_LINES : u16 = 376;
+; CORRECTED 2026-09-24: SAME_DAY_WITNESS_LINES was 339. Under the owner's ruling of that day the
+; admin API stores every event non-public, so the witness's write-side test could no longer find
+; its four events on the customer calendar; it now asserts that the calendar shows none of them and
+; reads the four from the admin's own list, each stored non-public. All 37 new lines sit inside that
+; test, below its start at :279, so the witness citations above it (:68-72, :134, :210, :237, :278)
+; did not move; its span, cited as :279-338 in refutation 5, is re-pointed there to :279-375.
+pub const SAME_DAY_WITNESS_LINES_BEFORE_2026_09_24 : u16 = 339;
+
+; --- Ownership edges ------------------------------------------------------------------------------
+; The pinned compiler lowers a brace import to an empty UseDecl and the gate rejects it, so a
+; cross-contract edge is a string holding the owner's ID plus a test asserting the literal. Every
+; edge below is named by ID and by the NAME of the declaration it leans on, never by line.
+;
+; CORRECTED 2026-09-21. This paragraph used to say "ten contracts were written beside this one in a
+; single wave". That number was wrong and wrong in the reassuring direction: counted from git, the
+; commit that added this file added THIRTEEN new contracts (and modified a fourteenth), and the TEN
+; belongs to the wave BEFORE it. So more siblings were moving under a line number than the sentence
+; admitted, not fewer. "Goes stale inside the hour" is dropped with the bad count -- nobody timed
+; the interval, and an untimed figure has no place beside measured ones.
+;
+; The corpus-wide RESIDUE is refused a constant here for a reason that proves the point: counted at
+; 63 when this correction began and at 7 a few minutes later, because sibling contracts are being
+; repaired in parallel. Pinning a live total would publish a number that goes stale before the
+; commit carrying it lands, which is the very defect this paragraph exists to warn about. What is
+; pinned is what cannot move: the wave sizes, which are git history, and this file's own
+; contribution, which is zero. Citations into src/, migrations/, data/, docs/ and DECISIONS.md are
+; different -- those files were not moving -- and they stay.
+pub const CORPUS_T27_FILE_COUNT : u8 = 43;
+pub const OWN_WAVE_NEW_CONTRACTS : u8 = 13;
+pub const PRIOR_WAVE_NEW_CONTRACTS : u8 = 10;
+pub const SIBLING_LINE_CITATIONS_IN_THIS_FILE : u8 = 0;
+pub const CORPUS_RESIDUE_IS_PINNED_HERE : bool = false;
+pub const CORPUS_RESIDUE_NOTE : str = "Counted twice on 2026-09-21 during this correction: 63 at the start and 7 a few minutes later. The drop is sibling contracts being repaired in parallel, not a measurement error. A live corpus-wide total is therefore refused a constant here, because pinning one would publish a number that goes stale before the commit carrying it lands. Any reader who needs today's figure can grep for it in one line; what this file owes is the two wave counts a grep cannot recover, and those are above.";
+pub const WAVE_CENSUS_MEASURED_AT : str = "2026-09-21";
+pub const WAVE_CENSUS_SOURCE : str = "git log over specs/turbobaby, added-file counts per commit";
+pub const STALENESS_INTERVAL_IS_PUBLISHED : bool = false;
+
+pub fn edge_is_durable(names_a_declaration: bool, names_a_line_number: bool) bool {
+  return names_a_declaration and !names_a_line_number;
+}
+;
+; legacy-retirement owns the one distinction this file would otherwise have had to invent: that
+; hiding DATA and retiring a SURFACE are different acts. Its HIDDEN_TABLES array already names
+; `events` and its data_decision_changes_the_surface already answers no. This file therefore
+; declares no retirement state of its own; it declares only the consequence for a NEW row, which
+; that contract does not cover because a visibility flag cannot reach a row that does not exist.
+pub const REUSES_LEGACY_RETIREMENT_ID : str = "turbobaby/legacy-retirement";
+; market owns the shop clock -- the offset, the zone name and the fact that it has no DST, in
+; TH_UTC_OFFSET_HOURS, TH_TIMEZONE and TH_DST. This file consumes the offset as an abstract whole
+; number of hours east and declares no zone, no offset literal and no DST rule. That discipline is
+; not decorative: src/api/events.rs:2063-2067 records a repaired bug where a hardcoded seven-hour
+; shift was typed UTC, and the repaired call at :1928 goes through the market clock.
+pub const REUSES_MARKET_ID : str = "turbobaby/market";
+; locale-policy owns the published locale set and what an unpublished one renders, in
+; PUBLISHED_LOCALES and resolution_is_total. Every customer-facing sentence on this surface is a
+; key in src/trios/i18n.rs selected at src/api/events.rs:2080-2084 and throughout the events
+; screen; this file pins the obligation that a sentence exists and never the sentence.
+pub const REUSES_LOCALE_POLICY_ID : str = "turbobaby/locale-policy";
+; notification-queue owns a queued outbound message: its row, its attempt budget and its drain, in
+; MAX_ATTEMPTS and drain_admits_row. Named here precisely because this surface does NOT use it --
+; see refutation 2 in the header. The abstract parameter this file takes from that contract is a
+; single boolean, is_queue_row, and the attempt count it implies.
+pub const REUSES_NOTIFICATION_QUEUE_ID : str = "turbobaby/notification-queue";
+; request-identity owns who a request is and the three gates, in identity_of_request and
+; strict_proof_ok. This file takes the gate's verdict as booleans and restates no gate, no
+; precedence and no attempt bound. Worth naming for one measured reason: the handle stored on a
+; booking row comes from validated initData and never from the request body
+; (src/api/events.rs:348-362 says why), so the identity edge is load-bearing on the guest list and
+; not only on the door.
+pub const REUSES_REQUEST_IDENTITY_ID : str = "turbobaby/request-identity";
+; rate-limit owns whether an attempt is admitted inside a window, in attempt_admitted. This file
+; makes two statements about that surface -- book_event carries a limiter (src/api/events.rs:528-540
+; with the budget at :25-26) and join_waitlist carries none (:1307-1405) -- and declares neither
+; budget, neither window nor any admission rule. The edge is added 2026-09-21 by this file's
+; adversarial review so that nobody later writes the event-booking budget into a booking contract.
+pub const REUSES_RATE_LIMIT_ID : str = "turbobaby/rate-limit";
+; promo-broadcast was not in this file's brief and is owed anyway: it already owns what a SOLD-OUT
+; event is worth to the promo sweeper, in the rule its own invariant calls
+; a_sold_out_event_is_ranked_below_everything_that_still_has_a_seat. That contract consumes the
+; verdict; this one defines it. The seam is one grep away and is named so nobody defines
+; "sold out" twice.
+pub const REUSES_PROMO_BROADCAST_ID : str = "turbobaby/promo-broadcast";
+pub const REUSE_EDGE_COUNT : u8 = 7;
+
+; --- The surface, counted -------------------------------------------------------------------------
+; src/api/events.rs:29-53. Paths and method bindings differ because :42 binds get and post to one
+; path and :43-46 binds get, put and delete to another.
+pub const HTTP_PATH_COUNT : u8 = 11;
+pub const HTTP_METHOD_BINDING_COUNT : u8 = 14;
+pub const HANDLER_COUNT : u8 = 14;
+pub const PUBLIC_PATH_COUNT : u8 = 6;
+pub const ADMIN_PATH_COUNT : u8 = 5;
+pub const ROUTER_MERGE_SITE : str = "src/api/mod.rs:90";
+pub const SCREEN_ROUTE_COUNT : u8 = 3;
+pub const SCREEN_ROUTES : [3]str = ["/events", "/events/:id", "/my-bookings"];
+pub const SCREEN_ROUTE_SITE : str = "src/ui/routes.rs:39-44";
+; CORRECTED 2026-09-24: the client paths onto this surface were three, not two -- /my-bookings at
+; src/ui/routes.rs:43 mounted this module's MyBookingsScreen and was left out. The old values are
+; kept below. Since the owner's ruling of the same day the three are still DECLARED (a link already
+; sent never expires) and none of them MOUNTS an events screen: their handlers render the catalog,
+; which is what EVENT_SCREENS_MOUNTED_BY_THE_CLIENT_ROUTER counts. The screens themselves still
+; compile in SCREEN_SOURCE, unmounted.
+pub const SCREEN_ROUTE_COUNT_BEFORE_2026_09_24 : u8 = 2;
+pub const SCREEN_ROUTES_BEFORE_2026_09_24 : [2]str = ["/events", "/events/:id"];
+pub const SCREEN_ROUTE_SITE_BEFORE_2026_09_24 : str = "src/ui/routes.rs:39-42";
+pub const EVENT_SCREENS_MOUNTED_BY_THE_CLIENT_ROUTER : u8 = 0;
+pub const EVENT_SCREENS_MOUNTED_BY_THE_CLIENT_ROUTER_BEFORE_2026_09_24 : u8 = 3;
+
+; --- D19: a hidden row is not a retired route -------------------------------------------------
+; migrations/085_unpublish_woody_catalog.sql:25 flips events.is_public to FALSE; :23 states no
+; table is dropped and no row deleted; :5-6 and DECISIONS.md:359 count the rows it hid. (The
+; earlier citation here said :6 alone; the words "30 events" sit at the end of :5 and :6 continues
+; the same sentence. Corrected 2026-09-21 by this file's adversarial review.)
+pub const HIDE_MIGRATION : str = "migrations/085_unpublish_woody_catalog.sql";
+pub const HIDDEN_EVENT_ROWS : u8 = 30;
+pub const HIDE_ROW_DELETES : u16 = 0;
+pub const HIDE_TABLE_DROPS : u16 = 0;
+pub const HIDE_VISIBILITY_UPDATES_ON_EVENTS : u8 = 1;
+pub const EVENT_ROUTES_RETIRED_BY_THE_HIDE : u8 = 0;
+pub const EVENT_SCREENS_RETIRED_BY_THE_HIDE : u8 = 0;
+
+; A hide retires a surface only if the surface stopped answering. Both the router merge and the
+; screen routes are measured live, so this returns false on the state this repository is in.
+; CORRECTED 2026-09-24: half of that sentence is now false. The screen routes no longer mount a
+; screen (EVENT_SCREENS_MOUNTED_BY_THE_CLIENT_ROUTER is 0), and the router merge is still live, so
+; the function still returns false on this tree -- for one reason now, not two. And it would
+; return false even with both: the screens went on the owner's ruling, not on the hide.
+pub const EVENT_HTTP_ROUTER_STILL_MERGED : bool = true;
+pub const EVENT_SCREENS_UNROUTED_BY_THE_RULING : u8 = 3;
+pub fn hide_retired_the_surface(rows_hidden: bool, routes_unmerged: bool, screens_unrouted: bool) bool {
+  if (!rows_hidden) {
+    return false;
+  }
+  return routes_unmerged and screens_unrouted;
+}
+
+; The owner's first TurboBaby event. The column default is NOT NULL DEFAULT TRUE
+; (migrations/043_events_booking.sql:17) and the handler default agrees (src/api/events.rs:211),
+; so an omitted flag means public. 085's UPDATE cannot reach it: its WHERE clause selects rows
+; that were public at migration time.
+pub fn new_event_is_public(flag_supplied: bool, flag_value: bool) bool {
+  if (flag_supplied) {
+    return flag_value;
+  }
+  return true;
+}
+
+; CORRECTED 2026-09-24. new_event_is_public still describes the REQUEST: an omitted flag still
+; reads as a request for public at src/api/events.rs:211. What is STORED is not that any more. On
+; the owner's ruling the handler stores storable_public_flag(requested), which is the requested
+; flag ANDed with EVENTS_PUBLISHABLE, and an edit stores a supplied flag the same way (:312) and
+; leaves an omitted one alone. EVENTS_PUBLISHABLE is false, so no event the admin API creates or
+; edits is public, and every customer read -- the calendar, one event, a booking, a waitlist join --
+; filters on the flag. EVENTS_PUBLISHABLE_BEFORE_2026_09_24 is the value the old behaviour had, and
+; flipping the constant back restores the write path exactly.
+; The write gate alone cannot reach a row that is ALREADY public: one made public between migration
+; 085 and this change, which D19 expected (TurboBaby events on a clean public slate) and the create
+; default made easy. Whether such a row exists is a production read this lane does not make, so the
+; answer does not wait on it: migrations/088_unpublish_events.sql flips every row still public to
+; hidden in 085's shape -- one visibility UPDATE on events, no row deleted, no table dropped, and
+; idempotent where 085 left nothing public. After it runs no row is public, and the admin API can
+; make none, so the four public reads and the promo sweeper's event scans have nothing to answer
+; with. What stays is what never filtered the flag, and it is listed below.
+pub const EVENTS_PUBLISHABLE : bool = false;
+pub const EVENTS_PUBLISHABLE_BEFORE_2026_09_24 : bool = true;
+pub const RULING_HIDE_MIGRATION : str = "migrations/088_unpublish_events.sql";
+pub const RULING_HIDE_VISIBILITY_UPDATES_ON_EVENTS : u8 = 1;
+pub const RULING_HIDE_ROW_DELETES : u16 = 0;
+pub const RULING_HIDE_TABLE_DROPS : u16 = 0;
+pub const RULING_HIDE_READ_PRODUCTION_FIRST : bool = false;
+
+pub fn new_event_is_stored_public(flag_supplied: bool, flag_value: bool, publishable: bool) bool {
+  return new_event_is_public(flag_supplied, flag_value) and publishable;
+}
+
+pub fn edit_stores_public(flag_supplied: bool, flag_value: bool, publishable: bool, stored_before: bool) bool {
+  if (!flag_supplied) {
+    return stored_before;
+  }
+  return flag_value and publishable;
+}
+
+; Whether an event row can be public once this change is deployed. A row the admin API writes is
+; public only if the write gate lets it be; a row that was public before is public only while 088
+; has not run. hide_retired_the_surface above still says what neither of them is: a retirement.
+pub fn a_public_row_survives(public_before_088: bool, migration_088_ran: bool, written_by_admin_after: bool, publishable: bool) bool {
+  if (written_by_admin_after) {
+    return publishable;
+  }
+  if (public_before_088) {
+    return !migration_088_ran;
+  }
+  return false;
+}
+
+; --- What the ruling of 2026-09-24 reached, and what it kept -------------------------------------
+; The share card. POST /api/share/prepare built a Telegram card for kind=event from the events row
+; with no is_public filter, so a hidden event could still be rendered into a card by id. Since the
+; ruling the event kind answers as the retired strain kind already did: it stays parseable, so the
+; client's wire vocabulary and the server's cannot diverge, and it answers not found.
+pub const EVENT_SHARE_CARD_IS_BUILT : bool = false;
+pub const EVENT_SHARE_CARD_IS_BUILT_BEFORE_2026_09_24 : bool = true;
+pub const EVENT_SHARE_KIND_STAYS_PARSEABLE : bool = true;
+pub const EVENT_SHARE_REFUSAL_ARMS : u8 = 1;
+; Kept on purpose, because each carries money or a promise already made, and named rather than
+; decided: the customer's own bookings list and self-cancel over HTTP (the Stars refund path), the
+; admin's guest list and cancel (the other refund path), and the 24-hour reminder to a confirmed
+; seat, which fires only for a booking a customer already holds. The Mini App no longer shows the
+; list: /my-bookings renders the catalog. The four other public paths answer only is_public rows,
+; of which 088 leaves none and the admin API can make none. The promo sweeper's event scans filter
+; the same flag and are therefore dormant, not removed. None of the kept paths filters the flag, so
+; 088 changes none of them. Whether any of these should go too is the owner's question.
+; REVERSED 2026-09-26 for the reminder, by the operator, under the owner's answer 3 of 2026-09-25
+; (quoted verbatim in the rules' module, src/trios/legacy_view.rs; this file stays ASCII), read as:
+; analyse all the previous shop's content a customer can still see and take it out of sight. The reminder was kept because it carries a promise already made. But since 085 and 088
+; every event is hidden, and every event that can still be reminded is one the previous shop made:
+; the reminder mailed its stored title and venue to the seat holder, a message a customer reads in
+; Telegram, outside any screen the ruling of 2026-09-24 closed. So it now joins public events only
+; (REMINDER_FILTERS_THE_FLAG, the join in send_event_reminders): a hidden event is never reminded,
+; its booking keeps reminder_sent_at empty, and nothing is written for it. A public event is reminded
+; exactly as before, so flipping EVENTS_PUBLISHABLE back brings the reminder back with it. The two
+; kept HTTP paths -- the customer's bookings list and self-cancel with its Stars refund -- and the
+; admin's guest list and cancel with theirs are not touched: a seat already held can still be
+; cancelled and refunded as before (REMINDER_REVERSAL_TOUCHES_A_REFUND).
+pub const KEPT_CUSTOMER_EVENT_HTTP_PATHS : u8 = 2;
+pub const PUBLIC_EVENT_PATHS_GATED_ON_THE_FLAG : u8 = 4;
+pub const REMINDER_KEPT_FOR_SEATS_ALREADY_HELD : bool = false;
+pub const REMINDER_KEPT_FOR_SEATS_ALREADY_HELD_BEFORE_2026_09_26 : bool = true;
+pub const REMINDER_REVERSED_AT : str = "2026-09-26";
+pub const REMINDER_REVERSED_BY : str = "operator, under the owner's answer 3 of 2026-09-25";
+pub const REMINDER_REVERSAL_READS : str = "Hidden events are the previous shop's, and the reminder mailed their stored titles and venues to seat holders.";
+pub const REMINDER_FILTERS_THE_FLAG : bool = true;
+pub const REMINDER_FLAG_FILTERED_JOINS : u8 = 1;
+pub const REMINDER_REVERSAL_TOUCHES_A_REFUND : bool = false;
+pub const REMINDER_REVERSAL_WRITES_A_ROW : bool = false;
+
+; Whether the 24-hour reminder is sent for a confirmed, unreminded booking of an event starting in
+; its window: only when the event is public.
+pub fn reminder_is_sent(event_is_public: bool) bool {
+  return event_is_public;
+}
+pub const CUSTOMER_BOOKINGS_SCREEN_IS_MOUNTED : bool = false;
+pub const CUSTOMER_BOOKINGS_SCREEN_IS_MOUNTED_BEFORE_2026_09_24 : bool = true;
+
+; --- The three booking states -------------------------------------------------------------------
+; migrations/045_events_waitlist_status.sql:9 is the whole vocabulary. Zero is UNSET and is never
+; a stored value, for the reason turbobaby/order-status gives for its own set in STATUS_UNSET
+; (re-opened 2026-09-21: that owner still declares zero as UNSET and never as an accepted status):
+; an unwritten slot in a
+; fixed-length array already holds zero, and a vocabulary starting at zero turns an unwritten slot
+; into a confident answer. The residual error here falls towards refusing to treat a row as a
+; seat, which loses nobody a place, rather than towards counting a phantom one.
+pub const BOOKING_STATE_UNSET : u8 = 0;
+pub const BOOKING_STATE_CONFIRMED : u8 = 1;
+pub const BOOKING_STATE_CANCELLED : u8 = 2;
+pub const BOOKING_STATE_WAITLISTED : u8 = 3;
+pub const BOOKING_STATE_COUNT : u8 = 3;
+pub const BOOKING_STATE_NAMES : [3]str = ["confirmed", "cancelled", "waitlisted"];
+; migrations/043_events_booking.sql:32.
+pub const BOOKING_STATE_DEFAULT : str = "confirmed";
+; The waitlist has no table and no rank column of its own: 045 widened one CHECK and added
+; nothing else.
+pub const WAITLIST_HAS_ITS_OWN_TABLE : bool = false;
+pub const WAITLIST_HAS_A_POSITION_COLUMN : bool = false;
+
+pub fn booking_state_is_known(code: u8) bool {
+  return code >= BOOKING_STATE_CONFIRMED and code <= BOOKING_STATE_WAITLISTED;
+}
+
+; Name to code, closed over the CHECK constraint. Anything else -- a misspelling, a case variant,
+; an empty string -- is UNSET, which is the verdict Postgres itself gives it: the constraint
+; refuses the write.
+pub fn booking_state_code_of(name: str) u8 {
+  if (name == "confirmed") {
+    return BOOKING_STATE_CONFIRMED;
+  }
+  if (name == "cancelled") {
+    return BOOKING_STATE_CANCELLED;
+  }
+  if (name == "waitlisted") {
+    return BOOKING_STATE_WAITLISTED;
+  }
+  return BOOKING_STATE_UNSET;
+}
+
+; Only a confirmed row occupies a seat, and this is not an opinion: every count of `taken` in the
+; tree filters status = 'confirmed' -- src/api/events.rs:417, :453, :620, :1061, :1348, :1419 and
+; :1541, seven sites, no exception. A waitlisted row holds a place in a line and nothing else.
+pub fn state_occupies_a_seat(code: u8) bool {
+  return code == BOOKING_STATE_CONFIRMED;
+}
+
+; --- Capacity, and the exact-capacity case ------------------------------------------------------
+; src/api/events.rs:616-630. `max_seats` is nullable (migrations/043_events_booking.sql:15), and a
+; NULL skips the whole check at :617 -- an event with no declared capacity can never sell out.
+; The comparison at :626 is strict, so the seat that brings the count level with the cap is SOLD.
+; The seat count per booking is not an assumption: src/api/events.rs:544-548 maps an absent field
+; and an explicit 1 to one seat and answers 400 to anything else, so `seats` is always 1 on the
+; write path even though migrations/043_events_booking.sql:31 would store more. (Citation added
+; 2026-09-21 by this file's adversarial review -- these two constants carried no file:line.)
+pub const SEATS_PER_BOOKING : u32 = 1;
+pub const MULTI_SEAT_REQUEST_IS_REFUSED : bool = true;
+pub const CAPACITY_MIN : u32 = 0;
+pub const CAPACITY_MAX : u32 = 1000000;
+pub const CAPACITY_IS_NULLABLE : bool = true;
+pub const EQUALITY_BELONGS_TO_THE_BOOKING_SIDE : bool = true;
+
+pub fn capacity_is_in_range(cap: u32) bool {
+  return cap >= CAPACITY_MIN and cap <= CAPACITY_MAX;
+}
+
+pub fn booking_fits(capacity_declared: bool, cap: u32, taken: u32, seats: u32) bool {
+  if (!capacity_declared) {
+    return true;
+  }
+  return taken + seats <= cap;
+}
+
+; src/api/events.rs:1337-1361. Three refusals before a place in the line: the event must be
+; public and exist (:1326-1336), the cap must be a positive number (:1337-1341 -- an unlimited
+; event unwraps to 0 and is refused), and the seats must actually be gone (:1359).
+pub fn waitlist_open(capacity_declared: bool, cap: u32, taken: u32) bool {
+  if (!capacity_declared) {
+    return false;
+  }
+  if (cap == 0) {
+    return false;
+  }
+  return taken >= cap;
+}
+
+; The two doors for a one-seat booking. For any cap of one or more exactly one of them is open,
+; which is the property that makes "sold out" a total verdict rather than a gap.
+pub fn exactly_one_door_is_open(cap: u32, taken: u32) bool {
+  if (booking_fits(true, cap, taken, SEATS_PER_BOOKING)) {
+    return !waitlist_open(true, cap, taken);
+  }
+  return waitlist_open(true, cap, taken);
+}
+
+; The one state where both doors are shut, declared rather than smoothed over. A zero-capacity
+; event is creatable: migrations/043_events_booking.sql:20 permits it and src/api/events.rs:196-200
+; admits it. Booking gives sold_out, the waitlist gives a 400, and the customer has no next step.
+pub const ZERO_CAPACITY_IS_CREATABLE : bool = true;
+pub const ZERO_CAPACITY_SHUTS_BOTH_DOORS : bool = true;
+
+; What the read API publishes as remaining seats. src/api/events.rs:341-343 clamps at zero, so an
+; overbooked row -- which the write path cannot produce but a lowered max_seats or a direct SQL
+; edit can -- reads as zero over HTTP and never as a negative number. This function models THAT
+; number.
+;
+; MEASURED CORRECTION, 2026-09-21, adversarial review of this file, and FIXED the same day. The
+; correction read: "the screen does NOT agree, and the earlier claim here that it did was wrong.
+; The screen's own count at src/ui/screens/events_screen.rs:250-252 is
+; `max_seats.map(|cap| cap.saturating_sub(seats_taken))` over i32, and i32 saturation floors at
+; i32::MIN, not at 0; the result goes straight into the seats label at :272 with no further clamp.
+; The same overbooked row therefore publishes 0 on the API and a negative number on the screen."
+; Both ends now call ONE function, src/trios/calendar.rs:375 `seats_free`, which subtracts in i64
+; and clamps to 0..=i32::MAX (D15). The API's call is at src/api/events.rs:343 and the screen's two
+; are at src/ui/screens/events_screen.rs:256 and :399, the second of which had the same defect and
+; is not the one the correction named. The disagreement is therefore gone rather than modelled, and
+; SCREEN_CLAMPS_SEATS_AT_ZERO says so; the invariant below that pinned the two as UNEQUAL is
+; replaced by one that pins them as equal, which is the only honest way to record a fix.
+pub const API_CLAMPS_SEATS_AT_ZERO : bool = true;
+pub const SCREEN_CLAMPS_SEATS_AT_ZERO : bool = true;
+pub const SEATS_FREE_IMPLEMENTATION_COUNT : u8 = 1;
+pub const SEATS_FREE_IMPLEMENTATION : str = "src/trios/calendar.rs:375 seats_free, called from src/api/events.rs:343 and from src/ui/screens/events_screen.rs:256 and :399";
+
+pub fn seats_available(capacity_declared: bool, cap: u32, taken: u32) u32 {
+  if (!capacity_declared) {
+    return 0;
+  }
+  if (taken >= cap) {
+    return 0;
+  }
+  return cap - taken;
+}
+
+; --- The door before the door: the event must not have started ---------------------------------
+; src/api/events.rs:598-602, inside the transaction and after the event row is locked at :588-592.
+; This is checked for a booking and NOT for a waitlist join: join_waitlist never reads starts_at,
+; so a line can still form for an evening already under way. Recorded as measured, not endorsed.
+pub const BOOKING_CHECKS_START_TIME : bool = true;
+pub const WAITLIST_CHECKS_START_TIME : bool = false;
+
+pub fn booking_door_open(event_public: bool, event_started: bool, capacity_declared: bool, cap: u32, taken: u32) bool {
+  if (!event_public) {
+    return false;
+  }
+  if (event_started) {
+    return false;
+  }
+  return booking_fits(capacity_declared, cap, taken, SEATS_PER_BOOKING);
+}
+
+; --- The duplicate guards, which do not agree ---------------------------------------------------
+; MEASURED DEFECT, reported as a measurement and not rewritten into a rule. book_event's guard at
+; src/api/events.rs:607 reads `status = 'confirmed'`; join_waitlist's at :1369 reads
+; `IN ('confirmed','waitlisted')`. The asymmetry is one-directional and reachable: a waitlisted
+; customer whose seat frees can call the book endpoint, pass the guard, and end holding a confirmed
+; row AND a live waitlisted row. The partial unique index at
+; migrations/043_events_booking.sql:47-49 does not catch it -- it covers
+; `status = 'confirmed' AND idempotency_key IS NULL` and the surviving row is not confirmed. A
+; later cancellation can then promote his own stale row.
+pub const GUARDS_AGREE : bool = false;
+
+pub fn duplicate_guard_sees(state: u8, guard_is_the_booking_one: bool) bool {
+  if (guard_is_the_booking_one) {
+    return state == BOOKING_STATE_CONFIRMED;
+  }
+  return state == BOOKING_STATE_CONFIRMED or state == BOOKING_STATE_WAITLISTED;
+}
+
+pub fn one_person_can_hold_two_rows(waitlisted_already: bool, a_seat_freed: bool) bool {
+  if (!waitlisted_already) {
+    return false;
+  }
+  if (!a_seat_freed) {
+    return false;
+  }
+  return !duplicate_guard_sees(BOOKING_STATE_WAITLISTED, true);
+}
+
+; --- Promotion ------------------------------------------------------------------------------------
+; src/api/events.rs:1052-1246 (:994-1141 before 2026-09-21). Promotion has no trigger of its own:
+; it lives inside cancel_booking_and_promote and runs nowhere else. Both cancel endpoints call it
+; -- the customer's at :1299 and the admin's at :1905 -- and no sweep, no loop and no boot path
+; does.
+pub const PROMOTION_TRIGGER_COUNT : u8 = 1;
+pub const PROMOTION_TRIGGER : str = "a committed cancellation, src/api/events.rs:1052-1246";
+pub const PROMOTIONS_PER_CANCEL_MAX : u8 = 1;
+; CHANGED 2026-09-21, and it is the whole of the head-of-line fix. Was 1: the SELECT was
+; `LIMIT 1`, so a cancellation read exactly one candidate and a head who could not pay ended the
+; promotion. The read is now `LIMIT PROMOTION_CANDIDATE_SCAN_MAX` (src/api/events.rs:850) and the
+; seat is offered down the line. One cancellation still promotes at most one person, because it
+; still frees exactly one seat -- PROMOTIONS_PER_CANCEL_MAX did not move.
+pub const CANDIDATES_READ_PER_CANCEL : u8 = 10;
+pub const PROMOTION_ORDER : str = "payers first, then created_at ASC, src/api/events.rs:1099-1104";
+pub const PROMOTION_SKIPS_TO_THE_NEXT_PAYER : bool = true;
+pub const PROMOTION_IS_AN_OFFER : bool = false;
+
+; The scan bound is the code's own number and not a measurement, and this file will not dress it as
+; one. Nothing in this repository publishes a waitlist length (see WAITLIST_LENGTH_CAP_PUBLISHED),
+; so there is nothing to take; ten bounds WORK, because the read holds the event row locked and
+; every booking of that event waits behind it. It does not decide who waits: the order puts every
+; customer who can pay ahead of every customer who cannot, so the tenth row is reached only after
+; nine balances moved between the read and the debit inside one transaction. When the whole scan
+; promotes nobody, the warn at src/api/events.rs:1236-1244 carries the event, the price, the rows
+; read and the debit attempts -- the failure is visible instead of a threshold quietly deciding.
+pub const PROMOTION_SCAN_BOUND_IS_MEASURED : bool = false;
+pub const PROMOTION_SCAN_BOUND_SITE : str = "src/api/events.rs:850 PROMOTION_CANDIDATE_SCAN_MAX";
+pub const PROMOTION_EXHAUSTED_SCAN_IS_LOGGED : bool = true;
+
+; Four conditions, all ANDs. The capacity one matters more than it looks: an unlimited event never
+; has a waitlist to promote from (:1057 is `if let Some(cap)`), and cancelling a WAITLISTED row
+; frees no seat, so the count afterwards is unchanged and :1072 refuses.
+pub fn promotion_runs(cancel_effective: bool, capacity_declared: bool, cap: u32, taken_after_cancel: u32, waitlist_nonempty: bool) bool {
+  if (!cancel_effective) {
+    return false;
+  }
+  if (!capacity_declared) {
+    return false;
+  }
+  if (!waitlist_nonempty) {
+    return false;
+  }
+  return taken_after_cancel < cap;
+}
+
+; src/api/events.rs:1134-1230. Whoever takes the seat is charged the event's price AS IT STANDS AT
+; PROMOTION TIME: :1076-1078 reads price_stars off the locked event row, and the join INSERT at
+; :1387 carries no stars column at all, so nothing was quoted to him when he joined. The parameter
+; was named head_balance until 2026-09-21; it is any candidate's balance now, because the head is
+; no longer the only one asked.
+pub fn promotion_completes(promotion_running: bool, price: u32, candidate_balance: u32) bool {
+  if (!promotion_running) {
+    return false;
+  }
+  if (price == 0) {
+    return true;
+  }
+  return candidate_balance >= price;
+}
+
+; MEASURED DEFECT, FIXED 2026-09-21. This paragraph read: "The head-of-line block, stated as
+; arithmetic. src/api/events.rs:1118-1120 is the `else { false }` arm: a head who cannot pay is not
+; skipped, the whole promotion ends, and the seat stays empty until the NEXT cancellation. Nobody
+; behind him is read, because the SELECT at :1018 is LIMIT 1 and runs once per cancel."
+;
+; That arm is gone. The SELECT at :1099-1104 reads up to CANDIDATES_READ_PER_CANCEL rows ordered
+; `(balance >= price) DESC, created_at ASC`, and next_promotable at :880 walks them until one can
+; pay. Being passed over costs nothing: no status and no created_at is rewritten, and created_at is
+; the only thing a place in this line is made of (the waitlist has no position column -- see
+; WAITLIST_HAS_A_POSITION_COLUMN), so a customer who tops up is at the head again.
+;
+; The seat can still end up empty, and the two ways are now NAMED rather than silent: nobody in the
+; rows read can pay, or every candidate that the read said could pay lost the balance between the
+; read and the debit (:1168-1180, which re-checks under the row lock and is the authority). Both
+; end at the warn at :1236-1244.
+pub fn seat_stays_empty_after_cancel(promotion_running: bool, price: u32, best_balance_in_line: u32) bool {
+  return !promotion_completes(promotion_running, price, best_balance_in_line);
+}
+
+; The same fix stated as the thing a reader can check against the code: two people wait, the head
+; cannot pay and the next can. Returns the place in the line that gets the seat, or 0 for nobody.
+; Before 2026-09-21 this returned 0 for the first case; it returns 2.
+pub fn seat_reaches(price: u32, head_balance: u32, next_balance: u32) u8 {
+  if (price == 0) {
+    return 1;
+  }
+  if (head_balance >= price) {
+    return 1;
+  }
+  if (next_balance >= price) {
+    return 2;
+  }
+  return 0;
+}
+
+; --- Cancellation and refund ----------------------------------------------------------------------
+; src/api/events.rs:935-939 returns before the refund block when the row is already cancelled, so
+; a replayed cancel moves no balance and fires no second promotion. A waitlisted row may be
+; cancelled -- it simply leaves the line.
+pub fn cancel_has_effect(current_state: u8) bool {
+  return booking_state_is_known(current_state) and current_state != BOOKING_STATE_CANCELLED;
+}
+
+; src/api/events.rs:941-948. The refund is the amount the ROW records, never the event's current
+; price, so a price change between booking and cancel can neither over- nor under-refund. A free
+; booking records zero and refunds zero.
+;
+; MEASURED, added 2026-09-21 by this file's adversarial review: "records zero" is exactly where the
+; storage and the code disagree. migrations/051_events_stars_price.sql:10 states that NULL means a
+; free booking, but src/api/events.rs:634 computes `stars_cost = price_stars.unwrap_or(0) * seats`
+; and :745 inserts that value unconditionally, so a free booking is stored as 0 and never as NULL.
+; The refund arithmetic is unharmed -- :948 gates on `stars_paid > 0` and 0 and NULL both fail it
+; -- but `stars_paid IS NULL` no longer separates a free booking from a paid-zero one, and the
+; CHECK added at 051:13 admits both. Recorded here and not modelled: this file owns the refund
+; SHAPE, and which of two falsy encodings the column carries is the schema's question.
+pub const FREE_BOOKING_IS_STORED_AS_NULL : bool = false;
+pub const FREE_BOOKING_IS_STORED_AS_ZERO : bool = true;
+
+pub fn refund_amount(cancel_effective: bool, amount_on_row: u32) u32 {
+  if (!cancel_effective) {
+    return 0;
+  }
+  return amount_on_row;
+}
+
+; MEASURED DEFECT, FIXED 2026-09-21. This paragraph read: "MEASURED, and the sharpest hole on the
+; money side. delete_event at src/api/events.rs:1532-1554 is a bare DELETE with no refund path, and
+; migrations/043_events_booking.sql:29 declares ON DELETE CASCADE, so every booking of that event
+; -- paid ones included -- disappears with it. The refund code exists only inside
+; cancel_booking_and_promote (:890-978) and delete never enters it."
+;
+; The cascade is untouched and still declared at migrations/043_events_booking.sql:29. What changed
+; is that the delete no longer walks into it: delete_event at src/api/events.rs:1747-1922 opens a
+; transaction, takes FOR UPDATE on the event row the way the booking door and the cancel path both
+; do, counts the rows that still record Stars -- `status <> 'cancelled' AND
+; COALESCE(stars_paid,0) > 0`, because cancelling is the one path that gives them back -- and
+; answers 409 `paid_bookings_exist` with the count and the total while any exist. An unreadable
+; count refuses too, rather than becoming a confident zero (D9): reading it as zero would open the
+; delete on exactly the failure the count exists to catch.
+;
+; It still refunds NOTHING, and the facts are kept in separate constants so none can be read as
+; another. Refusing is the reversible half: nothing is destroyed by it, and the owner already has
+; a path that returns Stars one booking at a time. Refunding from inside the delete would have had
+; to reuse cancel_booking_and_promote, whose second half PROMOTES a waitlisted customer -- charging
+; him for a seat at an event about to vanish.
+;
+; AND THE REFUSAL HAS A DOOR, corrected here the same day by the review of the fix above. This
+; block said "refuses" and stopped there, and a refusal with no way through is its own defect: an
+; event that already happened holds its paid bookings for ever, so a finished evening with three
+; paid seats was a row nobody -- the owner included -- could delete at all. The door is one query
+; parameter, DELETE_HATCH_PARAM, carrying the COUNT being given up:
+; DELETE /api/admin/events/:id?abandon_paid_bookings=3. Three properties, each asserted below.
+; (1) The refusal is the DEFAULT: absent is every caller that says nothing, which is every client
+; written before the parameter existed, so DELETE_REFUSAL_IS_THE_DEFAULT is true while
+; DELETE_REFUSAL_IS_UNCONDITIONAL is false. (2) It is EXPLICIT, and a NUMBER rather than a flag: a
+; flag can be set by a client with no idea what it is destroying. (3) The count is the SERVER'S --
+; it must equal what the transaction measured under the row lock, so a stale admin screen replaying
+; an old click cannot take a seat paid for since; that answer is 409 DELETE_STALE_ACK_CODE carrying
+; both numbers. Zero is not exempt: 0 against three paid bookings is the same false statement as
+; any other wrong number, and it is the one an empty form field sends. The door decides who may
+; destroy the rows, not whether the Stars come back -- DELETE_HATCH_REFUNDS is false for the same
+; reason DELETE_REFUNDS is, and src/trios/api_errors.rs is the one reader that turns either 409
+; into something the admin screen can say.
+;
+; DELETE_DESTROYS_PAID_BOOKINGS was one bool reading false and is now two, because with the door
+; open the single word "destroys" has two answers. It was TRUE before the refusal, false between
+; the refusal and the hatch, and is now false UNASKED and true WHEN NAMED.
+pub const DELETE_REFUNDS : bool = false;
+pub const DELETE_CASCADES_BOOKINGS : bool = true;
+pub const DELETE_DESTROYS_PAID_BOOKINGS_UNASKED : bool = false;
+pub const DELETE_DESTROYS_PAID_BOOKINGS_WHEN_NAMED : bool = true;
+pub const DELETE_REFUSES_WHILE_PAID_BOOKINGS_EXIST : bool = true;
+pub const DELETE_REFUSAL_IS_THE_DEFAULT : bool = true;
+pub const DELETE_REFUSAL_IS_UNCONDITIONAL : bool = false;
+pub const DELETE_REFUSAL_CODE : str = "paid_bookings_exist";
+pub const DELETE_REFUSAL_REPORTS_THE_COUNT : bool = true;
+pub const DELETE_COUNTS_UNDER_A_ROW_LOCK : bool = true;
+pub const DELETE_HATCH_PARAM : str = "abandon_paid_bookings";
+pub const DELETE_HATCH_IS_EXPLICIT : bool = true;
+pub const DELETE_HATCH_COUNT_IS_THE_SERVERS : bool = true;
+pub const DELETE_HATCH_REFUNDS : bool = false;
+pub const DELETE_STALE_ACK_CODE : str = "acknowledgement_is_stale";
+
+pub fn money_returns_on(path_is_cancel: bool, amount_on_row: u32) u32 {
+  if (!path_is_cancel) {
+    return 0;
+  }
+  return refund_amount(true, amount_on_row);
+}
+
+; The delete, as arithmetic. A cancelled row counts zero here because its Stars were already
+; returned; a waitlisted row counts zero because it never held any.
+pub fn delete_is_admitted(paid_bookings_attached: u32) bool {
+  return paid_bookings_attached == 0;
+}
+
+; The same delete with the door in it. `ack_sent` is the parameter's PRESENCE and nothing else:
+; absent is the road above, unchanged. Present, the number has to equal the count the server
+; measured -- an older screen's number is refused, and so is a zero.
+pub fn delete_is_admitted_with_ack(paid_attached: u32, acknowledged: u32, ack_sent: bool) bool {
+  if (!ack_sent) {
+    return delete_is_admitted(paid_attached);
+  }
+  return acknowledged == paid_attached;
+}
+
+; --- Reaching the attendee ------------------------------------------------------------------------
+; The tree has exactly two attendee reachouts and neither is a queue row. See refutation 2.
+pub const ATTENDEE_REACHOUT_COUNT : u8 = 2;
+pub const ATTENDEE_REACHOUT_SITES : [2]str = [
+  "src/api/events.rs:2130 send_event_reminders, one direct send per confirmed booking",
+  "src/api/events.rs:2026 send_event_bookings, one direct send of the guest list to the admin",
+];
+pub const ATTENDEE_REACHOUT_IS_A_QUEUE_ROW : bool = false;
+pub const QUEUE_ENQUEUE_FUNCTIONS_IN_TREE : u8 = 3;
+pub const QUEUE_ENQUEUE_SITES_FOR_EVENTS : u8 = 0;
+; MARKED COPY, and the only number in this file that a sibling also holds. turbobaby/notification-
+; queue owns the queue's attempt budget in its MAX_ATTEMPTS and its SEND_ATTEMPTS_PER_ROW; the
+; value is copied here, not derived here, because the only sentence this file needs it for is the
+; contrast with a direct send. Both readings stand on the same measurement,
+; src/notification_queue.rs:21 (`const MAX_ATTEMPTS: i32 = 3`, was :20 until the 2026-09-21 drain
+; rewrite added an import line above it -- the VALUE did not move). If that line moves, BOTH contracts
+; are wrong and the owner is the one to fix first. The drift invariant below is what makes the copy
+; visible instead of silent. (Marked 2026-09-21 by this file's adversarial review.)
+pub const QUEUE_MAX_ATTEMPTS : u8 = 3;
+pub const QUEUE_MAX_ATTEMPTS_IS_A_COPY : bool = true;
+pub const QUEUE_MAX_ATTEMPTS_OWNER : str = "turbobaby/notification-queue";
+pub const DIRECT_SEND_ATTEMPTS_PER_SWEEP : u8 = 1;
+
+pub fn reachout_attempts_per_pass(is_queue_row: bool) u8 {
+  if (is_queue_row) {
+    return QUEUE_MAX_ATTEMPTS;
+  }
+  return DIRECT_SEND_ATTEMPTS_PER_SWEEP;
+}
+
+; src/api/events.rs:2105-2108, three ANDed conditions, plus the window. src/main.rs:641 supplies
+; both numbers. A waitlisted row is reached by none of it, which is right: he holds no seat.
+pub const REMINDER_WINDOW_HOURS : u32 = 24;
+pub const REMINDER_SWEEP_SECONDS : u16 = 300;
+pub const REMINDER_MARKED_ONLY_AFTER_DELIVERY : bool = true;
+
+pub fn reminder_is_due(state: u8, already_reminded: bool, event_started: bool, hours_until_start: u32, window_hours: u32) bool {
+  if (!state_occupies_a_seat(state)) {
+    return false;
+  }
+  if (already_reminded) {
+    return false;
+  }
+  if (event_started) {
+    return false;
+  }
+  return hours_until_start <= window_hours;
+}
+
+; src/api/events.rs:2134-2149: the mark happens after the send, and a failed send takes a
+; `continue` without marking. So a failure is retried on the next sweep, every 300 seconds, until
+; it lands or the event starts -- which is a real retry policy and not the queue's bounded one.
+pub fn reminder_retried_next_sweep(delivered: bool, event_started: bool) bool {
+  if (delivered) {
+    return false;
+  }
+  return !event_started;
+}
+
+; The guest list the owner receives filters status = 'confirmed' (src/api/events.rs:1999), so the
+; waitlist is invisible on it. The customer's own view does not rank him either: my_bookings
+; (:787-791) selects his row's columns and joins the event, and computes no position.
+pub const GUEST_LIST_INCLUDES_WAITLIST : bool = false;
+pub const CUSTOMER_SEES_HIS_POSITION : bool = false;
+
+; --- The day an event belongs to ------------------------------------------------------------------
+; The collision rule is a grouping rule. tests/integration_events_same_day.rs:68-72 names the trap
+; in its own words: an afternoon event in the market's zone is a morning instant in UTC, so a UTC
+; date puts it on the day before. src/ui/screens/events_screen.rs:73-77 converts first and takes
+; the date second; the offset comes from :63-67, which asks the market clock.
+pub const DAY_IS_TAKEN_AFTER_CONVERSION : bool = true;
+pub const HOURS_PER_DAY : u32 = 24;
+; What carries the "no same-day limit" verdict is the SCHEMA and the write path, not the witness
+; test. Corrected 2026-09-21 by this file's adversarial review: all four tests in the witness carry
+; `#[ignore]` (tests/integration_events_same_day.rs:134, :210, :237, :278) and each returns early
+; when no database is reachable, so none of them runs in a default `cargo test` and the earlier
+; word "proves" overstated them. They are a DESIGNED case of four events on one date, which is
+; worth naming; the load-bearing evidence is that migrations/043_events_booking.sql declares no
+; unique key over `events` beyond the primary key at :6, and that create_event at
+; src/api/events.rs:1454-1477 (:1348-1371 before the 2026-09-21 delete refusal moved it)
+; is a plain INSERT with no ON CONFLICT arm.
+pub const SAME_DAY_EVENT_LIMIT_EXISTS : bool = false;
+pub const SAME_DAY_EVENTS_DESIGNED_INTO_THE_WITNESS : u8 = 4;
+pub const SAME_DAY_WITNESS_TEST_COUNT : u8 = 4;
+pub const SAME_DAY_WITNESS_TESTS_RUN_BY_DEFAULT : u8 = 0;
+; Non-PK: the primary key at migrations/043_events_booking.sql:6 is a unique key and is not counted
+; here, because a key over the surrogate id cannot refuse a second event on a date. Counted are
+; unique constraints and unique indexes over any business column of `events`; grep over
+; migrations/ for UNIQUE, 2026-09-21, finds them only on event_bookings (:39, :47-49).
+pub const EVENTS_NON_PK_UNIQUE_KEY_COUNT : u8 = 0;
+
+; Whole-hour offsets east only; market owns the value and the fact that it has no DST, so a single
+; number is enough and no daylight arm is needed.
+pub fn local_day_of(utc_day: u32, utc_hour: u32, offset_hours: u32) u32 {
+  if (utc_hour + offset_hours >= HOURS_PER_DAY) {
+    return utc_day + 1;
+  }
+  return utc_day;
+}
+
+pub fn events_share_a_day(utc_day_a: u32, utc_hour_a: u32, utc_day_b: u32, utc_hour_b: u32, offset_hours: u32) bool {
+  return local_day_of(utc_day_a, utc_hour_a, offset_hours) == local_day_of(utc_day_b, utc_hour_b, offset_hours);
+}
+
+; The naive check, kept so the disagreement is assertable rather than remembered. It returns false
+; exactly on the pairs where a UTC date would group the day wrongly.
+pub fn utc_day_comparison_agrees(utc_day_a: u32, utc_hour_a: u32, utc_day_b: u32, utc_hour_b: u32, offset_hours: u32) bool {
+  if (events_share_a_day(utc_day_a, utc_hour_a, utc_day_b, utc_hour_b, offset_hours)) {
+    return utc_day_a == utc_day_b;
+  }
+  return utc_day_a != utc_day_b;
+}
+
+; --- Month arithmetic, and what it does at a month end --------------------------------------------
+; src/trios/calendar.rs. The module's own header at :1-6 says why the maths lives outside src/ui:
+; that tree is wasm-gated and tests written there never run on the host.
+pub const MONTHS_PER_YEAR : u32 = 12;
+pub const MONTH_LENGTH_MIN : u32 = 28;
+pub const MONTH_LENGTH_MAX : u32 = 31;
+; src/trios/calendar.rs:28 -- the value returned when the date maths itself fails. The shortest
+; month, so a fallback can never claim a day the month does not have.
+pub const DAYS_IN_MONTH_FALLBACK : u32 = 28;
+; :44-49. shift_month always lands on the first, and :41-43 says why: the picker needs the month,
+; and day-preserving arithmetic from 31 January would land in March and skip February entirely.
+pub const SHIFT_MONTH_LANDS_ON_DAY : u32 = 1;
+pub const SHIFT_MONTH_PRESERVES_THE_DAY : bool = false;
+
+; Integer-division divisibility; the corpus has no modulo operator in use and this needs none.
+pub const LEAP_CYCLE_LONG : u32 = 400;
+pub const LEAP_CYCLE_CENTURY : u32 = 100;
+pub const LEAP_CYCLE_SHORT : u32 = 4;
+
+pub fn divides(n: u32, d: u32) bool {
+  return n - (n / d) * d == 0;
+}
+
+; :17-18 say leap years need no special case because the derivation steps to the next month and
+; back a day (the sentence spans both lines; the earlier citation here said :18 alone). This
+; contract states the RULE that derivation obeys -- it tables what the code derives, which is the
+; point: a table and a derivation that disagree is a bug the invariant below would catch. Its four
+; shipped assertions at
+; :193-197 are reproduced below as the test.
+pub fn is_leap_year(year: u32) bool {
+  if (divides(year, LEAP_CYCLE_LONG)) {
+    return true;
+  }
+  if (divides(year, LEAP_CYCLE_CENTURY)) {
+    return false;
+  }
+  return divides(year, LEAP_CYCLE_SHORT);
+}
+
+pub fn days_in_month(year: u32, month: u32) u32 {
+  if (month == 2) {
+    if (is_leap_year(year)) {
+      return 29;
+    }
+    return 28;
+  }
+  if (month == 4 or month == 6 or month == 9 or month == 11) {
+    return 30;
+  }
+  return 31;
+}
+
+; :45-47, the zero-based month index. December is the one arm days_in_month needs (:20-24) and the
+; one this index does not: adding to a flat index cannot produce a thirteenth month.
+pub fn month_index(year: u32, month: u32) u32 {
+  return year * MONTHS_PER_YEAR + month - 1;
+}
+
+pub fn month_of_index(index: u32) u32 {
+  return index - (index / MONTHS_PER_YEAR) * MONTHS_PER_YEAR + 1;
+}
+
+pub fn year_of_index(index: u32) u32 {
+  return index / MONTHS_PER_YEAR;
+}
+
+pub fn shift_month_index(year: u32, month: u32, delta_forward: u32) u32 {
+  return month_index(year, month) + delta_forward;
+}
+
+pub fn unshift_month_index(index: u32, delta_back: u32) u32 {
+  return index - delta_back;
+}
+
+; :58-63. In the current month the strip starts at today; in any other month it starts at the 1st.
+; :61 compares the FIRST OF THE MONTH, not the day number, which is why August a year away is not
+; trimmed by today's date in August (:268-274 pins exactly that).
+pub fn is_current_month(anchor_year: u32, anchor_month: u32, today_year: u32, today_month: u32) bool {
+  return anchor_year == today_year and anchor_month == today_month;
+}
+
+pub fn visible_day_count(month_length: u32, current_month: bool, today_day: u32) u32 {
+  if (!current_month) {
+    return month_length;
+  }
+  return month_length - today_day + 1;
+}
+
+; The month-end case, which is the one the brief asks for. On the last day of the month the strip
+; holds exactly one day and that day is today (:262-266). It never empties, and it never rolls
+; forward into the next month on its own -- stepping months is the picker's other control, at
+; :144-157 of the screen.
+pub fn month_end_leaves_at_least_today(month_length: u32, today_day: u32) bool {
+  return visible_day_count(month_length, true, today_day) >= 1;
+}
+
+; :325-330 time_range and :352-358 day_mark, the two labels the day carries. An end equal to the
+; start, blank, or absent prints the start alone -- :321 records that a missing end is a real
+; state, because migrations/043_events_booking.sql:12 makes ends_at nullable.
+pub const DAY_MARK_EMPTY : u8 = 0;
+pub const DAY_MARK_ONE : u8 = 1;
+pub const DAY_MARK_SEVERAL : u8 = 2;
+
+pub fn day_mark(event_count: u32) u8 {
+  if (event_count == 0) {
+    return DAY_MARK_EMPTY;
+  }
+  if (event_count == 1) {
+    return DAY_MARK_ONE;
+  }
+  return DAY_MARK_SEVERAL;
+}
+
+pub fn time_range_is_a_range(end_present: bool, end_is_blank: bool, end_equals_start: bool) bool {
+  if (!end_present) {
+    return false;
+  }
+  if (end_is_blank) {
+    return false;
+  }
+  return !end_equals_start;
+}
+
+; --- The handle bound, measured twice and reported as two numbers ---------------------------------
+; src/trios/attendees.rs:39 states that a Telegram handle is 5 to 32 characters of [A-Za-z0-9_].
+; The check at :41 tests only the upper bound. A three-character string therefore becomes a
+; t.me link the owner can tap into a dead page -- which is the exact failure :39-40 says the check
+; exists to prevent. Both numbers are declared because they are two numbers, not one.
+pub const HANDLE_MIN_DECLARED : u32 = 5;
+pub const HANDLE_MIN_ENFORCED : u32 = 1;
+pub const HANDLE_MAX_DECLARED : u32 = 32;
+pub const HANDLE_MAX_ENFORCED : u32 = 32;
+
+pub fn handle_is_accepted(length: u32) bool {
+  if (length == 0) {
+    return false;
+  }
+  return length <= HANDLE_MAX_ENFORCED;
+}
+
+pub fn handle_bounds_agree(declared_min: u32, enforced_min: u32) bool {
+  return declared_min == enforced_min;
+}
+
+; Why the gap between those two readings stayed green, measured 2026-09-22 by reading every value
+; the module's own tests hand the normaliser as a username. The GAP is the lengths the check admits
+; and its comment refuses: from HANDLE_MIN_ENFORCED up to, not including, HANDLE_MIN_DECLARED. No
+; test offers a value in it -- every non-blank username the tests pass is at least
+; HANDLE_MIN_DECLARED long. Exactly one test value is refused for its length alone: the
+; 35-character entry at src/trios/attendees.rs:331, above HANDLE_MAX_ENFORCED, in
+; text_that_cannot_be_a_handle_does_not_become_a_dead_link (src/trios/attendees.rs:324-340); the
+; other three values there are refused for their alphabet. Length zero IS tested -- the three
+; values at src/trios/attendees.rs:313 that normalise to nothing -- but it never reaches the
+; length check at src/trios/attendees.rs:41: the emptiness check at src/trios/attendees.rs:36-38
+; refuses it first, and that check is the whole of what HANDLE_MIN_ENFORCED records. So it tests
+; the enforced floor and neither end of the gap. ATTENDEE_SOURCE_TESTS counts the #[test]
+; attributes in the module, and scripts/verify_t27_against_source.py binds it the way it binds
+; ATTENDEE_SOURCE_LINES.
+;
+; The three constants arrived 2026-09-22 from turbobaby/person-naming, which held them under other
+; names beside a restatement of this bound, bound by nothing. Two were renamed on arrival to what
+; was measured: that file's "one length example" was one OVER-length example, and its "tests cover
+; the lower bound" is asked here of the gap, because length zero is tested and is not a test of
+; either minimum.
+pub const HANDLE_GAP_EXAMPLES_IN_TESTS : u8 = 0;
+pub const HANDLE_OVER_MAX_EXAMPLES_IN_TESTS : u8 = 1;
+pub const ATTENDEE_SOURCE_TESTS : u8 = 16;
+
+; WHAT GATE 3 SEES OF A FIX TO THE FLOOR, measured 2026-09-22 against planted copies of the module.
+; An edit that changes the module's line count or its #[test] count turns ATTENDEE_SOURCE_LINES or
+; ATTENDEE_SOURCE_TESTS red. An edit that changes neither turns neither, and the fix this section
+; waits for can be exactly that: the emptiness check at src/trios/attendees.rs:36 rewritten in
+; place as `handle.len() < 5` keeps 357 lines and 16 tests, and HANDLE_MIN_ENFORCED, the fact it
+; flips, is bound by nothing, because the floor it records is an emptiness check with no numeral
+; in it. With the bindings gate 3 held before this constant, that plant left the gate green.
+; ATTENDEE_SOURCE_LENGTH_COMPARISONS is the separately named fact that sees it: how many times the
+; module orders a length against something -- `<`, `<=`, `>` or `>=` on either side of a len() or
+; a count(), or a range `contains` over one. It is 1, the upper check at src/trios/attendees.rs:41;
+; the module's only other len(), at src/trios/attendees.rs:119, is printed and not compared. It
+; counts comparisons and not their direction, because `len() > N` is a ceiling where a condition
+; refuses and a floor where it accepts; a floor written as an ordering comparison makes it 2
+; whichever way it faces. Turned red on plants: the checker's, the same comparison reversed,
+; `chars().count() < N`, a range `contains`, a second comparison beside the one at
+; src/trios/attendees.rs:41, and a `len() >= N` or `len() > N` filter in the caller. A floor
+; written as `len().lt(&N)` or `get(N..).is_none()` still turns nothing red: HANDLE_MIN_ENFORCED
+; and HANDLE_GAP_EXAMPLES_IN_TESTS are then the facts it flips, and nothing sends a reader here.
+pub const ATTENDEE_SOURCE_LENGTH_COMPARISONS : u8 = 1;
+
+pub fn length_is_in_the_handle_gap(length: u32) bool {
+  return length >= HANDLE_MIN_ENFORCED and length < HANDLE_MIN_DECLARED;
+}
+
+; --- Honest refusals --------------------------------------------------------------------------------
+; Six things this repository does not publish. Each is a named boolean and a note saying what is
+; missing. None of them is a plausible number, because a plausible number here would read as a
+; finding.
+pub const REFUSAL_COUNT : u8 = 6;
+pub const REFUSAL_NAMES : [6]str = [
+  "default_capacity", "waitlist_length_cap", "waitlist_position",
+  "promotion_notice", "promotion_offer_ttl", "delete_refund",
+];
+
+pub const EVENT_TYPE_COUNT : u8 = 0;
+pub const EVENT_TYPE_COLUMN_EXISTS : bool = false;
+pub const DEFAULT_CAPACITY_PUBLISHED : bool = false;
+pub const DEFAULT_CAPACITY_NOTE : str = "max_seats is per-row admin input with no default and no per-type table. src/api/events.rs:196-200 bounds it to 0..=1000000 and migrations/043_events_booking.sql:15 permits NULL. The tree defines no event type anywhere -- no column in 043, 045, 051, 052, 055 or 070 and no variant in src/db/entities/event.rs -- so a seat count for a ride day or a community meet would be a number this repository has never held.";
+
+pub const WAITLIST_LENGTH_CAP_PUBLISHED : bool = false;
+pub const WAITLIST_LENGTH_CAP_NOTE : str = "Nothing bounds the number of waitlisted rows. join_waitlist has no limit of its own and, unlike book_event, no rate limiter: src/api/events.rs:528-540 applies one to booking with the budget at :25-26, and src/api/events.rs:1307-1405 applies none. The join also runs outside any transaction and takes no FOR UPDATE, so two concurrent joins can both pass the duplicate check at :1369. Re-measured 2026-09-21 after the promotion scan landed and still true in every clause: PROMOTION_CANDIDATE_SCAN_MAX bounds what ONE CANCELLATION READS and is not a cap on the line, which is why it is declared as a work bound above and not as the missing number here.";
+
+pub const WAITLIST_POSITION_PUBLISHED : bool = false;
+pub const WAITLIST_POSITION_NOTE : str = "No endpoint returns a queue position. my_bookings at src/api/events.rs:787-791 selects the row's own columns and joins the event, computing no rank, and the admin guest list at :1859 filters status = 'confirmed'. The waitlist is therefore absent from the customer's view and from the owner's. The promotion scan added 2026-09-21 reads the line in payer-first order but writes no rank and returns none, so this stays unpublished.";
+
+pub const PROMOTION_NOTICE_PUBLISHED : bool = false;
+pub const PROMOTION_NOTICE_NOTE : str = "A promoted customer is told nothing. cancel_booking_and_promote sends no message and enqueues no row; the promoted id travels only in the HTTP response to whoever cancelled, at src/api/events.rs:1301-1303 and :1907-1909. When the event carries a Stars price his balance is debited at :1152-1167 in the same transaction, so the first thing he can learn about the promotion is the missing balance. Unchanged by the 2026-09-21 skip fix, and it costs one more person: a customer the scan passes over is told that even less.";
+
+pub const PROMOTION_OFFER_TTL_PUBLISHED : bool = false;
+pub const PROMOTION_OFFER_TTL_NOTE : str = "Promotion is a fait accompli rather than an offer: the UPDATE at src/api/events.rs:1212-1220 writes 'confirmed' with no acceptance step, and no column exists anywhere in 043, 045, 051, 052 or 070 that could hold an expiry for one.";
+
+pub const DELETE_REFUND_PUBLISHED : bool = false;
+pub const DELETE_REFUND_NOTE : str = "Still unpublished on 2026-09-21, and no longer the way the money is lost. This note read: 'delete_event at src/api/events.rs:1532-1554 is a bare DELETE and migrations/043_events_booking.sql:29 declares ON DELETE CASCADE. Paid bookings vanish with the event and no Stars return.' The delete now refuses while paid bookings are attached (src/api/events.rs:1747-1922, 409 paid_bookings_exist carrying the count and the total), so nothing is destroyed unasked; the owner may still delete such an event by naming the count he gives up (DELETE_HATCH_PARAM), and that road returns no Stars either. A refund ON DELETE is published nowhere in this repository and none is invented here. The owner's route is the cancel path, one booking at a time, which refunds and may promote.";
+
+; --- What this file carries about people ------------------------------------------------------------
+pub const CARRIES_AN_ATTENDEE : bool = false;
+pub const CARRIES_A_PHONE : bool = false;
+pub const CARRIES_AN_EVENT_FIXTURE : bool = false;
+pub const CARRIES_A_CYRILLIC_SHIPPED_STRING : bool = false;
+pub const SHIPPED_STRING_RULE : str = "Every customer-facing sentence on this surface is a key in src/trios/i18n.rs, selected at src/api/events.rs:2080-2084 for the reminder body and throughout src/ui/screens/events_screen.rs for the calendar. The guest-list literals live at src/trios/attendees.rs:111 and :117. All are cited by path and line and none is quoted.";
+
+; --- Tests ---------------------------------------------------------------------------------------
+
+test the_last_seat_is_sold_and_the_one_after_it_is_not {
+  assert booking_fits(true, 10, 9, 1) == true;
+  assert booking_fits(true, 10, 10, 1) == false;
+  assert booking_fits(true, 1, 0, 1) == true;
+  assert booking_fits(true, 1, 1, 1) == false;
+  assert EQUALITY_BELONGS_TO_THE_BOOKING_SIDE == true;
+  assert SEATS_PER_BOOKING == 1;
+  assert MULTI_SEAT_REQUEST_IS_REFUSED == true;
+}
+
+test an_event_with_no_declared_capacity_never_sells_out {
+  assert booking_fits(false, 0, 99999, 1) == true;
+  assert waitlist_open(false, 0, 99999) == false;
+  assert seats_available(false, 0, 5) == 0;
+  assert CAPACITY_IS_NULLABLE == true;
+}
+
+test the_waitlist_opens_exactly_where_booking_closes {
+  assert waitlist_open(true, 10, 9) == false;
+  assert waitlist_open(true, 10, 10) == true;
+  assert waitlist_open(true, 10, 11) == true;
+  assert exactly_one_door_is_open(10, 9) == true;
+  assert exactly_one_door_is_open(10, 10) == true;
+  assert exactly_one_door_is_open(1, 0) == true;
+  assert exactly_one_door_is_open(1, 1) == true;
+}
+
+test a_zero_capacity_event_shuts_both_doors {
+  assert booking_fits(true, 0, 0, 1) == false;
+  assert waitlist_open(true, 0, 0) == false;
+  assert exactly_one_door_is_open(0, 0) == false;
+  assert capacity_is_in_range(0) == true;
+  assert ZERO_CAPACITY_IS_CREATABLE == true;
+}
+
+test remaining_seats_never_go_negative {
+  assert seats_available(true, 10, 4) == 6;
+  assert seats_available(true, 10, 10) == 0;
+  assert seats_available(true, 10, 12) == 0;
+  assert API_CLAMPS_SEATS_AT_ZERO == true;
+  assert SCREEN_CLAMPS_SEATS_AT_ZERO == true;
+  assert SEATS_FREE_IMPLEMENTATION_COUNT == 1;
+}
+
+test the_capacity_range_is_the_one_the_handler_admits {
+  assert capacity_is_in_range(1000000) == true;
+  assert capacity_is_in_range(1000001) == false;
+}
+
+test the_three_booking_states_are_a_closed_set {
+  assert booking_state_is_known(BOOKING_STATE_CONFIRMED) == true;
+  assert booking_state_is_known(BOOKING_STATE_CANCELLED) == true;
+  assert booking_state_is_known(BOOKING_STATE_WAITLISTED) == true;
+  assert booking_state_is_known(BOOKING_STATE_UNSET) == false;
+  assert booking_state_is_known(4) == false;
+  assert BOOKING_STATE_COUNT == 3;
+  assert BOOKING_STATE_NAMES.len == BOOKING_STATE_COUNT;
+}
+
+test a_state_name_outside_the_check_constraint_is_unset {
+  assert booking_state_code_of("confirmed") == BOOKING_STATE_CONFIRMED;
+  assert booking_state_code_of("cancelled") == BOOKING_STATE_CANCELLED;
+  assert booking_state_code_of("waitlisted") == BOOKING_STATE_WAITLISTED;
+  assert booking_state_code_of("Confirmed") == BOOKING_STATE_UNSET;
+  assert booking_state_code_of("pending") == BOOKING_STATE_UNSET;
+  assert booking_state_code_of("") == BOOKING_STATE_UNSET;
+}
+
+test only_a_confirmed_row_holds_a_seat {
+  assert state_occupies_a_seat(BOOKING_STATE_CONFIRMED) == true;
+  assert state_occupies_a_seat(BOOKING_STATE_WAITLISTED) == false;
+  assert state_occupies_a_seat(BOOKING_STATE_CANCELLED) == false;
+  assert state_occupies_a_seat(BOOKING_STATE_UNSET) == false;
+}
+
+test a_started_event_refuses_a_booking_at_any_capacity {
+  assert booking_door_open(true, false, true, 10, 0) == true;
+  assert booking_door_open(true, true, true, 10, 0) == false;
+  assert booking_door_open(false, false, true, 10, 0) == false;
+  assert booking_door_open(true, false, true, 10, 10) == false;
+  assert WAITLIST_CHECKS_START_TIME == false;
+}
+
+test the_two_duplicate_guards_disagree_and_the_gap_is_reachable {
+  assert duplicate_guard_sees(BOOKING_STATE_WAITLISTED, true) == false;
+  assert duplicate_guard_sees(BOOKING_STATE_WAITLISTED, false) == true;
+  assert duplicate_guard_sees(BOOKING_STATE_CONFIRMED, true) == true;
+  assert duplicate_guard_sees(BOOKING_STATE_CONFIRMED, false) == true;
+  assert one_person_can_hold_two_rows(true, true) == true;
+  assert one_person_can_hold_two_rows(false, true) == false;
+  assert one_person_can_hold_two_rows(true, false) == false;
+  assert GUARDS_AGREE == false;
+}
+
+test promotion_needs_a_cancel_a_capacity_and_a_line {
+  assert promotion_runs(true, true, 10, 9, true) == true;
+  assert promotion_runs(false, true, 10, 9, true) == false;
+  assert promotion_runs(true, false, 0, 0, true) == false;
+  assert promotion_runs(true, true, 10, 9, false) == false;
+  assert promotion_runs(true, true, 10, 10, true) == false;
+  assert PROMOTION_TRIGGER_COUNT == 1;
+}
+
+test a_head_who_cannot_pay_is_skipped_and_keeps_his_place {
+  assert promotion_completes(true, 0, 0) == true;
+  assert promotion_completes(true, 500, 500) == true;
+  assert promotion_completes(true, 500, 499) == false;
+  assert promotion_completes(false, 0, 999) == false;
+  assert seat_reaches(500, 0, 900) == 2;
+  assert seat_reaches(500, 900, 0) == 1;
+  assert seat_reaches(500, 499, 499) == 0;
+  assert seat_reaches(0, 0, 0) == 1;
+  assert seat_stays_empty_after_cancel(true, 500, 499) == true;
+  assert seat_stays_empty_after_cancel(true, 500, 500) == false;
+  assert PROMOTION_SKIPS_TO_THE_NEXT_PAYER == true;
+  assert CANDIDATES_READ_PER_CANCEL == 10;
+  assert PROMOTIONS_PER_CANCEL_MAX == 1;
+  assert PROMOTION_SCAN_BOUND_IS_MEASURED == false;
+  assert PROMOTION_EXHAUSTED_SCAN_IS_LOGGED == true;
+}
+
+test a_replayed_cancel_moves_no_money_and_promotes_nobody {
+  assert cancel_has_effect(BOOKING_STATE_CONFIRMED) == true;
+  assert cancel_has_effect(BOOKING_STATE_WAITLISTED) == true;
+  assert cancel_has_effect(BOOKING_STATE_CANCELLED) == false;
+  assert cancel_has_effect(BOOKING_STATE_UNSET) == false;
+  assert refund_amount(false, 300) == 0;
+  assert promotion_runs(false, true, 10, 9, true) == false;
+}
+
+test the_refund_is_the_amount_the_row_recorded {
+  assert refund_amount(true, 300) == 300;
+  assert refund_amount(true, 0) == 0;
+  assert money_returns_on(true, 300) == 300;
+  assert money_returns_on(false, 300) == 0;
+  assert DELETE_REFUNDS == false;
+  assert DELETE_CASCADES_BOOKINGS == true;
+  assert DELETE_DESTROYS_PAID_BOOKINGS_UNASKED == false;
+  assert DELETE_DESTROYS_PAID_BOOKINGS_WHEN_NAMED == true;
+  assert delete_is_admitted(1) == false;
+  assert delete_is_admitted(3) == false;
+  assert delete_is_admitted(0) == true;
+  assert DELETE_REFUSES_WHILE_PAID_BOOKINGS_EXIST == true;
+  assert DELETE_REFUSAL_IS_THE_DEFAULT == true;
+  assert DELETE_REFUSAL_IS_UNCONDITIONAL == false;
+  assert DELETE_REFUSAL_REPORTS_THE_COUNT == true;
+  assert DELETE_HATCH_IS_EXPLICIT == true;
+  assert DELETE_HATCH_COUNT_IS_THE_SERVERS == true;
+  assert DELETE_HATCH_REFUNDS == false;
+  assert DELETE_HATCH_PARAM == "abandon_paid_bookings";
+  assert DELETE_STALE_ACK_CODE == "acknowledgement_is_stale";
+  assert delete_is_admitted_with_ack(3, 3, true) == true;
+  assert delete_is_admitted_with_ack(3, 1, true) == false;
+  assert delete_is_admitted_with_ack(3, 0, true) == false;
+  assert delete_is_admitted_with_ack(3, 3, false) == false;
+  assert delete_is_admitted_with_ack(0, 0, false) == true;
+  assert delete_is_admitted_with_ack(0, 2, true) == false;
+  assert FREE_BOOKING_IS_STORED_AS_NULL == false;
+  assert FREE_BOOKING_IS_STORED_AS_ZERO == true;
+  assert refund_amount(true, 0) == 0;
+}
+
+test an_attendee_reachout_is_not_a_queue_row {
+  assert ATTENDEE_REACHOUT_IS_A_QUEUE_ROW == false;
+  assert ATTENDEE_REACHOUT_COUNT == 2;
+  assert QUEUE_ENQUEUE_SITES_FOR_EVENTS == 0;
+  assert reachout_attempts_per_pass(false) == 1;
+  assert reachout_attempts_per_pass(true) == 3;
+  assert reachout_attempts_per_pass(ATTENDEE_REACHOUT_IS_A_QUEUE_ROW) == DIRECT_SEND_ATTEMPTS_PER_SWEEP;
+  assert QUEUE_MAX_ATTEMPTS_IS_A_COPY == true;
+  assert QUEUE_MAX_ATTEMPTS_OWNER == REUSES_NOTIFICATION_QUEUE_ID;
+  assert ATTENDEE_REACHOUT_SITES.len == ATTENDEE_REACHOUT_COUNT;
+}
+
+test a_reminder_reaches_a_seat_holder_once_and_a_waitlister_never {
+  assert reminder_is_due(BOOKING_STATE_CONFIRMED, false, false, 10, REMINDER_WINDOW_HOURS) == true;
+  assert reminder_is_due(BOOKING_STATE_CONFIRMED, true, false, 10, REMINDER_WINDOW_HOURS) == false;
+  assert reminder_is_due(BOOKING_STATE_WAITLISTED, false, false, 10, REMINDER_WINDOW_HOURS) == false;
+  assert reminder_is_due(BOOKING_STATE_CANCELLED, false, false, 10, REMINDER_WINDOW_HOURS) == false;
+  assert reminder_is_due(BOOKING_STATE_CONFIRMED, false, true, 0, REMINDER_WINDOW_HOURS) == false;
+  assert reminder_is_due(BOOKING_STATE_CONFIRMED, false, false, 25, REMINDER_WINDOW_HOURS) == false;
+  assert reminder_is_due(BOOKING_STATE_CONFIRMED, false, false, 24, REMINDER_WINDOW_HOURS) == true;
+}
+
+test an_undelivered_reminder_is_retried_until_the_event_starts {
+  assert reminder_retried_next_sweep(false, false) == true;
+  assert reminder_retried_next_sweep(true, false) == false;
+  assert reminder_retried_next_sweep(false, true) == false;
+  assert REMINDER_MARKED_ONLY_AFTER_DELIVERY == true;
+}
+
+test two_events_share_a_day_by_the_market_clock_not_by_utc {
+  assert local_day_of(25, 8, 7) == 25;
+  assert local_day_of(25, 14, 7) == 25;
+  assert local_day_of(24, 18, 7) == 25;
+  assert local_day_of(24, 17, 7) == 25;
+  assert local_day_of(24, 16, 7) == 24;
+  assert events_share_a_day(25, 8, 24, 18, 7) == true;
+  assert events_share_a_day(25, 8, 25, 14, 7) == true;
+  assert events_share_a_day(25, 8, 24, 16, 7) == false;
+}
+
+test the_naive_utc_date_disagrees_exactly_where_the_trap_is {
+  assert utc_day_comparison_agrees(25, 8, 25, 14, 7) == true;
+  assert utc_day_comparison_agrees(25, 8, 24, 18, 7) == false;
+  assert utc_day_comparison_agrees(25, 8, 24, 16, 7) == true;
+  assert DAY_IS_TAKEN_AFTER_CONVERSION == true;
+}
+
+test one_date_holds_as_many_events_as_the_owner_creates {
+  assert SAME_DAY_EVENT_LIMIT_EXISTS == false;
+  assert EVENTS_NON_PK_UNIQUE_KEY_COUNT == 0;
+  assert SAME_DAY_EVENTS_DESIGNED_INTO_THE_WITNESS == 4;
+  assert SAME_DAY_WITNESS_TEST_COUNT == 4;
+  assert SAME_DAY_WITNESS_TESTS_RUN_BY_DEFAULT == 0;
+}
+
+test the_day_marks_itself_only_when_it_has_something {
+  assert day_mark(0) == DAY_MARK_EMPTY;
+  assert day_mark(1) == DAY_MARK_ONE;
+  assert day_mark(2) == DAY_MARK_SEVERAL;
+  assert day_mark(9) == DAY_MARK_SEVERAL;
+}
+
+test an_absent_or_equal_end_is_not_a_range {
+  assert time_range_is_a_range(true, false, false) == true;
+  assert time_range_is_a_range(false, false, false) == false;
+  assert time_range_is_a_range(true, true, false) == false;
+  assert time_range_is_a_range(true, false, true) == false;
+}
+
+test every_month_length_and_both_century_rules {
+  assert divides(2000, LEAP_CYCLE_LONG) == true;
+  assert divides(1900, LEAP_CYCLE_LONG) == false;
+  assert divides(1900, LEAP_CYCLE_CENTURY) == true;
+  assert is_leap_year(2026) == false;
+  assert is_leap_year(2028) == true;
+  assert is_leap_year(1900) == false;
+  assert is_leap_year(2000) == true;
+  assert days_in_month(2026, 1) == 31;
+  assert days_in_month(2026, 2) == 28;
+  assert days_in_month(2028, 2) == 29;
+  assert days_in_month(2026, 4) == 30;
+  assert days_in_month(2026, 6) == 30;
+  assert days_in_month(2026, 9) == 30;
+  assert days_in_month(2026, 11) == 30;
+  assert days_in_month(2026, 12) == 31;
+}
+
+test shifting_months_crosses_a_year_without_skipping_one {
+  assert month_of_index(shift_month_index(2026, 8, 1)) == 9;
+  assert year_of_index(shift_month_index(2026, 8, 1)) == 2026;
+  assert month_of_index(shift_month_index(2026, 12, 1)) == 1;
+  assert year_of_index(shift_month_index(2026, 12, 1)) == 2027;
+  assert month_of_index(shift_month_index(2026, 12, 13)) == 1;
+  assert year_of_index(shift_month_index(2026, 12, 13)) == 2028;
+  assert SHIFT_MONTH_LANDS_ON_DAY == 1;
+  assert SHIFT_MONTH_PRESERVES_THE_DAY == false;
+}
+
+test a_month_shift_round_trips {
+  assert unshift_month_index(shift_month_index(2026, 8, 13), 13) == month_index(2026, 8);
+  assert month_of_index(unshift_month_index(shift_month_index(2026, 8, 13), 13)) == 8;
+  assert year_of_index(unshift_month_index(shift_month_index(2026, 8, 13), 13)) == 2026;
+  assert month_of_index(unshift_month_index(month_index(2026, 1), 1)) == 12;
+  assert year_of_index(unshift_month_index(month_index(2026, 1), 1)) == 2025;
+}
+
+test the_current_month_starts_at_today_and_every_other_month_at_the_first {
+  assert visible_day_count(31, true, 10) == 22;
+  assert visible_day_count(30, false, 10) == 30;
+  assert visible_day_count(31, false, 1) == 31;
+  assert is_current_month(2026, 8, 2026, 8) == true;
+  assert is_current_month(2027, 8, 2026, 8) == false;
+  assert visible_day_count(31, is_current_month(2027, 8, 2026, 8), 10) == 31;
+}
+
+test the_last_day_of_a_month_leaves_exactly_today {
+  assert visible_day_count(31, true, 31) == 1;
+  assert visible_day_count(28, true, 28) == 1;
+  assert month_end_leaves_at_least_today(31, 31) == true;
+  assert month_end_leaves_at_least_today(28, 28) == true;
+  assert month_end_leaves_at_least_today(31, 1) == true;
+}
+
+test a_hidden_row_did_not_retire_this_surface {
+  assert hide_retired_the_surface(true, false, false) == false;
+  assert hide_retired_the_surface(true, true, true) == true;
+  assert hide_retired_the_surface(false, true, true) == false;
+  assert EVENT_ROUTES_RETIRED_BY_THE_HIDE == 0;
+  assert EVENT_SCREENS_RETIRED_BY_THE_HIDE == 0;
+  assert HIDE_ROW_DELETES == 0;
+  assert HIDE_TABLE_DROPS == 0;
+}
+
+test the_first_new_event_is_public_whatever_the_hidden_rows_say {
+  // The REQUEST's default. What is stored since 2026-09-24 is pinned by
+  // no_event_is_stored_public_while_events_are_retired below.
+  assert new_event_is_public(false, false) == true;
+  assert new_event_is_public(true, true) == true;
+  assert new_event_is_public(true, false) == false;
+  assert HIDDEN_EVENT_ROWS == 30;
+}
+
+test the_handle_check_enforces_one_of_its_two_declared_bounds {
+  assert handle_is_accepted(3) == true;
+  assert handle_is_accepted(5) == true;
+  assert handle_is_accepted(32) == true;
+  assert handle_is_accepted(33) == false;
+  assert handle_is_accepted(0) == false;
+  assert handle_bounds_agree(HANDLE_MIN_DECLARED, HANDLE_MIN_ENFORCED) == false;
+  assert handle_bounds_agree(HANDLE_MAX_DECLARED, HANDLE_MAX_ENFORCED) == true;
+}
+
+; Added 2026-09-22 with the three constants that moved here from turbobaby/person-naming.
+test the_checks_own_tests_never_offer_a_length_in_the_gap {
+  assert length_is_in_the_handle_gap(3) == true;
+  assert length_is_in_the_handle_gap(HANDLE_MIN_ENFORCED) == true;
+  assert length_is_in_the_handle_gap(HANDLE_MIN_DECLARED) == false;
+  assert length_is_in_the_handle_gap(0) == false;
+  assert length_is_in_the_handle_gap(33) == false;
+  assert HANDLE_GAP_EXAMPLES_IN_TESTS == 0;
+  assert HANDLE_OVER_MAX_EXAMPLES_IN_TESTS == 1;
+  assert ATTENDEE_SOURCE_TESTS == 16;
+}
+
+; Added 2026-09-22. The source-side reason HANDLE_MIN_ENFORCED is the emptiness check and nothing
+; more, under its own name, so that a floor fixed in place has a bound fact to trip: the module
+; compares a length once, and that once is the upper bound. A fix that raises the count flips
+; HANDLE_MIN_ENFORCED with it, and the invariant the_handle_lower_bound_is_declared_and_not_enforced
+; after both.
+test the_attendee_module_compares_a_length_once_and_from_above {
+  assert ATTENDEE_SOURCE_LENGTH_COMPARISONS == 1;
+  assert handle_bounds_agree(HANDLE_MAX_DECLARED, HANDLE_MAX_ENFORCED) == true;
+  assert HANDLE_MIN_ENFORCED == 1;
+  assert handle_is_accepted(HANDLE_MIN_ENFORCED) == true;
+  assert handle_is_accepted(0) == false;
+}
+
+test every_reuse_edge_names_its_owner_by_id {
+  assert REUSES_LEGACY_RETIREMENT_ID == "turbobaby/legacy-retirement";
+  assert REUSES_MARKET_ID == "turbobaby/market";
+  assert REUSES_LOCALE_POLICY_ID == "turbobaby/locale-policy";
+  assert REUSES_NOTIFICATION_QUEUE_ID == "turbobaby/notification-queue";
+  assert REUSES_REQUEST_IDENTITY_ID == "turbobaby/request-identity";
+  assert REUSES_PROMO_BROADCAST_ID == "turbobaby/promo-broadcast";
+  assert REUSES_RATE_LIMIT_ID == "turbobaby/rate-limit";
+  assert REUSE_EDGE_COUNT == 7;
+}
+
+test the_wave_census_is_counted_from_git_and_the_old_ten_is_corrected {
+  assert CORPUS_T27_FILE_COUNT == 43;
+  assert OWN_WAVE_NEW_CONTRACTS == 13;
+  assert PRIOR_WAVE_NEW_CONTRACTS == 10;
+  assert OWN_WAVE_NEW_CONTRACTS != PRIOR_WAVE_NEW_CONTRACTS;
+  assert OWN_WAVE_NEW_CONTRACTS > PRIOR_WAVE_NEW_CONTRACTS;
+  assert OWN_WAVE_NEW_CONTRACTS > REUSE_EDGE_COUNT;
+  assert SIBLING_LINE_CITATIONS_IN_THIS_FILE == 0;
+  assert CORPUS_RESIDUE_IS_PINNED_HERE == false;
+  assert CORPUS_RESIDUE_NOTE != "";
+  assert WAVE_CENSUS_MEASURED_AT == "2026-09-21";
+  assert WAVE_CENSUS_SOURCE != "";
+  assert STALENESS_INTERVAL_IS_PUBLISHED == false;
+  assert edge_is_durable(true, false) == true;
+  assert edge_is_durable(true, true) == false;
+  assert edge_is_durable(false, false) == false;
+}
+
+test the_surface_census_adds_up {
+  assert HTTP_PATH_COUNT == 11;
+  assert PUBLIC_PATH_COUNT + ADMIN_PATH_COUNT == HTTP_PATH_COUNT;
+  assert HTTP_METHOD_BINDING_COUNT == 14;
+  assert HANDLER_COUNT == HTTP_METHOD_BINDING_COUNT;
+  // 2 until 2026-09-24, when /my-bookings was counted; none of the three mounts a screen now.
+  assert SCREEN_ROUTE_COUNT == 3;
+  assert SCREEN_ROUTES.len == SCREEN_ROUTE_COUNT;
+  assert SCREEN_ROUTES_BEFORE_2026_09_24.len == SCREEN_ROUTE_COUNT_BEFORE_2026_09_24;
+  assert SCREEN_ROUTES[2] == "/my-bookings";
+  assert EVENT_SCREENS_MOUNTED_BY_THE_CLIENT_ROUTER == 0;
+  assert EVENT_SCREENS_MOUNTED_BY_THE_CLIENT_ROUTER_BEFORE_2026_09_24 == SCREEN_ROUTE_COUNT;
+  assert KEPT_CUSTOMER_EVENT_HTTP_PATHS + PUBLIC_EVENT_PATHS_GATED_ON_THE_FLAG == PUBLIC_PATH_COUNT;
+}
+
+test no_event_is_stored_public_while_events_are_retired {
+  assert EVENTS_PUBLISHABLE == false;
+  assert EVENTS_PUBLISHABLE_BEFORE_2026_09_24 == true;
+  assert new_event_is_stored_public(false, false, EVENTS_PUBLISHABLE) == false;
+  assert new_event_is_stored_public(true, true, EVENTS_PUBLISHABLE) == false;
+  assert new_event_is_stored_public(true, false, EVENTS_PUBLISHABLE) == false;
+  // Flipped back, the old behaviour returns exactly.
+  assert new_event_is_stored_public(false, false, EVENTS_PUBLISHABLE_BEFORE_2026_09_24) == true;
+  assert new_event_is_stored_public(true, false, EVENTS_PUBLISHABLE_BEFORE_2026_09_24) == false;
+  assert edit_stores_public(true, true, EVENTS_PUBLISHABLE, false) == false;
+  assert edit_stores_public(true, true, EVENTS_PUBLISHABLE, true) == false;
+  assert edit_stores_public(true, true, EVENTS_PUBLISHABLE_BEFORE_2026_09_24, false) == true;
+  // An edit that does not name the flag leaves the stored one: the edit does not reach a row 085
+  // missed. 088 does, below.
+  assert edit_stores_public(false, false, EVENTS_PUBLISHABLE, true) == true;
+}
+
+test a_row_made_public_after_085_does_not_survive_088 {
+  assert RULING_HIDE_MIGRATION == "migrations/088_unpublish_events.sql";
+  assert RULING_HIDE_MIGRATION != HIDE_MIGRATION;
+  assert RULING_HIDE_VISIBILITY_UPDATES_ON_EVENTS == HIDE_VISIBILITY_UPDATES_ON_EVENTS;
+  assert RULING_HIDE_ROW_DELETES == 0;
+  assert RULING_HIDE_TABLE_DROPS == 0;
+  assert RULING_HIDE_READ_PRODUCTION_FIRST == false;
+  // Undeployed, such a row is still served; deployed, it is not, whichever way it was made.
+  assert a_public_row_survives(true, false, false, EVENTS_PUBLISHABLE) == true;
+  assert a_public_row_survives(true, true, false, EVENTS_PUBLISHABLE) == false;
+  assert a_public_row_survives(false, true, true, EVENTS_PUBLISHABLE) == false;
+  assert a_public_row_survives(false, true, false, EVENTS_PUBLISHABLE) == false;
+  // An edit that leaves the flag alone after 088 leaves it hidden.
+  assert edit_stores_public(false, false, EVENTS_PUBLISHABLE, a_public_row_survives(true, true, false, EVENTS_PUBLISHABLE)) == false;
+  // Flipped back, the admin API publishes again, and 088 is no obstacle to that.
+  assert a_public_row_survives(false, true, true, EVENTS_PUBLISHABLE_BEFORE_2026_09_24) == true;
+  // Hiding is still not retiring: the router is merged.
+  assert hide_retired_the_surface(true, false, true) == false;
+}
+
+test the_screens_left_on_the_ruling_and_the_router_did_not {
+  assert hide_retired_the_surface(true, false, true) == false;
+  assert EVENT_HTTP_ROUTER_STILL_MERGED == true;
+  assert EVENT_SCREENS_UNROUTED_BY_THE_RULING == SCREEN_ROUTE_COUNT;
+  assert EVENT_ROUTES_RETIRED_BY_THE_HIDE == 0;
+  assert EVENT_SCREENS_RETIRED_BY_THE_HIDE == 0;
+  assert CUSTOMER_BOOKINGS_SCREEN_IS_MOUNTED == false;
+  assert CUSTOMER_BOOKINGS_SCREEN_IS_MOUNTED_BEFORE_2026_09_24 == true;
+  // kept until 2026-09-26, reversed that day for hidden events (next test)
+  assert REMINDER_KEPT_FOR_SEATS_ALREADY_HELD_BEFORE_2026_09_26 == true;
+  assert REMINDER_KEPT_FOR_SEATS_ALREADY_HELD == false;
+}
+
+test a_hidden_event_is_never_reminded_and_a_held_seat_keeps_its_refund {
+  assert REMINDER_REVERSED_AT == "2026-09-26";
+  assert REMINDER_REVERSED_BY != "";
+  assert REMINDER_REVERSAL_READS != "";
+  assert REMINDER_FILTERS_THE_FLAG == true;
+  assert REMINDER_FLAG_FILTERED_JOINS == 1;
+  assert reminder_is_sent(false) == false;
+  assert reminder_is_sent(true) == true;
+  // every event is hidden since 088 and the admin API can make none public, so none is reminded
+  assert EVENTS_PUBLISHABLE == false;
+  assert reminder_is_sent(a_public_row_survives(true, true, false, EVENTS_PUBLISHABLE)) == false;
+  assert reminder_is_sent(new_event_is_stored_public(true, true, EVENTS_PUBLISHABLE)) == false;
+  // flipped back, a public event is reminded again
+  assert reminder_is_sent(new_event_is_stored_public(true, true, EVENTS_PUBLISHABLE_BEFORE_2026_09_24)) == true;
+  assert REMINDER_REVERSAL_TOUCHES_A_REFUND == false;
+  assert KEPT_CUSTOMER_EVENT_HTTP_PATHS == 2;
+  assert REMINDER_REVERSAL_WRITES_A_ROW == false;
+  // the reversal changed the reminder in place and added a test below every cited line
+  assert HTTP_SOURCE_LINES_BEFORE_2026_09_26 == 2545;
+  assert HTTP_SOURCE_LINES > HTTP_SOURCE_LINES_BEFORE_2026_09_26;
+}
+
+test a_hidden_event_is_never_rendered_into_a_share_card {
+  assert EVENT_SHARE_CARD_IS_BUILT == false;
+  assert EVENT_SHARE_CARD_IS_BUILT_BEFORE_2026_09_24 == true;
+  assert EVENT_SHARE_KIND_STAYS_PARSEABLE == true;
+  assert EVENT_SHARE_REFUSAL_ARMS == 1;
+}
+
+test every_refusal_is_named_and_none_carries_a_number {
+  assert REFUSAL_COUNT == 6;
+  assert REFUSAL_NAMES.len == REFUSAL_COUNT;
+  assert DEFAULT_CAPACITY_PUBLISHED == false;
+  assert WAITLIST_LENGTH_CAP_PUBLISHED == false;
+  assert WAITLIST_POSITION_PUBLISHED == false;
+  assert PROMOTION_NOTICE_PUBLISHED == false;
+  assert PROMOTION_OFFER_TTL_PUBLISHED == false;
+  assert DELETE_REFUND_PUBLISHED == false;
+  assert EVENT_TYPE_COUNT == 0;
+  assert EVENT_TYPE_COLUMN_EXISTS == false;
+}
+
+test this_file_carries_no_person {
+  assert CARRIES_AN_ATTENDEE == false;
+  assert CARRIES_A_PHONE == false;
+  assert CARRIES_AN_EVENT_FIXTURE == false;
+  assert CARRIES_A_CYRILLIC_SHIPPED_STRING == false;
+}
+
+; --- Invariants ---------------------------------------------------------------------------------
+
+invariant the_seat_that_fills_the_room_is_sold_and_not_refused
+  assert booking_fits(true, 10, 9, 1) == true and booking_fits(true, 1, 0, 1) == true
+
+invariant a_full_room_refuses_the_next_seat
+  assert booking_fits(true, 10, 10, 1) == false and booking_fits(true, 1, 1, 1) == false
+
+invariant booking_and_the_waitlist_are_never_open_at_once
+  assert exactly_one_door_is_open(1, 0) == true and exactly_one_door_is_open(1, 1) == true and exactly_one_door_is_open(10, 9) == true and exactly_one_door_is_open(10, 10) == true
+
+invariant an_undeclared_capacity_opens_no_waitlist_and_closes_no_door
+  assert booking_fits(false, 0, 99999, 1) == true and waitlist_open(false, 0, 99999) == false
+
+invariant a_zero_capacity_event_leaves_the_customer_nowhere_to_go
+  assert booking_fits(true, 0, 0, 1) == false and waitlist_open(true, 0, 0) == false
+
+invariant the_api_never_publishes_a_negative_seat_count
+  assert seats_available(true, 10, 12) == 0 and seats_available(true, 10, 10) == 0
+
+invariant the_api_and_the_screen_clamp_the_seat_count_the_same_way
+  assert API_CLAMPS_SEATS_AT_ZERO == SCREEN_CLAMPS_SEATS_AT_ZERO and SEATS_FREE_IMPLEMENTATION_COUNT == 1
+
+invariant a_waitlisted_row_never_counts_as_a_seat
+  assert state_occupies_a_seat(BOOKING_STATE_WAITLISTED) == false and state_occupies_a_seat(BOOKING_STATE_CANCELLED) == false
+
+invariant an_unwritten_state_slot_is_never_a_known_state
+  assert booking_state_is_known(BOOKING_STATE_UNSET) == false and booking_state_code_of("") == BOOKING_STATE_UNSET
+
+invariant a_started_event_admits_nobody
+  assert booking_door_open(true, true, true, 10, 0) == false
+
+invariant the_two_duplicate_guards_do_not_agree
+  assert duplicate_guard_sees(BOOKING_STATE_WAITLISTED, true) != duplicate_guard_sees(BOOKING_STATE_WAITLISTED, false)
+
+invariant promotion_cannot_run_without_a_cancel
+  assert promotion_runs(false, true, 10, 0, true) == false
+
+invariant cancelling_a_waitlisted_row_frees_no_seat_and_promotes_nobody
+  assert promotion_runs(true, true, 10, 10, true) == false
+
+invariant at_most_one_person_is_promoted_per_cancellation
+  assert PROMOTIONS_PER_CANCEL_MAX == 1 and CANDIDATES_READ_PER_CANCEL >= PROMOTIONS_PER_CANCEL_MAX
+
+invariant a_head_who_cannot_pay_no_longer_decides_for_the_line
+  assert seat_reaches(500, 0, 900) == 2 and PROMOTION_SKIPS_TO_THE_NEXT_PAYER == true
+
+invariant a_line_where_nobody_can_pay_leaves_the_seat_empty_and_says_so
+  assert seat_stays_empty_after_cancel(true, 500, 499) == true and PROMOTION_EXHAUSTED_SCAN_IS_LOGGED == true
+
+invariant a_second_cancel_refunds_nothing
+  assert cancel_has_effect(BOOKING_STATE_CANCELLED) == false and refund_amount(false, 300) == 0
+
+invariant deleting_an_event_returns_no_money
+  assert money_returns_on(false, 300) == 0 and DELETE_REFUNDS == false
+
+; Renamed 2026-09-21 with the escape hatch: this read a_delete_never_destroys_a_paid_booking, which
+; the door makes false as a sentence. What survives the door, and is the half worth an invariant,
+; is that nothing destroys a paid booking NOBODY NAMED.
+invariant a_delete_never_destroys_a_paid_booking_nobody_named
+  assert delete_is_admitted(1) == false and delete_is_admitted_with_ack(3, 1, true) == false and DELETE_DESTROYS_PAID_BOOKINGS_UNASKED == false
+
+invariant the_hatch_opens_only_on_the_servers_own_count
+  assert delete_is_admitted_with_ack(3, 3, true) == true and delete_is_admitted_with_ack(3, 0, true) == false and DELETE_HATCH_REFUNDS == false
+
+invariant no_attendee_reachout_on_this_surface_is_a_queue_row
+  assert ATTENDEE_REACHOUT_IS_A_QUEUE_ROW == false and QUEUE_ENQUEUE_SITES_FOR_EVENTS == 0
+
+invariant the_queue_budget_here_is_a_marked_copy_of_its_owners_number
+  assert QUEUE_MAX_ATTEMPTS_IS_A_COPY == true and QUEUE_MAX_ATTEMPTS_OWNER == REUSES_NOTIFICATION_QUEUE_ID and QUEUE_MAX_ATTEMPTS > DIRECT_SEND_ATTEMPTS_PER_SWEEP
+
+invariant a_reminder_never_reaches_someone_who_holds_no_seat
+  assert reminder_is_due(BOOKING_STATE_WAITLISTED, false, false, 1, REMINDER_WINDOW_HOURS) == false and reminder_is_due(BOOKING_STATE_CANCELLED, false, false, 1, REMINDER_WINDOW_HOURS) == false
+
+invariant a_delivered_reminder_is_never_sent_twice
+  assert reminder_is_due(BOOKING_STATE_CONFIRMED, true, false, 1, REMINDER_WINDOW_HOURS) == false and reminder_retried_next_sweep(true, false) == false
+
+invariant the_calendar_day_is_the_market_day_and_the_utc_day_can_differ
+  assert events_share_a_day(25, 8, 24, 18, 7) == true and utc_day_comparison_agrees(25, 8, 24, 18, 7) == false
+
+invariant february_matches_the_derivation_in_every_century_case
+  assert days_in_month(2026, 2) == 28 and days_in_month(2028, 2) == 29 and days_in_month(1900, 2) == 28 and days_in_month(2000, 2) == 29
+
+invariant a_month_shift_skips_no_month_at_a_long_month_end
+  assert month_of_index(shift_month_index(2026, 1, 1)) == 2 and SHIFT_MONTH_PRESERVES_THE_DAY == false
+
+invariant a_month_shift_round_trips_to_the_same_month
+  assert unshift_month_index(shift_month_index(2026, 8, 13), 13) == month_index(2026, 8)
+
+invariant the_strip_never_empties_at_a_month_end
+  assert visible_day_count(31, true, 31) == 1 and visible_day_count(28, true, 28) == 1
+
+invariant the_same_month_number_in_another_year_is_not_the_current_month
+  assert is_current_month(2027, 8, 2026, 8) == false and visible_day_count(31, is_current_month(2027, 8, 2026, 8), 10) == 31
+
+invariant an_empty_day_carries_no_marker
+  assert day_mark(0) == DAY_MARK_EMPTY
+
+invariant hiding_rows_retired_neither_a_route_nor_a_screen
+  assert hide_retired_the_surface(true, false, false) == false and EVENT_ROUTES_RETIRED_BY_THE_HIDE == 0
+
+invariant a_new_event_is_public_by_default
+  assert new_event_is_public(false, false) == true
+
+invariant the_handle_lower_bound_is_declared_and_not_enforced
+  assert handle_bounds_agree(HANDLE_MIN_DECLARED, HANDLE_MIN_ENFORCED) == false and handle_is_accepted(3) == true
+
+invariant no_capacity_is_invented_for_an_event_type_the_tree_does_not_define
+  assert EVENT_TYPE_COUNT == 0 and DEFAULT_CAPACITY_PUBLISHED == false
+
+invariant every_refusal_stays_a_refusal
+  assert WAITLIST_POSITION_PUBLISHED == false and PROMOTION_NOTICE_PUBLISHED == false and PROMOTION_OFFER_TTL_PUBLISHED == false and WAITLIST_LENGTH_CAP_PUBLISHED == false
+
+invariant no_edge_of_this_contract_is_carried_by_a_line_number
+  assert SIBLING_LINE_CITATIONS_IN_THIS_FILE == 0 and edge_is_durable(true, false) == true and edge_is_durable(true, true) == false
+
+invariant the_wave_that_wrote_this_file_is_never_undercounted_again
+  assert OWN_WAVE_NEW_CONTRACTS == 13 and OWN_WAVE_NEW_CONTRACTS > PRIOR_WAVE_NEW_CONTRACTS and STALENESS_INTERVAL_IS_PUBLISHED == false
+
+invariant a_number_that_moves_while_it_is_read_is_never_pinned_as_a_constant
+  assert CORPUS_RESIDUE_IS_PINNED_HERE == false and CORPUS_RESIDUE_NOTE != "" and SIBLING_LINE_CITATIONS_IN_THIS_FILE == 0
+
+invariant this_contract_names_no_person
+  assert CARRIES_AN_ATTENDEE == false and CARRIES_A_PHONE == false and CARRIES_AN_EVENT_FIXTURE == false
+
+invariant no_event_is_stored_public_while_events_are_retired_by_the_owner
+  assert new_event_is_stored_public(false, false, EVENTS_PUBLISHABLE) == false and new_event_is_stored_public(true, true, EVENTS_PUBLISHABLE) == false and edit_stores_public(true, true, EVENTS_PUBLISHABLE, false) == false
+
+invariant no_client_path_mounts_an_events_screen_and_every_path_stays_declared
+  assert EVENT_SCREENS_MOUNTED_BY_THE_CLIENT_ROUTER == 0 and SCREEN_ROUTES.len == SCREEN_ROUTE_COUNT and SCREEN_ROUTE_COUNT == 3
+
+invariant no_public_event_row_survives_a_deployed_088
+  assert a_public_row_survives(true, true, false, EVENTS_PUBLISHABLE) == false and a_public_row_survives(false, true, true, EVENTS_PUBLISHABLE) == false and RULING_HIDE_ROW_DELETES == 0 and RULING_HIDE_TABLE_DROPS == 0
+
+invariant a_hidden_event_is_never_reminded
+  assert reminder_is_sent(false) == false and REMINDER_FILTERS_THE_FLAG == true and REMINDER_REVERSAL_WRITES_A_ROW == false and REMINDER_REVERSAL_TOUCHES_A_REFUND == false

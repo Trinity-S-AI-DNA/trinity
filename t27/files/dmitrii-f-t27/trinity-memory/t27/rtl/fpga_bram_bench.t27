@@ -1,0 +1,185 @@
+module TrinityFpgaBramBenchT27;
+
+// Sequencer of the block-RAM trit packing bench (fpga/ax7203/tms_bram_bench.v
+// wires it to up to three engines, t27/rtl/bram_trit_engine.t27 specialized per
+// format, the line emitter and the UART; `engines` is how many slots are
+// populated, from slot 0, and an empty slot is tied done with zero results).
+// One run: a header line, one start pulse to every engine, a wait until all are
+// done, eight report lines per populated engine, a totals line. A run starts
+// after reset and again on a UART start bit that arrives while the bench is idle;
+// edges during a run are ignored, so a trigger byte with several falling edges
+// still starts exactly one run.
+// Report lines (tag, a, b), b is 40 bits:
+//   H a=run number            b=(REPORT_FORMAT << 32) | populated engines
+//   P a=(engine << 16) | (format << 8) | lanes     b=words
+//   Q write ticks  S read ticks  M words whose decoded lanes differ
+//   I invalid groups  N (+1 count << 20) | -1 count  U dot product (two's complement)
+//   Z low 40 bits of the rotate-xor checksum of the stored words
+//   D a=bad words of all engines  b=invalid groups of all engines
+// Every statement reads a variable before the same tick writes it, so the C
+// and the Verilog backends agree.
+const S_IDLE: u32 = 0;
+const S_LINE_START: u32 = 1;
+const S_LINE_WAIT: u32 = 2;
+const S_START: u32 = 3;
+const S_ARM: u32 = 4;
+const S_WAIT: u32 = 5;
+const S_FIELD: u32 = 6;
+const S_TOTAL: u32 = 7;
+
+const FIELDS: u32 = 8;
+const REPORT_FORMAT: u64 = 1;
+const B40: u64 = 1099511627775;
+const TAG_H: u32 = 72;
+const TAG_P: u32 = 80;
+const TAG_Q: u32 = 81;
+const TAG_S: u32 = 83;
+const TAG_M: u32 = 77;
+const TAG_I: u32 = 73;
+const TAG_N: u32 = 78;
+const TAG_U: u32 = 85;
+const TAG_Z: u32 = 90;
+const TAG_D: u32 = 68;
+
+var state: u32 = 0;
+var after_line: u32 = 0;
+var arm: u32 = 0;
+var auto_started: bool = false;
+var rx1: bool = true;
+var rx2: bool = true;
+var rx3: bool = true;
+var runs: u32 = 0;
+var engine: u32 = 0;
+var field: u32 = 0;
+var engines_start: bool = false;
+var line_go: bool = false;
+var line_tag: u32 = 0;
+var line_a: u32 = 0;
+var line_b: u64 = 0;
+var run_done: bool = false;
+var any_bad: bool = false;
+var run_active: bool;
+run_active = state != S_IDLE;
+
+// The H line's b field. A typed local, not the constant: gen-c emits constants as
+// untyped macros, and REPORT_FORMAT << 32 would be a 32-bit int shift in C.
+fn header_b(engines: u32) -> u64 {
+    var fmt: u64 = REPORT_FORMAT;
+    return (fmt << 32) | (engines as u64);
+}
+
+fn field_tag(f: u32) -> u32 {
+    if (f == 0) { return TAG_P; }
+    if (f == 1) { return TAG_Q; }
+    if (f == 2) { return TAG_S; }
+    if (f == 3) { return TAG_M; }
+    if (f == 4) { return TAG_I; }
+    if (f == 5) { return TAG_N; }
+    if (f == 6) { return TAG_U; }
+    return TAG_Z;
+}
+
+fn pick32(e: u32, v0: u32, v1: u32, v2: u32) -> u32 {
+    if (e == 0) { return v0; }
+    if (e == 1) { return v1; }
+    return v2;
+}
+
+fn pick64(e: u32, v0: u64, v1: u64, v2: u64) -> u64 {
+    if (e == 0) { return v0; }
+    if (e == 1) { return v1; }
+    return v2;
+}
+
+fn field_b(f: u32, words: u32, wt: u32, rt: u32, bad: u32, inv: u32,
+           pos: u32, neg: u32, dot: u64, chk: u64) -> u64 {
+    if (f == 0) { return words as u64; }
+    if (f == 1) { return wt as u64; }
+    if (f == 2) { return rt as u64; }
+    if (f == 3) { return bad as u64; }
+    if (f == 4) { return inv as u64; }
+    if (f == 5) { return ((pos as u64) << 20) | ((neg as u64) & 1048575); }
+    if (f == 6) { return dot & B40; }
+    return chk & B40;
+}
+
+fn on_clock(uart_rx: bool, line_idle: bool, engines: u32,
+            d0: bool, words0: u32, fmt0: u32, lanes0: u32, wt0: u32, rt0: u32, bad0: u32, inv0: u32, pos0: u32, neg0: u32, dot0: i64, chk0: u64,
+            d1: bool, words1: u32, fmt1: u32, lanes1: u32, wt1: u32, rt1: u32, bad1: u32, inv1: u32, pos1: u32, neg1: u32, dot1: i64, chk1: u64,
+            d2: bool, words2: u32, fmt2: u32, lanes2: u32, wt2: u32, rt2: u32, bad2: u32, inv2: u32, pos2: u32, neg2: u32, dot2: i64, chk2: u64) {
+    line_go = false;
+    if (state == S_IDLE) {
+        engines_start = false;
+        // The edge is read from the old rx3/rx2 (shifted at the end of the tick), and
+        // only while idle, so a trigger byte with several falling edges starts one run.
+        if ((rx3 && !rx2) || !auto_started) {
+            auto_started = true;
+            run_done = false;
+            any_bad = false;
+            line_tag = TAG_H;
+            line_a = runs + 1;
+            runs = runs + 1;
+            line_b = header_b(engines);
+            line_go = true;
+            after_line = S_START;
+            state = S_LINE_START;
+        }
+    } else if (state == S_LINE_START) {
+        state = S_LINE_WAIT;
+    } else if (state == S_LINE_WAIT) {
+        if (line_idle) { state = after_line; }
+    } else if (state == S_START) {
+        engines_start = true;
+        arm = 0;
+        state = S_ARM;
+    } else if (state == S_ARM) {
+        engines_start = false;
+        if (arm == 3) { state = S_WAIT; } else { arm = arm + 1; }
+    } else if (state == S_WAIT) {
+        if (d0 && d1 && d2) {
+            engine = 0;
+            field = 0;
+            state = S_FIELD;
+        }
+    } else if (state == S_FIELD) {
+        line_tag = field_tag(field);
+        if (field == 0) {
+            line_a = (engine << 16) | (pick32(engine, fmt0, fmt1, fmt2) << 8) | pick32(engine, lanes0, lanes1, lanes2);
+        } else {
+            line_a = engine;
+        }
+        line_b = field_b(field, pick32(engine, words0, words1, words2), pick32(engine, wt0, wt1, wt2),
+                         pick32(engine, rt0, rt1, rt2), pick32(engine, bad0, bad1, bad2),
+                         pick32(engine, inv0, inv1, inv2), pick32(engine, pos0, pos1, pos2),
+                         pick32(engine, neg0, neg1, neg2),
+                         pick64(engine, dot0 as u64, dot1 as u64, dot2 as u64), pick64(engine, chk0, chk1, chk2));
+        line_go = true;
+        state = S_LINE_START;
+        if (field == FIELDS - 1) {
+            field = 0;
+            if (engine + 1 >= engines) { after_line = S_TOTAL; } else { engine = engine + 1; after_line = S_FIELD; }
+        } else {
+            field = field + 1;
+            after_line = S_FIELD;
+        }
+    } else if (state == S_TOTAL) {
+        line_tag = TAG_D;
+        line_a = bad0 + bad1 + bad2;
+        line_b = (inv0 + inv1 + inv2) as u64;
+        any_bad = (bad0 + bad1 + bad2 + inv0 + inv1 + inv2) != 0;
+        run_done = true;
+        line_go = true;
+        after_line = S_IDLE;
+        state = S_LINE_START;
+    }
+    rx3 = rx2;
+    rx2 = rx1;
+    rx1 = uart_rx;
+}
+
+test header_fields { assert_eq(header_b(3), 4294967299); assert_eq(header_b(1), 4294967297); }
+test tags_are_ascii { assert_eq(field_tag(0), 80); assert_eq(field_tag(7), 90); assert_eq(TAG_D, 68); }
+test pick_selects { assert_eq(pick32(1, 5, 6, 7), 6); assert_eq(pick64(2, 5, 6, 7), 7); }
+test counts_share_a_line { assert_eq(field_b(5, 0, 0, 0, 0, 0, 3, 2, 0, 0), 3145730); }
+test dot_is_forty_bit_twos_complement { assert_eq(field_b(6, 0, 0, 0, 0, 0, 0, 0, 18446744073709551615, 0), 1099511627775); }
+endmodule

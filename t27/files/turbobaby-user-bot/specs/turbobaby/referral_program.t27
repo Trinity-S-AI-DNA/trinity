@@ -1,0 +1,1368 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/turbobaby/referral_program.t27 -- the referral graph, and what a referral may pay
+; This contract owns the directed edge from one person to another: what the code that creates
+; that edge may encode, how many times the ledger can record the same edge, which direction the
+; status of an edge may move, whether a milestone can be taken back, and which currency a
+; referral settles in. It owns NO amount -- not a per-referral payout, not a milestone bonus, not
+; a welcome credit -- and the reason is recorded rather than assumed. It owns no /start grammar,
+; no link, no ledger structure and no proof of identity; each of those has an owner named below
+; and is consumed as a boolean. It writes down no account id, no handle and no referral code.
+; --
+; WHY (measured 2026-09-21). Three structures in this domain assert something the code cannot do,
+; and each was found by counting rather than by reading.
+; 1. THE STATUS LADDER HAS A RUNG NOTHING CAN REACH. migrations/007_referral_events.sql:10 names
+;    three statuses in the column's own comment, pending / confirmed / paid. FIVE read sites
+;    branch on paid -- src/db/referrals.rs:423, :470, :484, :498 and :651, which is every counter
+;    and every leaderboard the module has -- and ZERO writers produce it. The writers are
+;    src/db/referrals.rs:268 (pending) and :345 (confirmed), plus the one-time backfill at
+;    migrations/007_referral_events.sql:26 (confirmed). A sweep of src/ and migrations/ for a
+;    statement that SETS this column to paid returns nothing at all. Until 2026-09-26
+;    src/db/orders.rs:418 (at e39221e) documented the missing writer as though it ran: it stated
+;    that confirm_referral set referral_events.status to paid, and the line it described -- today
+;    src/db/referrals.rs:345, in confirm_referral_edge_in -- sets confirmed. That comment left with
+;    R3's rewrite of the completion step. So half the module's WHERE clauses are dead branches,
+;    and until R3 the completion path taught a lifecycle the database has never held.
+; 2. THE EXPERIMENT RECORDS NOTHING IT CAN LATER READ. src/trios/referrals.rs:9-17 assigns a share
+;    source deterministically per person so that A/B arms stay stable across sessions. It has
+;    exactly ONE production caller, src/api/referrals.rs:71, which hands the arm to the client and
+;    counts it on a metric. The referral_events table has a source column
+;    (migrations/007_referral_events.sql:11) and exactly ONE production writer,
+;    src/bot/commands.rs:201, which passes a fixed literal. The assigned arm is therefore never
+;    stored against the event it was invented to label, and the funnel counter at
+;    src/metrics.rs:140-144 carries a stage label and no arm. Every production row can hold one
+;    single value of source, so no arm can ever be compared with another on any outcome.
+; 3. THE ONE UNGATED ROUTE IS THE ONE THAT PUBLISHES THE ID. Four of the five registrations in
+;    src/api/referrals.rs:22-43 call check_owner on the request headers (:68, :88, :124, :164)
+;    before touching the graph. The leaderboard handler at src/api/referrals.rs:213-216 (at
+;    8000ae8) takes State and Query, takes no HeaderMap, and calls no gate; no middleware supplies
+;    one, because
+;    api_routes at src/api/mod.rs:81-106 applies exactly one layer, a body limit at :105, the nest
+;    that gives it its /api prefix carries none (src/api/mod.rs:77), and the layers in
+;    src/main.rs:1157-1205 are alerting, request id, CORS, a response-header override, metrics and
+;    header policy.
+;    That route serializes TopReferrer whole (src/api/referrals.rs:238, :228 at 8000ae8), and
+;    TopReferrer's first field is telegram_id (src/db/referrals.rs:22-28). One function away the
+;    same module withholds that same field deliberately: src/db/referrals.rs:529-531 records that
+;    the numeric id stays out of the invitee response, and the invitee route is owner-gated. The
+;    field the gated route protects is published by the ungated one.
+;    CLOSED 2026-09-26 by the owner's answer ("The referral top list", below): since then the
+;    handler's first statement is check_admin, as the loyalty leaderboard's has been since R1, so a
+;    caller without admin proof never reaches the serialization. The sentences of this item
+;    describe the handler as it stood at 8000ae8, and the item's title is the 2026-09-21 reading.
+; --
+; WHERE THE BRIEF IS REFUTED. Four readings, each re-measured against the line it names.
+; 1. "the migrations that create them (survey points at 029, 035, 046)". 029 is wrong and two are
+;    missing. migrations/029_order_idempotency_keys.sql is the checkout idempotency table -- its
+;    header at :1 names POST /api/orders -- and a case-insensitive grep of that file for referral
+;    returns 0. The two tables of this domain are created by migrations/007_referral_events.sql:4
+;    and migrations/068_referral_milestones.sql:4. 035 and 046 are correctly named and neither
+;    creates anything: 035 widens one column (:5-6), 046 rewrites values in place (:18-36).
+; 2. "src/trios/referrals.rs (the deterministic share-source assignment, header around :3-6)".
+;    The file's module doc is :1 and the function's doc comment is :3-8; :3-6 stops inside the
+;    second paragraph. Small, but the sentence that matters for this contract -- that the return
+;    is a clone so no caller holds a reference into config -- is at :7-8, outside the cited span.
+; 3. "no milestone amount or threshold unless the repository publishes one -- measure
+;    data/fleet_seed.json for 'referral' first". The measurement is real and I re-ran it:
+;    data/fleet_seed.json (19434 bytes, the only file in data/) holds 0 occurrences of referral,
+;    case-insensitive. (CORRECTED 2026-09-24: 19434 is a CRLF working copy's size; the committed
+;    blob is 19084 bytes with 350 lines, as turbobaby/order-money's FLEET_SEED_BYTES now records.
+;    The zero does not depend on line endings and still holds on the blob. The note constant below
+;    keeps the reading as it was taken.) (READ AT e39221e: the ladder, its defaults and its award
+;    were deleted on 2026-09-26, R3, and every src/db/referrals.rs line number in items 3 and 4
+;    names that commit, not the tree.) The inference from that zero does not reach the ladder. The
+;    THRESHOLDS were published, in exactly one place and on purpose: src/db/referrals.rs:712, whose own comment at
+;    :705-711 records that there used to be three copies of this list and that the point of
+;    collapsing them was to stop a fourth rung being promised by one copy and paid by none. That
+;    list is declared below with its citation. The AMOUNTS are refused, and not because of the
+;    seed zero -- they are refused because there is no single amount to declare: three different
+;    numbers answer "what does rung N pay", the compiled default at src/db/referrals.rs:716, the
+;    live shop value read from loyalty_config at :918-927, and the number actually credited, which
+;    is frozen into the row at :810 and read back (get_referral_milestones, still live at :636).
+;    src/api/referrals.rs:111-117 states the
+;    same split in prose. A contract that named one of the three would be wrong about the other
+;    two, which is the mistake the removed client-side table made.
+; 4. The brief reads the ladder collapse as complete. It is not, by one list.
+;    src/db/referrals.rs:716 is keyed by rung and so carries its own hand-written copy of the rung
+;    numbers. A fourth rung added at :712 gets no default from :716. The config read does iterate
+;    the ladder rather than the defaults (:918-927 loops MILESTONE_THRESHOLDS), so a live
+;    loyalty_config key WOULD rescue the new rung -- which is why the predicate below requires both
+;    sources to be absent rather than one. With neither, the map is seeded from :716 alone
+;    (:900-901) and the rung resolves to zero at :799, maybe_award_referral_milestones skips a
+;    non-positive amount at :800-802, and src/api/referrals.rs:145-151 (at e39221e) still published
+;    the rung to the customer with that zero beside it. The promised-but-unpayable rung was still
+;    reachable, through the defaults rather than through the ladder -- until R3 deleted both, and
+;    since 2026-09-26 the route serves no rung at all (src/api/referrals.rs:144-151).
+; --
+; WHAT THIS FILE NEVER DOES. It declares no per-referral bonus, no milestone bonus, no welcome
+; credit and no currency conversion. It restates no part of the /start payload grammar: the
+; prefix, the length bound on an incoming code and the conjunction that admits a referral belong
+; to turbobaby/bot-surface, which owns start_records_a_referral, and arrive here as one boolean.
+; It restates no link grammar, no payload character class and no landing: turbobaby/deeplink owns
+; those and owns the link-side statement that a referral travels as an opaque code. It restates
+; no ledger structure and no replay-key rule: turbobaby/loyalty-ledger owns the bonus ledger this
+; domain wrote into until 2026-09-26. It restates no notice: turbobaby/notification-queue owns the
+; friend-joined row this domain enqueues (and, until 2026-09-26, the friend-ordered and milestone
+; rows), and this file states only where those enqueues sat relative to a money commit. It copies no window ceiling: turbobaby/star-award owns the only
+; capped credit path in the corpus -- re-measured 2026-09-21 across all 43 .t27 files and still the
+; only one, and re-run 2026-09-22 over the 45 and still the only one, so the absence claimed here
+; is dated and not remembered -- and is named as precedent,
+; with neither the size of its ceiling nor the
+; size of its capped set reproduced here. It restates no identity proof: turbobaby/request-identity
+; owns the gates, and this file records only which of its own routes stands behind one. It carries
+; no leaderboard row, no rank, no
+; person-level field, and no referral code fixture of any length -- a plausible eight-character
+; string in a public spec is a code, and the alphabet is declared instead. Shipped Cyrillic
+; strings in the cited sources are referred to by path and never quoted. No D14 material appears.
+; --
+; R3, THE OWNER'S ANSWER OF 2026-09-26 (DECISIONS.md, "R1-R3, the owner's answers of 2026-09-26").
+; In translation (the Russian is verbatim in DECISIONS.md and in src/trios/referral_credit.rs): "it
+; must be credited only for someone who rented, a 10% discount"; "the inviter can take it as a
+; discount on a rental or as money"; and of the referral bonus points, "remove them, only the 10%
+; discount". So since 2026-09-26 this domain writes no referral credit at all: confirming an edge
+; pays nobody (confirm_referral_edge_in in src/db/referrals.rs replaced confirm_referral), the
+; milestone ladder and its award are deleted, and the welcome credit is gone. The money a referral
+; earns is turbobaby/referral-credit's: a THB ledger of its own, credited when a manager records a
+; completed rental of an invited friend, at a rate that file owns. This file still owns the edge,
+; its code, its status and its confirmation. The sections below on the three credits and the ladder
+; are kept as the record of what shipped until then, and a src/db/referrals.rs or src/db/orders.rs
+; line number in them that names deleted code is a reading of e39221e and says so.
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module turbobaby-referral-program;
+
+pub const KIND : str = "contract";
+pub const ID : str = "turbobaby/referral-program";
+pub const NAME : str = "TurboBaby referral graph and payout";
+pub const WORLD : str = "gHashTag/turbobaby-user-bot";
+pub const MEASURED_AT : str = "2026-09-21";
+
+; Where each rule below is implemented.
+pub const ROUTE_IMPLEMENTATION : str = "src/api/referrals.rs";
+pub const GRAPH_IMPLEMENTATION : str = "src/db/referrals.rs";
+pub const SHARE_SOURCE_IMPLEMENTATION : str = "src/trios/referrals.rs";
+pub const EVENT_ENTITY : str = "src/db/entities/referral_event.rs";
+pub const MILESTONE_ENTITY : str = "src/db/entities/referral_milestone.rs";
+pub const EVENT_MIGRATION : str = "migrations/007_referral_events.sql";
+pub const CODE_WIDTH_MIGRATION : str = "migrations/035_referral_code_telegram_id.sql";
+pub const OPACITY_MIGRATION : str = "migrations/046_opaque_referral_codes.sql";
+pub const MILESTONE_MIGRATION : str = "migrations/068_referral_milestones.sql";
+; The completion step that confirms the edge (step 7 of complete_order_and_update_loyalty). It
+; paid the referral credits until 2026-09-26 and is still named PAYOUT for continuity; since R3 it
+; confirms and pays nothing.
+pub const PAYOUT_CALL_SITE : str = "src/db/orders.rs:400-423";
+pub const PAYOUT_CALL_SITE_BEFORE_2026_09_26 : str = "src/db/orders.rs:423-489";
+pub const RECORD_CALL_SITE : str = "src/bot/commands.rs:188-215";
+pub const REGRESSION_WITNESS : str = "tests/integration_invite_counter.rs";
+
+; --- Reuse edges, named because there are no imports ---------------------------------------------
+; A cross-contract dependency is a string pinned to its literal by a test. Each edge names the
+; DECLARATION this file consumes, never a line in the sibling.
+;
+; RE-MEASURED 2026-09-21, from git rather than from memory, because the sentence that used to stand
+; here ("ten contracts were written in parallel one wave ago and every line citation between them
+; was stale within the hour") mixed one true count with one nobody timed. The true count: the wave
+; before this one landed exactly TEN new contracts in a single commit. What that sentence left out
+; is that this file's OWN wave landed THIRTEEN more beside it, so the hazard is larger than it
+; said, not smaller -- a line number typed into a sibling was typed against a file another author
+; was still editing. "Within the hour" is dropped: nobody measured the interval and this corpus does
+; not publish guessed numbers.
+;
+; The corpus-wide RESIDUE is deliberately not pinned either, and the reason is the finding itself.
+; It was counted at 63 when this correction began and at 7 a few minutes later, because sibling
+; contracts are being repaired in parallel right now. A total written into this file would be false
+; before the commit carrying it landed -- the same defect in a new costume. What is pinned is what
+; cannot move: the wave sizes, which are git history, and this file's own contribution, which is
+; zero. Citations into src/, migrations/, data/, docs/ and DECISIONS.md are a different case --
+; those files were not moving -- and they stay.
+pub const CORPUS_T27_FILE_COUNT : u8 = 43;
+; Re-measured 2026-09-22 and deliberately NOT bound: a census of the corpus moves with every new
+; contract. specs/ holds 45 .t27 files, all tracked. The two beyond the 43, order_presentation.t27
+; and person_naming.t27, landed together in 14b01ac later on 2026-09-21 and belong to neither wave
+; counted here (d1877db added ten, ed0ba9c thirteen). The star-award uniqueness sentence in the
+; header was taken over the 43 and was re-run over the two new files the same day: neither declares
+; a capped credit path (a case-insensitive grep for ceiling, capped or per-window returns 0 in
+; both), so it still holds over the 45. The 43 is kept as the 2026-09-21 reading.
+pub const CORPUS_T27_FILE_COUNT_REMEASURED : u8 = 45;
+pub const CORPUS_T27_FILE_COUNT_REMEASURED_AT : str = "2026-09-22";
+pub const STAR_AWARD_UNIQUENESS_RERUN_AT : str = "2026-09-22";
+pub const PRIOR_WAVE_NEW_CONTRACTS : u8 = 10;
+pub const OWN_WAVE_NEW_CONTRACTS : u8 = 13;
+pub const SIBLING_LINE_CITATIONS_IN_THIS_FILE : u8 = 0;
+pub const CORPUS_RESIDUE_IS_PINNED_HERE : bool = false;
+pub const CORPUS_RESIDUE_NOTE : str = "Counted twice on 2026-09-21 during this correction: 63 at the start and 7 a few minutes later. The drop is sibling contracts being repaired in parallel, not a measurement error. A live corpus-wide total is therefore refused a constant here, because pinning one would publish a number that goes stale before the commit carrying it lands. Any reader who needs today's figure can grep for it in one line; what this file owes is the two numbers a grep cannot recover, and those are above.";
+pub const WAVE_CENSUS_MEASURED_AT : str = "2026-09-21";
+pub const WAVE_CENSUS_SOURCE : str = "git log over specs/turbobaby, added-file counts per commit";
+pub const STALENESS_INTERVAL_IS_PUBLISHED : bool = false;
+
+pub fn edge_is_durable(names_a_declaration: bool, names_a_line_number: bool) bool {
+  return names_a_declaration and !names_a_line_number;
+}
+pub const REUSES_LOYALTY_LEDGER_ID : str = "turbobaby/loyalty-ledger";
+pub const REUSES_STAR_AWARD_ID : str = "turbobaby/star-award";
+pub const REUSES_REQUEST_IDENTITY_ID : str = "turbobaby/request-identity";
+pub const REUSES_DEEPLINK_ID : str = "turbobaby/deeplink";
+pub const REUSES_BOT_SURFACE_ID : str = "turbobaby/bot-surface";
+pub const REUSES_NOTIFICATION_QUEUE_ID : str = "turbobaby/notification-queue";
+; Since 2026-09-26 (R3): the referral credit, which owns what a referral earns now.
+pub const REUSES_REFERRAL_CREDIT_ID : str = "turbobaby/referral-credit";
+pub const REUSE_EDGE_COUNT : u8 = 7;
+pub const REUSE_EDGE_COUNT_BEFORE_2026_09_26 : u8 = 6;
+pub const REUSE_EDGES : [7]str = [
+  "turbobaby/loyalty-ledger",
+  "turbobaby/star-award",
+  "turbobaby/request-identity",
+  "turbobaby/deeplink",
+  "turbobaby/bot-surface",
+  "turbobaby/notification-queue",
+  "turbobaby/referral-credit",
+];
+
+pub const LOYALTY_LEDGER_SUPPLIES : str = "the bonus ledger a referral credit was a row in until 2026-09-26, and the finding that the balance movements that pair with a ledger insert are a subset of all of them (six of ten when this was written; three of seven since R3 removed this domain's three). All three of this domain's credits were inside that six, and that owner named all three by path and line into src/. This file adds no ledger column and no replay key. Re-checked 2026-09-21: that owner's LEDGER_BYPASS_SITES names four bypasses and not one of them is a referral site; re-checked 2026-09-26: this domain writes no balance at all, so it is in neither list.";
+
+; The agreement above, pinned so it cannot drift silently. turbobaby/loyalty-ledger declared the
+; same three sites from its side and names this contract back by ID; neither file cites the
+; other by line number, in either direction. If that owner's bypass list ever grows a referral
+; site, these literals and his disagree and the invariant below fails. R3 (2026-09-26) removed
+; this domain's three paired credits: seven movements are left, three of them paired, and none is
+; this domain's. The readings before it are kept under their _BEFORE_2026_09_26 names.
+pub const LEDGER_PAIRED_MOVEMENTS : u8 = 3;
+pub const LEDGER_MOVEMENTS_TOTAL : u8 = 7;
+pub const THIS_DOMAINS_CREDITS_INSIDE_THE_PAIRED_SIX : u8 = 0;
+pub const LEDGER_PAIRED_MOVEMENTS_BEFORE_2026_09_26 : u8 = 6;
+pub const LEDGER_MOVEMENTS_TOTAL_BEFORE_2026_09_26 : u8 = 10;
+pub const THIS_DOMAINS_CREDITS_INSIDE_THE_PAIRED_SIX_BEFORE_2026_09_26 : u8 = 3;
+pub const THIS_DOMAINS_CREDITS_AMONG_THE_BYPASSES : u8 = 0;
+pub const LEDGER_OWNER_NAMES_THIS_CONTRACT_BACK : bool = true;
+pub const LEDGER_AGREEMENT_CHECKED_AT : str = "2026-09-21";
+pub const LEDGER_CITATION_IS_BY_ID_IN_BOTH_DIRECTIONS : bool = true;
+
+pub fn ledger_contracts_agree(inside: u8, among_bypasses: u8, paired: u8, total: u8) bool {
+  if (among_bypasses != 0) {
+    return false;
+  }
+  return inside <= paired and paired <= total;
+}
+pub const STAR_AWARD_SUPPLIES : str = "the corpus precedent for a capped credit path -- a per-source rolling ceiling that trims rather than refuses, over a capped SET whose size is that owner's number and is not reproduced here. A referral credit has no equivalent ceiling, which is a fact about this file and not about that one.";
+pub const REQUEST_IDENTITY_SUPPLIES : str = "who the caller is and what a failed proof means. That owner declares CONSUMERS as a closed snapshot, and as of 2026-09-21 this file IS named in it -- see the note below, which records that the answer was the opposite earlier the same day. This file records only which of its own five routes stands behind a gate, which that owner explicitly does not carry.";
+pub const DEEPLINK_SUPPLIES : str = "the /start payload grammar in its link form, and REFERRAL_TRAVELS_AS_AN_OPAQUE_CODE -- the link-side statement that a referral travels as a code rather than as an identity. This file owns the mint that makes the code opaque, not the transport that carries it.";
+pub const BOT_SURFACE_SUPPLIES : str = "start_records_a_referral -- the conjunction of prefix, length bound, referrer lookup and sender comparison that admits an incoming referral at the COMMAND layer. It arrives here as the single boolean start_admitted, and none of its four terms is restated as a term of this file. The self edge recurs here only as a SECOND guard at a second site, the data layer, which that owner does not measure.";
+pub const NOTIFICATION_QUEUE_SUPPLIES : str = "the queued mail a referral produces -- the friend-joined row (and, until 2026-09-26, the friend-ordered and milestone rows, which that owner now holds), their kinds and their delivery. This file declares only where those enqueues sat relative to a money commit, and restates no kind, no markup, no retry and no table column.";
+pub const REFERRAL_CREDIT_SUPPLIES : str = "what a referral earns since 2026-09-26 (R3): the rate, the rounding, the base, who is creditable, the holds, the settlement, the payout by hand and the THB ledger. This file consumes it as the answer to 'what does a referral pay' and restates none of it; it keeps the edge the credit is read from.";
+
+; turbobaby/request-identity declares a closed snapshot of its consumers, and this file IS named in
+; it. The edge is declared from this side too, so the pair is named from both ends.
+;
+; CORRECTED 2026-09-21, and the correction is worth more than the fact. The sentence that stood
+; here -- "this file is not in that snapshot", written when the snapshot was taken before this file
+; existed -- was true when written and false by the time it was read. That owner re-measured the
+; same day: CONSUMER_COUNT went from 8 to 22, the array now names turbobaby/referral-program
+; outright, and he keeps the superseded figure in CONSUMER_COUNT_BEFORE_THE_RE_MEASUREMENT so the
+; move is visible rather than silent. A standing "is not in it" is exactly the false absence this
+; corpus cannot afford, so the claim below carries the day it was taken and nothing here asserts an
+; absence that only a date could make true.
+pub const NAMED_IN_THE_IDENTITY_CONSUMER_SNAPSHOT : bool = true;
+pub const IDENTITY_SNAPSHOT_CHECKED_AT : str = "2026-09-21";
+pub const IDENTITY_SNAPSHOT_SIZE : u8 = 22;
+pub const IDENTITY_SNAPSHOT_SIZE_BEFORE_THE_RE_MEASUREMENT : u8 = 8;
+pub const IDENTITY_SNAPSHOT_MOVED_THE_SAME_DAY : bool = true;
+; turbobaby/deeplink declares a co-declared-fact site pointing at turbobaby/bot-surface for the
+; referral payload. This file is the third holder of that fact and restates none of it.
+pub const RESTATES_THE_START_PAYLOAD_GRAMMAR : bool = false;
+pub const RESTATES_THE_LEDGER_STRUCTURE : bool = false;
+
+; --- What a referral code may encode -------------------------------------------------------------
+; src/db/referrals.rs:78-79. Thirty-two glyphs, eight positions. The alphabet omits 0/O and 1/I/l
+; on purpose (:76-77) so a code read aloud or copied by hand survives the trip.
+pub const CODE_ALPHABET : str = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+pub const CODE_ALPHABET_SIZE : u8 = 32;
+pub const CODE_ALPHABET_OMITS_AMBIGUOUS_GLYPHS : bool = true;
+pub const CODE_LENGTH : u16 = 8;
+
+; 32^8 is 2^40. Declared as the exponent because the product does not fit the integer widths this
+; corpus uses, and because the exponent is the honest form of a keyspace.
+pub const CODE_KEYSPACE_IS_TWO_TO_THE : u8 = 40;
+; src/db/referrals.rs:95-96 puts that keyspace at roughly 2.8e12. 2^40 is 1.0995e12, so the
+; comment overstates it by a factor of about 2.5. The conclusion drawn beside it -- that a
+; collision is remote and the retry loop is defence in depth -- survives the correction, which is
+; why this is recorded as a wrong number and not as a wrong design.
+pub const SOURCE_COMMENT_OVERSTATES_THE_KEYSPACE : bool = true;
+
+; The generator at src/db/referrals.rs:83-92 takes no argument at all: there is no telegram id in
+; scope, so no identity can be recovered from a code by any means, not by inversion and not by
+; lookup outside the profiles table. This was not always so.
+pub const CODE_IS_DERIVED_FROM_AN_IDENTITY : bool = false;
+pub const A_TELEGRAM_ID_WAS_ONCE_THE_CODE : bool = true;
+; migrations/035_referral_code_telegram_id.sql:1-3 records the era plainly: the code was the raw
+; telegram id, chosen for human-readable deep links, and the column had to be widened to hold
+; nineteen digits. migrations/046_opaque_referral_codes.sql:18-36 ended it, rewriting every
+; all-digit code in loyalty_profiles and carrying the rewrite into referral_events at :34 so
+; attribution survived the deploy.
+pub const OPACITY_WAS_RETROFITTED : bool = true;
+pub const REWRITE_CARRIED_THROUGH_TO_THE_EVENT_LEDGER : bool = true;
+
+pub fn code_is_opaque(derived_from_an_identity: bool, drawn_from_the_alphabet: bool, length: u16) bool {
+  return !derived_from_an_identity and drawn_from_the_alphabet and length == CODE_LENGTH;
+}
+
+; Eight of the thirty-two glyphs are digits, so an all-digit minted code has probability
+; (8/32)^8 = 4^-8, one in 65536. That matters twice. The legacy test in
+; migrations/046_opaque_referral_codes.sql:27 is the regular expression for an all-digit string,
+; so a minted code can be indistinguishable from the legacy shape it replaced; the migration is
+; ledgered and runs once (src/db/mod.rs:25 names the _schema_migrations table), so this is a trap
+; for the next author of such a test rather than a live rotation. And the unit test at
+; src/db/referrals.rs:686-691 pins non-derivability by asserting the code is not all digits,
+; which fails at exactly that rate.
+pub const ALL_DIGIT_CODE_ONE_IN : u32 = 65536;
+pub const A_MINTED_CODE_CAN_MATCH_THE_LEGACY_SHAPE : bool = true;
+pub const THE_LEGACY_REWRITE_RUNS_ONCE : bool = true;
+pub const THE_OPACITY_UNIT_TEST_IS_FLAKY_AT_THAT_RATE : bool = true;
+
+; --- Minting a code, and whether it holds still ---------------------------------------------------
+; migrations/001_initial.sql:16 gives loyalty_profiles.referral_code a fifty-character width and a
+; UNIQUE index. That index, not the application retry, is what makes two people sharing a code
+; impossible: a colliding insert violates it. migrations/007_referral_events.sql:8 gives the
+; event's copy of the code no uniqueness at all, and migrations/035_referral_code_telegram_id.sql
+; widened it to match.
+pub const PROFILE_CODE_COLUMN_MAX_LEN : u16 = 50;
+pub const EVENT_CODE_COLUMN_MAX_LEN : u16 = 50;
+pub const PROFILE_CODE_IS_UNIQUE_IN_THE_SCHEMA : bool = true;
+pub const EVENT_CODE_IS_UNIQUE_IN_THE_SCHEMA : bool = false;
+; src/db/referrals.rs:97. The retry bound the mint loop uses (:125, :134). It is declared because
+; the comment two lines above it (:94-96) is the one this file corrects, not because the loop is
+; what keeps codes distinct -- the UNIQUE index is.
+pub const MAX_CODE_RETRIES : u8 = 10;
+
+pub fn code_length_fits_the_column(length: u16) bool {
+  return length >= 1 and length <= PROFILE_CODE_COLUMN_MAX_LEN;
+}
+
+pub fn two_people_can_hold_one_code(schema_enforces_uniqueness: bool) bool {
+  return !schema_enforces_uniqueness;
+}
+
+; src/db/referrals.rs:101-161. The read at :112-121 and the write at :150-158 are separate
+; statements with no row lock -- contrast :333 in the confirmation path, which takes one -- and
+; the conflict action at :152-154 REPLACES the column rather than leaving it. So the only thing
+; holding a minted code still is that the read found one. Two first-time calls for the same person
+; that interleave end with the second code stored. The chain test at src/db/referrals.rs:791-797
+; pins stability across two sequential calls and states why it matters: a code that changes kills
+; every link already shared. It cannot pin the interleaved case.
+pub const CODE_MINT_TAKES_A_ROW_LOCK : bool = false;
+pub const MINT_CONFLICT_ACTION_REPLACES_THE_COLUMN : bool = true;
+pub const STABILITY_IS_PINNED_SEQUENTIALLY_ONLY : bool = true;
+
+pub fn mint_returns_the_stored_code(code_already_stored: bool) bool {
+  return code_already_stored;
+}
+
+pub fn a_second_code_can_replace_the_first(code_already_stored: bool, concurrent_first_mint: bool) bool {
+  if (code_already_stored) {
+    return false;
+  }
+  return concurrent_first_mint;
+}
+
+; --- The graph ------------------------------------------------------------------------------------
+; migrations/007_referral_events.sql:7. The unique key is the INVITEE alone, not the pair. A person
+; may be referred once ever, by one referrer, and a referrer has no ceiling on invitees anywhere in
+; the schema or the code.
+pub const EDGE_IS_DIRECTED : bool = true;
+pub const UNIQUE_KEY_IS_THE_INVITEE_ALONE : bool = true;
+pub const REFERRERS_PER_INVITEE_MAX : u8 = 1;
+pub const INVITEES_PER_REFERRER_HAVE_A_CEILING : bool = false;
+; src/db/referrals.rs:251. A pre-existing attribution wins over a later one, expressed as a
+; COALESCE because a plain upsert would overwrite it.
+pub const FIRST_TOUCH_WINS : bool = true;
+
+; The edge is stored twice and the two copies are read by different paths.
+; src/db/referrals.rs:242 writes loyalty_profiles.referred_by; :265 writes
+; referral_events.referrer_id. The confirmation reads the event (:341), and so, since 2026-09-26,
+; does the referral credit (record_rental in src/db/referral_credit.rs). Until then the milestone
+; award read the profile (src/db/orders.rs:446 calling get_referrer_of, src/db/referrals.rs:191-203,
+; both at e39221e); since R3 no money path reads referred_by. Nothing compares them.
+pub const ATTRIBUTION_IS_STORED_TWICE : bool = true;
+pub const THE_TWO_COPIES_ARE_EVER_COMPARED : bool = false;
+
+; Two terms, and referrer_found is deliberately NOT one of them. turbobaby/bot-surface owns
+; start_records_a_referral, whose four terms already include the referrer lookup and the sender
+; comparison; conjoining the lookup again here would restate a term this file does not measure and
+; would describe states that owner's contract forbids (admitted, yet no referrer). What this file
+; measures is the SECOND guard, at a second site: src/db/referrals.rs:216-218 refuses a self edge
+; in the data layer, so a caller that is not the bot -- an admin tool, a new endpoint -- still
+; meets one. The self-edge term therefore stands for that guard, not for the bot's :199.
+pub fn edge_may_be_recorded(start_admitted: bool, self_edge: bool) bool {
+  return start_admitted and !self_edge;
+}
+
+; --- The self edge ----------------------------------------------------------------------------------
+; Two guards, both in application code, both on the same path: src/bot/commands.rs:199 compares the
+; two ids before calling, and src/db/referrals.rs:216-218 refuses at the data layer. The comment
+; above the second (:209-215; :220-226 at e39221e) named the reason until 2026-09-26: a
+; self-referral pending event would later be paid out to the user's own balance by the
+; confirmation path. Since R3 the confirmation pays nothing, and the referral credit refuses a self
+; edge on its own (creditable_inviter's SelfEdge, turbobaby/referral-credit).
+pub const SELF_EDGE_GUARD_COUNT : u8 = 2;
+pub const SELF_EDGE_GUARDS_ARE_APPLICATION_CODE : bool = true;
+; migrations/007_referral_events.sql holds zero CHECK constraints. There is no schema-level
+; statement that referrer_id and referred_id differ.
+pub const SELF_EDGE_HAS_A_SCHEMA_CONSTRAINT : bool = false;
+; The backfill at migrations/007_referral_events.sql:21-32 inserts rows without passing either
+; guard, and its WHERE clause (:31) tests only that referred_by is not null. A profile whose
+; referred_by equals its own telegram_id satisfies the join at :30 against itself and produces a
+; self edge. The confirmation path (confirm_referral at src/db/referrals.rs:319-505 at e39221e;
+; confirm_referral_edge_in, :316-388, since 2026-09-26) never re-checks the two ids -- and since R3
+; it has no amount to check either.
+pub const BACKFILL_PASSES_THROUGH_A_GUARD : bool = false;
+pub const BACKFILL_EXCLUDES_THE_SELF_EDGE : bool = false;
+pub const PAYOUT_RECHECKS_THE_SELF_EDGE : bool = false;
+;
+; WHICH MONEY A SELF EDGE CAN ACTUALLY REACH, and the mistake of not asking. The status the row is
+; BORN with decides it, and the two ways of making one give different answers.
+; A backfilled row is born confirmed (migrations/007_referral_events.sql:26), and the confirmation
+; selects on status pending and nothing else (src/db/referrals.rs:332). So the per-referral credit
+; path COULD NOT pay a backfilled self edge: it found no pending row and took the no-op (:359-373 at
+; e39221e; the early return at :338 since 2026-09-26). The fraud the source comment at :220-226 (at
+; e39221e) described -- a self-referral event later paid out to the user's own balance -- was a
+; fact about the INSERT path, whose rows are born pending (:268), and that path has both guards.
+; The backfilled row was not harmless, and the reachable path was the other one.
+; count_confirmed_referrals counts status confirmed OR paid (src/db/referrals.rs:650-651),
+; maybe_award_referral_milestones read that count at :790 and paid the ladder off it (:795-796,
+; both at e39221e), and on a self edge the referrer IS the invitee -- so the row advanced that
+; person's own rung. R3 deleted the award on 2026-09-26, so no rung is advanced any more, and the
+; referral credit refuses the self edge by name. get_referrer_stats still counts it the same way at
+; :423 and the leaderboards at :470, :484 and :498.
+pub const BACKFILLED_EDGE_IS_BORN_CONFIRMED : bool = true;
+pub const INSERTED_EDGE_IS_BORN_PENDING : bool = true;
+pub const CONFIRMATION_SELECTS_ONLY_PENDING : bool = true;
+pub const A_CONFIRMED_SELF_EDGE_ADVANCES_ITS_OWN_LADDER : bool = false;
+pub const A_CONFIRMED_SELF_EDGE_ADVANCES_ITS_OWN_LADDER_BEFORE_2026_09_26 : bool = true;
+pub const SELF_EDGE_POPULATION_NOTE : str = "Whether such a row exists is a fact about a deployed database, which this repository does not publish and this file does not guess. What is measured is that the only barrier is on the insert path, that the backfill is not on it, and which of the two money paths a row born on each side can reach.";
+
+; The per-referral credit path. Born status is the term the first reading of this file omitted:
+; without it the predicate said yes for a backfilled row, which confirm_referral cannot see.
+pub fn payout_would_credit_the_invitees_own_balance(self_edge: bool, born_status: u8, payout_rechecks: bool) bool {
+  if (payout_rechecks) {
+    return false;
+  }
+  if (born_status != STATUS_PENDING) {
+    return false;
+  }
+  return self_edge;
+}
+
+; The milestone path, which does not care how the row was born, only that it counts as confirmed.
+pub fn self_edge_advances_its_own_ladder(self_edge: bool, counted_as_confirmed: bool) bool {
+  return self_edge and counted_as_confirmed;
+}
+
+; --- The event ledger and what makes two taps one event ---------------------------------------------
+; src/db/referrals.rs:272-281. Idempotency here is a unique index and a DO NOTHING, not a client
+; key header -- this table has no key column and no header is read on this path. The witness is
+; tests/integration_invite_counter.rs, and src/db/referrals.rs:829-864 taps three times and
+; asserts the counter reads one. Both witnesses need a database and are #[ignore]d
+; (src/db/referrals.rs:830, tests/integration_invite_counter.rs:62 and :132, the command spelled
+; out at its :20), so neither runs in a default cargo test. The behaviour is pinned by the UNIQUE
+; index at migrations/007_referral_events.sql:7 and demonstrated, not guarded, by those two.
+pub const THE_IDEMPOTENCY_WITNESSES_RUN_BY_DEFAULT : bool = false;
+pub const IDEMPOTENCY_IS_A_UNIQUE_INDEX : bool = true;
+pub const IDEMPOTENCY_IS_A_CLIENT_KEY_HEADER : bool = false;
+
+pub fn events_after_taps(taps: u8) u8 {
+  if (taps == 0) {
+    return 0;
+  }
+  return 1;
+}
+
+; The identifier is minted at src/db/referrals.rs:227, BEFORE the insert that may do nothing, and
+; returned unconditionally at :295. On a duplicate tap the caller receives a well-formed uuid that
+; names no row. It is harmless today only because the one production caller
+; (src/bot/commands.rs:201-211) discards the value and checks the error.
+pub const RECORD_RETURNS_AN_ID_UNCONDITIONALLY : bool = true;
+pub const THE_ONE_CALLER_DISCARDS_THE_ID : bool = true;
+
+pub fn returned_id_names_a_row(inserted: bool) bool {
+  return inserted;
+}
+
+; src/db/referrals.rs:197-201 states that the two statements are not wrapped in a transaction,
+; matching the raw SQL they replaced. The duplicate probe at :231-236 is a third statement, read
+; before either write, and the notice at :284-293 is sent on its result. Two taps that interleave
+; can both observe "not yet referred" and both enqueue the joined notice, while the unique index
+; still allows only one row. The duplicate is in the notification, not in the graph.
+pub const RECORD_IS_ONE_TRANSACTION : bool = false;
+pub const DUPLICATE_PROBE_IS_A_SEPARATE_READ : bool = true;
+pub const A_RACE_CAN_DUPLICATE_THE_JOINED_NOTICE : bool = true;
+pub const A_RACE_CAN_DUPLICATE_THE_EDGE : bool = false;
+
+; --- Status, and the rung nothing writes --------------------------------------------------------
+pub const STATUS_UNSET : u8 = 0;
+pub const STATUS_PENDING : u8 = 1;
+pub const STATUS_CONFIRMED : u8 = 2;
+pub const STATUS_PAID : u8 = 3;
+pub const STATUS_NAMED_IN_THE_SCHEMA : u8 = 3;
+pub const STATUS_VALUES_WITH_A_WRITER : u8 = 2;
+pub const PAID_READ_SITE_COUNT : u8 = 5;
+pub const PAID_WRITE_SITE_COUNT : u8 = 0;
+; The comment that claimed a paid writer left with R3's rewrite of the completion step.
+pub const A_COMMENT_CLAIMS_A_PAID_WRITER : bool = false;
+pub const A_COMMENT_CLAIMS_A_PAID_WRITER_BEFORE_2026_09_26 : bool = true;
+pub const STALE_PAID_CLAIM_SITE_BEFORE_2026_09_26 : str = "src/db/orders.rs:418";
+
+pub fn status_is_named_in_the_schema(status: u8) bool {
+  return status >= STATUS_PENDING and status <= STATUS_PAID;
+}
+
+pub fn status_has_a_writer(status: u8) bool {
+  return status == STATUS_PENDING or status == STATUS_CONFIRMED;
+}
+
+; What the five read sites mean by "confirmed" is the disjunction, and it admits a value no writer
+; produces. The branch is not wrong, it is unreachable, which is worse to read and cheaper to fix.
+pub fn status_counts_as_confirmed(status: u8) bool {
+  return status == STATUS_CONFIRMED or status == STATUS_PAID;
+}
+
+pub fn read_branch_is_reachable(status: u8) bool {
+  return status_counts_as_confirmed(status) and status_has_a_writer(status);
+}
+
+; confirm_referral_edge_in (src/db/referrals.rs:316-388) runs on its caller's transaction: its own
+; on a completion (confirm_referral_edge, :393-402, opened at :398 and committed at :400), or the
+; one record_rental holds. The pending row is taken under an exclusive lock (:333) so two
+; confirmations cannot count the friend twice, and a missing pending row returns at :338, the
+; wrapper still committing to release the lock. (confirm_referral, :346-503 at e39221e, did the
+; same around its three credits.) Nothing anywhere returns a confirmed row to pending.
+pub const CONFIRMATION_IS_ONE_TRANSACTION : bool = true;
+pub const CONFIRMATION_TAKES_A_ROW_LOCK : bool = true;
+pub const CONFIRMATION_IS_ONE_WAY : bool = true;
+pub const A_MISSING_PENDING_EVENT_IS_A_NO_OP : bool = true;
+
+; Until 2026-09-26, src/db/referrals.rs:337-339 (at e39221e) refused a non-finite or negative bonus
+; before the transaction opened, and :340-344 clamped a non-finite or non-positive welcome amount
+; to nothing rather than refusing, because the welcome credit was optional and the referral credit
+; was not. Since R3 the confirmation takes no amount; the function below is that history.
+pub fn confirmation_may_credit(pending_event_found: bool, amount_is_finite_and_nonnegative: bool) bool {
+  return pending_event_found and amount_is_finite_and_nonnegative;
+}
+
+pub fn status_after_confirmation(status: u8, credited: bool) u8 {
+  if (status != STATUS_PENDING) {
+    return status;
+  }
+  if (credited) {
+    return STATUS_CONFIRMED;
+  }
+  return STATUS_PENDING;
+}
+
+; --- What a referral paid in until 2026-09-26 ---------------------------------------------------
+; Three credits, all of them rows in the bonus ledger owned by turbobaby/loyalty-ledger, and none
+; of them in the Stars currency: a case-insensitive sweep of src/db/referrals.rs for star finds
+; only the word start. src/db/referrals.rs:414, :474 and :842 (all at e39221e) named the three
+; transaction types. R3 stopped all three on 2026-09-26; the constants below are that record, and
+; what a referral pays since is the R3 section's and turbobaby/referral-credit's.
+; Since R3 a referral pays in the THB referral credit (turbobaby/referral-credit), not in bonus.
+pub const PAYS_IN_BONUS_CURRENCY : bool = false;
+pub const PAYS_IN_BONUS_CURRENCY_BEFORE_2026_09_26 : bool = true;
+pub const PAYS_IN_THE_THB_REFERRAL_CREDIT : bool = true;
+pub const PAYS_IN_STARS : bool = false;
+pub const LEDGER_TX_TYPE_COUNT : u8 = 3;
+pub const LEDGER_TX_TYPES : [3]str = ["referral_bonus", "referral_welcome", "referral_milestone"];
+pub const CREDITS_TO_THE_REFERRER : u8 = 2;
+pub const CREDITS_TO_THE_INVITEE : u8 = 1;
+; Every one of the three paired a balance movement with a ledger insert, the insert first in each
+; case: :429 behind :419, :489 behind :481, :855 behind :847 (at e39221e). turbobaby/loyalty-ledger
+; measured the same three from the other side and counted all three among the six movements that
+; paired; since R3 it counts three paired movements of seven, none of them this domain's.
+pub const EVERY_CREDIT_PAIRS_WITH_A_LEDGER_ROW : bool = true;
+
+; The amounts were parameters, not constants: src/db/referrals.rs:319-323 took both, and they did
+; not arrive from the same place. The per-referral bonus was read from shop configuration by the one
+; production caller, with a compiled fallback beside it (src/db/orders.rs:423-439, passed at :440).
+; The welcome amount was not read there at all -- it was itself a parameter of complete_order
+; (src/db/orders.rs:195) and was passed straight through at :440, so its own source was further up
+; than this domain (every line number here at e39221e). This file named both seams and wrote down
+; neither number. Since R3 neither seam exists: complete_order takes no amount, and the
+; confirmation takes none either.
+pub const AMOUNTS_ARRIVE_AS_ARGUMENTS : bool = true;
+pub const THIS_FILE_DECLARES_AN_AMOUNT : bool = false;
+
+pub fn welcome_credit_is_written(referral_confirmed: bool, welcome_amount_is_positive: bool) bool {
+  return referral_confirmed and welcome_amount_is_positive;
+}
+
+; src/db/referrals.rs:382 (at e39221e) wrote bonus_paid, and it wrote only the per-referral credit.
+; The milestone credit (:855) and the welcome credit (:489) moved balances without touching it. So
+; the figure the profile screen calls total bonus earned, summed at :425 and shown at
+; src/api/referrals.rs:190, is the per-referral total and not what the referrer received. Nothing
+; writes bonus_paid since R3, so that figure freezes as history on 2026-09-26.
+pub const BONUS_PAID_COVERS_THE_PER_REFERRAL_CREDIT : bool = true;
+pub const BONUS_PAID_COVERS_THE_MILESTONE_CREDIT : bool = false;
+pub const EARNINGS_SUM_IS_THE_WHOLE_OF_WHAT_A_REFERRER_RECEIVED : bool = false;
+
+pub fn earnings_sum_includes(credit_is_the_per_referral_bonus: bool) bool {
+  return credit_is_the_per_referral_bonus;
+}
+
+; --- Milestones, until 2026-09-26 ------------------------------------------------------------------
+; src/db/referrals.rs:712 (at e39221e), the single ladder. Three rungs, counted in confirmed
+; referrals. R3 deleted the ladder, its defaults and its award on 2026-09-26; gate 3 no longer
+; binds these constants to src/ (there is nothing left to bind them to), and they stay as the
+; record of what was offered and paid. The rows already awarded are still read and still served.
+pub const MILESTONE_RUNG_COUNT : u8 = 3;
+pub const MILESTONE_THRESHOLDS : [3]u16 = [1, 3, 5];
+; migrations/068_referral_milestones.sql:9. The pair is the primary key, which is the whole of the
+; idempotency: src/db/referrals.rs:805-817 (at e39221e) inserted ON CONFLICT DO NOTHING and treated
+; a zero rows_affected as "already awarded", so no rung could pay twice even if the routine reran.
+pub const MILESTONE_KEY_IS_THE_PAIR : bool = true;
+pub const MILESTONE_CAN_BE_AWARDED_TWICE : bool = false;
+; No statement in src/ or migrations/ deletes from or updates referral_milestones; the only write
+; was the insert at :808 (at e39221e), and since R3 there is none. A rung, once reached, cannot be
+; taken back.
+pub const MILESTONE_CAN_BE_UN_AWARDED : bool = false;
+; The count is recomputed from the events on every call (:642-659, called at :632, and at :790 at
+; e39221e) while
+; the award row persists. A graph that shrinks therefore leaves the award standing, which is the
+; behaviour monotonicity means here.
+pub const MILESTONE_SURVIVES_A_SHRINKING_GRAPH : bool = true;
+
+pub fn milestone_reached(confirmed: u16, threshold: u16) bool {
+  return confirmed >= threshold;
+}
+
+pub fn milestone_award_is_written(reached: bool, already_awarded: bool, amount_is_positive: bool) bool {
+  return reached and !already_awarded and amount_is_positive;
+}
+
+pub fn milestones_held_after(already_awarded_count: u8, wrote: bool) u8 {
+  if (wrote) {
+    return already_awarded_count + 1;
+  }
+  return already_awarded_count;
+}
+
+; The three answers to "what does this rung pay", and why no single one of them is a contract
+; term: the compiled default at src/db/referrals.rs:716, the live shop value at :918-927, and the
+; amount frozen into the row at :810 (all three at e39221e) and read back at :636.
+; src/api/referrals.rs put two of them on the wire side by side, awards from the rows and bonuses
+; from the configuration, and :111-117 records why they are different numbers; since R3 its
+; bonuses are an empty list and only the awards remain.
+pub const MILESTONE_AMOUNT_SOURCE_COUNT : u8 = 3;
+pub const MILESTONE_AMOUNT_IS_DECLARED_HERE : bool = false;
+pub const THE_ROW_IS_THE_RECORD_OF_WHAT_WAS_PAID : bool = true;
+pub const THE_CONFIGURATION_IS_THE_RECORD_OF_WHAT_IS_OFFERED : bool = true;
+; The defaults literal is keyed by rung, so it carries a second copy of the ladder. A rung added to
+; the ladder alone is offered to the customer at zero and never awarded.
+pub const DEFAULTS_CARRY_A_SECOND_COPY_OF_THE_LADDER : bool = true;
+
+pub fn a_new_rung_can_be_offered_and_never_paid(in_the_ladder: bool, has_a_default: bool, has_a_configured_amount: bool) bool {
+  if (!in_the_ladder) {
+    return false;
+  }
+  return !has_a_default and !has_a_configured_amount;
+}
+
+; src/db/referrals.rs:792-871 was one transaction over every rung; the notices at :873-885 were
+; sent after the commit on purpose, so a messaging failure could not roll back money. The whole
+; routine was best-effort at its call site: src/db/orders.rs:451-459 logged a failure and completed
+; the order (every line number here at e39221e; the routine and its call were deleted by R3).
+; What those notices ARE -- the row, its kind, its markup and its delivery -- belongs to
+; turbobaby/notification-queue, which measures the same enqueues from the mail side. Only their
+; position relative to the commit is declared here, and no kind or column of theirs is restated.
+pub const MILESTONE_AWARD_IS_ONE_TRANSACTION : bool = true;
+pub const NOTICE_IS_SENT_AFTER_THE_COMMIT : bool = true;
+pub const A_FAILED_NOTICE_ROLLS_BACK_THE_CREDIT : bool = false;
+pub const MILESTONE_AWARD_IS_BEST_EFFORT_AT_ITS_CALL_SITE : bool = true;
+
+; --- The share-source experiment ------------------------------------------------------------------
+; src/trios/referrals.rs:14-16: a fixed multiply-add over the telegram id, then a Euclidean
+; remainder over the list length, so a negative id still lands in range and the same person always
+; lands in the same arm. The empty list is handled at :10-12 and cannot occur in production anyway,
+; because src/config.rs:223-244 substitutes a default pair for an absent, blank or fully-rejected
+; setting.
+pub const SHARE_SOURCE_IS_DETERMINISTIC : bool = true;
+pub const SHARE_SOURCE_DEPENDS_ON_THE_TELEGRAM_ID : bool = true;
+pub const SHARE_SOURCE_FALLBACK : str = "default";
+pub const CONFIGURED_LIST_CAN_BE_EMPTY_IN_PRODUCTION : bool = false;
+; An arm is one of a handful of buckets. It narrows an id to a residue class and recovers nothing,
+; which is the only reason an owner-gated route may return it at all.
+pub const SHARE_SOURCE_LEAKS_THE_TELEGRAM_ID : bool = false;
+
+; The measurement that makes this section worth writing down.
+pub const SHARE_SOURCE_PRODUCTION_CALLERS : u8 = 1;
+pub const EVENT_SOURCE_PRODUCTION_WRITERS : u8 = 1;
+pub const EVENT_SOURCE_DISTINCT_PRODUCTION_VALUES : u8 = 1;
+pub const ASSIGNED_ARM_IS_WRITTEN_TO_THE_EVENT : bool = false;
+pub const FUNNEL_METRIC_CARRIES_THE_ARM : bool = false;
+
+pub fn experiment_arm_is_recoverable(arm_written_to_the_event: bool, arm_labelled_on_the_metric: bool) bool {
+  return arm_written_to_the_event or arm_labelled_on_the_metric;
+}
+
+; --- Who may read the graph ----------------------------------------------------------------------
+pub const GATE_NONE : u8 = 0;
+pub const GATE_OWNER : u8 = 1;
+; The admin gate, which the fifth route has called since the owner's answer of 2026-09-26 ("The
+; referral top list", below). It proves the caller is an admin, not the subject of the rows.
+pub const GATE_ADMIN : u8 = 2;
+pub const ROUTE_COUNT : u8 = 5;
+pub const OWNER_GATED_ROUTE_COUNT : u8 = 4;
+; Bound by gate 3 (the check_admin calls of src/api/referrals.rs). With the two rows on ROUTE_COUNT
+; and OWNER_GATED_ROUTE_COUNT it pins the ungated count to 5 - 4 - 1 = 0.
+pub const ADMIN_GATED_ROUTE_COUNT : u8 = 1;
+pub const UNGATED_ROUTE_COUNT : u8 = 0;
+; Until the owner's answer of 2026-09-26 the fifth route called no gate (the header's item 3).
+pub const ADMIN_GATED_ROUTE_COUNT_BEFORE_THE_TOP_LIST_ANSWER : u8 = 0;
+pub const UNGATED_ROUTE_COUNT_BEFORE_THE_TOP_LIST_ANSWER : u8 = 1;
+; The path as a caller types it, not as the module registers it: src/api/referrals.rs:42 registers
+; /referrals/leaderboard and src/api/mod.rs:77 nests the whole set under /api. The handler's own
+; doc comment at src/api/referrals.rs:212 spells the joined form. Named UNGATED_ROUTE until
+; 2026-09-26, when the route stopped being ungated.
+pub const LEADERBOARD_ROUTE : str = "GET /api/referrals/leaderboard";
+; Still true: what an admin is served is the row as it was, whole id included.
+pub const LEADERBOARD_ROW_CARRIES_A_TELEGRAM_ID : bool = true;
+pub const INVITEE_ROW_CARRIES_A_TELEGRAM_ID : bool = false;
+; The 2026-09-21 reading: the field the owner-gated route withheld, the ungated one published. Since
+; 2026-09-26 no customer is served it by either route (A_CUSTOMER_IS_SERVED_ANOTHER_ACCOUNT_ID).
+pub const THE_TWO_DECISIONS_AGREE : bool = false;
+; src/api/referrals.rs:34-41 records a route that was removed for exactly this class of reason: it
+; took a referrer id from a request body, so an inviter could be named by a number a caller typed.
+; The removal was the precedent that the leaderboard exposure had not been measured against until
+; the owner closed it on 2026-09-26.
+pub const A_ROUTE_WAS_REMOVED_FOR_NAMING_A_PERSON_BY_NUMBER : bool = true;
+
+pub fn route_requires_proof_of_the_subject(gate: u8) bool {
+  return gate == GATE_OWNER;
+}
+
+pub fn an_anonymous_caller_can_read_an_account_id(gate: u8, row_carries_the_id: bool) bool {
+  return gate == GATE_NONE and row_carries_the_id;
+}
+
+; --- Refusals: what this repository does not publish ---------------------------------------------
+; data/fleet_seed.json is the whole of data/ and holds zero occurrences of referral,
+; case-insensitive, measured 2026-09-21. It is the fleet, not the programme, and its silence is
+; evidence about itself only. The ladder has a published source in src/ and is declared above; the
+; amounts have three and are declared nowhere.
+pub const SEED_REFERRAL_OCCURRENCES : u8 = 0;
+pub const SEED_MEASUREMENT_NOTE : str = "grep -ci referral data/fleet_seed.json returns 0 on 2026-09-21; data/ contains that one file, 19434 bytes. The zero bounds what the seed can be cited for and settles nothing about src/db/referrals.rs:712 (the ladder, at e39221e).";
+pub const SEED_ZERO_MAKES_THE_LADDER_UNOWNED : bool = false;
+
+; A pending referral event has no expiry. src/main.rs runs no sweep over this table -- the only
+; DELETE statements against referral_events anywhere in src/ are inside the test module at
+; src/db/referrals.rs:762 and :840 -- and the schema has no TTL column beyond created_at. An
+; invitee who never orders leaves a pending row that is counted forever by
+; src/api/referrals.rs:189 as pending.
+pub const PENDING_EVENT_EXPIRY_IS_NOT_SHIPPED : bool = true;
+pub const PENDING_EXPIRY_NOTE : str = "No sweep exists and no threshold is published, so no expiry period is declared here. Shipping one needs a decision on whether an aged pending edge is deleted, marked, or merely hidden from the counter.";
+
+; No bound exists on how fast one person may create edges. The rate helper this module owns is
+; applied at src/bot/commands.rs:348 and :375, both on the assistant commands; the referral branch
+; at :188-215 is not behind it. Nothing else in the path counts attempts.
+pub const PER_REFERRER_INVITE_RATE_BOUND_IS_NOT_SHIPPED : bool = true;
+pub const RATE_BOUND_NOTE : str = "Measured as an absence on one path, not as a claim that the system is unbounded: the transport imposes its own limits, and what a bound here should count -- taps, distinct invitees, or confirmations -- is a decision nobody has recorded.";
+
+pub const PERSON_LEVEL_FIELDS_CARRIED : [0]str = [];
+pub const CODE_FIXTURES_CARRIED : u8 = 0;
+pub const ACCOUNT_IDS_CARRIED : u8 = 0;
+pub const LEADERBOARD_CONTENT_CARRIED : bool = false;
+
+; --- R3: what a referral pays since 2026-09-26 ----------------------------------------------------
+; The owner's answer is quoted in the header. This file declares no rate: the 10% is
+; turbobaby/referral-credit's (CREDIT_PERCENT), and THIS_FILE_DECLARES_AN_AMOUNT stays false.
+pub const OWNER_R3_DECIDED_AT : str = "2026-09-26";
+; No loyalty-point credit is written by this domain any more, to either person.
+pub const CREDITS_TO_THE_REFERRER_SINCE_2026_09_26 : u8 = 0;
+pub const CREDITS_TO_THE_INVITEE_SINCE_2026_09_26 : u8 = 0;
+; Both bound by gate 3 over src/: no shipped line composes a referral bonus transaction (the
+; tx_type literal referral_ in a Set), and nothing inserts into referral_milestones.
+pub const REFERRAL_TX_TYPE_WRITERS_SINCE_2026_09_26 : u8 = 0;
+pub const MILESTONE_AWARD_WRITERS : u8 = 0;
+; GET /api/referrals/me/:id/milestones serves empty thresholds and bonuses: nothing is offered,
+; and a cached bundle's milestones panel renders nothing on an empty list.
+pub const MILESTONE_OFFERS_SERVED : u8 = 0;
+; The edge is still confirmed (pending -> confirmed, referral_count + 1), with no money: on the
+; friend's first completed order (step 7 of complete_order_and_update_loyalty, through
+; confirm_referral_edge) and on a creditable rental a manager records (record_rental, through
+; confirm_referral_edge_in in the record's own transaction).
+pub const CONFIRMATION_KEPT_WITHOUT_MONEY : bool = true;
+pub const CONFIRMATION_SITES_SINCE_2026_09_26 : u8 = 2;
+; Points already credited stay where they are: bonus_balance, the referral_bonus,
+; referral_welcome and referral_milestone rows of bonus_transactions, the referral_milestones rows
+; and referral_events.bonus_paid. Nothing is deleted or rewritten.
+pub const CREDITED_POINTS_KEPT : bool = true;
+; The referral credit refuses a self edge by name (creditable_inviter's SelfEdge), which the old
+; payout never re-checked.
+pub const CREDIT_RECHECKS_THE_SELF_EDGE : bool = true;
+
+pub fn points_a_confirmation_credits(before_r3: bool, per_referral: u8, welcome: u8) u8 {
+  if (before_r3) {
+    return per_referral + welcome;
+  }
+  return 0;
+}
+
+; --- The referral top list: the owner's answer of 2026-09-26 -----------------------------------------
+; Open question 2 of the DECISIONS.md entry "R1-R3, the owner's answers of 2026-09-26": GET
+; /api/referrals/leaderboard answered anyone with the top referrers' Telegram ids and their point
+; totals frozen before R3 (total_bonus_earned), and the invite screen's top-referrers list printed
+; them, each id cut to four digits on the client, which withholds nothing (turbobaby/person-naming
+; records why). The owner answered the same day; the Russian is verbatim in DECISIONS.md, "The base
+; of the 10% and the referral top list, the owner's answers of 2026-09-26". In translation: "remove
+; the top and close the address". Enforced as the operator read it:
+;   * THE ADDRESS. get_leaderboard (ROUTE_IMPLEMENTATION) calls check_admin as its first statement,
+;     exactly as the loyalty leaderboard has since R1 (turbobaby/loyalty-ledger,
+;     LEADERBOARD_GATE_SITES), and reads its query string only after the gate, through a fallible
+;     Query extractor: a caller without admin proof gets check_admin's 401, or 429 once the admin
+;     limiter trips, whatever query he sends -- the status, content type and bytes R1's route gives
+;     him, compared on PostgreSQL by LEADERBOARD_GATE_WITNESS, which also shows one limiter behind
+;     both routes. An admin is served as before; his malformed query is a bare 400, as an unknown
+;     period already was. The route stays registered, and no row is read or written differently.
+;   * THE TOP. The referral page (src/ui/pages/referrals.rs) neither fetches the address nor renders
+;     the list, and the four keys only the list used are retired, each line of src/trios/i18n.rs one
+;     for one by a comment line (turbobaby/locale-policy counts them). The rest of the page stands:
+;     the link, the three counters, the referral balance with its two requests, the friends panel.
+;   * THE ADMIN SCREEN reads no referral top: its Loyalty tab reads R1's leaderboard, and its
+;     referral panel reads the four admin routes of turbobaby/referral-credit. Nothing there changed.
+;   * THE BOT'S /refstats BUTTON opens the referral page and was labelled with the locale field
+;     referral_leaderboard, a chart glyph and the word leaderboard, after the list the page no
+;     longer has. It now carries referrals_open_app, the label every referral notification already
+;     gives a button to the same page; no sentence was written. referral_leaderboard stays in both
+;     bot locales, read by nobody, like the other stopped strings (REFSTATS_BUTTON_WITNESS).
+; What an admin is served still carries the whole id and the frozen total; the answer changed who is
+; served, not what. A customer is served no other account's id by any of the five routes now.
+pub const OWNER_TOP_LIST_ANSWER_AT : str = "2026-09-26";
+pub const OWNER_TOP_LIST_ANSWER_WORDS : str = "Remove the top and close the address";
+pub const LEADERBOARD_ROUTE_GATE : u8 = 2;
+; Bound by gate 3: get_leaderboard's first statement is the admin gate, the shape R1's row binds.
+pub const LEADERBOARD_GATE_SITES : u8 = 1;
+pub const LEADERBOARD_ANSWERS_A_NON_ADMIN_AS_R1_DOES : bool = true;
+pub const LEADERBOARD_QUERY_IS_READ_AFTER_THE_GATE : bool = true;
+pub const LEADERBOARD_ROUTE_STAYS_REGISTERED : bool = true;
+pub const LEADERBOARD_ROWS_TOUCHED : u8 = 0;
+pub const A_CUSTOMER_IS_SERVED_ANOTHER_ACCOUNT_ID : bool = false;
+pub const TOP_LIST_READERS_IN_THE_MINI_APP : u8 = 0;
+pub const TOP_LIST_READERS_IN_THE_MINI_APP_BEFORE_THE_ANSWER : u8 = 1;
+pub const ADMIN_SCREEN_READS_THE_REFERRAL_TOP : bool = false;
+pub const TOP_LIST_KEYS_RETIRED : [4]str = ["referral.top", "referral.empty_leaderboard", "referral.id_mask", "referral.row_meta"];
+pub const TOP_LIST_KEYS_RETIRED_WITNESS : str = "src/trios/i18n.rs the_referral_top_list_keys_stay_retired";
+pub const TOP_LIST_CLIENT_WITNESS : str = "tests/referral_credit_client_wiring.rs the_top_referrers_list_is_gone_and_the_rest_of_the_page_stands";
+pub const ADMIN_ONLY_READ_FETCH_WITNESS : str = "tests/ui_endpoints_exist.rs an_admin_only_read_is_fetched_by_the_admin_screen_alone";
+pub const LEADERBOARD_GATE_WIRING_WITNESS : str = "tests/referral_credit_wiring.rs the_referral_leaderboard_is_admin_only_like_r1";
+pub const LEADERBOARD_GATE_WITNESS : str = "tests/integration_closed_reads.rs the_referral_leaderboard_answers_an_admin_only_like_r1";
+pub const REFSTATS_BUTTON_LABEL_FIELD : str = "referrals_open_app";
+pub const REFSTATS_BUTTON_LABEL_FIELD_BEFORE_THE_ANSWER : str = "referral_leaderboard";
+pub const REFSTATS_BUTTON_LABEL_WORDED_FOR_IT : bool = false;
+pub const REFSTATS_BUTTON_WITNESS : str = "tests/referral_credit_wiring.rs the_refstats_button_no_longer_promises_a_leaderboard";
+
+; --- Tests -----------------------------------------------------------------------------------------
+
+test r3_a_referral_writes_no_points_and_offers_no_rung {
+  assert OWNER_R3_DECIDED_AT == "2026-09-26";
+  assert CREDITS_TO_THE_REFERRER_SINCE_2026_09_26 == 0;
+  assert CREDITS_TO_THE_INVITEE_SINCE_2026_09_26 == 0;
+  assert REFERRAL_TX_TYPE_WRITERS_SINCE_2026_09_26 == 0;
+  assert MILESTONE_AWARD_WRITERS == 0;
+  assert MILESTONE_OFFERS_SERVED == 0;
+  assert CONFIRMATION_KEPT_WITHOUT_MONEY == true;
+  assert CONFIRMATION_SITES_SINCE_2026_09_26 == 2;
+  assert CREDITED_POINTS_KEPT == true;
+  assert CREDIT_RECHECKS_THE_SELF_EDGE == true;
+  assert PAYOUT_RECHECKS_THE_SELF_EDGE == false;
+  assert THIS_FILE_DECLARES_AN_AMOUNT == false;
+  assert PAYS_IN_BONUS_CURRENCY == false;
+  assert PAYS_IN_BONUS_CURRENCY_BEFORE_2026_09_26 == true;
+  assert PAYS_IN_THE_THB_REFERRAL_CREDIT == true;
+  assert points_a_confirmation_credits(true, CREDITS_TO_THE_REFERRER, CREDITS_TO_THE_INVITEE) == LEDGER_TX_TYPE_COUNT;
+  assert points_a_confirmation_credits(false, CREDITS_TO_THE_REFERRER, CREDITS_TO_THE_INVITEE) == 0;
+  assert PAYOUT_CALL_SITE == "src/db/orders.rs:400-423";
+  assert PAYOUT_CALL_SITE_BEFORE_2026_09_26 == "src/db/orders.rs:423-489";
+  assert A_COMMENT_CLAIMS_A_PAID_WRITER == false;
+  assert A_COMMENT_CLAIMS_A_PAID_WRITER_BEFORE_2026_09_26 == true;
+}
+
+
+test the_seven_reuse_edges_are_named_by_id_and_none_is_this_file {
+  assert REUSE_EDGE_COUNT == 7;
+  assert REUSE_EDGE_COUNT_BEFORE_2026_09_26 == 6;
+  assert REUSE_EDGES[6] == REUSES_REFERRAL_CREDIT_ID;
+  assert REUSES_REFERRAL_CREDIT_ID == "turbobaby/referral-credit";
+  assert REUSES_REFERRAL_CREDIT_ID != ID;
+  assert REUSE_EDGES[0] == REUSES_LOYALTY_LEDGER_ID;
+  assert REUSE_EDGES[1] == REUSES_STAR_AWARD_ID;
+  assert REUSE_EDGES[2] == REUSES_REQUEST_IDENTITY_ID;
+  assert REUSE_EDGES[3] == REUSES_DEEPLINK_ID;
+  assert REUSE_EDGES[4] == REUSES_BOT_SURFACE_ID;
+  assert REUSE_EDGES[5] == REUSES_NOTIFICATION_QUEUE_ID;
+  assert REUSES_LOYALTY_LEDGER_ID != ID;
+  assert REUSES_STAR_AWARD_ID != ID;
+  assert REUSES_REQUEST_IDENTITY_ID != ID;
+  assert REUSES_DEEPLINK_ID != ID;
+  assert REUSES_BOT_SURFACE_ID != ID;
+  assert REUSES_NOTIFICATION_QUEUE_ID != ID;
+}
+
+test this_file_owns_its_own_identity {
+  assert ID == "turbobaby/referral-program";
+  assert KIND == "contract";
+  assert MEASURED_AT == "2026-09-21";
+}
+
+test the_wave_census_is_measured_and_the_unmeasured_interval_is_refused {
+  assert CORPUS_T27_FILE_COUNT == 43;
+  assert CORPUS_T27_FILE_COUNT_REMEASURED == 45;
+  assert CORPUS_T27_FILE_COUNT_REMEASURED_AT == "2026-09-22";
+  assert CORPUS_T27_FILE_COUNT_REMEASURED_AT != MEASURED_AT;
+  assert CORPUS_T27_FILE_COUNT_REMEASURED > CORPUS_T27_FILE_COUNT;
+  assert STAR_AWARD_UNIQUENESS_RERUN_AT == CORPUS_T27_FILE_COUNT_REMEASURED_AT;
+  assert PRIOR_WAVE_NEW_CONTRACTS == 10;
+  assert OWN_WAVE_NEW_CONTRACTS == 13;
+  assert OWN_WAVE_NEW_CONTRACTS > PRIOR_WAVE_NEW_CONTRACTS;
+  assert SIBLING_LINE_CITATIONS_IN_THIS_FILE == 0;
+  assert CORPUS_RESIDUE_IS_PINNED_HERE == false;
+  assert CORPUS_RESIDUE_NOTE != "";
+  assert WAVE_CENSUS_MEASURED_AT == "2026-09-21";
+  assert WAVE_CENSUS_SOURCE != "";
+  assert STALENESS_INTERVAL_IS_PUBLISHED == false;
+  assert edge_is_durable(true, false) == true;
+  assert edge_is_durable(true, true) == false;
+  assert edge_is_durable(false, false) == false;
+}
+
+test the_ledger_agreement_is_pinned_in_both_directions {
+  assert REUSES_LOYALTY_LEDGER_ID == "turbobaby/loyalty-ledger";
+  assert LEDGER_PAIRED_MOVEMENTS == 3;
+  assert LEDGER_MOVEMENTS_TOTAL == 7;
+  assert THIS_DOMAINS_CREDITS_INSIDE_THE_PAIRED_SIX == 0;
+  assert LEDGER_PAIRED_MOVEMENTS_BEFORE_2026_09_26 == 6;
+  assert LEDGER_MOVEMENTS_TOTAL_BEFORE_2026_09_26 == 10;
+  assert THIS_DOMAINS_CREDITS_INSIDE_THE_PAIRED_SIX_BEFORE_2026_09_26 == 3;
+  assert LEDGER_PAIRED_MOVEMENTS_BEFORE_2026_09_26 - LEDGER_PAIRED_MOVEMENTS == THIS_DOMAINS_CREDITS_INSIDE_THE_PAIRED_SIX_BEFORE_2026_09_26;
+  assert LEDGER_MOVEMENTS_TOTAL_BEFORE_2026_09_26 - LEDGER_MOVEMENTS_TOTAL == THIS_DOMAINS_CREDITS_INSIDE_THE_PAIRED_SIX_BEFORE_2026_09_26;
+  assert ledger_contracts_agree(THIS_DOMAINS_CREDITS_INSIDE_THE_PAIRED_SIX_BEFORE_2026_09_26, THIS_DOMAINS_CREDITS_AMONG_THE_BYPASSES, LEDGER_PAIRED_MOVEMENTS_BEFORE_2026_09_26, LEDGER_MOVEMENTS_TOTAL_BEFORE_2026_09_26) == true;
+  assert THIS_DOMAINS_CREDITS_AMONG_THE_BYPASSES == 0;
+  assert LEDGER_OWNER_NAMES_THIS_CONTRACT_BACK == true;
+  assert LEDGER_CITATION_IS_BY_ID_IN_BOTH_DIRECTIONS == true;
+  assert LEDGER_AGREEMENT_CHECKED_AT == "2026-09-21";
+  assert ledger_contracts_agree(THIS_DOMAINS_CREDITS_INSIDE_THE_PAIRED_SIX, THIS_DOMAINS_CREDITS_AMONG_THE_BYPASSES, LEDGER_PAIRED_MOVEMENTS, LEDGER_MOVEMENTS_TOTAL) == true;
+  assert ledger_contracts_agree(3, 1, 6, 10) == false;
+  assert ledger_contracts_agree(7, 0, 6, 10) == false;
+}
+
+test a_code_is_opaque_only_when_it_is_random_and_full_length {
+  assert code_is_opaque(false, true, 8) == true;
+  assert code_is_opaque(true, true, 8) == false;
+  assert code_is_opaque(false, false, 8) == false;
+  assert code_is_opaque(false, true, 7) == false;
+  assert CODE_LENGTH == 8;
+  assert CODE_ALPHABET_SIZE == 32;
+  assert CODE_ALPHABET == "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  assert CODE_ALPHABET_OMITS_AMBIGUOUS_GLYPHS == true;
+}
+
+test the_keyspace_is_declared_as_an_exponent_and_the_source_comment_is_wrong {
+  assert CODE_KEYSPACE_IS_TWO_TO_THE == 40;
+  assert SOURCE_COMMENT_OVERSTATES_THE_KEYSPACE == true;
+  assert ALL_DIGIT_CODE_ONE_IN == 65536;
+  assert THE_OPACITY_UNIT_TEST_IS_FLAKY_AT_THAT_RATE == true;
+  assert A_MINTED_CODE_CAN_MATCH_THE_LEGACY_SHAPE == true;
+  assert THE_LEGACY_REWRITE_RUNS_ONCE == true;
+}
+
+test the_identity_era_is_recorded_as_history_not_as_practice {
+  assert A_TELEGRAM_ID_WAS_ONCE_THE_CODE == true;
+  assert CODE_IS_DERIVED_FROM_AN_IDENTITY == false;
+  assert OPACITY_WAS_RETROFITTED == true;
+  assert REWRITE_CARRIED_THROUGH_TO_THE_EVENT_LEDGER == true;
+}
+
+test the_schema_and_not_the_retry_loop_keeps_codes_distinct {
+  assert two_people_can_hold_one_code(PROFILE_CODE_IS_UNIQUE_IN_THE_SCHEMA) == false;
+  assert two_people_can_hold_one_code(EVENT_CODE_IS_UNIQUE_IN_THE_SCHEMA) == true;
+  assert code_length_fits_the_column(CODE_LENGTH) == true;
+  assert code_length_fits_the_column(0) == false;
+  assert code_length_fits_the_column(50) == true;
+  assert code_length_fits_the_column(51) == false;
+  assert PROFILE_CODE_COLUMN_MAX_LEN == EVENT_CODE_COLUMN_MAX_LEN;
+  assert MAX_CODE_RETRIES == 10;
+}
+
+test a_stored_code_is_returned_and_only_a_first_mint_can_be_overwritten {
+  assert mint_returns_the_stored_code(true) == true;
+  assert mint_returns_the_stored_code(false) == false;
+  assert a_second_code_can_replace_the_first(true, true) == false;
+  assert a_second_code_can_replace_the_first(false, true) == true;
+  assert a_second_code_can_replace_the_first(false, false) == false;
+  assert CODE_MINT_TAKES_A_ROW_LOCK == false;
+  assert MINT_CONFLICT_ACTION_REPLACES_THE_COLUMN == true;
+  assert STABILITY_IS_PINNED_SEQUENTIALLY_ONLY == true;
+}
+
+test an_edge_needs_admission_and_two_different_people {
+  assert edge_may_be_recorded(true, false) == true;
+  assert edge_may_be_recorded(false, false) == false;
+  assert edge_may_be_recorded(true, true) == false;
+  assert edge_may_be_recorded(false, true) == false;
+}
+
+test the_graph_is_directed_one_referrer_deep_and_stored_twice {
+  assert EDGE_IS_DIRECTED == true;
+  assert UNIQUE_KEY_IS_THE_INVITEE_ALONE == true;
+  assert REFERRERS_PER_INVITEE_MAX == 1;
+  assert INVITEES_PER_REFERRER_HAVE_A_CEILING == false;
+  assert FIRST_TOUCH_WINS == true;
+  assert ATTRIBUTION_IS_STORED_TWICE == true;
+  assert THE_TWO_COPIES_ARE_EVER_COMPARED == false;
+}
+
+test the_self_edge_is_barred_on_the_insert_path_only {
+  assert SELF_EDGE_GUARD_COUNT == 2;
+  assert SELF_EDGE_GUARDS_ARE_APPLICATION_CODE == true;
+  assert SELF_EDGE_HAS_A_SCHEMA_CONSTRAINT == false;
+  assert BACKFILL_PASSES_THROUGH_A_GUARD == false;
+  assert BACKFILL_EXCLUDES_THE_SELF_EDGE == false;
+}
+
+test which_money_a_self_edge_reaches_depends_on_the_status_it_was_born_with {
+  assert BACKFILLED_EDGE_IS_BORN_CONFIRMED == true;
+  assert INSERTED_EDGE_IS_BORN_PENDING == true;
+  assert CONFIRMATION_SELECTS_ONLY_PENDING == true;
+  assert payout_would_credit_the_invitees_own_balance(true, STATUS_PENDING, PAYOUT_RECHECKS_THE_SELF_EDGE) == true;
+  assert payout_would_credit_the_invitees_own_balance(true, STATUS_CONFIRMED, PAYOUT_RECHECKS_THE_SELF_EDGE) == false;
+  assert payout_would_credit_the_invitees_own_balance(true, STATUS_PENDING, true) == false;
+  assert payout_would_credit_the_invitees_own_balance(false, STATUS_PENDING, false) == false;
+  assert A_CONFIRMED_SELF_EDGE_ADVANCES_ITS_OWN_LADDER_BEFORE_2026_09_26 == true;
+  assert A_CONFIRMED_SELF_EDGE_ADVANCES_ITS_OWN_LADDER == false;
+  assert self_edge_advances_its_own_ladder(true, status_counts_as_confirmed(STATUS_CONFIRMED)) == true;
+  assert self_edge_advances_its_own_ladder(true, status_counts_as_confirmed(STATUS_PENDING)) == false;
+  assert self_edge_advances_its_own_ladder(false, true) == false;
+}
+
+test any_number_of_taps_records_one_event {
+  assert events_after_taps(0) == 0;
+  assert events_after_taps(1) == 1;
+  assert events_after_taps(2) == 1;
+  assert events_after_taps(3) == 1;
+  assert IDEMPOTENCY_IS_A_UNIQUE_INDEX == true;
+  assert IDEMPOTENCY_IS_A_CLIENT_KEY_HEADER == false;
+  assert THE_IDEMPOTENCY_WITNESSES_RUN_BY_DEFAULT == false;
+}
+
+test the_returned_identifier_names_a_row_only_on_the_first_tap {
+  assert returned_id_names_a_row(true) == true;
+  assert returned_id_names_a_row(false) == false;
+  assert RECORD_RETURNS_AN_ID_UNCONDITIONALLY == true;
+  assert THE_ONE_CALLER_DISCARDS_THE_ID == true;
+}
+
+test the_race_duplicates_the_notice_and_not_the_edge {
+  assert RECORD_IS_ONE_TRANSACTION == false;
+  assert DUPLICATE_PROBE_IS_A_SEPARATE_READ == true;
+  assert A_RACE_CAN_DUPLICATE_THE_JOINED_NOTICE == true;
+  assert A_RACE_CAN_DUPLICATE_THE_EDGE == false;
+}
+
+test the_schema_names_three_statuses_and_two_of_them_have_writers {
+  assert STATUS_NAMED_IN_THE_SCHEMA == 3;
+  assert STATUS_VALUES_WITH_A_WRITER == 2;
+  assert status_is_named_in_the_schema(STATUS_PENDING) == true;
+  assert status_is_named_in_the_schema(STATUS_CONFIRMED) == true;
+  assert status_is_named_in_the_schema(STATUS_PAID) == true;
+  assert status_is_named_in_the_schema(STATUS_UNSET) == false;
+  assert status_has_a_writer(STATUS_PENDING) == true;
+  assert status_has_a_writer(STATUS_CONFIRMED) == true;
+  assert status_has_a_writer(STATUS_PAID) == false;
+}
+
+test five_read_sites_branch_on_a_value_no_writer_produces {
+  assert PAID_READ_SITE_COUNT == 5;
+  assert PAID_WRITE_SITE_COUNT == 0;
+  assert status_counts_as_confirmed(STATUS_PAID) == true;
+  assert read_branch_is_reachable(STATUS_PAID) == false;
+  assert read_branch_is_reachable(STATUS_CONFIRMED) == true;
+  assert read_branch_is_reachable(STATUS_PENDING) == false;
+  assert A_COMMENT_CLAIMS_A_PAID_WRITER_BEFORE_2026_09_26 == true;
+  assert STALE_PAID_CLAIM_SITE_BEFORE_2026_09_26 == "src/db/orders.rs:418";
+}
+
+test confirmation_is_locked_single_and_one_way {
+  assert CONFIRMATION_IS_ONE_TRANSACTION == true;
+  assert CONFIRMATION_TAKES_A_ROW_LOCK == true;
+  assert confirmation_may_credit(true, true) == true;
+  assert confirmation_may_credit(false, true) == false;
+  assert confirmation_may_credit(true, false) == false;
+  assert status_after_confirmation(STATUS_PENDING, true) == STATUS_CONFIRMED;
+  assert status_after_confirmation(STATUS_PENDING, false) == STATUS_PENDING;
+  assert status_after_confirmation(STATUS_CONFIRMED, true) == STATUS_CONFIRMED;
+  assert A_MISSING_PENDING_EVENT_IS_A_NO_OP == true;
+}
+
+test a_referral_settled_in_bonus_until_r3_and_never_in_stars {
+  assert PAYS_IN_BONUS_CURRENCY_BEFORE_2026_09_26 == true;
+  assert PAYS_IN_STARS == false;
+  assert LEDGER_TX_TYPE_COUNT == 3;
+  assert LEDGER_TX_TYPES[0] == "referral_bonus";
+  assert LEDGER_TX_TYPES[1] == "referral_welcome";
+  assert LEDGER_TX_TYPES[2] == "referral_milestone";
+  assert EVERY_CREDIT_PAIRS_WITH_A_LEDGER_ROW == true;
+  assert CREDITS_TO_THE_REFERRER == 2;
+  assert CREDITS_TO_THE_INVITEE == 1;
+  assert CREDITS_TO_THE_REFERRER + CREDITS_TO_THE_INVITEE == LEDGER_TX_TYPE_COUNT;
+}
+
+test the_welcome_credit_is_optional_and_the_amounts_are_arguments {
+  assert welcome_credit_is_written(true, true) == true;
+  assert welcome_credit_is_written(true, false) == false;
+  assert welcome_credit_is_written(false, true) == false;
+  assert AMOUNTS_ARRIVE_AS_ARGUMENTS == true;
+  assert THIS_FILE_DECLARES_AN_AMOUNT == false;
+}
+
+test the_earnings_figure_is_the_per_referral_total_only {
+  assert earnings_sum_includes(true) == true;
+  assert earnings_sum_includes(false) == false;
+  assert BONUS_PAID_COVERS_THE_PER_REFERRAL_CREDIT == true;
+  assert BONUS_PAID_COVERS_THE_MILESTONE_CREDIT == false;
+  assert EARNINGS_SUM_IS_THE_WHOLE_OF_WHAT_A_REFERRER_RECEIVED == false;
+}
+
+test the_ladder_is_three_rungs_counted_in_confirmed_referrals {
+  assert MILESTONE_RUNG_COUNT == 3;
+  assert MILESTONE_THRESHOLDS[0] == 1;
+  assert MILESTONE_THRESHOLDS[1] == 3;
+  assert MILESTONE_THRESHOLDS[2] == 5;
+  assert milestone_reached(0, MILESTONE_THRESHOLDS[0]) == false;
+  assert milestone_reached(1, MILESTONE_THRESHOLDS[0]) == true;
+  assert milestone_reached(2, MILESTONE_THRESHOLDS[1]) == false;
+  assert milestone_reached(3, MILESTONE_THRESHOLDS[1]) == true;
+  assert milestone_reached(9, MILESTONE_THRESHOLDS[2]) == true;
+}
+
+test a_rung_pays_once_and_is_never_taken_back {
+  assert milestone_award_is_written(true, false, true) == true;
+  assert milestone_award_is_written(true, true, true) == false;
+  assert milestone_award_is_written(false, false, true) == false;
+  assert milestone_award_is_written(true, false, false) == false;
+  assert milestones_held_after(2, true) == 3;
+  assert milestones_held_after(2, false) == 2;
+  assert MILESTONE_KEY_IS_THE_PAIR == true;
+  assert MILESTONE_CAN_BE_AWARDED_TWICE == false;
+  assert MILESTONE_CAN_BE_UN_AWARDED == false;
+  assert MILESTONE_SURVIVES_A_SHRINKING_GRAPH == true;
+}
+
+test one_rung_has_three_prices_so_this_file_names_none {
+  assert MILESTONE_AMOUNT_SOURCE_COUNT == 3;
+  assert MILESTONE_AMOUNT_IS_DECLARED_HERE == false;
+  assert THE_ROW_IS_THE_RECORD_OF_WHAT_WAS_PAID == true;
+  assert THE_CONFIGURATION_IS_THE_RECORD_OF_WHAT_IS_OFFERED == true;
+}
+
+test a_rung_added_to_the_ladder_alone_is_offered_and_never_paid {
+  assert DEFAULTS_CARRY_A_SECOND_COPY_OF_THE_LADDER == true;
+  assert a_new_rung_can_be_offered_and_never_paid(true, false, false) == true;
+  assert a_new_rung_can_be_offered_and_never_paid(true, true, false) == false;
+  assert a_new_rung_can_be_offered_and_never_paid(true, false, true) == false;
+  assert a_new_rung_can_be_offered_and_never_paid(false, false, false) == false;
+}
+
+test money_commits_before_any_notice_is_sent {
+  assert MILESTONE_AWARD_IS_ONE_TRANSACTION == true;
+  assert NOTICE_IS_SENT_AFTER_THE_COMMIT == true;
+  assert A_FAILED_NOTICE_ROLLS_BACK_THE_CREDIT == false;
+  assert MILESTONE_AWARD_IS_BEST_EFFORT_AT_ITS_CALL_SITE == true;
+}
+
+test the_assigned_arm_is_returned_to_the_client_and_stored_nowhere {
+  assert SHARE_SOURCE_PRODUCTION_CALLERS == 1;
+  assert EVENT_SOURCE_PRODUCTION_WRITERS == 1;
+  assert EVENT_SOURCE_DISTINCT_PRODUCTION_VALUES == 1;
+  assert experiment_arm_is_recoverable(ASSIGNED_ARM_IS_WRITTEN_TO_THE_EVENT, FUNNEL_METRIC_CARRIES_THE_ARM) == false;
+  assert experiment_arm_is_recoverable(true, false) == true;
+  assert experiment_arm_is_recoverable(false, true) == true;
+}
+
+test the_arm_is_stable_bounded_and_carries_no_identity {
+  assert SHARE_SOURCE_IS_DETERMINISTIC == true;
+  assert SHARE_SOURCE_DEPENDS_ON_THE_TELEGRAM_ID == true;
+  assert SHARE_SOURCE_LEAKS_THE_TELEGRAM_ID == false;
+  assert SHARE_SOURCE_FALLBACK == "default";
+  assert CONFIGURED_LIST_CAN_BE_EMPTY_IN_PRODUCTION == false;
+}
+
+; The 2026-09-21 reading, kept as it was measured; the fifth route is admin-gated since the owner's
+; answer of 2026-09-26 (the test after this one).
+test four_routes_prove_the_subject_and_the_fifth_publishes_the_id {
+  assert ROUTE_COUNT == 5;
+  assert OWNER_GATED_ROUTE_COUNT == 4;
+  assert UNGATED_ROUTE_COUNT_BEFORE_THE_TOP_LIST_ANSWER == 1;
+  assert route_requires_proof_of_the_subject(GATE_OWNER) == true;
+  assert route_requires_proof_of_the_subject(GATE_NONE) == false;
+  assert an_anonymous_caller_can_read_an_account_id(GATE_NONE, LEADERBOARD_ROW_CARRIES_A_TELEGRAM_ID) == true;
+  assert an_anonymous_caller_can_read_an_account_id(GATE_OWNER, LEADERBOARD_ROW_CARRIES_A_TELEGRAM_ID) == false;
+  assert an_anonymous_caller_can_read_an_account_id(GATE_NONE, INVITEE_ROW_CARRIES_A_TELEGRAM_ID) == false;
+  assert THE_TWO_DECISIONS_AGREE == false;
+  assert OWNER_GATED_ROUTE_COUNT + ADMIN_GATED_ROUTE_COUNT_BEFORE_THE_TOP_LIST_ANSWER + UNGATED_ROUTE_COUNT_BEFORE_THE_TOP_LIST_ANSWER == ROUTE_COUNT;
+  assert LEADERBOARD_ROUTE == "GET /api/referrals/leaderboard";
+  assert A_ROUTE_WAS_REMOVED_FOR_NAMING_A_PERSON_BY_NUMBER == true;
+}
+
+test the_fifth_route_answers_an_admin_only_since_the_owners_answer {
+  assert OWNER_TOP_LIST_ANSWER_AT == "2026-09-26";
+  assert OWNER_TOP_LIST_ANSWER_AT == OWNER_R3_DECIDED_AT;
+  assert OWNER_TOP_LIST_ANSWER_WORDS == "Remove the top and close the address";
+  assert UNGATED_ROUTE_COUNT == 0;
+  assert ADMIN_GATED_ROUTE_COUNT == 1;
+  assert OWNER_GATED_ROUTE_COUNT + ADMIN_GATED_ROUTE_COUNT + UNGATED_ROUTE_COUNT == ROUTE_COUNT;
+  assert ADMIN_GATED_ROUTE_COUNT - ADMIN_GATED_ROUTE_COUNT_BEFORE_THE_TOP_LIST_ANSWER == UNGATED_ROUTE_COUNT_BEFORE_THE_TOP_LIST_ANSWER - UNGATED_ROUTE_COUNT;
+  assert LEADERBOARD_ROUTE_GATE == GATE_ADMIN;
+  assert GATE_ADMIN != GATE_NONE;
+  assert GATE_ADMIN != GATE_OWNER;
+  assert route_requires_proof_of_the_subject(GATE_ADMIN) == false;
+  assert an_anonymous_caller_can_read_an_account_id(LEADERBOARD_ROUTE_GATE, LEADERBOARD_ROW_CARRIES_A_TELEGRAM_ID) == false;
+  assert LEADERBOARD_ROW_CARRIES_A_TELEGRAM_ID == true;
+  assert A_CUSTOMER_IS_SERVED_ANOTHER_ACCOUNT_ID == false;
+  assert LEADERBOARD_GATE_SITES == 1;
+  assert LEADERBOARD_ANSWERS_A_NON_ADMIN_AS_R1_DOES == true;
+  assert LEADERBOARD_QUERY_IS_READ_AFTER_THE_GATE == true;
+  assert LEADERBOARD_ROUTE_STAYS_REGISTERED == true;
+  assert LEADERBOARD_ROWS_TOUCHED == 0;
+  assert REUSES_LOYALTY_LEDGER_ID == "turbobaby/loyalty-ledger";
+}
+
+test the_top_list_left_the_mini_app_with_its_four_keys {
+  assert TOP_LIST_READERS_IN_THE_MINI_APP == 0;
+  assert TOP_LIST_READERS_IN_THE_MINI_APP_BEFORE_THE_ANSWER == 1;
+  assert ADMIN_SCREEN_READS_THE_REFERRAL_TOP == false;
+  assert TOP_LIST_KEYS_RETIRED.len == 4;
+  assert TOP_LIST_KEYS_RETIRED[0] == "referral.top";
+  assert TOP_LIST_KEYS_RETIRED[2] == "referral.id_mask";
+  assert TOP_LIST_KEYS_RETIRED[3] == "referral.row_meta";
+  assert TOP_LIST_KEYS_RETIRED_WITNESS == "src/trios/i18n.rs the_referral_top_list_keys_stay_retired";
+  assert TOP_LIST_CLIENT_WITNESS != ADMIN_ONLY_READ_FETCH_WITNESS;
+  assert LEADERBOARD_GATE_WIRING_WITNESS != LEADERBOARD_GATE_WITNESS;
+  assert LEADERBOARD_CONTENT_CARRIED == false;
+  assert REFSTATS_BUTTON_LABEL_FIELD == "referrals_open_app";
+  assert REFSTATS_BUTTON_LABEL_FIELD != REFSTATS_BUTTON_LABEL_FIELD_BEFORE_THE_ANSWER;
+  assert REFSTATS_BUTTON_LABEL_WORDED_FOR_IT == false;
+  assert REFSTATS_BUTTON_WITNESS != LEADERBOARD_GATE_WIRING_WITNESS;
+}
+
+test the_refusals_are_measured_and_carry_no_invented_number {
+  assert SEED_REFERRAL_OCCURRENCES == 0;
+  assert SEED_ZERO_MAKES_THE_LADDER_UNOWNED == false;
+  assert PENDING_EVENT_EXPIRY_IS_NOT_SHIPPED == true;
+  assert PER_REFERRER_INVITE_RATE_BOUND_IS_NOT_SHIPPED == true;
+  assert CODE_FIXTURES_CARRIED == 0;
+  assert ACCOUNT_IDS_CARRIED == 0;
+  assert LEADERBOARD_CONTENT_CARRIED == false;
+  assert PERSON_LEVEL_FIELDS_CARRIED.len == 0;
+}
+
+test this_file_restates_no_owned_decision {
+  assert RESTATES_THE_START_PAYLOAD_GRAMMAR == false;
+  assert RESTATES_THE_LEDGER_STRUCTURE == false;
+  assert NAMED_IN_THE_IDENTITY_CONSUMER_SNAPSHOT == true;
+}
+
+test the_identity_snapshot_names_this_file_and_moved_the_day_it_was_checked {
+  assert NAMED_IN_THE_IDENTITY_CONSUMER_SNAPSHOT == true;
+  assert IDENTITY_SNAPSHOT_CHECKED_AT == "2026-09-21";
+  assert IDENTITY_SNAPSHOT_SIZE == 22;
+  assert IDENTITY_SNAPSHOT_SIZE_BEFORE_THE_RE_MEASUREMENT == 8;
+  assert IDENTITY_SNAPSHOT_SIZE > IDENTITY_SNAPSHOT_SIZE_BEFORE_THE_RE_MEASUREMENT;
+  assert IDENTITY_SNAPSHOT_MOVED_THE_SAME_DAY == true;
+  assert REUSES_REQUEST_IDENTITY_ID == "turbobaby/request-identity";
+}
+
+; --- Invariants -------------------------------------------------------------------------------------
+
+invariant a_code_that_encodes_an_identity_is_not_opaque
+  assert code_is_opaque(true, true, CODE_LENGTH) == false
+
+invariant the_mint_never_derives_a_code_from_a_person
+  assert CODE_IS_DERIVED_FROM_AN_IDENTITY == false and code_is_opaque(CODE_IS_DERIVED_FROM_AN_IDENTITY, true, CODE_LENGTH) == true
+
+invariant a_unique_index_is_what_makes_two_people_unable_to_share_a_code
+  assert two_people_can_hold_one_code(PROFILE_CODE_IS_UNIQUE_IN_THE_SCHEMA) == false
+
+invariant a_stored_code_is_never_replaced_by_a_mint
+  assert a_second_code_can_replace_the_first(true, true) == false
+
+invariant a_person_can_never_refer_themselves_through_the_recording_path
+  assert edge_may_be_recorded(true, true) == false
+
+invariant nothing_but_the_insert_path_bars_the_self_edge
+  assert SELF_EDGE_HAS_A_SCHEMA_CONSTRAINT == false and BACKFILL_EXCLUDES_THE_SELF_EDGE == false and payout_would_credit_the_invitees_own_balance(true, STATUS_PENDING, PAYOUT_RECHECKS_THE_SELF_EDGE) == true
+
+invariant a_backfilled_self_edge_escapes_the_credit_path_and_not_the_ladder
+  assert payout_would_credit_the_invitees_own_balance(true, STATUS_CONFIRMED, PAYOUT_RECHECKS_THE_SELF_EDGE) == false and self_edge_advances_its_own_ladder(true, status_counts_as_confirmed(STATUS_CONFIRMED)) == true
+
+invariant no_number_of_taps_creates_a_second_edge
+  assert events_after_taps(2) == events_after_taps(1) and events_after_taps(9) == events_after_taps(1)
+
+invariant a_duplicate_tap_returns_an_identifier_that_names_nothing
+  assert returned_id_names_a_row(false) == false and RECORD_RETURNS_AN_ID_UNCONDITIONALLY == true
+
+invariant the_paid_status_is_readable_and_unreachable
+  assert status_counts_as_confirmed(STATUS_PAID) == true and status_has_a_writer(STATUS_PAID) == false and read_branch_is_reachable(STATUS_PAID) == false
+
+invariant a_confirmed_edge_never_returns_to_pending
+  assert status_after_confirmation(STATUS_CONFIRMED, false) == STATUS_CONFIRMED and CONFIRMATION_IS_ONE_WAY == true
+
+invariant an_unfound_pending_event_credits_nothing
+  assert confirmation_may_credit(false, true) == false
+
+invariant a_negative_or_unrepresentable_amount_credits_nothing
+  assert confirmation_may_credit(true, false) == false
+
+invariant a_referral_never_settles_in_stars
+  assert PAYS_IN_STARS == false and PAYS_IN_BONUS_CURRENCY_BEFORE_2026_09_26 == true and PAYS_IN_THE_THB_REFERRAL_CREDIT == true
+
+invariant no_amount_is_declared_in_this_contract
+  assert THIS_FILE_DECLARES_AN_AMOUNT == false and MILESTONE_AMOUNT_IS_DECLARED_HERE == false and MILESTONE_AMOUNT_SOURCE_COUNT == 3
+
+invariant a_rung_already_held_cannot_be_written_again
+  assert milestone_award_is_written(true, true, true) == false
+
+invariant the_count_of_rungs_held_never_decreases
+  assert milestones_held_after(3, false) == 3 and milestones_held_after(3, true) == 4 and MILESTONE_CAN_BE_UN_AWARDED == false
+
+invariant a_rung_below_the_confirmed_count_is_reached_and_one_above_is_not
+  assert milestone_reached(3, MILESTONE_THRESHOLDS[1]) == true and milestone_reached(3, MILESTONE_THRESHOLDS[2]) == false
+
+invariant the_experiment_arm_survives_in_neither_place_it_could
+  assert experiment_arm_is_recoverable(ASSIGNED_ARM_IS_WRITTEN_TO_THE_EVENT, FUNNEL_METRIC_CARRIES_THE_ARM) == false
+
+; The 2026-09-21 reading (the function over GATE_NONE); the route has been admin-gated since
+; 2026-09-26, which the invariant after it holds.
+invariant the_one_ungated_route_is_the_one_that_publishes_an_account_id
+  assert an_anonymous_caller_can_read_an_account_id(GATE_NONE, LEADERBOARD_ROW_CARRIES_A_TELEGRAM_ID) == true and an_anonymous_caller_can_read_an_account_id(GATE_NONE, INVITEE_ROW_CARRIES_A_TELEGRAM_ID) == false
+
+invariant a_seed_that_never_mentions_referrals_settles_nothing_about_the_ladder
+  assert SEED_REFERRAL_OCCURRENCES == 0 and SEED_ZERO_MAKES_THE_LADDER_UNOWNED == false and MILESTONE_RUNG_COUNT == 3
+
+invariant no_edge_of_this_contract_is_carried_by_a_line_number
+  assert SIBLING_LINE_CITATIONS_IN_THIS_FILE == 0 and edge_is_durable(true, false) == true and edge_is_durable(true, true) == false
+
+invariant an_unmeasured_interval_is_never_published_as_a_number
+  assert STALENESS_INTERVAL_IS_PUBLISHED == false and WAVE_CENSUS_MEASURED_AT == "2026-09-21"
+
+invariant a_number_that_moves_while_it_is_read_is_never_pinned_as_a_constant
+  assert CORPUS_RESIDUE_IS_PINNED_HERE == false and CORPUS_RESIDUE_NOTE != "" and SIBLING_LINE_CITATIONS_IN_THIS_FILE == 0
+
+invariant no_credit_of_this_domain_escapes_the_ledger
+  assert THIS_DOMAINS_CREDITS_AMONG_THE_BYPASSES == 0 and ledger_contracts_agree(THIS_DOMAINS_CREDITS_INSIDE_THE_PAIRED_SIX, THIS_DOMAINS_CREDITS_AMONG_THE_BYPASSES, LEDGER_PAIRED_MOVEMENTS, LEDGER_MOVEMENTS_TOTAL) == true
+
+invariant this_contract_carries_no_person_and_no_code
+  assert CODE_FIXTURES_CARRIED == 0 and ACCOUNT_IDS_CARRIED == 0 and LEADERBOARD_CONTENT_CARRIED == false
+
+invariant r3_no_credit_of_this_domain_survives
+  assert CREDITS_TO_THE_REFERRER_SINCE_2026_09_26 + CREDITS_TO_THE_INVITEE_SINCE_2026_09_26 == 0 and REFERRAL_TX_TYPE_WRITERS_SINCE_2026_09_26 == 0 and MILESTONE_AWARD_WRITERS == 0 and points_a_confirmation_credits(false, 2, 1) == 0
+
+invariant r3_the_edge_is_still_confirmed_and_what_was_paid_stays
+  assert CONFIRMATION_KEPT_WITHOUT_MONEY == true and CREDITED_POINTS_KEPT == true and CONFIRMATION_IS_ONE_WAY == true
+
+invariant since_the_owners_answer_no_route_of_the_graph_is_ungated
+  assert UNGATED_ROUTE_COUNT == 0 and LEADERBOARD_ROUTE_GATE == GATE_ADMIN and an_anonymous_caller_can_read_an_account_id(LEADERBOARD_ROUTE_GATE, LEADERBOARD_ROW_CARRIES_A_TELEGRAM_ID) == false and TOP_LIST_READERS_IN_THE_MINI_APP == 0

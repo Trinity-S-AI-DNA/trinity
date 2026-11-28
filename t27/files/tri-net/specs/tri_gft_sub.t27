@@ -1,0 +1,491 @@
+// TRI-NET verifiable GF-T16 SUBTRACTION (different-sign add): the deferred case of
+// tri_gft_add. Adding two DIFFERENT-sign operands subtracts magnitudes, which can
+// CANCEL leading bits and needs variable renormalization -- the hard float case.
+//
+// Correctness needs FULL PRECISION during the subtract (a truncated alignment then
+// a left-renormalization amplifies the error and mis-rounds). With |a| >= |b| and
+// d = offset_a - offset_b:
+//   * d <= 21: form the EXACT scaled difference V = ((512+Ma) << d) - (512+Mb) at
+//     base exponent offset_b (fits u32), normalize so V's top set bit sits at the
+//     implicit-1 position (bit 9): offset = offset_b + hi_bit(V) - 9, mantissa =
+//     (V shifted to 10 bits) - 512. Exact cancellation (V == 0) -> zero sentinel.
+//   * d >= 22: b is below one ULP of a and cannot be exposed by more than a single
+//     renorm step, so round-toward-zero borrows one ULP: Ma>=1 -> (offset_a, Ma-1);
+//     Ma==0 -> (offset_a-1, 511).
+// hi_bit is a fixed if-ladder (no loop / no reassignment). Rounding toward zero.
+
+module TriGftSub {
+    use base::types;
+
+    const MANT_ONE: u32 = 512;      // 2^9 GF-T16 significand scale
+    const MANT_BITS: u32 = 9;       // GF-T16 mantissa width
+    const ALIGN_CAP: u32 = 22;      // d >= 22: exact <<d would overflow u32; b < 1 ULP
+                                    // (safe for GF-T4/8/16, mant_one <= 512)
+
+    // Index of the highest set bit of x (x in [1, 2^31)).
+    fn hi_bit(x: u32) -> u32 {
+        if (x >= 1073741824) { return 30; }
+        if (x >= 536870912) { return 29; }
+        if (x >= 268435456) { return 28; }
+        if (x >= 134217728) { return 27; }
+        if (x >= 67108864) { return 26; }
+        if (x >= 33554432) { return 25; }
+        if (x >= 16777216) { return 24; }
+        if (x >= 8388608) { return 23; }
+        if (x >= 4194304) { return 22; }
+        if (x >= 2097152) { return 21; }
+        if (x >= 1048576) { return 20; }
+        if (x >= 524288) { return 19; }
+        if (x >= 262144) { return 18; }
+        if (x >= 131072) { return 17; }
+        if (x >= 65536) { return 16; }
+        if (x >= 32768) { return 15; }
+        if (x >= 16384) { return 14; }
+        if (x >= 8192) { return 13; }
+        if (x >= 4096) { return 12; }
+        if (x >= 2048) { return 11; }
+        if (x >= 1024) { return 10; }
+        if (x >= 512) { return 9; }
+        if (x >= 256) { return 8; }
+        if (x >= 128) { return 7; }
+        if (x >= 64) { return 6; }
+        if (x >= 32) { return 5; }
+        if (x >= 16) { return 4; }
+        if (x >= 8) { return 3; }
+        if (x >= 4) { return 2; }
+        if (x >= 2) { return 1; }
+        return 0;
+    }
+
+    // --- Per-rung parametric subtract. `mant_one` = 2^MANT and `mant_bits` = MANT for
+    // the rung (GF-T4 -> 2/1, GF-T8 -> 16/4, GF-T16 -> 512/9; see tri_gft_ladder). hi_bit
+    // is rung-independent. u32-safe for these rungs; GF-T32 needs u64 (t27c defect).
+
+    // Normalize V (top set bit at hb) to a (mant_bits+1)-bit significand.
+    fn norm_sig_p(v: u32, hb: u32, mant_bits: u32) -> u32 {
+        if (hb >= mant_bits) {
+            return v >> (hb - mant_bits);
+        } else {
+            return v << (mant_bits - hb);
+        }
+    }
+
+    // Result exponent offset (assumes |a| >= |b|), for a rung's mant_one / mant_bits.
+    fn gft_sub_offset_p(offset_a: u32, offset_b: u32, ma: u32, mb: u32, mant_one: u32, mant_bits: u32) -> u32 {
+        let d: u32 = offset_a - offset_b;
+        if (d >= ALIGN_CAP) {
+            if (ma >= 1) {
+                return offset_a;
+            } else {
+                if (offset_a >= 1) {
+                    return offset_a - 1;
+                } else {
+                    return 0;
+                }
+            }
+        } else {
+            let v: u32 = ((mant_one + ma) << d) - (mant_one + mb);
+            if (v == 0) {
+                return 0;
+            } else {
+                let hb: u32 = hi_bit(v);
+                if (offset_b + hb < mant_bits) {
+                    return 0;
+                } else {
+                    return (offset_b + hb) - mant_bits;
+                }
+            }
+        }
+    }
+
+    // Result mantissa (assumes |a| >= |b|), for a rung's mant_one / mant_bits.
+    fn gft_sub_mant_p(offset_a: u32, offset_b: u32, ma: u32, mb: u32, mant_one: u32, mant_bits: u32) -> u32 {
+        let d: u32 = offset_a - offset_b;
+        if (d >= ALIGN_CAP) {
+            if (ma >= 1) {
+                return ma - 1;
+            } else {
+                return mant_one - 1;
+            }
+        } else {
+            let v: u32 = ((mant_one + ma) << d) - (mant_one + mb);
+            if (v == 0) {
+                return 0;
+            } else {
+                let hb: u32 = hi_bit(v);
+                if (offset_b + hb < mant_bits) {
+                    return 0;
+                } else {
+                    return norm_sig_p(v, hb, mant_bits) - mant_one;
+                }
+            }
+        }
+    }
+
+    // GF-T16 entry points: thin views of the parametric form (behavior unchanged).
+    fn norm_sig(v: u32, hb: u32) -> u32 {
+        return norm_sig_p(v, hb, MANT_BITS);
+    }
+    fn gft_sub_offset(offset_a: u32, offset_b: u32, ma: u32, mb: u32) -> u32 {
+        return gft_sub_offset_p(offset_a, offset_b, ma, mb, MANT_ONE, MANT_BITS);
+    }
+    fn gft_sub_mant(offset_a: u32, offset_b: u32, ma: u32, mb: u32) -> u32 {
+        return gft_sub_mant_p(offset_a, offset_b, ma, mb, MANT_ONE, MANT_BITS);
+    }
+
+    // Order-independent entries: pick the larger magnitude as `a` (by exponent, then
+    // mantissa on a tie).
+    fn gft_sub_offset_c(oa: u32, ob: u32, ma: u32, mb: u32) -> u32 {
+        if (oa > ob) {
+            return gft_sub_offset(oa, ob, ma, mb);
+        } else {
+            if (ob > oa) {
+                return gft_sub_offset(ob, oa, mb, ma);
+            } else {
+                if (ma >= mb) {
+                    return gft_sub_offset(oa, ob, ma, mb);
+                } else {
+                    return gft_sub_offset(ob, oa, mb, ma);
+                }
+            }
+        }
+    }
+    fn gft_sub_mant_c(oa: u32, ob: u32, ma: u32, mb: u32) -> u32 {
+        if (oa > ob) {
+            return gft_sub_mant(oa, ob, ma, mb);
+        } else {
+            if (ob > oa) {
+                return gft_sub_mant(ob, oa, mb, ma);
+            } else {
+                if (ma >= mb) {
+                    return gft_sub_mant(oa, ob, ma, mb);
+                } else {
+                    return gft_sub_mant(ob, oa, mb, ma);
+                }
+            }
+        }
+    }
+
+    // A verifier accepts a claimed subtractive GF-T add result iff exponent+mantissa
+    // recompute.
+    fn verify_gft_sub(oa: u32, ob: u32, ma: u32, mb: u32, claimed_offset: u32, claimed_mant: u32) -> bool {
+        if (gft_sub_offset_c(oa, ob, ma, mb) == claimed_offset) {
+            return gft_sub_mant_c(oa, ob, ma, mb) == claimed_mant;
+        } else {
+            return oa != oa;
+        }
+    }
+
+    // Per-rung order-independent entries + verify (thread mant_one / mant_bits).
+    fn gft_sub_offset_c_p(oa: u32, ob: u32, ma: u32, mb: u32, mant_one: u32, mant_bits: u32) -> u32 {
+        if (oa > ob) {
+            return gft_sub_offset_p(oa, ob, ma, mb, mant_one, mant_bits);
+        } else {
+            if (ob > oa) {
+                return gft_sub_offset_p(ob, oa, mb, ma, mant_one, mant_bits);
+            } else {
+                if (ma >= mb) {
+                    return gft_sub_offset_p(oa, ob, ma, mb, mant_one, mant_bits);
+                } else {
+                    return gft_sub_offset_p(ob, oa, mb, ma, mant_one, mant_bits);
+                }
+            }
+        }
+    }
+    fn gft_sub_mant_c_p(oa: u32, ob: u32, ma: u32, mb: u32, mant_one: u32, mant_bits: u32) -> u32 {
+        if (oa > ob) {
+            return gft_sub_mant_p(oa, ob, ma, mb, mant_one, mant_bits);
+        } else {
+            if (ob > oa) {
+                return gft_sub_mant_p(ob, oa, mb, ma, mant_one, mant_bits);
+            } else {
+                if (ma >= mb) {
+                    return gft_sub_mant_p(oa, ob, ma, mb, mant_one, mant_bits);
+                } else {
+                    return gft_sub_mant_p(ob, oa, mb, ma, mant_one, mant_bits);
+                }
+            }
+        }
+    }
+    fn verify_gft_sub_p(oa: u32, ob: u32, ma: u32, mb: u32, claimed_offset: u32, claimed_mant: u32, mant_one: u32, mant_bits: u32) -> bool {
+        if (gft_sub_offset_c_p(oa, ob, ma, mb, mant_one, mant_bits) == claimed_offset) {
+            return gft_sub_mant_c_p(oa, ob, ma, mb, mant_one, mant_bits) == claimed_mant;
+        } else {
+            return oa != oa;
+        }
+    }
+
+
+    // --- GF-T32 subtract (u64). GF-T32's 25-bit mantissa makes the exact aligned
+    // difference ((mant_one+ma) << d) reach ~2^47, which overflows u32, so the
+    // subtractive path runs in u64. Same full-precision method and round-toward-zero
+    // renormalization as the u32 rungs. mant_one = 2^25, mant_bits = 25; the exact
+    // <<d branch is safe up to ALIGN_CAP_U64 = 38 (b is below one ULP beyond that).
+    // (Unblocked by the t27c u64-comparison codegen fix.)
+
+    fn hi_bit_u64(x: u64) -> u32 {
+        if ((x >> 63) != 0) { return 63; }
+        if ((x >> 62) != 0) { return 62; }
+        if ((x >> 61) != 0) { return 61; }
+        if ((x >> 60) != 0) { return 60; }
+        if ((x >> 59) != 0) { return 59; }
+        if ((x >> 58) != 0) { return 58; }
+        if ((x >> 57) != 0) { return 57; }
+        if ((x >> 56) != 0) { return 56; }
+        if ((x >> 55) != 0) { return 55; }
+        if ((x >> 54) != 0) { return 54; }
+        if ((x >> 53) != 0) { return 53; }
+        if ((x >> 52) != 0) { return 52; }
+        if ((x >> 51) != 0) { return 51; }
+        if ((x >> 50) != 0) { return 50; }
+        if ((x >> 49) != 0) { return 49; }
+        if ((x >> 48) != 0) { return 48; }
+        if ((x >> 47) != 0) { return 47; }
+        if ((x >> 46) != 0) { return 46; }
+        if ((x >> 45) != 0) { return 45; }
+        if ((x >> 44) != 0) { return 44; }
+        if ((x >> 43) != 0) { return 43; }
+        if ((x >> 42) != 0) { return 42; }
+        if ((x >> 41) != 0) { return 41; }
+        if ((x >> 40) != 0) { return 40; }
+        if ((x >> 39) != 0) { return 39; }
+        if ((x >> 38) != 0) { return 38; }
+        if ((x >> 37) != 0) { return 37; }
+        if ((x >> 36) != 0) { return 36; }
+        if ((x >> 35) != 0) { return 35; }
+        if ((x >> 34) != 0) { return 34; }
+        if ((x >> 33) != 0) { return 33; }
+        if ((x >> 32) != 0) { return 32; }
+        if ((x >> 31) != 0) { return 31; }
+        if ((x >> 30) != 0) { return 30; }
+        if ((x >> 29) != 0) { return 29; }
+        if ((x >> 28) != 0) { return 28; }
+        if ((x >> 27) != 0) { return 27; }
+        if ((x >> 26) != 0) { return 26; }
+        if ((x >> 25) != 0) { return 25; }
+        if ((x >> 24) != 0) { return 24; }
+        if ((x >> 23) != 0) { return 23; }
+        if ((x >> 22) != 0) { return 22; }
+        if ((x >> 21) != 0) { return 21; }
+        if ((x >> 20) != 0) { return 20; }
+        if ((x >> 19) != 0) { return 19; }
+        if ((x >> 18) != 0) { return 18; }
+        if ((x >> 17) != 0) { return 17; }
+        if ((x >> 16) != 0) { return 16; }
+        if ((x >> 15) != 0) { return 15; }
+        if ((x >> 14) != 0) { return 14; }
+        if ((x >> 13) != 0) { return 13; }
+        if ((x >> 12) != 0) { return 12; }
+        if ((x >> 11) != 0) { return 11; }
+        if ((x >> 10) != 0) { return 10; }
+        if ((x >> 9) != 0) { return 9; }
+        if ((x >> 8) != 0) { return 8; }
+        if ((x >> 7) != 0) { return 7; }
+        if ((x >> 6) != 0) { return 6; }
+        if ((x >> 5) != 0) { return 5; }
+        if ((x >> 4) != 0) { return 4; }
+        if ((x >> 3) != 0) { return 3; }
+        if ((x >> 2) != 0) { return 2; }
+        if ((x >> 1) != 0) { return 1; }
+        return 0;
+    }
+
+    fn norm_sig_u64(v: u64, hb: u32, mant_bits: u32) -> u64 {
+        if (hb >= mant_bits) {
+            return v >> (hb - mant_bits);
+        } else {
+            return v << (mant_bits - hb);
+        }
+    }
+
+    fn gft_sub_offset_u64(offset_a: u32, offset_b: u32, ma: u64, mb: u64, mant_one: u64, mant_bits: u32, align_cap: u32) -> u32 {
+        let d: u32 = offset_a - offset_b;
+        if (d >= align_cap) {
+            if (ma >= 1) {
+                return offset_a;
+            } else {
+                if (offset_a >= 1) {
+                    return offset_a - 1;
+                } else {
+                    return 0;
+                }
+            }
+        } else {
+            let v: u64 = ((mant_one + ma) << d) - (mant_one + mb);
+            if (v == 0) {
+                return 0;
+            } else {
+                let hb: u32 = hi_bit_u64(v);
+                if (offset_b + hb < mant_bits) {
+                    return 0;
+                } else {
+                    return (offset_b + hb) - mant_bits;
+                }
+            }
+        }
+    }
+
+    fn gft_sub_mant_u64(offset_a: u32, offset_b: u32, ma: u64, mb: u64, mant_one: u64, mant_bits: u32, align_cap: u32) -> u32 {
+        let d: u32 = offset_a - offset_b;
+        if (d >= align_cap) {
+            if (ma >= 1) {
+                return (ma - 1) as u32;
+            } else {
+                return (mant_one - 1) as u32;
+            }
+        } else {
+            let v: u64 = ((mant_one + ma) << d) - (mant_one + mb);
+            if (v == 0) {
+                return 0;
+            } else {
+                let hb: u32 = hi_bit_u64(v);
+                if (offset_b + hb < mant_bits) {
+                    return 0;
+                } else {
+                    return (norm_sig_u64(v, hb, mant_bits) - mant_one) as u32;
+                }
+            }
+        }
+    }
+
+    fn gft_sub_offset_c_u64(oa: u32, ob: u32, ma: u64, mb: u64, mant_one: u64, mant_bits: u32, align_cap: u32) -> u32 {
+        if (oa > ob) {
+            return gft_sub_offset_u64(oa, ob, ma, mb, mant_one, mant_bits, align_cap);
+        } else {
+            if (ob > oa) {
+                return gft_sub_offset_u64(ob, oa, mb, ma, mant_one, mant_bits, align_cap);
+            } else {
+                if (ma >= mb) {
+                    return gft_sub_offset_u64(oa, ob, ma, mb, mant_one, mant_bits, align_cap);
+                } else {
+                    return gft_sub_offset_u64(ob, oa, mb, ma, mant_one, mant_bits, align_cap);
+                }
+            }
+        }
+    }
+    fn gft_sub_mant_c_u64(oa: u32, ob: u32, ma: u64, mb: u64, mant_one: u64, mant_bits: u32, align_cap: u32) -> u32 {
+        if (oa > ob) {
+            return gft_sub_mant_u64(oa, ob, ma, mb, mant_one, mant_bits, align_cap);
+        } else {
+            if (ob > oa) {
+                return gft_sub_mant_u64(ob, oa, mb, ma, mant_one, mant_bits, align_cap);
+            } else {
+                if (ma >= mb) {
+                    return gft_sub_mant_u64(oa, ob, ma, mb, mant_one, mant_bits, align_cap);
+                } else {
+                    return gft_sub_mant_u64(ob, oa, mb, ma, mant_one, mant_bits, align_cap);
+                }
+            }
+        }
+    }
+    fn verify_gft_sub_u64(oa: u32, ob: u32, ma: u64, mb: u64, claimed_offset: u32, claimed_mant: u32, mant_one: u64, mant_bits: u32, align_cap: u32) -> bool {
+        if (gft_sub_offset_c_u64(oa, ob, ma, mb, mant_one, mant_bits, align_cap) == claimed_offset) {
+            return gft_sub_mant_c_u64(oa, ob, ma, mb, mant_one, mant_bits, align_cap) == claimed_mant;
+        } else {
+            return oa != oa;
+        }
+    }
+
+    // ---- Tests / invariants ---- (GF-T16 offset 40 = 2^0; M=0 -> 1.0, M=256 -> 1.5)
+
+    test hi_bit_ladder {
+        assert(hi_bit(1) == 0, "bit 0");
+        assert(hi_bit(481) == 8, "481 -> bit 8");
+        assert(hi_bit(523776) == 18, "523776 -> bit 18");
+        assert(hi_bit(1073741824) == 30, "2^30 -> bit 30");
+    }
+
+    // 1.5 - 1.0 = 0.5: same exponent, leading-1 cancels -> offset 39, mantissa 0.
+    test subtract_same_exp {
+        assert(gft_sub_offset_c(40, 40, 256, 0) == 39, "1.5 - 1.0 = 0.5 -> offset 39");
+        assert(gft_sub_mant_c(40, 40, 256, 0) == 0, "0.5 -> mantissa 0");
+    }
+
+    // Exact cancellation: x - x = 0 -> zero sentinel.
+    test exact_cancellation {
+        assert(gft_sub_offset_c(40, 40, 100, 100) == 0, "x - x = 0 -> offset 0");
+        assert(gft_sub_mant_c(40, 40, 100, 100) == 0, "x - x = 0 -> mantissa 0");
+    }
+
+    // The near-cancellation the truncated method mis-rounded is exact here.
+    test near_cancellation_exact {
+        assert(gft_sub_offset_c(30, 31, 31, 0) == 29, "near-cancel exponent 29");
+        assert(gft_sub_mant_c(30, 31, 31, 0) == 450, "near-cancel mantissa 450 (not the truncated 452)");
+        assert(gft_sub_offset_c(25, 35, 0, 0) == 34, "2^-5 - 2^-15 exponent 34");
+        assert(gft_sub_mant_c(25, 35, 0, 0) == 511, "all-ones mantissa 511");
+    }
+
+    // Far-apart operands (d >= 22): b below one ULP, single-ULP borrow.
+    test far_apart_borrow {
+        assert(gft_sub_offset_c(70, 40, 100, 0) == 70, "big(M>0) - tiny keeps exponent");
+        assert(gft_sub_mant_c(70, 40, 100, 0) == 99, "mantissa borrows one ULP -> 99");
+        assert(gft_sub_offset_c(70, 40, 0, 0) == 69, "big(M=0) - tiny renorms down one");
+        assert(gft_sub_mant_c(70, 40, 0, 0) == 511, "and mantissa is all ones");
+    }
+
+    // The verifier accepts an honest subtract and rejects a wrong result.
+    test verify_catches_sub_fraud {
+        assert(verify_gft_sub(40, 40, 256, 0, 39, 0) == true, "honest 1.5-1.0=0.5 accepted");
+        assert(verify_gft_sub(40, 40, 256, 0, 40, 0) == false, "wrong exponent rejected");
+        assert(verify_gft_sub(30, 31, 31, 0, 29, 452) == false, "the 2-ULP-off truncated result rejected");
+    }
+
+    // Per-rung subtract (mant_one/mant_bits from tri_gft_ladder): GF-T16 (512/9)
+    // unchanged; GF-T8 (16/4) and GF-T4 (2/1) now verify. GF-T8: 1.5 - 1.0 = 0.5
+    // (offset 13, M8 - M0 -> renorm to offset 12, mant 0).
+    test per_rung_subtract {
+        assert(gft_sub_offset_c_p(40, 40, 256, 0, 512, 9) == 39, "GF-T16 view: 1.5-1.0 -> offset 39");
+        assert(gft_sub_mant_c_p(40, 40, 256, 0, 512, 9) == 0, "GF-T16 view mantissa 0");
+        // GF-T8: 1.5 (offset 13, M8) - 1.0 (offset 13, M0) = 0.5 -> offset 12, mant 0.
+        assert(verify_gft_sub_p(13, 13, 8, 0, 12, 0, 16, 4) == true, "GF-T8 1.5-1.0 = 0.5 (offset 12)");
+        assert(verify_gft_sub_p(13, 13, 8, 0, 13, 0, 16, 4) == false, "GF-T8 missed renorm rejected");
+        // GF-T4: 1.5 (offset 4, M1) - 1.0 (offset 4, M0) = 0.5 -> offset 3, mant 0.
+        assert(verify_gft_sub_p(4, 4, 1, 0, 3, 0, 2, 1) == true, "GF-T4 1.5-1.0 = 0.5 (offset 3)");
+    }
+
+    // GF-T32 subtract (u64): mant_one 2^25 = 33554432, mant_bits 25, ALIGN_CAP_U64 38.
+    // M = 2^24 (16777216) is 1.5; unity is offset 364. 1.5 - 1.0 = 0.5 (leading-1
+    // cancel) -> offset 363, mantissa 0.
+    test gft32_subtract {
+        assert(verify_gft_sub_u64(364, 364, 16777216, 0, 363, 0, 33554432, 25, 38) == true, "GF-T32 1.5-1.0 = 0.5 -> offset 363");
+        assert(verify_gft_sub_u64(364, 364, 16777216, 0, 364, 0, 33554432, 25, 38) == false, "GF-T32 missed renorm rejected");
+        assert(gft_sub_mant_c_u64(364, 364, 100, 100, 33554432, 25, 38) == 0, "GF-T32 x - x = 0 mantissa");
+        assert(gft_sub_offset_c_u64(364, 364, 100, 100, 33554432, 25, 38) == 0, "GF-T32 x - x = 0 offset (zero sentinel)");
+    }
+
+    // Perf-profile bench (pairs with tri_gft_add's add_mantissa_sweep): a subtract
+    // sweep through the GF-T16 near path -- eight equal-exponent points walking the
+    // minuend mantissa plus two cross-exponent points -- with cycle count reported
+    // by the icarus flow. Expected values come from the verified Rust transcription
+    // (gft_sub_kat_cross oracle).
+    bench sub_mantissa_sweep {
+        o1 = gft_sub_offset(44, 44, 112, 64);
+        m1 = gft_sub_mant(44, 44, 112, 64);
+        o2 = gft_sub_offset(44, 44, 160, 64);
+        m2 = gft_sub_mant(44, 44, 160, 64);
+        m3 = gft_sub_mant(44, 44, 208, 64);
+        m4 = gft_sub_mant(44, 44, 256, 64);
+        m5 = gft_sub_mant(44, 44, 304, 64);
+        m6 = gft_sub_mant(44, 44, 352, 64);
+        m7 = gft_sub_mant(44, 44, 400, 64);
+        m8 = gft_sub_mant(44, 44, 448, 64);
+        oz = gft_sub_offset(45, 44, 0, 0);
+        mz = gft_sub_mant(45, 44, 0, 0);
+        ox = gft_sub_offset(50, 44, 256, 384);
+        mx = gft_sub_mant(50, 44, 256, 384);
+        assert(o1 == 40, "step 1 offset: deep cancellation drops 4 exponents");
+        assert(m1 == 256, "step 1 mantissa");
+        assert(o2 == 41, "step 2 offset");
+        assert(m2 == 256, "step 2 mantissa");
+        assert(m3 == 64, "step 3 mantissa");
+        assert(m4 == 256, "step 4 mantissa");
+        assert(m5 == 448, "step 5 mantissa");
+        assert(m6 == 64, "step 6 mantissa");
+        assert(m7 == 160, "step 7 mantissa");
+        assert(m8 == 256, "step 8 mantissa");
+        assert(oz == 44, "2.0 - 1.0 = 1.0: offset back to 44");
+        assert(mz == 0, "2.0 - 1.0 = 1.0: mantissa 0");
+        assert(ox == 50, "far-ish pair keeps the larger exponent");
+        assert(mx == 242, "cross-exponent mantissa from the oracle");
+    }
+}

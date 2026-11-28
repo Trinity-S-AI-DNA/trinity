@@ -1,0 +1,508 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/automation/engage-desk.t27 -- the engage desk: the owner's signed-in browser
+// searches X, LinkedIn, Reddit, Threads and Habr for recent posts on the topics of his
+// research (the topics come from his own blog feed), drafts one substantive comment
+// tied to his work, and asks him. A comment is posted only after his yes, per item.
+// Host: 999-multibots-telegraf apps/vibee-editor/render/src/agent/engage-desk.ts (the
+//       tick: open questions first, then at most two proposals per network per search;
+//       the caps, the dedupe, the claim and mention guards, the receipt) beside
+//       src/agent/engage-desk-wiring.ts (the search pages read in the owner's
+//       browser, the model's draft, the comment box pressed by its label), driven by
+//       the interval in render-server.ts with the search pace kept in the database.
+// Laws carried from the blog desk (specs/automation/blog-share.t27, 2026-10-02):
+//       - a question lives as long as its approval row says (ttl_ms, 24 h here), not
+//         the ten minutes of a click;
+//       - a decline is real only when the approval was decided; silence is told;
+//       - a press is not a comment: only the comment's words found on the post page
+//         afterwards are a receipt.
+// The owner's rules for anything said in his name: no mentions, no direct messages,
+// never twice on one post, a small daily cap per network, and nothing the claim guard
+// refuses (no top rank, no multiplier-freedom credited to the format, no FPGA decode
+// advantage).
+// UI words (the owner reads Russian) stay in the host; the spec holds the rules.
+// Claim status: the desk is built behind ENGAGE_DESK_ENABLED=1 on the render service;
+//       no comment has been posted through it yet.
+// v2 (2026-10-02): scaled up. As many desk tabs as the pod has room for, up to eight,
+//       measured on the owner's pod: the PID ceiling binds, not memory or CPU
+//       (pids.max 1000; memory.max 24 GB with about 2 GB used; 24 vCPU). Baseline 645-707
+//       PIDs with the owner's 11 pages open; a heavy search tab (Reddit, X, LinkedIn,
+//       Threads) adds about 44 PIDs and 220 MB, and all of it comes back on close.
+//       The wedge history agrees: 27 restored pages exhausted the PIDs, and a fifteenth
+//       page once stopped the browser. So the room is counted from the pages open now,
+//       and the desk's own tabs live in their own windows placed outside the 1280-wide
+//       screen the owner watches: never in his tab strip, never frozen as a hidden
+//       tab, closed when the read is done, and never counted or closed by the tab sweep.
+//       Readers added: Facebook (its search page, when its login cookie is seen) and
+//       Telegram (public channels through the t.me/s web preview, read-only; a comment
+//       only where the owner's own account may write in the post's discussion group,
+//       never by joining one). Habr's login is what Habr says, not a cookie: measured,
+//       the profile held connect_sid, habrsession_id and PHPSESSID while Habr's own
+//       /kek/v2/me answered empty and its page showed the sign-in button.
+// v3 (2026-10-05): more proactive, because the owner asked for it ("make the agent more
+//       proactive! it works slowly and not on all networks"). Measured before
+//       (999-multibots-telegraf#3606): one search every 6 h, one topic per search, so a
+//       topic came once per 36 h; every network answered "nothing fresh on topic", a
+//       line that hid five different causes; Habr was never searched (its login is
+//       always unknown); the search mark was written BEFORE the search, so a deploy
+//       mid-search lost 6 h. Now: a search every 2 h (SEARCH_EVERY_MS), three feed
+//       topics per search in rotation (TOPICS_PER_SEARCH, topic_at), two proposals per
+//       network per search and five a day (PER_SEARCH_PER_NETWORK, DAILY_CAP_PER_NETWORK);
+//       the mark is written when the search ENDS, and a start left open by a cut search
+//       is retried after SEARCH_STALE_MS (search_may_start); the owner's own posts are
+//       never commented on (worth_a_comment); Habr is read from its public search
+//       without a sign-in (may_search) and a Habr question says when the pod has no
+//       Habr sign-in to post with (ask_says_no_sign_in); an empty search says why, by
+//       count (NOTHING_FOUND_REASONS). Unchanged: the owner's yes, per comment.
+//       Corrected: v2 named Facebook and Telegram readers; neither was built in the host
+//       (its vendored copy was still v1 on 2026-10-05). READER_NETWORKS counts the
+//       readers that exist (5); the Facebook and Telegram rules stay for the readers
+//       to come.
+// phi^2 + 1/phi^2 = 3 | TRINITY
+
+module automation::engage_desk {
+
+    pub const KIND : str = "automation";
+    pub const ID : str = "engage-desk";
+    pub const REPO : str = "999-multibots-telegraf";
+    pub const VERSION : u8 = 3;
+
+    // ---- The pace -------------------------------------------------------------------
+    pub const TICK_MS : u32 = 300000;  // render-server.ts: every five minutes, so a yes
+                                       // is acted on within five minutes
+    pub const SEARCH_EVERY_MS : u32 = 7200000;  // 2 h between searches; the mark lives in
+                                                // agent_strategies, a deploy cannot reset it
+    pub const SEARCH_STALE_MS : u32 = 1800000;  // a search started 30 min ago and never
+                                                // ended was cut (a deploy): run it again
+    pub const TOPICS_PER_SEARCH : u32 = 3;  // feed topics per search, in rotation
+    pub const ANSWER_WAIT_MS : u32 = 86400000;  // 24 h: the approval's own lifetime
+    pub const DAY_MS : u32 = 86400000;  // the window the daily cap is counted in
+
+    // ---- The limits -----------------------------------------------------------------
+    pub const DAILY_CAP_PER_NETWORK : u8 = 5;  // comment proposals per network per day
+    pub const PER_SEARCH_PER_NETWORK : u8 = 2;  // proposals per network per search
+    pub const POST_MAX_AGE_MS : u32 = 604800000;  // 7 days: only recent posts
+    pub const COMMENT_MIN_CHARS : u16 = 80;  // shorter is not substantive
+    pub const COMMENT_MAX_CHARS : u16 = 1000;  // LinkedIn and Reddit
+    pub const X_COMMENT_MAX_CHARS : u16 = 280;  // X and Threads: short replies
+    pub const RECEIPT_SNIPPET_CHARS : u8 = 40;  // the words looked for on the post page
+
+    // ---- The rules that are not numbers ---------------------------------------------
+    pub const ASK_NEEDS_YES : bool = true;  // every comment, every time, per item
+    pub const ONE_COMMENT_PER_POST : bool = true;  // never twice on the same post
+    pub const MENTIONS_ALLOWED : bool = false;  // no @name, no u/name
+    pub const DMS_ALLOWED : bool = false;  // the desk never writes a direct message
+    pub const CLAIM_GUARD_REQUIRED : bool = true;  // the draft passes the claim guard
+    pub const OWN_POSTS_SKIPPED : bool = true;  // never a comment under the owner's own post
+    // An empty search says why, by count: the search failed, it read no item, items
+    // without a time, stale, off topic, the owner's own, already proposed.
+    pub const NOTHING_FOUND_REASONS : u8 = 7;
+
+    // ---- Many networks, many tabs ---------------------------------------------------
+    // Readers built: x, linkedin, reddit, threads (searched when the owner is SEEN signed
+    // in) and habr (its public search, read without a sign-in). Facebook and Telegram
+    // have rules here and no reader yet: reported, never guessed at.
+    pub const READER_NETWORKS : u8 = 5;
+    pub const HABR_READS_WITHOUT_SIGN_IN : bool = true;
+    pub const PARALLEL_TABS_MAX : u8 = 8;  // the desk's tabs at once, when the pod has room
+
+    // ---- The pod's room, measured 2026-10-02 ----------------------------------------
+    pub const PIDS_MAX : u16 = 1000;  // the pod's pids.max (Railway's cgroup, not ours)
+    pub const PIDS_BROWSER_BASE : u16 = 250;  // Chromium itself before any page
+    pub const PIDS_PER_TAB : u16 = 44;  // one heavy search tab, measured under load
+    pub const PIDS_MARGIN : u16 = 100;  // kept free: a page that spawns more than measured
+    pub const PAGE_CEILING : u8 = 14;  // every page open at once, the owner's and the desk's
+    pub const POD_SCREEN_WIDTH : u16 = 1280;  // the screen the owner watches over neko
+    pub const DESK_WINDOW_LEFT : u16 = 6000;  // the desk's windows sit off that screen
+    pub const DESK_TABS_CLOSED : bool = true;  // every desk tab is closed when its read ends
+    pub const SWEEP_SKIPS_DESK_TABS : bool = true;  // the tab sweep neither counts nor closes them
+
+    // ---- Telegram -------------------------------------------------------------------
+    pub const TELEGRAM_READS_PREVIEW : bool = true;  // t.me/s/<channel>?q=, public, read-only
+    pub const TELEGRAM_JOINS : bool = false;  // never joins a group to be allowed to comment
+
+    // ---- Each network's own rules (the per-network table) ---------------------------
+    // Reddit: the 9:1 guideline -- at most one in ten of the owner's comments there may
+    //   point at his own work; a subreddit's rules are read BEFORE proposing, and a
+    //   subreddit that bans AI-written posts or bots is skipped, one that bans
+    //   self-promotion gets no link.
+    // X: automated replies are forbidden by its automation rules; every reply here is
+    //   written for one post and sent by the owner's yes, never in bulk, and carries no
+    //   link (link replies read as spam).
+    // LinkedIn: no automated commenting or engagement pods; a person approves each one;
+    //   no link in a comment.
+    // Threads, Habr: no link in a comment; Habr bans advertising in comments.
+    // Facebook: no automated engagement; a person approves each comment; no link.
+    // Telegram: a comment goes to the post's discussion group as a reply to the post;
+    //   no link, and only where the owner's account may already write there.
+    pub const PROMO_SHARE_MAX_PERCENT : u8 = 10;  // Reddit 9:1
+    pub const PROMO_WINDOW_MS : u32 = 2592000000;  // the share counted over 30 days
+    pub const RULES_READ_FIRST : bool = true;  // a subreddit's rules before a proposal
+
+    // ---- Context and voice ----------------------------------------------------------
+    pub const THREAD_CONTEXT_REQUIRED : bool = true;  // the thread is read before a draft
+    pub const VOICE_REFRESH_MS : u32 = 604800000;  // the owner's voice profile, weekly
+    pub const VOICE_SAMPLES : u8 = 3;  // his own paragraphs shown to the drafter
+
+    // ---- Leads ----------------------------------------------------------------------
+    pub const LEAD_CHECK_AFTER_MS : u32 = 86400000;  // first look at replies a day later
+    pub const LEAD_CHECK_LAST_MS : u32 = 604800000;  // the last look a week after posting
+
+    // ---- Not claimed ----------------------------------------------------------------
+    pub const RUN_LIVE : bool = false;  // flips when a comment is confirmed by its receipt
+
+    // A search is due when none ever ran, or the last one is a pace old.
+    fn search_due(ever_searched: bool, since_last_ms: u32) -> bool {
+        return !ever_searched || since_last_ms >= SEARCH_EVERY_MS;
+    }
+
+    // A search may start when no start is open, or the open one is stale (it was cut).
+    fn search_may_start(started_open: bool, started_since_ms: u32) -> bool {
+        return !started_open || started_since_ms >= SEARCH_STALE_MS;
+    }
+
+    // The k-th topic of the n-th search: TOPICS_PER_SEARCH consecutive feed topics,
+    // the next search starting where this one stopped.
+    fn topic_at(search_index: u32, k: u32, topic_count: u32) -> u32 {
+        return (search_index * TOPICS_PER_SEARCH + k) % topic_count;
+    }
+
+    // A found post is worth a draft: recent, on the topic, not the owner's own, and
+    // not already proposed.
+    fn worth_a_comment(is_fresh: bool, on_topic: bool, own_post: bool, seen_post: bool) -> bool {
+        return is_fresh && on_topic && !own_post && !seen_post;
+    }
+
+    // Room for one more question in this search on this network.
+    fn search_has_room(made_this_search: u8, asked_today: u8) -> bool {
+        return made_this_search < PER_SEARCH_PER_NETWORK && asked_today < DAILY_CAP_PER_NETWORK;
+    }
+
+    // Searched: a network the owner is seen signed into, and Habr always (public search).
+    fn may_search(network: str, signed_in: bool) -> bool {
+        return signed_in || network == "habr";
+    }
+
+    // A Habr question found without a sign-in tells the owner the pod cannot post it yet.
+    fn ask_says_no_sign_in(network: str, signed_in: bool) -> bool {
+        return network == "habr" && !signed_in;
+    }
+
+    // Only a post younger than a week is worth a comment.
+    fn fresh(age_ms: u32) -> bool {
+        return age_ms < POST_MAX_AGE_MS;
+    }
+
+    // The comment fits its network and is long enough to say something.
+    fn fits(network: str, len: u16) -> bool {
+        return len >= COMMENT_MIN_CHARS
+            && (((network == "x" || network == "threads") && len <= X_COMMENT_MAX_CHARS)
+                || (network != "x" && network != "threads" && len <= COMMENT_MAX_CHARS));
+    }
+
+    // A proposal may be asked: under the day's cap for its network, never on a post
+    // already proposed, no mention in it, and the claim guard passed.
+    fn may_propose(asked_today: u8, seen_post: bool, has_mention: bool, claims_ok: bool) -> bool {
+        return asked_today < DAILY_CAP_PER_NETWORK && !seen_post && !has_mention && claims_ok;
+    }
+
+    // An open question is still waited on while pending and younger than its lifetime.
+    fn still_waiting(answer: str, age_ms: u32) -> bool {
+        return answer == "pending" && age_ms < ANSWER_WAIT_MS;
+    }
+
+    // Only "allowed" posts the comment.
+    fn posts_only_on_yes(answer: str) -> bool {
+        return answer == "allowed";
+    }
+
+    // A decline is real only when a person decided it.
+    fn decline_is_real(answer: str) -> bool {
+        return answer == "denied";
+    }
+
+    // The receipt: the comment's own words were read back from the post page.
+    fn receipt_seen(snippet_len: u8, found: bool) -> bool {
+        return snippet_len > 0 && found;
+    }
+
+    // Only Reddit takes a link, and only to the owner's own page, under the 9:1 share
+    // and where the subreddit does not ban self-promotion.
+    fn link_allowed(network: str, sub_bans_promo: bool, promo_ok: bool) -> bool {
+        return network == "reddit" && !sub_bans_promo && promo_ok;
+    }
+
+    // One more promotional comment keeps the share at or under the cap.
+    fn promo_ok(promo_before: u16, total_before: u16) -> bool {
+        return (promo_before + 1) * 100 <= PROMO_SHARE_MAX_PERCENT * (total_before + 1);
+    }
+
+    // A community that bans AI-written posts or bots is not commented in at all.
+    fn community_allows(bans_ai: bool, rules_read: bool) -> bool {
+        return rules_read && !bans_ai;
+    }
+
+    // A draft is written only after the thread itself was read.
+    fn may_draft(thread_read: bool) -> bool {
+        return thread_read;
+    }
+
+    // How many desk tabs may open now, from the pages already open: the room under
+    // the ceiling, never more than the cap, none when the pod is at the ceiling.
+    fn tabs_room(open_pages: u8) -> u8 {
+        if open_pages >= PAGE_CEILING {
+            return 0;
+        }
+        if PAGE_CEILING - open_pages > PARALLEL_TABS_MAX {
+            return PARALLEL_TABS_MAX;
+        }
+        return PAGE_CEILING - open_pages;
+    }
+
+    // Signed in is what the site says where the cookie lies (Habr), the login cookie
+    // elsewhere.
+    fn signed_in(network: str, cookie_seen: bool, site_says: bool) -> bool {
+        return (network == "habr" && site_says) || (network != "habr" && cookie_seen);
+    }
+
+    // A Telegram post takes the owner's comment only through its discussion group,
+    // where his account may write without joining anything.
+    fn telegram_may_comment(has_discussion: bool, write_forbidden: bool, must_join: bool,
+                            is_member: bool) -> bool {
+        return has_discussion && !write_forbidden && (!must_join || is_member);
+    }
+
+    // A posted comment is looked at for replies between a day and a week after.
+    fn lead_check_due(posted_age_ms: u32, since_check_ms: u32, ever_checked: bool) -> bool {
+        return posted_age_ms >= LEAD_CHECK_AFTER_MS && posted_age_ms < LEAD_CHECK_LAST_MS
+            && (!ever_checked || since_check_ms >= LEAD_CHECK_AFTER_MS);
+    }
+
+    test "a search every two hours, on a five-minute tick" {
+        assert(search_due(false, 0));
+        assert(!search_due(true, 7199999));
+        assert(search_due(true, 7200000));
+        assert(SEARCH_EVERY_MS == 7200000);
+        assert(TICK_MS == 300000);
+        assert(TICK_MS < SEARCH_EVERY_MS);
+    }
+
+    test "only recent posts" {
+        assert(fresh(0));
+        assert(fresh(604799999));
+        assert(!fresh(604800000));
+    }
+
+    test "a comment fits its network and says something" {
+        assert(fits("x", 80));
+        assert(fits("x", 280));
+        assert(!fits("x", 281));
+        assert(fits("linkedin", 281));
+        assert(fits("reddit", 1000));
+        assert(!fits("reddit", 1001));
+        assert(!fits("linkedin", 79));
+        assert(!fits("x", 0));
+        assert(!fits("threads", 281));
+        assert(fits("facebook", 1000));
+        assert(fits("telegram", 1000));
+        assert(!fits("telegram", 1001));
+    }
+
+    test "at most five proposals a day per network, two per search" {
+        assert(may_propose(0, false, false, true));
+        assert(may_propose(4, false, false, true));
+        assert(!may_propose(5, false, false, true));
+        assert(DAILY_CAP_PER_NETWORK == 5);
+        assert(PER_SEARCH_PER_NETWORK == 2);
+        assert(DAILY_CAP_PER_NETWORK >= PER_SEARCH_PER_NETWORK);
+        assert(search_has_room(0, 0));
+        assert(search_has_room(1, 4));
+        assert(!search_has_room(2, 0));
+        assert(!search_has_room(0, 5));
+        assert(DAY_MS == 86400000);
+        assert(ASK_NEEDS_YES);
+    }
+
+    test "three topics a search, every topic within two searches" {
+        assert(TOPICS_PER_SEARCH == 3);
+        assert(topic_at(0, 0, 6) == 0);
+        assert(topic_at(0, 2, 6) == 2);
+        assert(topic_at(1, 0, 6) == 3);
+        assert(topic_at(1, 2, 6) == 5);
+        assert(topic_at(2, 0, 6) == 0);
+        assert(topic_at(5, 1, 4) == 0);
+        assert(topic_at(0, 2, 2) == 0);
+        // six seed topics: each one comes every 4 h, where v2 took 36 h
+        assert((6 / TOPICS_PER_SEARCH) * SEARCH_EVERY_MS == 14400000);
+    }
+
+    test "a search is marked when it ends, and a cut one is run again" {
+        assert(search_may_start(false, 0));
+        assert(!search_may_start(true, 0));
+        assert(!search_may_start(true, 1799999));
+        assert(search_may_start(true, 1800000));
+        assert(SEARCH_STALE_MS < SEARCH_EVERY_MS);
+        assert(SEARCH_STALE_MS > TICK_MS);
+    }
+
+    test "the owner's own posts are not commented on" {
+        assert(worth_a_comment(true, true, false, false));
+        assert(!worth_a_comment(true, true, true, false));
+        assert(!worth_a_comment(false, true, false, false));
+        assert(!worth_a_comment(true, false, false, false));
+        assert(!worth_a_comment(true, true, false, true));
+        assert(OWN_POSTS_SKIPPED);
+    }
+
+    test "an empty search says why" {
+        assert(NOTHING_FOUND_REASONS == 7);
+    }
+
+    test "Habr is read without a sign-in, and its question says so" {
+        assert(HABR_READS_WITHOUT_SIGN_IN);
+        assert(may_search("habr", false));
+        assert(may_search("habr", true));
+        assert(may_search("x", true));
+        assert(!may_search("x", false));
+        assert(!may_search("linkedin", false));
+        assert(ask_says_no_sign_in("habr", false));
+        assert(!ask_says_no_sign_in("habr", true));
+        assert(!ask_says_no_sign_in("x", false));
+    }
+
+    test "never twice on the same post" {
+        assert(!may_propose(0, true, false, true));
+        assert(ONE_COMMENT_PER_POST);
+    }
+
+    test "no mentions and no direct messages" {
+        assert(!may_propose(0, false, true, true));
+        assert(!MENTIONS_ALLOWED);
+        assert(!DMS_ALLOWED);
+    }
+
+    test "nothing the claim guard refuses" {
+        assert(!may_propose(0, false, false, false));
+        assert(CLAIM_GUARD_REQUIRED);
+    }
+
+    test "an open question is waited on for a day, then let go" {
+        assert(still_waiting("pending", 0));
+        assert(still_waiting("pending", 86399999));
+        assert(!still_waiting("pending", 86400000));
+        assert(!still_waiting("allowed", 0));
+        assert(!still_waiting("expired", 0));
+        assert(ANSWER_WAIT_MS == 86400000);
+    }
+
+    test "a comment is posted only on a yes" {
+        assert(posts_only_on_yes("allowed"));
+        assert(!posts_only_on_yes("denied"));
+        assert(!posts_only_on_yes("expired"));
+        assert(!posts_only_on_yes("pending"));
+        assert(ASK_NEEDS_YES);
+    }
+
+    test "a decline is real only if the approval was decided" {
+        assert(decline_is_real("denied"));
+        assert(!decline_is_real("expired"));
+        assert(!decline_is_real("pending"));
+        assert(!decline_is_real("allowed"));
+    }
+
+    test "the comment read back on the post is the receipt" {
+        assert(receipt_seen(40, true));
+        assert(!receipt_seen(40, false));
+        assert(!receipt_seen(0, true));
+        assert(RECEIPT_SNIPPET_CHARS == 40);
+    }
+
+    test "many networks side by side, as many tabs as the pod has room for" {
+        assert(READER_NETWORKS == 5);
+        assert(PARALLEL_TABS_MAX == 8);
+        assert(tabs_room(0) == 8);
+        assert(tabs_room(6) == 8);
+        assert(tabs_room(7) == 7);
+        assert(tabs_room(11) == 3);
+        assert(tabs_room(13) == 1);
+        assert(tabs_room(14) == 0);
+        assert(tabs_room(27) == 0);
+    }
+
+    test "the page ceiling is the PID ceiling, measured" {
+        assert(PIDS_MAX == 1000);
+        assert(PIDS_PER_TAB == 44);
+        assert(PAGE_CEILING == 14);
+        assert(PAGE_CEILING * PIDS_PER_TAB <= PIDS_MAX - PIDS_MARGIN - PIDS_BROWSER_BASE);
+        assert((PAGE_CEILING + 1) * PIDS_PER_TAB > PIDS_MAX - PIDS_MARGIN - PIDS_BROWSER_BASE);
+    }
+
+    test "the desk's tabs are its own, off the owner's screen, and closed" {
+        assert(DESK_WINDOW_LEFT > POD_SCREEN_WIDTH);
+        assert(DESK_TABS_CLOSED);
+        assert(SWEEP_SKIPS_DESK_TABS);
+    }
+
+    test "a login is what the site says where the cookie lies" {
+        assert(!signed_in("habr", true, false));
+        assert(signed_in("habr", false, true));
+        assert(signed_in("x", true, false));
+        assert(!signed_in("x", false, true));
+        assert(!signed_in("facebook", false, false));
+    }
+
+    test "Telegram is read from the public preview and commented only where allowed" {
+        assert(TELEGRAM_READS_PREVIEW);
+        assert(!TELEGRAM_JOINS);
+        assert(telegram_may_comment(true, false, false, false));
+        assert(telegram_may_comment(true, false, true, true));
+        assert(!telegram_may_comment(false, false, false, true));
+        assert(!telegram_may_comment(true, true, false, true));
+        assert(!telegram_may_comment(true, false, true, false));
+    }
+
+    test "a link only on Reddit, only under nine to one" {
+        assert(link_allowed("reddit", false, true));
+        assert(!link_allowed("reddit", true, true));
+        assert(!link_allowed("reddit", false, false));
+        assert(!link_allowed("x", false, true));
+        assert(!link_allowed("linkedin", false, true));
+        assert(!link_allowed("telegram", false, true));
+        assert(!link_allowed("facebook", false, true));
+        assert(promo_ok(0, 9));
+        assert(!promo_ok(0, 0));
+        assert(!promo_ok(1, 10));
+        assert(promo_ok(1, 19));
+        assert(PROMO_SHARE_MAX_PERCENT == 10);
+        assert(PROMO_WINDOW_MS == 2592000000);
+    }
+
+    test "the community's rules are read before a proposal" {
+        assert(community_allows(false, true));
+        assert(!community_allows(true, true));
+        assert(!community_allows(false, false));
+        assert(RULES_READ_FIRST);
+    }
+
+    test "the thread is read and the owner's voice is used" {
+        assert(may_draft(true));
+        assert(!may_draft(false));
+        assert(THREAD_CONTEXT_REQUIRED);
+        assert(VOICE_REFRESH_MS == 604800000);
+        assert(VOICE_SAMPLES == 3);
+    }
+
+    test "replies are looked for between a day and a week" {
+        assert(!lead_check_due(86399999, 0, false));
+        assert(lead_check_due(86400000, 0, false));
+        assert(!lead_check_due(100000000, 1000, true));
+        assert(lead_check_due(200000000, 86400000, true));
+        assert(!lead_check_due(604800000, 0, false));
+    }
+
+    test "the desk is built, a confirmed comment is not yet" {
+        assert(!RUN_LIVE);
+        assert(VERSION == 3);
+    }
+}
+
+// phi^2 + 1/phi^2 = 3 | TRINITY

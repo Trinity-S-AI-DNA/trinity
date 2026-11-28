@@ -1,0 +1,465 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/isa/tri27_machine.t27 -- the TRI-27 machine as the pinned Trinity emulator executes it
+; S05 of gHashTag/trinity#988 (gHashTag/t27#3567). The consumer's selected runtime for TRI-27
+; programs is src/tri27/emu/executor.zig with cpu_state.zig, tri_cpu.zig and tri_memory.zig at
+; 976df517: the only executor the owner's tests drive (test_comprehensive.zig, test_golden.zig,
+; smoke_tests.zig); tri_exec.zig is a dead twin. This file states its register file, memory,
+; fetch rule, entry points, flags, the numeric rule of every executed opcode, the control-flow and
+; stack rules, the execution budget, the error set and how each error reaches the process, and
+; the host boundary. Everything that decides a value is a function the C backend executes;
+; tools/trinity_tri27.py composes them into a reference interpreter and replays the golden
+; programs and the negatives of conformance/trinity/tri27_programs.json through the generated C.
+; The status codes are this spec's own numbering: the owner's error set has no ordinals, and
+; three of its halts are silent. The canonical register alphabet, control-flow and memory
+; contracts of this directory (registers.t27, ternary_control_flow.t27, ternary_memory.t27)
+; describe a machine the consumer does not run; they are cited, not copied. ASCII only (L3).
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module Tri27Machine;
+
+pub const KIND : str = "isa-machine";
+pub const ID : str = "isa/tri27_machine";
+pub const NAME : str = "The TRI-27 machine of the pinned Trinity emulator";
+pub const CONSUMER_REPO : str = "gHashTag/trinity";
+pub const PINNED_REVISION : str = "976df517419f918f05b78e73767e2fdf4aad14be";
+pub const OWNER_MODULES : [4]str = ["src/tri27/emu/executor.zig", "src/tri27/emu/cpu_state.zig", "src/tri27/emu/tri_cpu.zig", "src/tri27/emu/tri_memory.zig"];
+pub const OWNER_LINES : str = "ExecError :19-27; execute :32-897; estimateCycles :903-922; run :927-954; CPUState :86-178; Flags :19-25; Trit27 tri_cpu.zig:12-38";
+pub const ENCODING_SPEC : str = "specs/isa/ternary_encoding.t27";
+pub const BYTECODE_SPEC : str = "specs/isa/tri27_bytecode.t27";
+; --- State ----------------------------------------------------------------------------------
+pub const REGISTER_COUNT : u32 = 27;
+pub const REGISTER_TYPE : str = "i64 (Trit27.trits); nothing constrains a register to 27 trits or to a trit";
+pub const GF16_REGISTERS : u32 = 8;
+pub const VECTOR_REGISTERS : u32 = 16;
+pub const VECTOR_LANES : u32 = 16;
+pub const MEMORY_WORDS : u32 = 19683;
+pub const WORD_BYTES : u32 = 8;
+pub const MEMORY_BYTES : u32 = 157464;
+pub const MEMORY_LEN_UNIT : str = "memory_len counts words (19683) and is compared with byte offsets by CALL and STI; the byte view is 157464 bytes";
+pub const INSTRUCTION_BYTES : u32 = 4;
+pub const FETCH_RULE : str = "byte address pc * 4; four bytes little-endian; a fetch past the byte view sets H and stops the run without an error";
+pub const ENTRY_PC_INIT : u32 = 3;
+pub const ENTRY_SP_INIT : u32 = 0;
+pub const ENTRY_PC_LOADER : u32 = 0;
+pub const ENTRY_SP_LOADER : u32 = 19682;
+pub const ENTRY_FP : u32 = 0;
+pub const ENTRY_RULE : str = "CPUState.init and resetExecution: pc 3, sp 0; loader.load: pc 0, sp 19682; `tri tri27 run` copies the file to byte 0 and keeps pc 3";
+pub const REGISTER_INIT : str = "t27 and v are left undefined by CPUState.init; f is zeroed; the test that asserts zeroed registers reads undefined memory";
+pub const FLAG_Z_BIT : u32 = 0;
+pub const FLAG_N_BIT : u32 = 1;
+pub const FLAG_V_BIT : u32 = 2;
+pub const FLAG_H_BIT : u32 = 3;
+pub const FLAG_V_WRITTEN : bool = false;
+pub const FLAG_RULE : str = "every value-writing opcode sets Z = (result == 0) and N = (result < 0); PHI_CONST, PI_CONST, E_CONST clear both; jumps, CALL, RET, HALT, SYSCALL leave the flags; V is never written";
+; --- Numbers --------------------------------------------------------------------------------
+pub const MODULUS : i64 = 19683;
+pub const MODULUS_NOTE : str = "3^9; tri_cpu.zig and executor.zig label it 3^27, and 3^27 = 7625597484987 appears nowhere in the tree";
+pub const ARITHMETIC_RULE : str = "ADD, SUB, MUL, INC, DEC, SHL, SHR, AND, OR, XOR, NOT, EXP, SIN compute on i64 without reduction; DOT, BIND, SACR modes 1, 2 and 4 reduce modulo 19683 with a non-negative result; BUNDLE2 truncates toward zero";
+pub const PHI_SCALED : i64 = 9842;
+pub const PI_SCALED : i64 = 19088;
+pub const E_SCALED : i64 = 16514;
+pub const SACRED_SCALE : i64 = 6075;
+pub const FIXED_SCALE : i64 = 1000;
+pub const SACR_MODES : [4]u32 = [1, 2, 3, 4];
+pub const SACR_MODE_NAMES : [4]str = ["add mod 19683", "mul mod 19683", "div truncated (b == 0 is DivisionByZero)", "pow mod 19683"];
+pub const SACR_DEFAULT : str = "any other mode computes add mod 19683; tri27_isa.md documents modes 0..4 with 4 as sine";
+pub const SACR_OPERANDS : str = "a = t[src1], b = t[dst]; dst is both an operand and the destination";
+; --- Budget ---------------------------------------------------------------------------------
+pub const MAX_INSTRUCTIONS : u32 = 100000;
+pub const BUDGET_RULE : str = "run stops when instructions_executed reaches 100000 and sets H; nothing distinguishes this from HALT; tri_emu_main.runEmulator calls execute directly and is unbounded unless --max-cycles is given";
+pub const CYCLES_RULE : str = "estimateCycles is a table; run never adds to cpu.cycles, so `tri tri27 run` prints 0 cycles";
+; --- Errors and how they leave --------------------------------------------------------------
+pub const ERROR_NAMES : [7]str = ["InvalidRegister", "InvalidMemory", "DivisionByZero", "StackOverflow", "StackUnderflow", "InvalidOpcode", "Halted"];
+pub const ERROR_RETURNED : [7]bool = [true, true, true, true, false, true, false];
+pub const STATUS_HALTED : u32 = 0;
+pub const STATUS_INVALID_REGISTER : u32 = 1;
+pub const STATUS_INVALID_MEMORY : u32 = 2;
+pub const STATUS_DIVISION_BY_ZERO : u32 = 3;
+pub const STATUS_STACK_OVERFLOW : u32 = 4;
+pub const STATUS_STACK_UNDERFLOW : u32 = 5;
+pub const STATUS_INVALID_OPCODE : u32 = 6;
+pub const STATUS_HALTED_ERROR : u32 = 7;
+pub const STATUS_FETCH_OUT_OF_RANGE : u32 = 8;
+pub const STATUS_BUDGET_EXHAUSTED : u32 = 9;
+pub const STATUS_RET_UNDERFLOW : u32 = 10;
+pub const STATUS_HOST_IO_NOT_REPLAYED : u32 = 11;
+pub const STATUS_NAMES : [12]str = ["halted", "InvalidRegister", "InvalidMemory", "DivisionByZero", "StackOverflow", "StackUnderflow", "InvalidOpcode", "Halted", "fetch out of range", "budget exhausted", "RET underflow", "host I/O not replayed"];
+pub const STATUS_OWNER_SIGNAL : [12]str = ["flags.H after HALT", "ExecError", "ExecError", "ExecError", "ExecError", "declared, never returned", "ExecError (ADD3, SUB3, CMP3)", "declared, never returned", "flags.H, silent", "flags.H, silent", "flags.H, silent", "this spec does not replay STR_ and FILE_ opcodes"];
+pub const STATUS_NONZERO_RULE : str = "every status other than halted is nonzero in the replay; the owner reports 8, 9 and 10 as a plain halt";
+pub const EXIT_SUCCESS : u32 = 0;
+pub const EXIT_ERR : u32 = 1;
+pub const EXIT_USAGE : u32 = 64;
+pub const EXIT_NO_INPUT : u32 = 66;
+pub const EXIT_OS_ERR : u32 = 71;
+pub const EXIT_IO_ERROR : u32 = 74;
+pub const EXIT_NO_PERM : u32 = 77;
+pub const EXIT_RULE : str = "src/tri/main.zig exitCodeFromError: FileNotFound 66, AccessDenied 77, OutOfMemory 71, InvalidArgument 64, NotOpen or PipeFail 74, any other error 1; an ExecError from `tri tri27 run` reaches the process as 1; a missing argument or an unknown subcommand returns 0; the table 0..4 printed by tri_emu_main.printUsage is not implemented";
+; --- Host boundary --------------------------------------------------------------------------
+pub const SYSCALL_RULE : str = "SYSCALL (0x88) advances pc and does nothing: no syscall number space, no argument convention, no dispatcher; neither assembler can emit it";
+pub const HOST_IO_OPCODES : [6]str = ["STR_LOAD", "STR_CONCAT", "STR_PRINT", "FILE_READ", "FILE_WRITE", "FILE_EXISTS"];
+pub const HOST_IO_RULE : str = "STR_PRINT writes the u16-length-prefixed string to stderr; FILE_READ and FILE_WRITE open the path found in guest memory through std.fs.cwd(), the path must begin with '/', FILE_READ reads at most 1024 bytes; FILE_EXISTS reports through Z; every failure is InvalidMemory; nothing is sandboxed";
+pub const HOST_IO_REPLAYED : bool = false;
+; --- Findings ------------------------------------------------------------------------------
+pub const FINDING_COUNT : u32 = 15;
+pub const FINDINGS : [15]str = ["after loader.load the first CALL fails with StackOverflow: sp is 19682 and the guard compares sp + 4 with the word count 19683", "no encodable LD, ST or STI can reach InvalidMemory: the largest fifteen-bit immediate addresses byte 65540 of 157464; only the STR_ and FILE_ opcodes reach it", "the run loop halts silently on the instruction budget, on a fetch past memory and on RET with sp < 4; StackUnderflow and Halted are declared and never returned", "ADD, SUB, MUL, INC, DEC never reduce; an i64 overflow is a panic in the owner, undefined in the generated C, and no golden program approaches it", "SHL shifts by the absolute immediate without a bound; a shift of 64 or more is a panic in the owner; this spec returns 0 there and the replay never encodes one", "SACR mode 4 raises to an integer power: a negative exponent or an overflow is a panic in the owner; this spec returns 0 for a negative exponent", "NOT complements t[dst] and ignores src1; BUNDLE3 reads its third register from the field the encoder never writes", "LD scales its immediate by four (a word index) while ST, STI and the string opcodes use it as a byte address", "STI stores clamp(imm, -1, 1) at byte |imm|: the immediate is both the value and the address", "the emitted VM of src/tri27/emit_zig.zig has a sixteen-entry stack, 256 memory words and its own flag bits (H 0, V 2, C 5, Z 6, N 7); it is a template, not this machine", "src/tri27/emu/tri_exec.zig carries a second CPUState with an ip field and a second execute; nothing imports it", "the calling convention and the memory map of src/tri27/emu/specs/tri27_isa.md (t4-t7 arguments, t8 return, stack at 0x8000) exist in no code path", "CALL pushes the address of the CALL itself (pc is not advanced before the push) and RET returns to it: every CALL/RET pair is an endless loop with sp alternating between two values, stopped only by the instruction budget; no subroutine can return past its call site, and no owner test executes a CALL", "loader.load writes each code word into an eight-byte memory word from word 3 on, while run fetches four-byte units at pc * 4: a loaded program executes a NOP between every two of its instructions and its absolute jump targets, counted in four-byte units from 3, miss; the path the owner's tests drive copies the file to byte 0 and starts at 3 (test_golden.zig, `tri tri27 run`); loader.load is used only by tri_emu_main.zig, which has no build target", "SACR takes its mode from the immediate, which the decoder never reads for SACR (specs/isa/ternary_encoding.t27 SACR_MODE_RULE): every decoded SACR adds modulo 19683; modes 2, 3 and 4 are executed only from Instruction values the owner's tests construct"];
+pub const ENABLED : bool = true;
+
+; --- Registers and operands -----------------------------------------------------------------
+
+pub fn registers_valid(dst: u32, src1: u32, src2: u32, cond: u32) -> bool {
+    if (dst >= REGISTER_COUNT) { return false; }
+    if (src1 >= REGISTER_COUNT) { return false; }
+    if (src2 >= REGISTER_COUNT) { return false; }
+    if (cond >= REGISTER_COUNT) { return false; }
+    return true;
+}
+
+pub fn abs_imm(imm: i32) -> u32 {
+    if (imm < 0) { return (0 - imm) as u32; }
+    return imm as u32;
+}
+
+pub fn clamp_trit(v: i64) -> i64 {
+    if (v > 1) { return 1; }
+    if (v < -1) { return -1; }
+    return v;
+}
+
+pub fn flag_z(r: i64) -> bool {
+    return r == 0;
+}
+
+pub fn flag_n(r: i64) -> bool {
+    return r < 0;
+}
+
+; --- Arithmetic -----------------------------------------------------------------------------
+
+pub fn alu_add(a: i64, b: i64) -> i64 {
+    return a + b;
+}
+
+pub fn alu_sub(a: i64, b: i64) -> i64 {
+    return a - b;
+}
+
+pub fn alu_mul(a: i64, b: i64) -> i64 {
+    return a * b;
+}
+
+pub fn alu_div_defined(b: i64) -> bool {
+    return b != 0;
+}
+
+pub fn alu_div(a: i64, b: i64) -> i64 {
+    return a / b;
+}
+
+pub fn alu_inc(a: i64) -> i64 {
+    return a + 1;
+}
+
+pub fn alu_dec(a: i64) -> i64 {
+    return a - 1;
+}
+
+pub fn exp_fixed(x: i64) -> i64 {
+    var xs : i64 = x * FIXED_SCALE;
+    var x2 : i64 = (xs * xs) / FIXED_SCALE;
+    var x3 : i64 = (x2 * xs) / FIXED_SCALE;
+    var x4 : i64 = (x3 * xs) / FIXED_SCALE;
+    return FIXED_SCALE + xs + x2 / 2 + x3 / 6 + x4 / 24;
+}
+
+pub fn sin_fixed(x: i64) -> i64 {
+    var xs : i64 = x * FIXED_SCALE;
+    var x2 : i64 = (xs * xs) / FIXED_SCALE;
+    var x3 : i64 = (x2 * xs) / FIXED_SCALE;
+    var x5 : i64 = (x3 * x2) / FIXED_SCALE;
+    var x7 : i64 = (x5 * x2) / FIXED_SCALE;
+    return xs - x3 / 6 + x5 / 120 - x7 / 5040;
+}
+
+; --- Logic and shifts -----------------------------------------------------------------------
+
+pub fn and_bits(a: i64, b: i64) -> i64 {
+    return a & b;
+}
+
+pub fn or_ternary(a: i64, b: i64) -> i64 {
+    if (a > 0 or b > 0) { return a; }
+    if (a < 0 and b < 0) { return b; }
+    return a;
+}
+
+pub fn xor_ternary(a: i64, b: i64) -> i64 {
+    if (a != 0 and b != 0) { return a; }
+    if (a == 0 or b == 0) { return b; }
+    return a;
+}
+
+pub fn not_bits(a: i64) -> i64 {
+    return ~a;
+}
+
+pub fn shl_bits(a: i64, n: u32) -> i64 {
+    if (n > 63) { return 0; }
+    return a << n;
+}
+
+pub fn shr_bits(a: i64, n: u32) -> i64 {
+    var k : u32 = n;
+    if (k > 63) { k = 63; }
+    return a >> k;
+}
+
+; --- Modular and VSA-named scalar operations -------------------------------------------------
+
+pub fn mod_pos(a: i64, m: i64) -> i64 {
+    var r : i64 = a % m;
+    if (r < 0) { r = r + m; }
+    return r;
+}
+
+pub fn dot_mod(a: i64, b: i64) -> i64 {
+    return mod_pos(a * b, MODULUS);
+}
+
+pub fn bind_mod(a: i64, b: i64) -> i64 {
+    if (a == 0) { return b; }
+    if (b == 0) { return a; }
+    return mod_pos(a + b, MODULUS);
+}
+
+pub fn bundle2_avg(a: i64, b: i64) -> i64 {
+    if (a == 0) { return b; }
+    if (b == 0) { return a; }
+    return (a + b) / 2;
+}
+
+pub fn bundle3_majority(a: i64, b: i64, c: i64) -> i64 {
+    if (a == b) { return a; }
+    if (a == c) { return a; }
+    if (b == c) { return b; }
+    return a;
+}
+
+pub fn pow_int(a: i64, b: i64) -> i64 {
+    if (b < 0) { return 0; }
+    var r : i64 = 1;
+    var i : i64 = 0;
+    while (i < b) {
+        r = r * a;
+        i = i + 1;
+    }
+    return r;
+}
+
+pub fn sacr_defined(mode: i32, b: i64) -> bool {
+    if (mode == 3 and b == 0) { return false; }
+    return true;
+}
+
+pub fn sacr(mode: i32, a: i64, b: i64) -> i64 {
+    if (mode == 2) { return mod_pos(a * b, MODULUS); }
+    if (mode == 3) { return a / b; }
+    if (mode == 4) { return mod_pos(pow_int(a, b), MODULUS); }
+    return mod_pos(a + b, MODULUS);
+}
+
+; --- Memory and stack rules -----------------------------------------------------------------
+
+pub fn ld_byte_addr(imm: i32) -> u32 {
+    return abs_imm(imm) * 4;
+}
+
+pub fn ld_in_range(imm: i32, memory_bytes: u32) -> bool {
+    return ld_byte_addr(imm) + 4 <= memory_bytes;
+}
+
+// Two's complement reading of a 32-bit word, written as arithmetic: a cast through i32 is a
+// range-checked narrowing in the Zig backend and traps for words above 2^31 - 1.
+pub fn ld_sign_extend(word: u32) -> i64 {
+    if (word >= 2147483648) {
+        return (word as i64) - 4294967296;
+    }
+    return word as i64;
+}
+
+pub fn st_in_range(imm: i32, memory_bytes: u32) -> bool {
+    return abs_imm(imm) + 4 <= memory_bytes;
+}
+
+pub fn st_low32(v: i64) -> u32 {
+    return (v & 4294967295) as u32;
+}
+
+pub fn sti_in_range(imm: i32, memory_words: u32) -> bool {
+    return abs_imm(imm) + 4 <= memory_words;
+}
+
+pub fn sti_value(imm: i32) -> i64 {
+    return clamp_trit(imm as i64);
+}
+
+pub fn call_overflows(sp: u32, memory_words: u32) -> bool {
+    return sp + 4 > memory_words;
+}
+
+pub fn ret_underflows(sp: u32) -> bool {
+    return sp < 4;
+}
+
+pub fn fetch_in_range(pc: u64, memory_bytes: u64) -> bool {
+    return pc * 4 + 4 <= memory_bytes;
+}
+
+pub fn budget_exhausted(executed: u32) -> bool {
+    return executed >= MAX_INSTRUCTIONS;
+}
+
+; --- Jumps ----------------------------------------------------------------------------------
+
+pub fn taken_z(v: i64) -> bool {
+    return v == 0;
+}
+
+pub fn taken_nz(v: i64) -> bool {
+    return v != 0;
+}
+
+pub fn taken_gt(a: i64, b: i64) -> bool {
+    return a > b;
+}
+
+pub fn taken_lt(a: i64, b: i64) -> bool {
+    return a < b;
+}
+
+invariant the_byte_view_is_eight_bytes_per_word { MEMORY_BYTES == MEMORY_WORDS * WORD_BYTES }
+invariant the_modulus_is_three_to_the_nine { MODULUS == 19683 }
+invariant the_loader_stack_pointer_is_the_last_word { ENTRY_SP_LOADER == MEMORY_WORDS - 1 }
+invariant every_status_but_halted_is_nonzero { STATUS_HALTED == 0 }
+
+test arithmetic_does_not_reduce_and_division_truncates {
+    assert alu_add(19682, 5) == 19687;
+    assert alu_sub(3, 5) == -2;
+    assert alu_mul(-4, 5) == -20;
+    assert alu_div(-7, 2) == -3;
+    assert alu_div(7, -2) == -3;
+    assert alu_div_defined(0) == false;
+    assert alu_inc(-1) == 0;
+    assert alu_dec(0) == -1;
+}
+
+test the_fixed_point_series_of_exp_and_sin {
+    assert exp_fixed(0) == 1000;
+    assert exp_fixed(1) == 2707;
+    assert exp_fixed(-1) == 375;
+    assert exp_fixed(2) == 6999;
+    assert sin_fixed(0) == 0;
+    assert sin_fixed(1) == 842;
+    assert sin_fixed(-1) == -842;
+    assert sin_fixed(2) == 908;
+}
+
+test logic_is_binary_for_and_and_ternary_shaped_for_or_and_xor {
+    assert and_bits(-1, 1) == 1;
+    assert and_bits(6, 3) == 2;
+    assert or_ternary(-1, 1) == -1;
+    assert or_ternary(-1, -1) == -1;
+    assert or_ternary(0, 0) == 0;
+    assert or_ternary(0, -2) == 0;
+    assert xor_ternary(-1, 1) == -1;
+    assert xor_ternary(0, 5) == 5;
+    assert xor_ternary(5, 0) == 0;
+    assert not_bits(1) == -2;
+    assert not_bits(0) == -1;
+}
+
+test shifts_are_unbounded_left_and_clamped_right {
+    assert shl_bits(3, 2) == 12;
+    assert shl_bits(-1, 3) == -8;
+    assert shl_bits(3, 64) == 0;
+    assert shr_bits(-8, 1) == -4;
+    assert shr_bits(1024, 100) == 0;
+    assert shr_bits(-1, 100) == -1;
+}
+
+test the_modular_scalar_operations {
+    assert mod_pos(-5, 19683) == 19678;
+    assert dot_mod(100, 200) == 317;
+    assert bind_mod(0, 5) == 5;
+    assert bind_mod(5, 0) == 5;
+    assert bind_mod(19682, 2) == 1;
+    assert bind_mod(-5, 2) == 19680;
+    assert bundle2_avg(0, 7) == 7;
+    assert bundle2_avg(3, 4) == 3;
+    assert bundle2_avg(-3, -4) == -3;
+    assert bundle3_majority(1, 1, -1) == 1;
+    assert bundle3_majority(1, -1, -1) == -1;
+    assert bundle3_majority(1, 2, 1) == 1;
+    assert bundle3_majority(1, 2, 3) == 1;
+}
+
+test the_sacred_operation_modes {
+    assert sacr(1, 9842, 3) == 9845;
+    assert sacr(2, 100, 200) == 317;
+    assert sacr(3, 7, 2) == 3;
+    assert sacr(4, 2, 10) == 1024;
+    assert sacr(4, 3, 9) == 0;
+    assert sacr(9, 1, 1) == 2;
+    assert sacr_defined(3, 0) == false;
+    assert sacr_defined(1, 0) == true;
+    assert pow_int(2, -1) == 0;
+}
+
+test immediates_become_values_addresses_and_trits {
+    assert clamp_trit(5) == 1;
+    assert clamp_trit(-5) == -1;
+    assert clamp_trit(0) == 0;
+    assert abs_imm(-5) == 5;
+    assert abs_imm(7) == 7;
+    assert ld_byte_addr(25) == 100;
+    assert ld_sign_extend(4294967295) == -1;
+    assert ld_sign_extend(1234) == 1234;
+    assert st_low32(-1) == 4294967295;
+    assert st_low32(1234) == 1234;
+    assert sti_value(-5) == -1;
+    assert sti_value(8) == 1;
+    assert flag_z(0) == true;
+    assert flag_n(-1) == true;
+    assert flag_n(0) == false;
+}
+
+test no_encodable_load_or_store_can_leave_memory {
+    assert ld_in_range(-16384, MEMORY_BYTES) == true;
+    assert ld_in_range(16383, MEMORY_BYTES) == true;
+    assert st_in_range(-16384, MEMORY_BYTES) == true;
+    assert sti_in_range(-16384, MEMORY_WORDS) == true;
+    assert sti_in_range(19680, MEMORY_WORDS) == false;
+}
+
+test the_stack_the_fetch_and_the_budget {
+    assert call_overflows(ENTRY_SP_LOADER, MEMORY_WORDS) == true;
+    assert call_overflows(ENTRY_SP_INIT, MEMORY_WORDS) == false;
+    assert call_overflows(19679, MEMORY_WORDS) == false;
+    assert ret_underflows(0) == true;
+    assert ret_underflows(4) == false;
+    assert fetch_in_range(3, 157464) == true;
+    assert fetch_in_range(39365, 157464) == true;
+    assert fetch_in_range(39366, 157464) == false;
+    assert budget_exhausted(99999) == false;
+    assert budget_exhausted(100000) == true;
+}
+
+test the_jump_conditions {
+    assert taken_z(0) == true;
+    assert taken_nz(0) == false;
+    assert taken_gt(3, 2) == true;
+    assert taken_gt(2, 2) == false;
+    assert taken_lt(-1, 0) == true;
+    assert registers_valid(26, 26, 26, 26) == true;
+    assert registers_valid(27, 0, 0, 0) == false;
+    assert registers_valid(0, 0, 0, 31) == false;
+}

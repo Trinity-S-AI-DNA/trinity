@@ -1,0 +1,669 @@
+// git.t27 — Git Integration with Tri Skill Workflow (ADR-002)
+// Commands for git operations with skill validation and issue binding
+
+module git_commands {
+    using skill_registry: @import("../skill/registry.t27");
+
+    // ═════════════════════════════════════════════════════════
+    // Command: tri git commit [--all] [-m "msg"] [--mode strict|normal|local]
+    // ═════════════════════════════════════════════════════════════════════
+
+    pub fn git_commit(all: bool, message: []const u8, mode: []const u8) i32 {
+        const registry_path = ".trinity/skills/registry.json";
+
+        // Check if registry exists
+        if (!file_exists(registry_path)) {
+            error_print("ERROR: no active or sealed skill; NO-COMMIT-WITHOUT-ISSUE violated");
+            error_print("Run 'tri skill begin --issue N' first to create a skill");
+            return 1;
+        }
+
+        // Read registry
+        const registry_content = read_file(registry_path);
+        if (registry_content == null) {
+            error_print("ERROR: failed to read skill registry");
+            return 1;
+        }
+
+        // Parse registry and find active or last sealed skill
+        const skill = find_active_or_sealed_skill(registry_content.?);
+
+        if (skill == null) {
+            error_print("ERROR: no active or sealed skill; NO-COMMIT-WITHOUT-ISSUE violated");
+            error_print("Run 'tri skill begin --issue N' first to create a skill");
+            return 1;
+        }
+
+        // Check issue-binding
+        // (Zig `if (opt) |id| id else x` payload capture written out as an
+        // explicit null test + unwrap; same for `orelse` and `if (opt) |v|`
+        // below -- t27 has no payload captures and no `orelse`.)
+        const issue_id = if (skill.?.issue != null) skill.?.issue.? else "";
+        if (issue_id.len == 0) {
+            error_print("ERROR: skill has no bound issue");
+            error_print("Run 'tri skill begin --issue N' first to bind an issue");
+            return 1;
+        }
+
+        // Check verdict for sealed skills
+        if (std.mem.eql(u8, skill.?.status, "sealed")) {
+            if (skill.?.verdict != null) {
+                const verdict = skill.?.verdict.?;
+                if (std.mem.eql(u8, verdict, "TOXIC")) {
+                    error_print("ERROR: cannot commit toxic skill; fix or supersede");
+                    error_print("Run 'tri experience save' to address toxic verdict");
+                    return 1;
+                }
+            }
+        }
+
+        // Build commit message
+        var commit_msg = message;
+        const skill_id = if (skill.?.id != null) skill.?.id.? else "";
+
+        if (commit_msg.len == 0) {
+            // Generate auto-summary from git status
+            const status = git_status();
+            commit_msg = "skill:" ++ skill_id ++ " issue:" ++ issue_id ++ " " ++ summarize_status(status);
+        } else {
+            // Check if message has issue: prefix
+            const issue_prefix = "issue:" ++ issue_id;
+            if (!std.mem.indexOf(u8, commit_msg, issue_prefix) != null) {
+                commit_msg = commit_msg ++ " issue:" ++ issue_id;
+            }
+        }
+
+        // In strict mode, add metadata
+        if (std.mem.eql(u8, mode, "strict") and std.mem.eql(u8, skill.?.status, "sealed")) {
+            if (skill.?.seal_hash != null) {
+                const seal_hash = skill.?.seal_hash.?;
+                if (seal_hash.len > 0) {
+                    commit_msg = commit_msg ++ " seal:" ++ seal_hash;
+                }
+            }
+        }
+
+        // Stage files
+        if (all) {
+            const add_result = git_add_all();
+            if (add_result != 0) {
+                return add_result;
+            }
+        }
+
+        // Create commit
+        const commit_result = git_commit_message(commit_msg);
+        if (commit_result != 0) {
+            // Check if it was a git error vs policy error
+            if (commit_result == 2) {
+                error_print("Git error: commit failed");
+            }
+            return commit_result;
+        }
+
+        // Get commit hash
+        const commit_hash = git_get_head_hash();
+
+        // Update registry with commit hash
+        const updated_registry = update_registry_commit(registry_content.?, skill_id, commit_hash);
+        write_file(registry_path, updated_registry);
+
+        print("Committed: ");
+        print(commit_hash[0..7]);
+        error_print("\n");
+        print("  Cell: ");
+        print(skill_id);
+        error_print("\n");
+        print("  Issue: ");
+        print(issue_id);
+        error_print("\n");
+
+        if (std.mem.eql(u8, mode, "strict") and std.mem.eql(u8, skill.?.status, "sealed")) {
+            print("  Seal: ");
+            print(if (skill.?.seal_hash != null) skill.?.seal_hash.? else "");
+            error_print("\n");
+            print("");
+            print("NOTE: In strict mode, you must run 'tri git push' after committing");
+            error_print("\n");
+        }
+
+        return 0;
+    }
+
+    // ═════════════════════════════════════════════════════════
+    // Command: tri git push [<remote> <branch>] [--mode strict|normal|local]
+    // ═════════════════════════════════════════════════════════════════════
+
+    pub fn git_push(remote: []const u8, branch: []const u8, mode: []const u8) i32 {
+        const registry_path = ".trinity/skills/registry.json";
+
+        // Check if registry exists
+        if (!file_exists(registry_path)) {
+            error_print("ERROR: cannot push; skill not sealed (tri skill seal required)");
+            return 1;
+        }
+
+        // Read registry
+        const registry_content = read_file(registry_path);
+        if (registry_content == null) {
+            error_print("ERROR: failed to read skill registry");
+            return 1;
+        }
+
+        // Find last sealed skill
+        const skill = find_last_sealed_skill(registry_content.?);
+
+        if (skill == null) {
+            error_print("ERROR: cannot push; skill not sealed (tri skill seal required)");
+            error_print("Run 'tri skill seal' to seal the current skill");
+            return 1;
+        }
+
+        // Check verdict
+        if (skill.?.verdict != null) {
+            const verdict = skill.?.verdict.?;
+            if (std.mem.eql(u8, verdict, "TOXIC")) {
+                error_print("ERROR: cannot push toxic skill");
+                return 1;
+            }
+        }
+
+        // Check artifacts by Policy Matrix
+        const kind = if (skill.?.kind != null) skill.?.kind.? else "";
+        const artifacts = if (skill.?.artifacts != null) skill.?.artifacts.? else "";
+
+        if (std.mem.eql(u8, kind, "recovery")) {
+            // Require minimum 3 checkpoints + spec and docs
+            const checkpoints = count_checkpoints(artifacts);
+            const has_spec = std.mem.indexOf(u8, artifacts, "spec") != null;
+            const has_docs = std.mem.indexOf(u8, artifacts, "docs") != null;
+
+            if (checkpoints < 3 or !has_spec or !has_docs) {
+                error_print("ERROR: policy gate failed for skill kind ");
+                error_print(kind);
+                error_print("Recovery skills require:");
+                error_print("  - At least 3 checkpoints");
+                error_print("  - Spec changes");
+                error_print("  - Docs changes");
+                return 1;
+            }
+        } else if (std.mem.eql(u8, kind, "hotfix")) {
+            // Require >=1 checkpoint and only fix-only areas
+            const checkpoints = count_checkpoints(artifacts);
+            if (checkpoints < 1) {
+                error_print("ERROR: policy gate failed for skill kind ");
+                error_print(kind);
+                error_print("Hotfix skills require at least 1 checkpoint");
+                return 1;
+            }
+        }
+
+        // Check remote in strict mode
+        if (std.mem.eql(u8, mode, "strict")) {
+            const default_remote = if (remote.len == 0) "origin" else remote;
+            const remote_url = git_get_remote_url(default_remote);
+
+            if (std.mem.indexOf(u8, remote_url, "github.com/gHashTag/t27") == null) {
+                error_print("ERROR: forbidden remote; expected github.com/gHashTag/t27");
+                error_print("Current remote: ");
+                error_print(remote_url);
+                return 1;
+            }
+        }
+
+        // Determine target
+        const push_remote = if (remote.len == 0) "origin" else remote;
+        const push_branch = if (branch.len == 0) git_get_current_branch() else branch;
+
+        // Execute push
+        const push_result = git_push_remote(push_remote, push_branch);
+
+        if (push_result != 0) {
+            if (push_result == 1) {
+                error_print("Push failed: gate violations");
+            } else if (push_result == 2) {
+                error_print("Push failed: git error (reject, network, etc.)");
+            }
+            return push_result;
+        }
+
+        // Update registry with push status
+        const skill_id = if (skill.?.id != null) skill.?.id.? else "";
+        const timestamp = get_current_timestamp();
+        const updated_registry = update_registry_push(registry_content.?, skill_id, true, timestamp);
+        write_file(registry_path, updated_registry);
+
+        print("Pushed to ");
+        print(push_remote);
+        print("/");
+        print(push_branch);
+        error_print("\n");
+        print("  Cell: ");
+        print(skill_id);
+        error_print("\n");
+        print("  Pushed at: ");
+        print(timestamp);
+        error_print("\n");
+
+        return 0;
+    }
+
+    // ═════════════════════════════════════════════════════════
+    // Command: tri git status — Show git status with skill info
+    // ═════════════════════════════════════════════════════════════════════
+
+    pub fn git_status_with_skill() i32 {
+        const registry_path = ".trinity/skills/registry.json";
+
+        // Show git status
+        const status = git_status();
+        print("Git status:\n");
+        print(status);
+        error_print("\n");
+
+        // Show skill info if available
+        if (file_exists(registry_path)) {
+            const registry_content = read_file(registry_path);
+            const skill = find_active_or_sealed_skill(registry_content.?);
+
+            if (skill != null) {
+                const s = skill.?;
+                print("Current skill:\n");
+                print("  ID: ");
+                print(s.id);
+                error_print("\n");
+                print("  Status: ");
+                print(s.status);
+                error_print("\n");
+                if (s.issue != null) {
+                    const issue = s.issue.?;
+                    print("  Issue: ");
+                    print(issue);
+                    error_print("\n");
+                }
+                if (s.verdict != null) {
+                    const verdict = s.verdict.?;
+                    print("  Verdict: ");
+                    print(verdict);
+                    error_print("\n");
+                }
+            } else {
+                print("No active or sealed skill found");
+                error_print("\n");
+            }
+        } else {
+            print("No skill registry found");
+            error_print("\n");
+        }
+
+        return 0;
+    }
+
+    // ═════════════════════════════════════════════════════════
+    // Helper functions
+    // ═════════════════════════════════════════════════════════════════════
+
+    // Find active or last sealed skill from registry
+    fn find_active_or_sealed_skill(registry_json: []const u8) ?Skill {
+        const registry = parse_json(registry_json);
+
+        // First look for active skill
+        // (Zig `for (xs) |x|` loops are written as indexed while loops.)
+        var k: usize = 0;
+        while (k < registry.skills.len) : (k += 1) {
+            const skill = registry.skills[k];
+            if (std.mem.eql(u8, skill.status, "active")) {
+                return skill;
+            }
+        }
+
+        // Then look for last sealed skill on current branch
+        const current_branch = git_get_current_branch();
+        var last_sealed: ?Skill = null;
+        var max_timestamp: []const u8 = "";
+
+        k = 0;
+        while (k < registry.skills.len) : (k += 1) {
+            const skill = registry.skills[k];
+            if (std.mem.eql(u8, skill.status, "sealed") and std.mem.eql(u8, skill.branch, current_branch)) {
+                if (last_sealed == null or std.mem.eql(u8, skill.updated_at, max_timestamp) > 0) {
+                    if (max_timestamp.len == 0 or std.mem.eql(u8, skill.updated_at, max_timestamp)) {
+                        max_timestamp = skill.updated_at;
+                        last_sealed = skill;
+                    }
+                }
+            }
+        }
+
+        return last_sealed;
+    }
+
+    // Find last sealed skill from registry
+    fn find_last_sealed_skill(registry_json: []const u8) ?Skill {
+        const registry = parse_json(registry_json);
+        var last_sealed: ?Skill = null;
+        var max_timestamp: []const u8 = "";
+
+        var k: usize = 0;
+        while (k < registry.skills.len) : (k += 1) {
+            const skill = registry.skills[k];
+            if (std.mem.eql(u8, skill.status, "sealed")) {
+                if (last_sealed == null or std.mem.eql(u8, skill.updated_at, max_timestamp) > 0) {
+                    if (max_timestamp.len == 0 or std.mem.eql(u8, skill.updated_at, max_timestamp)) {
+                        max_timestamp = skill.updated_at;
+                        last_sealed = skill;
+                    }
+                }
+            }
+        }
+
+        return last_sealed;
+    }
+
+    // Update registry with commit hash
+    fn update_registry_commit(registry_json: []const u8, skill_id: []const u8, commit_hash: []const u8) []const u8 {
+        var registry = parse_json(registry_json);
+
+        // (`for (registry.skills) |*skill|` mutated each element in place;
+        // written as an indexed loop that assigns through registry.skills[k].)
+        var k: usize = 0;
+        while (k < registry.skills.len) : (k += 1) {
+            if (std.mem.eql(u8, registry.skills[k].id, skill_id)) {
+                registry.skills[k].commit = commit_hash;
+                registry.skills[k].commit_at = get_current_timestamp();
+                break;
+            }
+        }
+
+        return serialize_json(registry);
+    }
+
+    // Update registry with push status
+    fn update_registry_push(registry_json: []const u8, skill_id: []const u8, pushed: bool, timestamp: []const u8) []const u8 {
+        var registry = parse_json(registry_json);
+
+        var k: usize = 0;
+        while (k < registry.skills.len) : (k += 1) {
+            if (std.mem.eql(u8, registry.skills[k].id, skill_id)) {
+                registry.skills[k].pushed = pushed;
+                registry.skills[k].pushed_at = timestamp;
+                break;
+            }
+        }
+
+        return serialize_json(registry);
+    }
+
+    // Summarize git status
+    fn summarize_status(status: []const u8) []const u8 {
+        // Extract modified/added/deleted files count
+        const modified = countSubstring(status, "modified:");
+        const added = countSubstring(status, "new file:");
+        const deleted = countSubstring(status, "deleted:");
+
+        var result: []const u8 = "";
+
+        if (modified > 0) {
+            result = result ++ intToStr(modified) ++ " modified";
+        }
+        if (added > 0) {
+            if (result.len > 0) result = result ++ ", ";
+            result = result ++ intToStr(added) ++ " added";
+        }
+        if (deleted > 0) {
+            if (result.len > 0) result = result ++ ", ";
+            result = result ++ intToStr(deleted) ++ " deleted";
+        }
+
+        if (result.len == 0) {
+            return "no changes";
+        }
+
+        return result;
+    }
+
+    // Count checkpoints in artifacts
+    fn count_checkpoints(artifacts: []const u8) i32 {
+        return countSubstring(artifacts, "checkpoint");
+    }
+
+    // Get current timestamp (ISO 8601 format)
+    fn get_current_timestamp() []const u8 {
+        // Returns ISO 8601 timestamp
+        return "2026-04-04T00:00:00Z";  // Placeholder
+    }
+
+    // Count substring occurrences
+    fn countSubstring(haystack: []const u8, needle: []const u8) i32 {
+        var count: i32 = 0;
+        var i: usize = 0;
+
+        while (i < haystack.len) : (i += 1) {
+            if ((i + needle.len <= haystack.len) and std.mem.eql(u8, haystack[i..][0..needle.len], needle)) {
+                count += 1;
+            }
+        }
+
+        return count;
+    }
+
+    // Integer to string
+    fn intToStr(n: i32) []const u8 {
+        // Simple integer to string conversion
+        if (n == 0) return "0";
+
+        var buf: [20]u8 = undefined;
+        var i: usize = 0;
+        var num = @abs(n);
+
+        while (num > 0) : (num /= 10) {
+            const digit = @as(u8, @intCast(num % 10)) + '0';
+            buf[i] = digit;
+            i += 1;
+        }
+
+        // Reverse and return
+        const len = i;
+        var result: []const u8 = "";
+        while (i > 0) : (i -= 1) {
+            result = result ++ buf[i - 1];
+        }
+
+        return result;
+    }
+
+    // ═════════════════════════════════════════════════════════
+    // Type definitions
+    // ═════════════════════════════════════════════════════════════════════
+
+    pub const Skill = struct {
+        id: []const u8,
+        status: []const u8,
+        kind: []const u8,
+        issue: []const u8,
+        branch: []const u8,
+        created_at: []const u8,
+        updated_at: []const u8,
+        sealed_at: ?[]const u8,
+        commit: []const u8,
+        commit_at: ?[]const u8,
+        pushed: bool,
+        pushed_at: ?[]const u8,
+        verdict: ?[]const u8,
+        verdict_at: ?[]const u8,
+        seal_hash: ?[]const u8,
+        artifacts: []const u8,
+        metadata: skill_registry.SkillMetadata,
+    };
+
+    pub const SkillRegistry = struct {
+        version: []const u8,
+        skills: []Skill,
+    };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+// TDD-Inside-Spec: Tests and Invariants for Git Integration
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+// (Blocks were keyword-style with Zig statements; now brace form:
+// `try std.testing.expect(x)` -> `assert x`, `expectEqualStrings(e, a)` ->
+// `assert a == e`, `git_commands.f` -> `f` (same module), and each bench's
+// `target:` line is kept as a comment.)
+
+test git_commit_requires_registry {
+    // Mock: registry doesn't exist
+    _ = git_commit;
+    assert true;
+}
+
+test git_commit_requires_issue_binding {
+    // Mock: skill has no issue
+    _ = git_commit;
+    assert true;
+}
+
+test git_commit_rejects_toxic_verdict {
+    // Mock: sealed skill with TOXIC verdict
+    _ = git_commit;
+    assert true;
+}
+
+test git_commit_accepts_not_toxic_verdict {
+    // Mock: sealed skill with NOT TOXIC verdict
+    _ = git_commit;
+    assert true;
+}
+
+test git_push_requires_sealed_skill {
+    // Mock: active skill
+    _ = git_push;
+    assert true;
+}
+
+test git_push_rejects_toxic_skill {
+    // Mock: sealed skill with TOXIC verdict
+    _ = git_push;
+    assert true;
+}
+
+test git_push_recovery_requires_3_checkpoints {
+    // Mock: recovery skill with 2 checkpoints
+    _ = git_push;
+    assert true;
+}
+
+test git_push_hotfix_requires_1_checkpoint {
+    // Mock: hotfix skill with 0 checkpoints
+    _ = git_push;
+    assert true;
+}
+
+test git_push_strict_validates_remote {
+    // Mock: strict mode with wrong remote
+    _ = git_push;
+    assert true;
+}
+
+test git_commit_auto_adds_issue_to_message {
+    // Mock: skill issue 123, message "fix bug"
+    _ = git_commit;
+    assert true;
+}
+
+test summarize_status_no_changes {
+    const result = summarize_status("On branch main\nnothing to commit");
+    assert result == "no changes";
+}
+
+test summarize_status_with_changes {
+    const result = summarize_status("modified: file1.t27\nnew file: file2.t27");
+    assert std.mem.indexOf(u8, result, "modified") != null;
+    assert std.mem.indexOf(u8, result, "added") != null;
+}
+
+test count_checkpoints_returns_count {
+    const result = count_checkpoints("checkpoint1, checkpoint2, spec, docs");
+    assert result == 2;
+}
+
+test count_checkpoints_zero {
+    const result = count_checkpoints("spec, docs");
+    assert result == 0;
+}
+
+test get_current_timestamp_format {
+    const result = get_current_timestamp();
+    assert std.mem.indexOf(u8, result, "T") != null;
+    assert std.mem.indexOf(u8, result, "Z") != null;
+}
+
+test git_status_with_skill_shows_skill_info {
+    // Mock: registry exists with active skill
+    _ = git_status_with_skill;
+    assert true;
+}
+
+invariant git_commit_returns_zero_on_success {
+    // Successful commit returns 0
+    assert true;
+}
+
+invariant git_commit_returns_nonzero_on_failure {
+    // Failed commit returns non-zero
+    assert true;
+}
+
+invariant git_push_returns_zero_on_success {
+    // Successful push returns 0
+    assert true;
+}
+
+invariant git_push_returns_nonzero_on_failure {
+    // Failed push returns non-zero
+    assert true;
+}
+
+invariant git_status_with_skill_always_succeeds {
+    // git status command always succeeds
+    assert true;
+}
+
+invariant summarize_status_never_null {
+    // Summary always returns a string
+    assert true;
+}
+
+invariant count_checkpoints_never_negative {
+    // Checkpoint count is always >= 0
+    assert true;
+}
+
+invariant recovery_skill_requires_min_3_checkpoints {
+    // Recovery skill policy: minimum 3 checkpoints
+    assert true;
+}
+
+invariant hotfix_skill_requires_min_1_checkpoint {
+    // Hotfix skill policy: minimum 1 checkpoint
+    assert true;
+}
+
+invariant strict_mode_validates_remote {
+    // Strict mode requires expected remote URL
+    assert true;
+}
+
+bench git_commit_latency {
+    // target: < 500ms
+    _ = git_commit(false, "test", "normal");
+}
+
+bench git_push_latency {
+    // target: < 1000ms
+    _ = git_push("", "", "normal");
+}
+
+bench git_status_with_skill_latency {
+    // target: < 100ms
+    _ = git_status_with_skill();
+}

@@ -1,0 +1,183 @@
+// TRI-NET A2A message wire layout inside the SEALED mesh payload. tri_a2a defines
+// the message classes and port demux; this fixes the BYTE layout an endpoint
+// parses after decrypting (a relay never parses it -- the payload is ciphertext,
+// demuxed by port, per tri_a2a). Fixed-length header (no variable-length parsing,
+// so no length-confusion / injection surface, unlike JSON-RPC A2A):
+//
+//   [ msg_class(1) | task_id(4, big-endian) | skill(2, big-endian) | body... ]
+//
+// taskAssign body = GF operands; taskResult body = the compute receipt.
+
+module TriA2AWire {
+    use base::types;
+
+    const OFF_CLASS: u32 = 0;
+    const OFF_TASK:  u32 = 1;
+    const OFF_SKILL: u32 = 5;
+    const OFF_BODY:  u32 = 7;
+    const HDR_LEN:   u32 = 7;
+
+    // Message classes (match tri_a2a).
+    const MSG_TASK_ASSIGN: u32 = 1;
+    const MSG_TASK_RESULT: u32 = 2;
+    const MSG_HEARTBEAT:   u32 = 3;
+
+    // Reassemble the 32-bit task id from its 4 big-endian header bytes.
+    fn task_id(b1: u32, b2: u32, b3: u32, b4: u32) -> u32 {
+        return (b1 << 24) | (b2 << 16) | (b3 << 8) | b4;
+    }
+
+    // Reassemble the 16-bit skill id from its 2 big-endian header bytes.
+    fn skill_id(b5: u32, b6: u32) -> u32 {
+        return (b5 << 8) | b6;
+    }
+
+    // Where the body starts (fixed header, so constant).
+    fn body_offset() -> u32 {
+        return OFF_BODY;
+    }
+
+    // A message is well-formed iff its msg_class is one of the known classes.
+    fn class_valid(msg_class: u32) -> bool {
+        if (msg_class == MSG_TASK_ASSIGN) { return msg_class == msg_class; }
+        else { if (msg_class == MSG_TASK_RESULT) { return msg_class == msg_class; }
+        else { return msg_class == MSG_HEARTBEAT; } }
+    }
+
+    // Only a taskResult carries a receipt in its body (matches tri_a2a.carries_receipt).
+    fn body_has_receipt(msg_class: u32) -> bool {
+        return msg_class == MSG_TASK_RESULT;
+    }
+
+    // A signed taskResult body is the receipt fields followed by the executor's
+    // Ed25519 signature over the 256-bit receipt digest. Fixing SIG_LEN and its
+    // position keeps parsing unambiguous (fixed-length, no length-prefix confusion,
+    // same rule as the header): the endpoint verifies the signature before settling.
+    const SIG_LEN: u32 = 64;   // Ed25519 signature = 64 bytes
+
+    // Only a taskResult carries a signature (a taskAssign has no result to sign).
+    fn body_has_signature(msg_class: u32) -> bool {
+        return msg_class == MSG_TASK_RESULT;
+    }
+
+    // Byte offset of the signature inside the datagram, after a receipt body of the
+    // given length.
+    fn sig_offset(receipt_body_len: u32) -> u32 {
+        return OFF_BODY + receipt_body_len;
+    }
+
+    // Total datagram length of a signed taskResult: header + receipt body + signature.
+    fn signed_result_len(receipt_body_len: u32) -> u32 {
+        return OFF_BODY + receipt_body_len + SIG_LEN;
+    }
+
+    // A taskAssign body carries the two GF-T operands so a recipient can RECOMPUTE
+    // the result and reject a wrong compute (not just a bad signature):
+    //   [ op(1) | a_offset(1) | a_mant(2 BE) | b_offset(1) | b_mant(2 BE) ] = 7 bytes.
+    // The 9-bit mantissa needs 2 bytes. Fixed layout, so parsing is unambiguous.
+    const OFF_ASSIGN_OP:     u32 = 0;
+    const OFF_ASSIGN_A_OFF:  u32 = 1;
+    const OFF_ASSIGN_A_MANT: u32 = 2;
+    const OFF_ASSIGN_B_OFF:  u32 = 4;
+    const OFF_ASSIGN_B_MANT: u32 = 5;
+    const ASSIGN_BODY_LEN:   u32 = 7;
+
+    // Reassemble a 9-bit GF-T mantissa from its 2 big-endian body bytes.
+    fn assign_mant(hi: u32, lo: u32) -> u32 {
+        return (hi << 8) | lo;
+    }
+
+    // The receipt's `in_hash` must COMMIT the assigned operands, so the signature
+    // (which covers in_hash via the digest) binds the compute to the exact inputs
+    // the requester sent -- not an arbitrary value. operand_pre is the canonical
+    // single-block SHA-256 preimage of the 5 operand fields (op + the two GF-T
+    // operands); in_hash = SHA-256(operand_pre)[0], composed via tri_sha256 in the
+    // wrapper. A verifier recomputes it from the taskAssign and checks it equals the
+    // receipt's in_hash before trusting the recompute.
+    const SHA_PAD_W:     u32 = 0x80000000;   // SHA-256 pad marker after the message
+    const OPERAND_BITS:  u32 = 160;          // 5 message words * 32 bits = 20 bytes
+
+    fn operand_pre(idx: u32, op: u32, a_off: u32, a_mant: u32, b_off: u32, b_mant: u32) -> u32 {
+        if (idx == 0) { return op; }
+        if (idx == 1) { return a_off; }
+        if (idx == 2) { return a_mant; }
+        if (idx == 3) { return b_off; }
+        if (idx == 4) { return b_mant; }
+        if (idx == 5) { return SHA_PAD_W; }
+        if (idx == 15) { return OPERAND_BITS; }
+        return 0;
+    }
+
+    // ---- Tests / invariants ----
+
+    // Big-endian task id / skill reassembly is exact.
+    test be_reassembly {
+        assert(task_id(0x12, 0x34, 0x56, 0x78) == 0x12345678, "task id from 4 BE bytes");
+        assert(skill_id(0xA6, 0x11) == 0xA611, "skill id from 2 BE bytes (GF-T16 mul)");
+    }
+
+    // The header is fixed-length; the body starts right after it.
+    test header_layout {
+        assert(HDR_LEN == 7, "msg_class(1)+task(4)+skill(2)");
+        assert(body_offset() == OFF_BODY, "body after the fixed header");
+        assert(OFF_SKILL == 5, "skill at byte 5");
+    }
+
+    // Class validity + receipt-presence rules.
+    test class_rules {
+        assert(class_valid(MSG_TASK_ASSIGN) == true, "assign is valid");
+        assert(class_valid(MSG_TASK_RESULT) == true, "result is valid");
+        assert(class_valid(0) == false, "msg_class 0 is malformed");
+        assert(class_valid(99) == false, "unknown msg_class is malformed");
+        assert(body_has_receipt(MSG_TASK_RESULT) == true, "result carries a receipt");
+        assert(body_has_receipt(MSG_TASK_ASSIGN) == false, "assign carries no receipt");
+    }
+
+    // A signed taskResult places a fixed 64-byte signature right after the receipt
+    // body, so an endpoint knows exactly where to read it and what to verify.
+    test signed_result_layout {
+        assert(SIG_LEN == 64, "Ed25519 signature is 64 bytes");
+        assert(body_has_signature(MSG_TASK_RESULT) == true, "a result carries a signature");
+        assert(body_has_signature(MSG_TASK_ASSIGN) == false, "an assign carries no signature");
+        assert(sig_offset(36) == OFF_BODY + 36, "signature after a 36-byte receipt body");
+        assert(signed_result_len(36) == OFF_BODY + 36 + SIG_LEN, "total = header + body + 64B signature");
+    }
+
+    // The taskAssign operand layout is fixed, and a 9-bit mantissa reassembles from
+    // its two big-endian bytes, so a recipient can parse operands and recompute.
+    test assign_operand_layout {
+        assert(ASSIGN_BODY_LEN == 7, "op(1)+a_off(1)+a_mant(2)+b_off(1)+b_mant(2)");
+        assert(OFF_ASSIGN_B_OFF == 4, "b operand after a");
+        assert(assign_mant(0x01, 0x00) == 256, "mantissa 256 from bytes 0x01 0x00");
+        assert(assign_mant(0x01, 0xFF) == 511, "mantissa 511 (max 9-bit) from 0x01 0xFF");
+    }
+
+    // The operand preimage places the 5 operand fields in block 1, then the SHA
+    // padding for a 20-byte message. (Bit-exactness vs hashlib is proven by the
+    // node binary; here we pin the layout.)
+    test operand_preimage_layout {
+        assert(operand_pre(0, 0x11, 41, 0, 41, 0) == 0x11, "op at word 0");
+        assert(operand_pre(1, 0x11, 41, 0, 41, 0) == 41, "a_offset at word 1");
+        assert(operand_pre(4, 0x11, 41, 0, 41, 7) == 7, "b_mantissa at word 4");
+        assert(operand_pre(5, 0, 0, 0, 0, 0) == SHA_PAD_W, "pad marker at word 5");
+        assert(operand_pre(15, 0, 0, 0, 0, 0) == OPERAND_BITS, "160-bit length at word 15");
+        assert(operand_pre(9, 0x11, 41, 0, 41, 0) == 0, "interior pad word is zero");
+    }
+
+    // Each operand field is committed at its OWN preimage word, so tampering ANY of them changes
+    // the preimage -> the SHA-256 in_hash -> the signature: a node cannot swap operands under a
+    // signed receipt. The layout test positioned the fields; this proves the binding is SENSITIVE
+    // (a change moves its word) and NON-ALIASING (a change touches only its own word).
+    test operand_tamper_changes_the_preimage {
+        // Sensitivity: changing any one operand changes exactly its word.
+        assert(operand_pre(0, 0x10, 41, 0, 41, 0) != operand_pre(0, 0x11, 41, 0, 41, 0), "op tamper moves word 0");
+        assert(operand_pre(1, 0x11, 42, 0, 41, 0) != operand_pre(1, 0x11, 41, 0, 41, 0), "a_off tamper moves word 1");
+        assert(operand_pre(2, 0x11, 41, 5, 41, 0) != operand_pre(2, 0x11, 41, 0, 41, 0), "a_mant tamper moves word 2");
+        assert(operand_pre(3, 0x11, 41, 0, 42, 0) != operand_pre(3, 0x11, 41, 0, 41, 0), "b_off tamper moves word 3");
+        assert(operand_pre(4, 0x11, 41, 0, 41, 9) != operand_pre(4, 0x11, 41, 0, 41, 0), "b_mant tamper moves word 4");
+        // Non-aliasing: a word depends ONLY on its own operand, so changing other operands leaves it put.
+        assert(operand_pre(0, 0x11, 99, 99, 99, 99) == operand_pre(0, 0x11, 41, 0, 41, 0), "word 0 depends only on op");
+        assert(operand_pre(1, 0x10, 41, 5, 42, 9) == operand_pre(1, 0x11, 41, 0, 41, 0), "word 1 depends only on a_off");
+        assert(operand_pre(4, 0x10, 99, 99, 99, 7) == operand_pre(4, 0x11, 41, 0, 41, 7), "word 4 depends only on b_mant");
+    }
+}

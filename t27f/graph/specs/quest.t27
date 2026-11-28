@@ -1,0 +1,360 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/t27f/quest.t27 -- one quest turn on a topic map: the Queen picks one cell and one relevant bee,
+; the bee's evidence goes through the engine's gates, a progression event fires once, and anything
+; high-impact waits for a human (gHashTag/t27#10030).
+; This is an application built on T27F, like the topic map it walks (gHashTag/trinity#1677). It is
+; not T27F: T27F is the visual spec of a .t27 file; the definition lives in
+; .claude/skills/t27f/SKILL.md, "What T27F is".
+; Every gate is read from specs/t27f/topic_engine.t27 with `use`; nothing here restates a constant,
+; a bee list or a status rule. What this file adds is the turn around those gates:
+;   - quest_target(): the one cell a turn works on -- the first OPEN cell, else the first GAP, else
+;     none -- decided by the engine's bee_target();
+;   - bee_fits() / dispatch(): a bee is dispatched only while dispatch_allowed() holds and only if its
+;     name is on the domain's *_BEES list (kw_in_list, the engine's own reader); a GAP takes GAP_BEE;
+;   - review_counts(): a review is evidence only when the reviewer is not the author;
+;   - quest_evidence(): one piece of evidence through verify(), refusing a self-review;
+;   - progression_event(): true exactly when counts_as_progress() flips from false to true, worth
+;     POINTS_PER_VERIFIED_LESSON and never money;
+;   - quest_action(): the engine's approval gate, unchanged; a bee never publishes on its own;
+;   - board_state(): the cell's column on the Queen's board, as specs/queen/tasks.t27 TS_* codes.
+; Pilot: step 16 of the GF16 vs bfloat16 NMSE research map (specs/t27f/reel_gf16_nmse.t27, cell 15,
+; "The sealed run", DELIVER stage, research domain). The pilot starts from the cell as a GAP, its
+; state when that map was measured; it does not read the map's STATUS row, which is grounded
+; separately. The five-step timeline below is a worked rule check, not a record of a run.
+; Not claimed: no runtime dispatches a bee from this file yet, and no board shows a quest.
+; ASCII only (L3).
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module t27f_quest;
+
+use t27f::reel::CELL_COUNT;
+use t27f::topic_engine::STATUS_GAP;
+use t27f::topic_engine::STATUS_LOCKED;
+use t27f::topic_engine::STATUS_OPEN;
+use t27f::topic_engine::STATUS_DRAFT;
+use t27f::topic_engine::STATUS_VERIFIED;
+use t27f::topic_engine::STATUS_PUBLISHED;
+use t27f::topic_engine::STAGE_DELIVER;
+use t27f::topic_engine::DOMAIN_GENERAL;
+use t27f::topic_engine::DOMAIN_CONTENT;
+use t27f::topic_engine::DOMAIN_ENGINEERING;
+use t27f::topic_engine::DOMAIN_RESEARCH;
+use t27f::topic_engine::DOMAIN_SALES;
+use t27f::topic_engine::GENERAL_BEES;
+use t27f::topic_engine::CONTENT_BEES;
+use t27f::topic_engine::ENGINEERING_BEES;
+use t27f::topic_engine::RESEARCH_BEES;
+use t27f::topic_engine::SALES_BEES;
+use t27f::topic_engine::GAP_BEE;
+use t27f::topic_engine::MAX_ACTIVE_BEES;
+use t27f::topic_engine::TARGET_OPEN_LESSON;
+use t27f::topic_engine::EVIDENCE_NONE;
+use t27f::topic_engine::EVIDENCE_SOURCE_LINK;
+use t27f::topic_engine::EVIDENCE_TEST_PASS;
+use t27f::topic_engine::EVIDENCE_REVIEW;
+use t27f::topic_engine::ACTION_DRAFT_ONLY;
+use t27f::topic_engine::ACTION_PUBLISH;
+use t27f::topic_engine::ACTION_DESTRUCTIVE;
+use t27f::topic_engine::POINTS_PER_VERIFIED_LESSON;
+use t27f::topic_engine::REWARD_IS_MONEY;
+use t27f::topic_engine::step_stage;
+use t27f::topic_engine::kw_in_list;
+use t27f::topic_engine::dispatch_allowed;
+use t27f::topic_engine::bee_target;
+use t27f::topic_engine::verify;
+use t27f::topic_engine::counts_as_progress;
+use t27f::topic_engine::needs_human_approval;
+use t27f::topic_engine::action_allowed;
+use t27f::topic_engine::after_action;
+use t27f::topic_engine::earned_status;
+use t27f::reel_gf16_nmse::DOMAIN;
+use t27f::reel_gf16_nmse::TITLES;
+use queen::tasks::TS_BACKLOG;
+use queen::tasks::TS_BLOCKED;
+use queen::tasks::TS_RUNNING;
+use queen::tasks::TS_REVIEW;
+use queen::tasks::TS_DONE;
+
+/// No cell to work on: every cell is past OPEN and none is a GAP.
+pub const QUEST_NONE : i32 = -1;
+
+/// The pilot: step 16 of the NMSE research map is cell 15.
+pub const PILOT_CELL : u8 = 15;
+pub const PILOT_STEP_NUMBER : u8 = 16;
+
+/// The pilot's two bees, by id, and their names as the bee lists spell them.
+pub const BEE_RESEARCHER : u8 = 1;
+pub const BEE_REVIEWER : u8 = 2;
+pub const RESEARCHER_NAME : str = "researcher";
+pub const REVIEWER_NAME : str = "reviewer";
+pub const CODER_NAME : str = "coder";
+pub const WRITER_NAME : str = "writer";
+
+/// The five steps of the pilot timeline, in order.
+pub const TIMELINE_STEPS : u8 = 5;
+pub const TIMELINE_NAMES : [5]str = ["run", "schema check", "self-review", "independent review", "publish"];
+
+/// Fixtures for quest_target: a map with two gaps, the same map with one OPEN cell, a finished map.
+pub const MAP_TWO_GAPS : [27]u8 = [5, 5, 5, 5, 5, 5, 3, 3, 3, 5, 5, 5, 5, 5, 5, 0, 0, 1, 5, 4, 5, 5, 3, 3, 1, 1, 3];
+pub const MAP_ONE_OPEN : [27]u8 = [5, 5, 5, 5, 5, 5, 3, 3, 3, 5, 5, 5, 5, 5, 5, 0, 0, 1, 5, 4, 2, 5, 3, 3, 1, 1, 3];
+pub const MAP_DONE : [27]u8 = [5, 5, 5, 5, 5, 5, 4, 4, 4, 5, 5, 5, 5, 5, 5, 4, 4, 4, 5, 4, 5, 5, 4, 4, 4, 4, 4];
+
+/// How many cells hold one status, as the u8 bee_target() takes.
+pub fn count_with(status: [27]u8, s: u8) -> u8 {
+    var n : u8 = 0;
+    var c : i32 = 0;
+    while (c < CELL_COUNT) {
+        if (status[@intCast(c)] == s) {
+            n = n + 1;
+        }
+        c = c + 1;
+    }
+    return n;
+}
+
+/// The first cell holding one status, or QUEST_NONE.
+pub fn first_with(status: [27]u8, s: u8) -> i32 {
+    var c : i32 = 0;
+    while (c < CELL_COUNT) {
+        if (status[@intCast(c)] == s) {
+            return c;
+        }
+        c = c + 1;
+    }
+    return QUEST_NONE;
+}
+
+/// The one cell a quest turn works on: the engine's bee_target() decides between the first OPEN
+/// cell and the first GAP; a map with neither has no target.
+pub fn quest_target(status: [27]u8) -> i32 {
+    if (bee_target(count_with(status, STATUS_OPEN)) == TARGET_OPEN_LESSON) {
+        return first_with(status, STATUS_OPEN);
+    }
+    return first_with(status, STATUS_GAP);
+}
+
+/// Whether a bee name is on the domain's list, read with the engine's own list reader.
+pub fn bee_on_list(domain: u8, name: []const u8, n: usize) -> bool {
+    if (domain == DOMAIN_CONTENT) {
+        return kw_in_list(name, 0, n, CONTENT_BEES, CONTENT_BEES.len);
+    }
+    if (domain == DOMAIN_ENGINEERING) {
+        return kw_in_list(name, 0, n, ENGINEERING_BEES, ENGINEERING_BEES.len);
+    }
+    if (domain == DOMAIN_RESEARCH) {
+        return kw_in_list(name, 0, n, RESEARCH_BEES, RESEARCH_BEES.len);
+    }
+    if (domain == DOMAIN_SALES) {
+        return kw_in_list(name, 0, n, SALES_BEES, SALES_BEES.len);
+    }
+    return kw_in_list(name, 0, n, GENERAL_BEES, GENERAL_BEES.len);
+}
+
+/// A bee fits a cell when it is on the domain's list; a GAP takes GAP_BEE, whose task is a source.
+pub fn bee_fits(status: u8, domain: u8, name: []const u8, n: usize) -> bool {
+    if (bee_on_list(domain, name, n) == false) {
+        return false;
+    }
+    if (status == STATUS_GAP) {
+        return kw_in_list(name, 0, n, GAP_BEE, GAP_BEE.len);
+    }
+    return status == STATUS_OPEN;
+}
+
+/// The Queen dispatches one bee only while the cap allows it and only a bee that fits the cell.
+pub fn dispatch(active_bees: u8, status: u8, domain: u8, name: []const u8, n: usize) -> bool {
+    return dispatch_allowed(active_bees) && bee_fits(status, domain, name, n);
+}
+
+/// A review is evidence only from someone other than the author.
+pub fn review_counts(author: u8, reviewer: u8) -> bool {
+    return author != reviewer;
+}
+
+/// One piece of evidence for a cell, through verify(); a self-review changes nothing.
+pub fn quest_evidence(status: u8, step: u8, domain: u8, evidence: u8, author: u8, reviewer: u8) -> u8 {
+    if (evidence == EVIDENCE_REVIEW && review_counts(author, reviewer) == false) {
+        return status;
+    }
+    return verify(status, step_stage(step), domain, evidence);
+}
+
+/// The progression event: a cell starts to count as progress. It fires once per cell.
+pub fn progression_event(before: u8, after: u8) -> bool {
+    return counts_as_progress(before) == false && counts_as_progress(after);
+}
+
+/// The points a status change earns: one event's worth or nothing. Points are never money.
+pub fn event_points(before: u8, after: u8) -> u32 {
+    if (progression_event(before, after)) {
+        return POINTS_PER_VERIFIED_LESSON;
+    }
+    return 0;
+}
+
+/// An action on a cell, through the engine's approval gate; `approved` is a human's yes.
+pub fn quest_action(status: u8, action: u8, approved: bool) -> u8 {
+    return after_action(status, action, approved);
+}
+
+/// The cell's column on the Queen's board (specs/queen/tasks.t27). A working bee means RUNNING; a
+/// draft waits in REVIEW for its evidence; a counted cell is DONE.
+pub fn board_state(status: u8, bee_working: bool) -> u8 {
+    if (bee_working) {
+        return TS_RUNNING;
+    }
+    if (status == STATUS_LOCKED) {
+        return TS_BLOCKED;
+    }
+    if (status == STATUS_DRAFT) {
+        return TS_REVIEW;
+    }
+    if (counts_as_progress(status)) {
+        return TS_DONE;
+    }
+    return TS_BACKLOG;
+}
+
+test the_target_is_first_open_else_first_gap {
+    assert quest_target(MAP_TWO_GAPS) == 15;
+    assert quest_target(MAP_ONE_OPEN) == 20;
+    assert quest_target(MAP_DONE) == QUEST_NONE;
+    assert count_with(MAP_TWO_GAPS, STATUS_OPEN) == 0;
+    assert count_with(MAP_ONE_OPEN, STATUS_OPEN) == 1;
+    assert count_with(MAP_TWO_GAPS, STATUS_GAP) == 2;
+}
+
+test only_a_listed_bee_is_dispatched {
+    // research lists researcher, analyst, reviewer; coder is engineering's
+    assert bee_on_list(DOMAIN_RESEARCH, REVIEWER_NAME, REVIEWER_NAME.len);
+    assert bee_on_list(DOMAIN_RESEARCH, CODER_NAME, CODER_NAME.len) == false;
+    assert bee_on_list(DOMAIN_ENGINEERING, CODER_NAME, CODER_NAME.len);
+    assert bee_on_list(DOMAIN_GENERAL, WRITER_NAME, WRITER_NAME.len);
+    assert bee_on_list(DOMAIN_SALES, WRITER_NAME, WRITER_NAME.len) == false;
+    // a gap takes the gap bee only
+    assert bee_fits(STATUS_GAP, DOMAIN_RESEARCH, RESEARCHER_NAME, RESEARCHER_NAME.len);
+    assert bee_fits(STATUS_GAP, DOMAIN_RESEARCH, REVIEWER_NAME, REVIEWER_NAME.len) == false;
+    assert bee_fits(STATUS_OPEN, DOMAIN_RESEARCH, REVIEWER_NAME, REVIEWER_NAME.len);
+    // a cell past OPEN is not a dispatch target
+    assert bee_fits(STATUS_DRAFT, DOMAIN_RESEARCH, REVIEWER_NAME, REVIEWER_NAME.len) == false;
+    assert bee_fits(STATUS_LOCKED, DOMAIN_RESEARCH, RESEARCHER_NAME, RESEARCHER_NAME.len) == false;
+}
+
+test the_cap_holds_before_relevance {
+    assert dispatch(0, STATUS_GAP, DOMAIN_RESEARCH, RESEARCHER_NAME, RESEARCHER_NAME.len);
+    assert dispatch(MAX_ACTIVE_BEES - 1, STATUS_GAP, DOMAIN_RESEARCH, RESEARCHER_NAME, RESEARCHER_NAME.len);
+    assert dispatch(MAX_ACTIVE_BEES, STATUS_GAP, DOMAIN_RESEARCH, RESEARCHER_NAME, RESEARCHER_NAME.len) == false;
+    assert dispatch(0, STATUS_GAP, DOMAIN_RESEARCH, CODER_NAME, CODER_NAME.len) == false;
+}
+
+test a_self_review_is_not_evidence {
+    assert review_counts(BEE_RESEARCHER, BEE_REVIEWER);
+    assert review_counts(BEE_RESEARCHER, BEE_RESEARCHER) == false;
+    assert quest_evidence(STATUS_DRAFT, PILOT_CELL, DOMAIN_RESEARCH, EVIDENCE_REVIEW, BEE_RESEARCHER, BEE_RESEARCHER) == STATUS_DRAFT;
+    assert quest_evidence(STATUS_DRAFT, PILOT_CELL, DOMAIN_RESEARCH, EVIDENCE_REVIEW, BEE_RESEARCHER, BEE_REVIEWER) == STATUS_VERIFIED;
+    assert quest_evidence(STATUS_DRAFT, PILOT_CELL, DOMAIN_RESEARCH, EVIDENCE_NONE, BEE_RESEARCHER, BEE_REVIEWER) == STATUS_DRAFT;
+}
+
+test the_event_fires_exactly_on_the_flip {
+    var b : u8 = STATUS_GAP;
+    while (b <= STATUS_PUBLISHED) {
+        var a : u8 = STATUS_GAP;
+        while (a <= STATUS_PUBLISHED) {
+            const want : bool = counts_as_progress(b) == false && counts_as_progress(a);
+            assert progression_event(b, a) == want;
+            if (want) {
+                assert event_points(b, a) == POINTS_PER_VERIFIED_LESSON;
+            } else {
+                assert event_points(b, a) == 0;
+            }
+            a = a + 1;
+        }
+        b = b + 1;
+    }
+    assert progression_event(STATUS_DRAFT, STATUS_VERIFIED);
+    assert progression_event(STATUS_VERIFIED, STATUS_PUBLISHED) == false;
+    assert progression_event(STATUS_DRAFT, STATUS_PUBLISHED);
+}
+
+test no_high_impact_action_without_a_yes {
+    var s : u8 = STATUS_GAP;
+    while (s <= STATUS_PUBLISHED) {
+        var act : u8 = ACTION_PUBLISH;
+        while (act <= ACTION_DESTRUCTIVE) {
+            assert needs_human_approval(act);
+            assert action_allowed(s, act, false) == false;
+            assert quest_action(s, act, false) == s;
+            act = act + 1;
+        }
+        s = s + 1;
+    }
+    assert needs_human_approval(ACTION_DRAFT_ONLY) == false;
+}
+
+test the_board_reads_the_status {
+    assert board_state(STATUS_GAP, false) == TS_BACKLOG;
+    assert board_state(STATUS_OPEN, false) == TS_BACKLOG;
+    assert board_state(STATUS_LOCKED, false) == TS_BLOCKED;
+    assert board_state(STATUS_GAP, true) == TS_RUNNING;
+    assert board_state(STATUS_DRAFT, false) == TS_REVIEW;
+    assert board_state(STATUS_VERIFIED, false) == TS_DONE;
+    assert board_state(STATUS_PUBLISHED, false) == TS_DONE;
+}
+
+test the_pilot_is_step_16_of_the_nmse_map {
+    assert PILOT_CELL + 1 == PILOT_STEP_NUMBER;
+    assert DOMAIN == DOMAIN_RESEARCH;
+    assert step_stage(PILOT_CELL) == STAGE_DELIVER;
+    assert TITLES[15].len > 0;
+    // at the start the cell is a GAP, so the turn's bee is the gap bee and its job is a source
+    assert dispatch(0, STATUS_GAP, DOMAIN, RESEARCHER_NAME, RESEARCHER_NAME.len);
+    assert dispatch(0, STATUS_GAP, DOMAIN, REVIEWER_NAME, REVIEWER_NAME.len) == false;
+}
+
+test the_pilot_timeline {
+    // 1. run: the bee's sealed manifest grounds the cell; a DELIVER step in research wants a review
+    const s0 : u8 = STATUS_GAP;
+    const s1 : u8 = earned_status(PILOT_CELL, DOMAIN, true, false, false, false);
+    assert s1 == STATUS_DRAFT;
+    assert quest_evidence(STATUS_DRAFT, PILOT_CELL, DOMAIN, EVIDENCE_SOURCE_LINK, BEE_RESEARCHER, BEE_RESEARCHER) == s1;
+    assert board_state(s1, false) == TS_REVIEW;
+    // 2. schema check passes: a passing test clears PRACTICE, not DELIVER
+    const s2 : u8 = earned_status(PILOT_CELL, DOMAIN, true, true, false, false);
+    assert s2 == STATUS_DRAFT;
+    assert quest_evidence(s1, PILOT_CELL, DOMAIN, EVIDENCE_TEST_PASS, BEE_RESEARCHER, BEE_RESEARCHER) == s2;
+    // 3. the author reviews its own run: refused
+    const s3 : u8 = earned_status(PILOT_CELL, DOMAIN, true, true, review_counts(BEE_RESEARCHER, BEE_RESEARCHER), false);
+    assert s3 == STATUS_DRAFT;
+    assert quest_evidence(s2, PILOT_CELL, DOMAIN, EVIDENCE_REVIEW, BEE_RESEARCHER, BEE_RESEARCHER) == s3;
+    // 4. an independent reviewer: VERIFIED, the one progression event
+    const s4 : u8 = earned_status(PILOT_CELL, DOMAIN, true, true, review_counts(BEE_RESEARCHER, BEE_REVIEWER), false);
+    assert s4 == STATUS_VERIFIED;
+    assert quest_evidence(s3, PILOT_CELL, DOMAIN, EVIDENCE_REVIEW, BEE_RESEARCHER, BEE_REVIEWER) == s4;
+    assert board_state(s4, false) == TS_DONE;
+    // 5. publish: a bee alone is refused; after a human's yes the cell is PUBLISHED
+    assert quest_action(s4, ACTION_PUBLISH, false) == STATUS_VERIFIED;
+    const s5 : u8 = quest_action(s4, ACTION_PUBLISH, true);
+    assert s5 == STATUS_PUBLISHED;
+    assert s5 == earned_status(PILOT_CELL, DOMAIN, true, true, true, true);
+    // exactly one event, worth one point, across the five steps
+    const points : u32 = event_points(s0, s1) + event_points(s1, s2) + event_points(s2, s3) + event_points(s3, s4) + event_points(s4, s5);
+    assert points == POINTS_PER_VERIFIED_LESSON;
+    assert progression_event(s3, s4);
+    assert TIMELINE_NAMES[4].len > 0;
+    assert TIMELINE_STEPS == 5;
+}
+
+invariant points_are_not_money {
+    assert REWARD_IS_MONEY == false;
+    assert POINTS_PER_VERIFIED_LESSON == 1;
+}
+
+invariant one_turn_one_bee_under_the_cap {
+    assert MAX_ACTIVE_BEES >= 1;
+    assert dispatch_allowed(MAX_ACTIVE_BEES) == false;
+}
+
+invariant publish_needs_a_human {
+    assert needs_human_approval(ACTION_PUBLISH);
+    assert quest_action(STATUS_VERIFIED, ACTION_PUBLISH, false) == STATUS_VERIFIED;
+}

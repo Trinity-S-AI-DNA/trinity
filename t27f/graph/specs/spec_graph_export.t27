@@ -1,0 +1,971 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/t27f/spec_graph_export.t27 -- the T27F exporter: spec source bytes -> SpecGraph
+; (RFC gHashTag/trinity#1649, epic gHashTag/trinity#1648, tracked in gHashTag/t27#10162).
+; specs/t27f/spec_graph.t27 defines the graph IR and holds one graph, read by hand. This file reads
+; a graph out of real source instead: export_graph(path, src) is a deterministic byte scanner, with
+; no language model and no heuristic beyond the rules below. It reuses spec_graph's builders, codes
+; and validate_graph through `use`; it restates none of them.
+; What it decides:
+;   - Nodes. Each top-level declaration line, with an optional leading `pub `, is one node: module,
+;     use, const, fn, test, invariant and bench map to their NODE_* kind; node 0 is the module and
+;     spans the file. struct, enum, var, spec and endmodule are NODE_OPAQUE with LABEL_EXACT (read,
+;     but no finer kind in IR version 1). Any other word at the head of a declaration, or a known
+;     keyword with no readable name, is NODE_OPAQUE with LABEL_UNKNOWN. A file with no module line
+;     gets node 0 named "(no module)", LABEL_UNKNOWN, and no edge out of it.
+;   - Spans. A node runs from its declaration line to the line of the brace that closes it, counting
+;     braces outside strings, character literals and comments. A declaration with no brace ends at
+;     the line whose code ends in `;` or `}`, or at its last indented continuation line.
+;   - Labels. Everything read directly is LABEL_EXACT. The scanner never emits DERIVED or SUGGESTED.
+;   - Edges, all EXACT, each with the line of its first use: CALLS to a declared fn when a body
+;     names it followed by `(`; USES to a declared const or an imported name (the last segment of a
+;     `use` path) when a body names it; CONSTRAINS from an invariant to a const it names; USES from
+;     the module to each `use` line. fn, test, invariant and bench bodies are read, and a fn's own
+;     name on its declaration is not a call. Duplicates are dropped.
+;   - Capacity. More than MAX_NODES nodes or MAX_EDGES edges keeps counting, so validate_graph
+;     answers ERR_TOO_MANY_NODES or ERR_TOO_MANY_EDGES; the graph is refused, never truncated.
+; Compared with the hand-read fixture tutorial_08_graph(): the 14 declaration nodes and the 9 EXACT
+; edges are identical (kind, label, name, span, endpoints, line). The fixture also holds what a
+; scanner must not invent: node 14 (std.testing, an UNKNOWN region inferred from call targets),
+; four DATA_FLOW edges and three TESTED_BY edges, all DERIVED. The test
+; tutorial_08_exports_the_fixture_exactly_except_what_is_derived states that boundary.
+; Not claimed here:
+;   - Names are matched as text, not resolved: a local variable or parameter named like a const
+;     or an import counts as a use of it, and one named like a fn counts only when followed by `(`.
+;   - Only the top level is read: no node for a statement, branch or parameter; nothing inside a
+;     struct or enum body; no `use` of a name from another spec is followed to that spec.
+;   - A `;` as the first non-blank character of a line is always a comment, and only `//` ends a
+;     line of code; there are no block comments. An opening brace that is not on the declaration
+;     line or an indented continuation line starts a node of its own. A block-form module is not
+;     descended as a unit: its declarations are read as top-level ones and its closing brace is
+;     skipped.
+;   - Capacity is the IR's: 192 nodes and 254 edges (measured, see spec_graph.t27), which holds about
+;     98 of 100 specs in specs/; the larger ones are refused.
+;   - The scanner takes the source as a byte slice; tutorial 08 is embedded below as a snapshot
+;     (sha256 c291e925d9dabef8b72b5a64aef153a2126c0b0b43d67bc08b1b2d7eaa98039a) and the test
+;     compares the snapshot, not the live file.
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module t27f_spec_graph_export;
+
+use t27f::spec_graph::SpecGraph;
+use t27f::spec_graph::blank_graph;
+use t27f::spec_graph::with_node;
+use t27f::spec_graph::with_edge;
+use t27f::spec_graph::validate_graph;
+use t27f::spec_graph::tutorial_08_graph;
+use t27f::spec_graph::has_edge;
+use t27f::spec_graph::count_node_kind;
+use t27f::spec_graph::count_node_label;
+use t27f::spec_graph::count_edge_kind;
+use t27f::spec_graph::count_edge_label;
+use t27f::spec_graph::NODE_MODULE;
+use t27f::spec_graph::NODE_CONST;
+use t27f::spec_graph::NODE_FN;
+use t27f::spec_graph::NODE_TEST;
+use t27f::spec_graph::NODE_INVARIANT;
+use t27f::spec_graph::NODE_BENCH;
+use t27f::spec_graph::NODE_USE;
+use t27f::spec_graph::NODE_OPAQUE;
+use t27f::spec_graph::EDGE_CALLS;
+use t27f::spec_graph::EDGE_USES;
+use t27f::spec_graph::EDGE_TESTED_BY;
+use t27f::spec_graph::EDGE_CONSTRAINS;
+use t27f::spec_graph::EDGE_DATA_FLOW;
+use t27f::spec_graph::LABEL_EXACT;
+use t27f::spec_graph::LABEL_DERIVED;
+use t27f::spec_graph::LABEL_SUGGESTED;
+use t27f::spec_graph::LABEL_UNKNOWN;
+use t27f::spec_graph::MAX_NODES;
+use t27f::spec_graph::MAX_EDGES;
+use t27f::spec_graph::GRAPH_OK;
+use t27f::spec_graph::ERR_SPEC_PATH;
+use t27f::spec_graph::ERR_TOO_MANY_NODES;
+use t27f::spec_graph::ERR_TOO_MANY_EDGES;
+
+/// Node 0's name when the source has no module line.
+pub const NO_MODULE_NAME : str = "(no module)";
+
+/// Tutorial lesson 08 as a snapshot of specs/tutorial/08_modules_and_arrays.t27 at gHashTag/t27
+/// commit 2f395025f: 93 lines, sha256 c291e925d9dabef8b72b5a64aef153a2126c0b0b43d67bc08b1b2d7eaa98039a.
+pub const TUTORIAL_08_SRC : []const u8 = "// SPDX-License-Identifier: Apache-2.0\n; 08 -- Modules, visibility and arrays\n; Lesson 8, the last one. How a spec names itself, what it exposes, how it\n; pulls in another spec, and the array/index syntax used by every lookup table\n; in the corpus.\n; .\n; After this, open specs/numeric/gf16.t27 -- it is a real spec built entirely\n; out of what these eight lessons cover.\n; phi^2 + 1/phi^2 = 3 | TRINITY\n\nmodule tutorial-08-modules;\n\n// ============================================================================\n// use\n//\n//   use path::to::spec;\n//\n// Pulls in another spec. Paths are `::`-separated and rooted at the corpus,\n// not at the filesystem.\n// ============================================================================\n\nuse base::types;\n\n// ============================================================================\n// pub\n//\n// `pub` makes a name part of this spec's surface. Without it the name is\n// internal: usable here, invisible elsewhere. Default to leaving things\n// private -- a spec's exported surface is a promise to whoever imports it.\n// ============================================================================\n\npub const EXPORTED_WIDTH : u8 = 16;\n\n// No `pub`: an implementation detail of this module.\nconst INTERNAL_SCALE : u8 = 4;\n\npub fn scaled_width() u8 {\n    return EXPORTED_WIDTH / INTERNAL_SCALE;\n}\n\n// ============================================================================\n// Arrays\n//\n//   pub const NAME : [N]TYPE = [a, b, c];\n//\n// The length and the element type are part of the declared type, written out\n// like every other width in this language. Fixed tables like this are how the\n// numeric specs carry their constants.\n//\n// The Zig-style `[_]TYPE{ a, b, c }` parses, but it lowers to an untyped tuple:\n// indexing one with a runtime value does not compile. Write the type.\n// ============================================================================\n\npub const TRIT_VALUES : [3]i8 = [-1, 0, 1];\n\npub const POWERS_OF_TWO : [8]u16 = [1, 2, 4, 8, 16, 32, 64, 128];\n\npub const EXPONENT_BIAS : [4]u8 = [15, 31, 63, 127];\n\n// ============================================================================\n// Indexing\n//\n// `array[i]`, zero-based.\n// ============================================================================\n\npub fn power_of_two(index: u8) u16 {\n    return POWERS_OF_TWO[index];\n}\n\npub fn bias_for_width(index: u8) u8 {\n    return EXPONENT_BIAS[index];\n}\n\n// ============================================================================\n// Tests\n// ============================================================================\n\ntest \"the power table matches its own definition\" {\n    try std.testing.expectEqual(@as(u16, 1), power_of_two(0));\n    try std.testing.expectEqual(@as(u16, 128), power_of_two(7));\n}\n\ntest \"bias table carries the four standard widths\" {\n    try std.testing.expectEqual(@as(u8, 15), bias_for_width(0));\n    try std.testing.expectEqual(@as(u8, 127), bias_for_width(3));\n}\n\ntest \"a private constant is still usable inside its own module\" {\n    try std.testing.expectEqual(@as(u8, 4), scaled_width());\n}\n\ninvariant exported_width_is_a_power_of_two\n    assert EXPORTED_WIDTH == 16\n";
+
+/// One classified declaration line: node kind and label, the name's byte range, the byte range an
+/// identifier must equal to refer to the node (the whole name, or a `use` path's last segment),
+/// and whether it is a module line.
+pub struct Decl {
+    kind: u8,
+    label: u8,
+    na: usize,
+    nb: usize,
+    sa: usize,
+    sb: usize,
+    is_module: bool,
+}
+
+/// What reading one line of code leaves: the brace depth after it and its last code byte (0 when
+/// the line holds no code, only blanks or a comment).
+pub struct LineScan {
+    depth: u32,
+    tail: u8,
+}
+
+/// Per node: where its name matches and where its first line starts, as byte offsets into the
+/// source. Entries at or past node_count are not read.
+pub struct NameSpans {
+    ma: [192]usize,
+    mb: [192]usize,
+    ia: [192]usize,
+}
+
+pub fn ex_space(c: u8) -> bool {
+    return c == ' ' or c == '\t' or c == '\r';
+}
+
+/// A name byte: letter, digit or '_'.
+pub fn ex_word(c: u8) -> bool {
+    if (c >= '0' and c <= '9') { return true; }
+    if (c >= 'a' and c <= 'z') { return true; }
+    if (c >= 'A' and c <= 'Z') { return true; }
+    return c == '_';
+}
+
+pub fn skip_space(src: []const u8, i: usize, b: usize) -> usize {
+    var k : usize = i;
+    while (k < b and ex_space(src[k])) { k += 1; }
+    return k;
+}
+
+/// The end of the run of name bytes that starts at src[i], within the line that ends at b.
+pub fn word_end(src: []const u8, i: usize, b: usize) -> usize {
+    var k : usize = i;
+    while (k < b and ex_word(src[k])) { k += 1; }
+    return k;
+}
+
+/// The end of the token that starts at src[i]: up to a blank, `;` or `{`.
+pub fn token_end(src: []const u8, i: usize, b: usize) -> usize {
+    var k : usize = i;
+    while (k < b and ex_space(src[k]) == false and src[k] != ';' and src[k] != '{') { k += 1; }
+    return k;
+}
+
+/// The index of the newline that ends the line starting at a, or the length of src.
+pub fn line_end_at(src: []const u8, a: usize) -> usize {
+    var k : usize = a;
+    while (k < src.len and src[k] != '\n') { k += 1; }
+    return k;
+}
+
+/// The number of lines of src: its newlines, plus one for a last line with no newline.
+pub fn count_lines(src: []const u8) -> u32 {
+    var c : u32 = 0;
+    var k : usize = 0;
+    while (k < src.len) {
+        if (src[k] == '\n') { c += 1; }
+        k += 1;
+    }
+    if (src.len > 0 and src[src.len - 1] != '\n') { c += 1; }
+    return c;
+}
+
+/// If a string or character literal starts at src[i], the index just past it (a string that does
+/// not close stops at the line end b); otherwise i.
+pub fn skip_lit(src: []const u8, b: usize, i: usize) -> usize {
+    const c : u8 = src[i];
+    if (c == '"') {
+        var j : usize = i + 1;
+        while (j < b and src[j] != '"') {
+            if (src[j] == '\\') { j += 1; }
+            j += 1;
+        }
+        if (j >= b) { return b; }
+        return j + 1;
+    }
+    if (c == '\'') {
+        if (i + 2 < b and src[i + 1] != '\\' and src[i + 2] == '\'') { return i + 3; }
+        if (i + 3 < b and src[i + 1] == '\\' and src[i + 3] == '\'') { return i + 4; }
+    }
+    return i;
+}
+
+/// The index of the quote that closes the string whose first byte is src[i], or b.
+pub fn closing_quote(src: []const u8, i: usize, b: usize) -> usize {
+    var j : usize = i;
+    while (j < b and src[j] != '"') {
+        if (src[j] == '\\') { j += 1; }
+        j += 1;
+    }
+    if (j > b) { return b; }
+    return j;
+}
+
+/// Read the line src[a..b] (b is the newline or the end) starting at brace depth `depth_in`. A
+/// line whose first non-blank byte is `;` is a comment. Braces inside literals and after `//` do
+/// not count, and a `}` at depth 0 is dropped.
+pub fn scan_line(src: []const u8, a: usize, b: usize, depth_in: u32) -> LineScan {
+    var depth : u32 = depth_in;
+    var tail : u8 = 0;
+    var i : usize = skip_space(src, a, b);
+    if (i < b and src[i] == ';') { return LineScan { depth: depth, tail: 0 }; }
+    var stop : bool = false;
+    while (i < b and stop == false) {
+        const c : u8 = src[i];
+        if (c == '/' and i + 1 < b and src[i + 1] == '/') {
+            stop = true;
+        } else {
+            const j : usize = skip_lit(src, b, i);
+            if (j != i) {
+                tail = '"';
+                i = j;
+            } else {
+                if (c == '{') { depth += 1; }
+                if (c == '}') {
+                    if (depth > 0) { depth -= 1; }
+                }
+                if (ex_space(c) == false) { tail = c; }
+                i += 1;
+            }
+        }
+    }
+    return LineScan { depth: depth, tail: tail };
+}
+
+/// Keywords that declare something the IR has no finer kind for.
+pub fn opaque_keyword(kw: str) -> bool {
+    return kw == "struct" or kw == "enum" or kw == "var" or kw == "spec" or kw == "endmodule";
+}
+
+/// Classify the declaration line src[a..b] (it holds code). The node name is src[na .. nb].
+pub fn classify(src: []const u8, a: usize, b: usize) -> Decl {
+    const i0 : usize = skip_space(src, a, b);
+    const j0 : usize = word_end(src, i0, b);
+    var i : usize = i0;
+    var j : usize = j0;
+    var kw : str = src[i0 .. j0];
+    if (kw == "pub") {
+        const i1 : usize = skip_space(src, j0, b);
+        const j1 : usize = word_end(src, i1, b);
+        if (j1 > i1) {
+            i = i1;
+            j = j1;
+            kw = src[i1 .. j1];
+        }
+    }
+    // the fallback: the head word, or the one byte that is not a word, as an UNKNOWN opaque node
+    var d : Decl = Decl { kind: NODE_OPAQUE, label: LABEL_UNKNOWN, na: i, nb: j, sa: i, sb: j, is_module: false };
+    if (j == i) {
+        d.nb = i + 1;
+        d.sb = i + 1;
+        return d;
+    }
+    const k : usize = skip_space(src, j, b);
+    if (kw == "module") {
+        const e : usize = token_end(src, k, b);
+        if (e == k) { return d; }
+        return Decl { kind: NODE_MODULE, label: LABEL_EXACT, na: k, nb: e, sa: k, sb: e, is_module: true };
+    }
+    if (kw == "use") {
+        const e : usize = token_end(src, k, b);
+        if (e == k) { return d; }
+        var s : usize = e;
+        while (s > k and src[s - 1] != ':') { s -= 1; }
+        return Decl { kind: NODE_USE, label: LABEL_EXACT, na: k, nb: e, sa: s, sb: e, is_module: false };
+    }
+    if (kw == "const" or kw == "fn") {
+        const e : usize = word_end(src, k, b);
+        if (e == k) { return d; }
+        var kind : u8 = NODE_CONST;
+        if (kw == "fn") { kind = NODE_FN; }
+        return Decl { kind: kind, label: LABEL_EXACT, na: k, nb: e, sa: k, sb: e, is_module: false };
+    }
+    if (kw == "test" or kw == "invariant" or kw == "bench") {
+        var kind : u8 = NODE_TEST;
+        if (kw == "invariant") { kind = NODE_INVARIANT; }
+        if (kw == "bench") { kind = NODE_BENCH; }
+        if (k < b and src[k] == '"') {
+            const q : usize = closing_quote(src, k + 1, b);
+            if (q == k + 1) { return d; }
+            return Decl { kind: kind, label: LABEL_EXACT, na: k + 1, nb: q, sa: k + 1, sb: q, is_module: false };
+        }
+        const e : usize = word_end(src, k, b);
+        if (e == k) { return d; }
+        return Decl { kind: kind, label: LABEL_EXACT, na: k, nb: e, sa: k, sb: e, is_module: false };
+    }
+    if (opaque_keyword(kw)) {
+        const e : usize = word_end(src, k, b);
+        if (e == k) {
+            return Decl { kind: NODE_OPAQUE, label: LABEL_EXACT, na: i, nb: j, sa: i, sb: j, is_module: false };
+        }
+        return Decl { kind: NODE_OPAQUE, label: LABEL_EXACT, na: k, nb: e, sa: k, sb: e, is_module: false };
+    }
+    return d;
+}
+
+/// Is there already an edge of this kind between these nodes? Reads only stored edges, so it is
+/// safe on a graph that has gone past capacity.
+pub fn edge_seen(g: SpecGraph, ek: u8, f: u32, t: u32) -> bool {
+    var j : u32 = 0;
+    while (j < g.edge_count and j < MAX_EDGES) {
+        const m : usize = j as usize;
+        if (g.edge_kind[m] == ek and (g.edge_from[m] as u32) == f and (g.edge_to[m] as u32) == t) { return true; }
+        j += 1;
+    }
+    return false;
+}
+
+/// The edges one name token makes: it is src[i .. e], read in node k on `line`, whose source line
+/// ends at b. The first declared fn, const or import it equals is the target; nothing else is.
+pub fn token_edges(g0: SpecGraph, src: []const u8, sp: NameSpans, k: u32, i: usize, e: usize, b: usize, line: u32) -> SpecGraph {
+    var g : SpecGraph = g0;
+    const tok : str = src[i .. e];
+    const ks : usize = k as usize;
+    var t : u32 = 1;
+    var found : bool = false;
+    while (t < g.node_count and found == false) {
+        const ts : usize = t as usize;
+        const tk : u8 = g.node_kind[ts];
+        if (tk == NODE_FN or tk == NODE_CONST or tk == NODE_USE) {
+            const cand : str = src[sp.ma[ts] .. sp.mb[ts]];
+            if (tok == cand) {
+                found = true;
+                const own : bool = t == k and i >= sp.ma[ks] and i < sp.mb[ks];
+                if (own == false) {
+                    var ek : u8 = EDGE_USES;
+                    var emit : bool = true;
+                    if (tk == NODE_FN) {
+                        ek = EDGE_CALLS;
+                        const p : usize = skip_space(src, e, b);
+                        emit = p < b and src[p] == '(';
+                    }
+                    if (tk == NODE_CONST and g.node_kind[ks] == NODE_INVARIANT) { ek = EDGE_CONSTRAINS; }
+                    if (emit and edge_seen(g, ek, k, t) == false) {
+                        g = with_edge(g, ek, k as u8, t as u8, LABEL_EXACT, line);
+                    }
+                }
+            }
+        }
+        t += 1;
+    }
+    return g;
+}
+
+/// The edges read from one source line src[p..b] of node k: every name token outside strings,
+/// character literals and comments.
+pub fn line_edges(g0: SpecGraph, src: []const u8, sp: NameSpans, k: u32, p: usize, b: usize, line: u32) -> SpecGraph {
+    var g : SpecGraph = g0;
+    var i : usize = skip_space(src, p, b);
+    if (i < b and src[i] == ';') { return g; }
+    while (i < b) {
+        const c : u8 = src[i];
+        if (c == '/' and i + 1 < b and src[i + 1] == '/') {
+            i = b;
+        } else {
+            const j : usize = skip_lit(src, b, i);
+            if (j != i) {
+                i = j;
+            } else {
+                if (ex_word(c)) {
+                    const e : usize = word_end(src, i, b);
+                    if (c < '0' or c > '9') { g = token_edges(g, src, sp, k, i, e, b, line); }
+                    i = e;
+                } else {
+                    i += 1;
+                }
+            }
+        }
+    }
+    return g;
+}
+
+/// The edges read from the whole body of node k, line by line from its first to its last line.
+pub fn body_edges(g0: SpecGraph, src: []const u8, sp: NameSpans, k: u32) -> SpecGraph {
+    var g : SpecGraph = g0;
+    const ks : usize = k as usize;
+    const last : u32 = g.line_end[ks];
+    var line : u32 = g.line_start[ks];
+    var p : usize = sp.ia[ks];
+    while (line <= last and p < src.len) {
+        const b : usize = line_end_at(src, p);
+        g = line_edges(g, src, sp, k, p, b, line);
+        p = b + 1;
+        line += 1;
+    }
+    return g;
+}
+
+/// All edges: the module's USES of each `use` line, then the edges read from each fn, test,
+/// invariant and bench body in node order. Called only when every node is stored.
+pub fn read_edges(g0: SpecGraph, src: []const u8, sp: NameSpans) -> SpecGraph {
+    var g : SpecGraph = g0;
+    var k : u32 = 1;
+    if (g.node_label[0] == LABEL_EXACT) {
+        while (k < g.node_count) {
+            if (g.node_kind[k as usize] == NODE_USE) {
+                g = with_edge(g, EDGE_USES, 0, k as u8, LABEL_EXACT, g.line_start[k as usize]);
+            }
+            k += 1;
+        }
+    }
+    k = 1;
+    while (k < g.node_count) {
+        const kind : u8 = g.node_kind[k as usize];
+        if (kind == NODE_FN or kind == NODE_TEST or kind == NODE_INVARIANT or kind == NODE_BENCH) {
+            g = body_edges(g, src, sp, k);
+        }
+        k += 1;
+    }
+    return g;
+}
+
+/// The graph of the spec whose source is `src` and whose path is `path`. Pass 1 reads the nodes
+/// and spans line by line; pass 2 reads the edges. The result is always a SpecGraph;
+/// validate_graph says whether it is a valid one (empty source, no path, more than MAX_NODES nodes
+/// or MAX_EDGES edges are refused there).
+pub fn export_graph(path: str, src: []const u8) -> SpecGraph {
+    const n : usize = src.len;
+    var g : SpecGraph = blank_graph();
+    g.spec_path = path;
+    g.line_count = count_lines(src);
+    g = with_node(g, NODE_MODULE, LABEL_UNKNOWN, NO_MODULE_NAME, 1, g.line_count);
+    var sp : NameSpans = NameSpans { ma: [0; 192], mb: [0; 192], ia: [0; 192] };
+    var pos : usize = 0;
+    var line : u32 = 0;
+    var depth : u32 = 0;
+    var live : bool = false;
+    var closed : bool = true;
+    var cur : u32 = 0;
+    var mod_seen : bool = false;
+    while (pos < n) {
+        const b : usize = line_end_at(src, pos);
+        line += 1;
+        const sc : LineScan = scan_line(src, pos, b, depth);
+        if (depth > 0) {
+            // inside a body: this line belongs to the open node, up to the brace that closes it
+            if (live and cur < MAX_NODES) { g.line_end[cur as usize] = line; }
+            depth = sc.depth;
+            if (depth == 0) { closed = true; }
+        } else {
+            if (sc.tail != 0) {
+                const indented : bool = src[pos] == ' ' or src[pos] == '\t';
+                const first : usize = skip_space(src, pos, b);
+                if (live and closed == false and indented) {
+                    // a continuation line of a declaration that has no brace yet
+                    if (cur < MAX_NODES) { g.line_end[cur as usize] = line; }
+                    depth = sc.depth;
+                    if (depth == 0 and (sc.tail == ';' or sc.tail == '}')) { closed = true; }
+                } else {
+                    if (src[first] == '}') {
+                        // a stray closing brace, or the end of a block-form module
+                        depth = 0;
+                    } else {
+                        const d : Decl = classify(src, pos, b);
+                        if (d.is_module and mod_seen == false) {
+                            mod_seen = true;
+                            g.node_name[0] = src[d.na .. d.nb];
+                            g.node_label[0] = LABEL_EXACT;
+                            live = false;
+                            depth = 0;
+                        } else {
+                            var kind : u8 = d.kind;
+                            if (kind == NODE_MODULE) { kind = NODE_OPAQUE; }
+                            cur = g.node_count;
+                            g = with_node(g, kind, d.label, src[d.na .. d.nb], line, line);
+                            if (cur < MAX_NODES) {
+                                sp.ma[cur as usize] = d.sa;
+                                sp.mb[cur as usize] = d.sb;
+                                sp.ia[cur as usize] = pos;
+                            }
+                            live = true;
+                            depth = sc.depth;
+                            closed = depth == 0 and (sc.tail == ';' or sc.tail == '}');
+                        }
+                    }
+                }
+            }
+        }
+        pos = b + 1;
+    }
+    if (g.node_count <= MAX_NODES) { g = read_edges(g, src, sp); }
+    return g;
+}
+
+/// validate_graph of the export: GRAPH_OK, or the first rule the exported graph breaks.
+pub fn export_verdict(path: str, src: []const u8) -> u8 {
+    return validate_graph(export_graph(path, src));
+}
+
+/// Do node i of e and node i of f agree on kind, label, name and span? Both must hold node i.
+pub fn node_matches(e: SpecGraph, f: SpecGraph, i: u32) -> bool {
+    const k : usize = i as usize;
+    if (e.node_kind[k] != f.node_kind[k]) { return false; }
+    if (e.node_label[k] != f.node_label[k]) { return false; }
+    const en : str = e.node_name[k];
+    const fn_ : str = f.node_name[k];
+    if ((en == fn_) == false) { return false; }
+    if (e.line_start[k] != f.line_start[k]) { return false; }
+    return e.line_end[k] == f.line_end[k];
+}
+
+/// How many nodes, by index, the two graphs share.
+pub fn nodes_in_common(e: SpecGraph, f: SpecGraph) -> u32 {
+    var c : u32 = 0;
+    var i : u32 = 0;
+    while (i < e.node_count and i < f.node_count and i < MAX_NODES) {
+        if (node_matches(e, f, i)) { c += 1; }
+        i += 1;
+    }
+    return c;
+}
+
+/// Does g hold an edge with exactly these kind, endpoints, label and line?
+pub fn edge_in(g: SpecGraph, ek: u8, f: u8, t: u8, l: u8, line: u32) -> bool {
+    var j : u32 = 0;
+    while (j < g.edge_count and j < MAX_EDGES) {
+        const m : usize = j as usize;
+        if (g.edge_kind[m] == ek and g.edge_from[m] == f and g.edge_to[m] == t and g.edge_label[m] == l and g.edge_line[m] == line) { return true; }
+        j += 1;
+    }
+    return false;
+}
+
+/// How many edges of a are also edges of b, compared on every field.
+pub fn edges_shared(a: SpecGraph, b: SpecGraph) -> u32 {
+    var c : u32 = 0;
+    var j : u32 = 0;
+    while (j < a.edge_count and j < MAX_EDGES) {
+        const m : usize = j as usize;
+        if (edge_in(b, a.edge_kind[m], a.edge_from[m], a.edge_to[m], a.edge_label[m], a.edge_line[m])) { c += 1; }
+        j += 1;
+    }
+    return c;
+}
+
+test line_counts_follow_the_newlines {
+    assert count_lines("") == 0;
+    assert count_lines("a") == 1;
+    assert count_lines("a\n") == 1;
+    assert count_lines("a\nb") == 2;
+    assert count_lines("a\n\n") == 2;
+    assert count_lines("\n") == 1;
+    // negative controls: not one more for a trailing newline, not one fewer for a missing one
+    assert count_lines("a\n") != 2;
+    assert count_lines("a\nb") != 1;
+    assert count_lines(TUTORIAL_08_SRC) == 93;
+}
+
+test the_module_line_names_node_zero {
+    const g : SpecGraph = export_graph("specs/x.t27", "module m_one;\n");
+    assert g.node_count == 1;
+    assert g.node_kind[0] == NODE_MODULE;
+    assert g.node_label[0] == LABEL_EXACT;
+    assert g.node_name[0] == "m_one";
+    assert g.line_start[0] == 1;
+    assert g.line_end[0] == 1;
+    assert g.spec_path == "specs/x.t27";
+    assert validate_graph(g) == GRAPH_OK;
+    // a hyphenated module name is read whole, as tutorial 08 writes it
+    assert export_graph("specs/x.t27", "module a-b-c;\n").node_name[0] == "a-b-c";
+    // negative control: no module line means an UNKNOWN node 0, never an invented name
+    const h : SpecGraph = export_graph("specs/x.t27", "const A : u8 = 1;\n");
+    assert h.node_label[0] == LABEL_UNKNOWN;
+    assert h.node_name[0] == NO_MODULE_NAME;
+    assert (h.node_name[0] == "m_one") == false;
+    assert h.node_count == 2;
+    assert validate_graph(h) == GRAPH_OK;
+}
+
+test every_declaration_kind_reads_as_its_node_kind {
+    const src : []const u8 = "module m;\nuse p::q::Thing;\npub const A : u8 = 1;\nconst B : u8 = 2;\npub fn f() u8 { return A; }\nfn g() u8 { return B; }\ntest \"t one\" { assert f() == 1; }\ninvariant inv_one assert A == 1;\nbench bench_one { f(); }\n";
+    const g : SpecGraph = export_graph("specs/x.t27", src);
+    assert validate_graph(g) == GRAPH_OK;
+    assert g.node_count == 9;
+    assert g.line_count == 9;
+    assert g.node_kind[0] == NODE_MODULE;
+    assert g.node_kind[1] == NODE_USE;
+    assert g.node_kind[2] == NODE_CONST;
+    assert g.node_kind[3] == NODE_CONST;
+    assert g.node_kind[4] == NODE_FN;
+    assert g.node_kind[5] == NODE_FN;
+    assert g.node_kind[6] == NODE_TEST;
+    assert g.node_kind[7] == NODE_INVARIANT;
+    assert g.node_kind[8] == NODE_BENCH;
+    assert g.node_name[1] == "p::q::Thing";
+    assert g.node_name[2] == "A";
+    assert g.node_name[4] == "f";
+    assert g.node_name[6] == "t one";
+    assert g.node_name[7] == "inv_one";
+    assert g.node_name[8] == "bench_one";
+    // each is on its own line; a single-line declaration has start == end
+    assert g.line_start[1] == 2 and g.line_end[1] == 2;
+    assert g.line_start[4] == 5 and g.line_end[4] == 5;
+    assert g.line_start[6] == 7 and g.line_end[6] == 7;
+    assert g.line_start[8] == 9 and g.line_end[8] == 9;
+    // `pub` changes nothing about the kind: A is pub, B is not, both are consts
+    assert count_node_kind(g, NODE_CONST) == 2;
+    assert count_node_kind(g, NODE_FN) == 2;
+    // everything read directly is EXACT; negative control: nothing is UNKNOWN here
+    assert count_node_label(g, LABEL_EXACT) == 9;
+    assert count_node_label(g, LABEL_UNKNOWN) == 0;
+    // the six edges this source holds
+    assert g.edge_count == 6;
+    assert has_edge(g, EDGE_USES, 0, 1);
+    assert has_edge(g, EDGE_USES, 4, 2);
+    assert has_edge(g, EDGE_USES, 5, 3);
+    assert has_edge(g, EDGE_CALLS, 6, 4);
+    assert has_edge(g, EDGE_CONSTRAINS, 7, 2);
+    assert has_edge(g, EDGE_CALLS, 8, 4);
+    // negative controls: the invariant constrains A, it does not merely use it; nothing reads backwards
+    assert has_edge(g, EDGE_USES, 7, 2) == false;
+    assert has_edge(g, EDGE_CALLS, 4, 6) == false;
+    assert has_edge(g, EDGE_USES, 5, 2) == false;
+}
+
+test other_declarations_are_opaque {
+    const src : []const u8 = "module m;\nstruct S {\n    x: u8,\n}\nenum E { A, B }\nwhat is this;\n";
+    const g : SpecGraph = export_graph("specs/x.t27", src);
+    assert validate_graph(g) == GRAPH_OK;
+    assert g.node_count == 4;
+    // a known keyword is read: OPAQUE and EXACT, named, with its brace-closed span
+    assert g.node_kind[1] == NODE_OPAQUE;
+    assert g.node_label[1] == LABEL_EXACT;
+    assert g.node_name[1] == "S";
+    assert g.line_start[1] == 2 and g.line_end[1] == 4;
+    assert g.node_kind[2] == NODE_OPAQUE;
+    assert g.node_label[2] == LABEL_EXACT;
+    assert g.node_name[2] == "E";
+    assert g.line_start[2] == 5 and g.line_end[2] == 5;
+    // negative control: a word the scanner does not know is UNKNOWN, not guessed at
+    assert g.node_kind[3] == NODE_OPAQUE;
+    assert g.node_label[3] == LABEL_UNKNOWN;
+    assert g.node_name[3] == "what";
+    assert g.node_label[3] != LABEL_EXACT;
+    assert count_node_label(g, LABEL_UNKNOWN) == 1;
+}
+
+test a_declaration_with_no_readable_name_is_unknown {
+    const nameless_fn : SpecGraph = export_graph("specs/x.t27", "module m;\nfn () u8 { return 1; }\n");
+    assert validate_graph(nameless_fn) == GRAPH_OK;
+    assert nameless_fn.node_kind[1] == NODE_OPAQUE;
+    assert nameless_fn.node_label[1] == LABEL_UNKNOWN;
+    assert nameless_fn.node_name[1] == "fn";
+    const nameless_const : SpecGraph = export_graph("specs/x.t27", "module m;\nconst : u8 = 1;\n");
+    assert nameless_const.node_kind[1] == NODE_OPAQUE;
+    assert nameless_const.node_label[1] == LABEL_UNKNOWN;
+    const nameless_test : SpecGraph = export_graph("specs/x.t27", "module m;\ntest {\n}\n");
+    assert nameless_test.node_label[1] == LABEL_UNKNOWN;
+    const empty_title : SpecGraph = export_graph("specs/x.t27", "module m;\ntest \"\" { }\n");
+    assert empty_title.node_label[1] == LABEL_UNKNOWN;
+    const pub_alone : SpecGraph = export_graph("specs/x.t27", "module m;\npub\n");
+    assert pub_alone.node_label[1] == LABEL_UNKNOWN;
+    assert pub_alone.node_name[1] == "pub";
+    // positive controls: with a name, the same lines are fn, const and test nodes
+    assert export_graph("specs/x.t27", "module m;\nfn a() u8 { return 1; }\n").node_kind[1] == NODE_FN;
+    assert export_graph("specs/x.t27", "module m;\nconst A : u8 = 1;\n").node_kind[1] == NODE_CONST;
+    assert export_graph("specs/x.t27", "module m;\ntest \"t\" { }\n").node_kind[1] == NODE_TEST;
+}
+
+test a_span_runs_to_the_matching_closing_brace {
+    const src : []const u8 = "module m;\nfn f() u8 {\n    if (x) {\n        y();\n    }\n    return 1;\n}\nconst C : u8 = 1;\n";
+    const g : SpecGraph = export_graph("specs/x.t27", src);
+    assert validate_graph(g) == GRAPH_OK;
+    assert g.node_count == 3;
+    // nested braces: the fn closes on line 7, not on the inner brace at line 5
+    assert g.line_start[1] == 2;
+    assert g.line_end[1] == 7;
+    assert g.line_end[1] != 5;
+    // the next declaration starts after it, on its own line
+    assert g.node_kind[2] == NODE_CONST;
+    assert g.line_start[2] == 8 and g.line_end[2] == 8;
+    // a body that never closes runs to the end of the file, and the graph is still valid
+    const open_body : SpecGraph = export_graph("specs/x.t27", "module m;\nfn f() u8 {\n    return 1;\n");
+    assert open_body.line_end[1] == 3;
+    assert validate_graph(open_body) == GRAPH_OK;
+    // a closing brace on the declaration line gives a one-line span; negative control: it is not 2 lines
+    const one_line : SpecGraph = export_graph("specs/x.t27", "module m;\nfn f() u8 { return 1; }\nfn g() u8 { return 2; }\n");
+    assert one_line.line_start[1] == 2 and one_line.line_end[1] == 2;
+    assert one_line.line_start[2] == 3 and one_line.line_end[2] == 3;
+}
+
+test braces_in_strings_comments_and_characters_do_not_count {
+    // a closing brace in a string, a line comment, a character literal and a `;` comment line:
+    // none of them closes the fn, which still runs to its real brace on line 8
+    const closing : []const u8 = "module m;\nfn f() u8 {\n    let s = \"}\";\n    // }\n    let c = '}';\n    ; }\n    return 1;\n}\nconst C : u8 = 1;\n";
+    const g : SpecGraph = export_graph("specs/x.t27", closing);
+    assert validate_graph(g) == GRAPH_OK;
+    assert g.node_count == 3;
+    assert g.line_start[1] == 2 and g.line_end[1] == 8;
+    assert g.line_start[2] == 9 and g.line_end[2] == 9;
+    // an opening brace in the same places does not open anything: the fn closes on line 8
+    const opening : []const u8 = "module m;\nfn f() u8 {\n    let s = \"{\";\n    // {\n    let c = '{';\n    ; {\n    return 1;\n}\nconst C : u8 = 1;\n";
+    const h : SpecGraph = export_graph("specs/x.t27", opening);
+    assert h.node_count == 3;
+    assert h.line_end[1] == 8;
+    assert h.line_start[2] == 9;
+    // an escaped quote does not end the string, so the brace after it is still inside it
+    const escaped : []const u8 = "module m;\nfn f() u8 {\n    let s = \"a\\\"}\";\n}\nconst C : u8 = 1;\n";
+    const k : SpecGraph = export_graph("specs/x.t27", escaped);
+    assert k.node_count == 3;
+    assert k.line_end[1] == 4;
+    assert k.line_start[2] == 5;
+    // negative control: a real brace outside any literal does count
+    const real : []const u8 = "module m;\nfn f() u8 {\n    let s = 1;\n}\nconst C : u8 = 1;\n";
+    assert export_graph("specs/x.t27", real).line_end[1] == 4;
+    assert export_graph("specs/x.t27", real).line_end[1] != 3;
+}
+
+test a_declaration_with_no_brace_ends_at_its_last_continuation_line {
+    const src : []const u8 = "module m;\ninvariant big_one\n    assert A == 1\n    and B == 2\nconst A : u8 =\n    1;\nconst B : u8 = 2;\ninvariant after\nassert 1 == 1\n";
+    const g : SpecGraph = export_graph("specs/x.t27", src);
+    assert validate_graph(g) == GRAPH_OK;
+    assert g.node_count == 6;
+    // the invariant runs over its two indented lines
+    assert g.node_kind[1] == NODE_INVARIANT;
+    assert g.line_start[1] == 2 and g.line_end[1] == 4;
+    // a const split over two lines ends at the line with its `;`
+    assert g.node_kind[2] == NODE_CONST;
+    assert g.line_start[2] == 5 and g.line_end[2] == 6;
+    assert g.line_start[3] == 7 and g.line_end[3] == 7;
+    // negative control: an unindented line is not a continuation; it starts a node of its own
+    assert g.node_kind[4] == NODE_INVARIANT;
+    assert g.line_end[4] == 8;
+    assert g.node_kind[5] == NODE_OPAQUE;
+    assert g.node_label[5] == LABEL_UNKNOWN;
+    assert g.line_start[5] == 9;
+    // the continuation lines name A and B, so the invariant constrains both, on the lines it names them
+    assert g.edge_count == 2;
+    assert edge_in(g, EDGE_CONSTRAINS, 1, 2, LABEL_EXACT, 3);
+    assert edge_in(g, EDGE_CONSTRAINS, 1, 3, LABEL_EXACT, 4);
+}
+
+test blank_lines_and_comments_between_declarations_belong_to_none {
+    const src : []const u8 = "// header\n; prose\n\nmodule m;\n\n// about A\nconst A : u8 = 1;\n\n; about f\nfn f() u8 {\n\n    return A;\n\n}\n\n// trailing\n";
+    const g : SpecGraph = export_graph("specs/x.t27", src);
+    assert validate_graph(g) == GRAPH_OK;
+    assert g.node_count == 3;
+    assert g.line_count == 16;
+    assert g.line_start[1] == 7 and g.line_end[1] == 7;
+    // the fn runs from its declaration to its closing brace, blank lines included, and not into the trailing comment
+    assert g.line_start[2] == 10 and g.line_end[2] == 14;
+    assert g.line_end[2] != 16;
+    assert has_edge(g, EDGE_USES, 2, 1);
+}
+
+test a_block_form_module_still_exports_its_declarations {
+    const src : []const u8 = "module m {\n    const A : u8 = 1;\n    fn f() u8 { return A; }\n}\n";
+    const g : SpecGraph = export_graph("specs/x.t27", src);
+    assert validate_graph(g) == GRAPH_OK;
+    assert g.node_name[0] == "m";
+    assert g.node_label[0] == LABEL_EXACT;
+    assert g.node_count == 3;
+    assert g.node_kind[1] == NODE_CONST;
+    assert g.line_start[1] == 2;
+    assert g.node_kind[2] == NODE_FN;
+    assert has_edge(g, EDGE_USES, 2, 1);
+    // negative control: the module's closing brace is not a node
+    assert g.node_count != 4;
+    assert g.line_end[2] == 3;
+}
+
+test a_second_module_line_is_opaque_not_a_second_module {
+    const g : SpecGraph = export_graph("specs/x.t27", "module a;\nmodule b;\n");
+    assert validate_graph(g) == GRAPH_OK;
+    assert count_node_kind(g, NODE_MODULE) == 1;
+    assert g.node_name[0] == "a";
+    assert g.node_kind[1] == NODE_OPAQUE;
+    assert g.node_label[1] == LABEL_EXACT;
+    assert g.node_name[1] == "b";
+    assert (g.node_name[0] == "b") == false;
+}
+
+test edges_follow_the_direction_rules_and_carry_their_line {
+    const src : []const u8 = "module m;\nuse x::imp;\nconst K : u8 = 1;\nfn leaf() u8 { return K; }\nfn mid() u8 {\n    let a = leaf();\n    let b = leaf();\n    return a + b + imp();\n}\nfn rec(n: u8) u8 { return rec(n); }\nfn plain() u8 { let v = leaf; return v; }\nfn quiet() u8 { let s = \"leaf() K imp()\"; return 0; } // leaf() K\n";
+    const g : SpecGraph = export_graph("specs/x.t27", src);
+    assert validate_graph(g) == GRAPH_OK;
+    assert g.node_count == 8;
+    assert g.edge_count == 5;
+    // the module uses its import, on the `use` line
+    assert edge_in(g, EDGE_USES, 0, 1, LABEL_EXACT, 2);
+    // a fn naming a const uses it, on the line of the use
+    assert edge_in(g, EDGE_USES, 3, 2, LABEL_EXACT, 4);
+    // a call is a CALLS edge on the line of the first call; the second call, line 7, adds nothing
+    assert edge_in(g, EDGE_CALLS, 4, 3, LABEL_EXACT, 6);
+    assert edge_in(g, EDGE_CALLS, 4, 3, LABEL_EXACT, 7) == false;
+    assert count_edge_kind(g, EDGE_CALLS) == 2;
+    // an imported name is the last segment of its `use` path
+    assert edge_in(g, EDGE_USES, 4, 1, LABEL_EXACT, 8);
+    // recursion is a call; the fn's own name on its declaration is not
+    assert edge_in(g, EDGE_CALLS, 5, 5, LABEL_EXACT, 10);
+    assert g.edge_line[4] == 10;
+    // negative controls: a name with no `(` is not a call, and a name inside a string or after
+    // `//` is not a use, so plain and quiet have no edge out
+    assert has_edge(g, EDGE_CALLS, 6, 3) == false;
+    assert has_edge(g, EDGE_USES, 7, 2) == false;
+    assert has_edge(g, EDGE_USES, 7, 1) == false;
+    assert has_edge(g, EDGE_CALLS, 7, 3) == false;
+    // no const reads back into a fn, no fn is used (only called)
+    assert has_edge(g, EDGE_USES, 4, 3) == false;
+    assert has_edge(g, EDGE_CALLS, 3, 3) == false;
+}
+
+test a_test_that_calls_a_fn_calls_it_and_the_scanner_does_not_read_it_backwards {
+    const src : []const u8 = "module m;\nfn f() u8 { return 1; }\ntest \"calls f\" {\n    assert f() == 1;\n    assert f() == 1;\n}\n";
+    const g : SpecGraph = export_graph("specs/x.t27", src);
+    assert validate_graph(g) == GRAPH_OK;
+    assert g.edge_count == 1;
+    assert edge_in(g, EDGE_CALLS, 2, 1, LABEL_EXACT, 4);
+    // TESTED_BY is the call read backwards, so it is DERIVED by definition and not the scanner's
+    assert count_edge_kind(g, EDGE_TESTED_BY) == 0;
+    assert has_edge(g, EDGE_TESTED_BY, 1, 2) == false;
+}
+
+test a_name_in_a_non_body_position_makes_no_edge {
+    // const and use lines are not bodies; the module's only edge is its USES of the import
+    const g : SpecGraph = export_graph("specs/x.t27", "module m;\nuse a::K;\nconst K : u8 = 1;\nconst L : u8 = K;\n");
+    assert validate_graph(g) == GRAPH_OK;
+    assert g.edge_count == 1;
+    assert has_edge(g, EDGE_USES, 0, 1);
+    // negative control: the same const used from a fn body is an edge
+    const h : SpecGraph = export_graph("specs/x.t27", "module m;\nconst K : u8 = 1;\nfn f() u8 { return K; }\n");
+    assert has_edge(h, EDGE_USES, 2, 1);
+    // an unknown module has no edge out: UNKNOWN endpoints are refused by the IR
+    const n : SpecGraph = export_graph("specs/x.t27", "use a::K;\n");
+    assert n.edge_count == 0;
+    assert validate_graph(n) == GRAPH_OK;
+    const y : SpecGraph = export_graph("specs/x.t27", "module m;\nuse a::K;\n");
+    assert y.edge_count == 1;
+}
+
+test the_scanner_never_emits_derived_or_suggested {
+    const g : SpecGraph = export_graph("specs/tutorial/08_modules_and_arrays.t27", TUTORIAL_08_SRC);
+    assert count_node_label(g, LABEL_DERIVED) == 0;
+    assert count_node_label(g, LABEL_SUGGESTED) == 0;
+    assert count_edge_label(g, LABEL_DERIVED) == 0;
+    assert count_edge_label(g, LABEL_SUGGESTED) == 0;
+    assert count_edge_kind(g, EDGE_TESTED_BY) == 0;
+    assert count_edge_kind(g, EDGE_DATA_FLOW) == 0;
+    // negative control: the check can fail, because the hand-read fixture does hold such labels
+    const f : SpecGraph = tutorial_08_graph();
+    assert count_edge_label(f, LABEL_DERIVED) == 7;
+    assert count_edge_kind(f, EDGE_TESTED_BY) == 3;
+}
+
+test more_nodes_than_the_ir_holds_is_refused_not_truncated {
+    // module + 191 consts = 192 nodes: exactly at capacity, valid
+    const at_cap : []const u8 = "module m;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\n";
+    const a : SpecGraph = export_graph("specs/x.t27", at_cap);
+    assert a.node_count == MAX_NODES;
+    assert validate_graph(a) == GRAPH_OK;
+    // module + 192 consts = 193 nodes: one over, and the count says so
+    const over : []const u8 = "module m;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\nconst a : u8 = 1;\n";
+    const g : SpecGraph = export_graph("specs/x.t27", over);
+    assert g.node_count == MAX_NODES + 1;
+    assert validate_graph(g) == ERR_TOO_MANY_NODES;
+    assert export_verdict("specs/x.t27", over) == ERR_TOO_MANY_NODES;
+    // negative controls: the verdict is the capacity one, and it is not OK
+    assert export_verdict("specs/x.t27", over) != GRAPH_OK;
+    assert export_verdict("specs/x.t27", over) != ERR_TOO_MANY_EDGES;
+    assert export_verdict("specs/x.t27", at_cap) == GRAPH_OK;
+}
+
+test more_edges_than_the_ir_holds_is_refused_not_truncated {
+    // 2 fns and 127 tests that each call both: 254 edges, exactly at capacity
+    const at_cap : []const u8 = "module m;\nfn a() u8 { return 1; }\nfn b() u8 { return 1; }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\n";
+    const a : SpecGraph = export_graph("specs/x.t27", at_cap);
+    assert a.node_count == 130;
+    assert a.edge_count == MAX_EDGES;
+    assert validate_graph(a) == GRAPH_OK;
+    // a 128th test makes 256: over, and the count says so
+    const over : []const u8 = "module m;\nfn a() u8 { return 1; }\nfn b() u8 { return 1; }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\ntest \"t\" { a(); b(); }\n";
+    const g : SpecGraph = export_graph("specs/x.t27", over);
+    assert g.node_count == 131;
+    assert g.edge_count == MAX_EDGES + 2;
+    assert validate_graph(g) == ERR_TOO_MANY_EDGES;
+    // negative controls: it is the edge verdict, not the node one, and it is not OK
+    assert export_verdict("specs/x.t27", over) == ERR_TOO_MANY_EDGES;
+    assert export_verdict("specs/x.t27", over) != ERR_TOO_MANY_NODES;
+    assert export_verdict("specs/x.t27", at_cap) == GRAPH_OK;
+}
+
+test an_empty_source_or_a_missing_path_is_refused {
+    assert export_verdict("specs/x.t27", "") == ERR_SPEC_PATH;
+    assert export_verdict("", "module m;\n") == ERR_SPEC_PATH;
+    // negative control: a path and a line make a valid graph
+    assert export_verdict("specs/x.t27", "module m;\n") == GRAPH_OK;
+    assert export_verdict("specs/x.t27", "\n") == GRAPH_OK;
+    assert export_graph("specs/x.t27", "").node_count == 1;
+}
+
+test tutorial_08_export_is_a_valid_graph_of_the_lesson {
+    const g : SpecGraph = export_graph("specs/tutorial/08_modules_and_arrays.t27", TUTORIAL_08_SRC);
+    assert validate_graph(g) == GRAPH_OK;
+    assert g.spec_path == "specs/tutorial/08_modules_and_arrays.t27";
+    assert g.line_count == 93;
+    assert g.node_count == 14;
+    assert g.edge_count == 9;
+    assert g.node_name[0] == "tutorial-08-modules";
+    assert g.line_start[0] == 1 and g.line_end[0] == 93;
+    assert count_node_kind(g, NODE_USE) == 1;
+    assert count_node_kind(g, NODE_CONST) == 5;
+    assert count_node_kind(g, NODE_FN) == 3;
+    assert count_node_kind(g, NODE_TEST) == 3;
+    assert count_node_kind(g, NODE_INVARIANT) == 1;
+    assert count_node_kind(g, NODE_OPAQUE) == 0;
+    // negative control: the same lesson with a line cut off is a different graph
+    const cut : SpecGraph = export_graph("specs/tutorial/08_modules_and_arrays.t27", "module tutorial-08-modules;\nuse base::types;\n");
+    assert cut.node_count == 2;
+    assert cut.node_count != g.node_count;
+}
+
+test tutorial_08_exports_the_fixture_exactly_except_what_is_derived {
+    const e : SpecGraph = export_graph("specs/tutorial/08_modules_and_arrays.t27", TUTORIAL_08_SRC);
+    const f : SpecGraph = tutorial_08_graph();
+    assert validate_graph(e) == GRAPH_OK;
+    assert validate_graph(f) == GRAPH_OK;
+    assert e.spec_path == f.spec_path;
+    assert e.line_count == f.line_count;
+    // the 14 declaration nodes are identical, node by node: kind, label, name and span
+    assert nodes_in_common(e, f) == 14;
+    assert node_matches(e, f, 0);
+    assert node_matches(e, f, 4);
+    assert node_matches(e, f, 10);
+    assert node_matches(e, f, 13);
+    // difference 1: the fixture's node 14 (std.testing, UNKNOWN) is inferred from call targets,
+    // not declared in the file, so the scanner does not produce it
+    assert f.node_count == 15;
+    assert e.node_count == 14;
+    assert f.node_label[14] == LABEL_UNKNOWN;
+    // every edge the scanner reads is in the fixture, with the same kind, endpoints, label and line
+    assert e.edge_count == 9;
+    assert edges_shared(e, f) == 9;
+    // every EXACT edge of the fixture is one the scanner reads
+    assert count_edge_label(f, LABEL_EXACT) == 9;
+    assert edges_shared(f, e) == 9;
+    // difference 2: the fixture's other 7 edges are DERIVED (4 data flow, 3 tested_by), and the scanner never derives
+    assert f.edge_count == 16;
+    assert f.edge_count - edges_shared(f, e) == 7;
+    assert count_edge_label(f, LABEL_DERIVED) == 7;
+    assert count_edge_kind(f, EDGE_DATA_FLOW) == 4;
+    assert count_edge_kind(f, EDGE_TESTED_BY) == 3;
+    assert count_edge_kind(e, EDGE_DATA_FLOW) == 0;
+    assert count_edge_kind(e, EDGE_TESTED_BY) == 0;
+    // the nine, by name: USES 0->1 22, 4->2 38, 4->3 38, 8->6 67, 9->7 71; CALLS 10->8 79, 11->9 84, 12->4 89; CONSTRAINS 13->2 93
+    assert edge_in(e, EDGE_USES, 0, 1, LABEL_EXACT, 22);
+    assert edge_in(e, EDGE_USES, 4, 2, LABEL_EXACT, 38);
+    assert edge_in(e, EDGE_USES, 4, 3, LABEL_EXACT, 38);
+    assert edge_in(e, EDGE_USES, 8, 6, LABEL_EXACT, 67);
+    assert edge_in(e, EDGE_USES, 9, 7, LABEL_EXACT, 71);
+    assert edge_in(e, EDGE_CALLS, 10, 8, LABEL_EXACT, 79);
+    assert edge_in(e, EDGE_CALLS, 11, 9, LABEL_EXACT, 84);
+    assert edge_in(e, EDGE_CALLS, 12, 4, LABEL_EXACT, 89);
+    assert edge_in(e, EDGE_CONSTRAINS, 13, 2, LABEL_EXACT, 93);
+    // negative controls: the comparison can fail. A fixture with one span moved is not matched,
+    // and one with an edge line moved shares one fewer edge.
+    var moved : SpecGraph = tutorial_08_graph();
+    moved.line_end[4] = 40;
+    assert node_matches(e, moved, 4) == false;
+    assert nodes_in_common(e, moved) == 13;
+    var shifted : SpecGraph = tutorial_08_graph();
+    shifted.edge_line[1] = 37;
+    assert edges_shared(e, shifted) == 8;
+    assert edges_shared(e, shifted) != edges_shared(e, f);
+}

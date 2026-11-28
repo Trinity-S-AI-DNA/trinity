@@ -1,0 +1,228 @@
+// TRI-NET DePIN settlement aggregator -- turns per-epoch Proof-of-Relay receipts
+// (from tri_depin) into a node's $TRI reward for a payout round. A round is a set
+// of epochs; each node's verified total_bytes are summed, and the round's token
+// pool is split proportionally to metered bytes. Pure arithmetic, verifiable, so a
+// settlement contract (or any auditor) can recompute every payout.
+
+module TriSettle {
+    use base::types;
+
+    const PPM: u32 = 1000000; // parts-per-million fixed-point for shares
+    const SNR_FLOOR: u32 = 3;  // dB below which a link is too weak to earn
+    const SNR_CEIL:  u32 = 40; // dB above which link quality saturates
+
+    // Fold one epoch's verified byte count into the running round total.
+    // Saturating so an overflow can never wrap the round total DOWNWARD.
+    fn round_add(round_total: u32, epoch_bytes: u32) -> u32 {
+        let sum: u32 = round_total +% epoch_bytes;
+        if (sum < round_total) {
+            return 0xFFFFFFFF; // saturate
+        } else {
+            return sum;
+        }
+    }
+
+    // A node's share of the round, in parts-per-million. Zero-guarded so an empty
+    // round (no bytes relayed by anyone) pays nobody instead of dividing by zero.
+    fn reward_share_ppm(node_bytes: u32, round_bytes: u32) -> u32 {
+        if (round_bytes == 0) {
+            return 0;
+        } else {
+            let scaled: u64 = (node_bytes as u64) * (PPM as u64);
+            return (scaled / (round_bytes as u64)) as u32;
+        }
+    }
+
+    // A node's actual token units from a round pool, = pool * node_bytes / round_bytes.
+    // u64 intermediate avoids overflow; floor division means the sum of all nodes'
+    // units never exceeds the pool (no over-issuance). Zero-guarded.
+    fn reward_units(node_bytes: u32, round_bytes: u32, pool: u32) -> u64 {
+        if (round_bytes == 0) {
+            return 0;
+        } else {
+            let num: u64 = (pool as u64) * (node_bytes as u64);
+            return num / (round_bytes as u64);
+        }
+    }
+
+    // ---- Tests / invariants ----
+
+    // Proportionality: twice the bytes -> twice the share.
+    test share_proportional {
+        half    = reward_share_ppm(100, 200);
+        quarter = reward_share_ppm(50, 200);
+        assert(half == 500000, "half");
+        assert(quarter == 250000, "quarter");
+        assert(half == quarter + quarter, "2x bytes = 2x share");
+    }
+
+    // A node that relayed the whole round gets the whole share.
+    test share_full {
+        assert(reward_share_ppm(200, 200) == PPM, "full share");
+    }
+
+    // Empty round / zero node -> zero share, no divide-by-zero.
+    test share_zero_guard {
+        assert(reward_share_ppm(5, 0) == 0, "empty round pays nobody");
+        assert(reward_share_ppm(0, 200) == 0, "no work no share");
+    }
+
+    // No free mint: a node that relayed nothing earns nothing.
+    test units_no_free_mint {
+        assert(reward_units(0, 200, 1000) == 0, "no free mint");
+    }
+
+    // Proportional units from a pool.
+    test units_proportional {
+        assert(reward_units(100, 200, 1000) == 500, "half of pool");
+    }
+
+    // Conservation: with floor division, the sum of all nodes' units never exceeds
+    // the pool (the protocol can never issue more than the round's pool).
+    test units_conservation {
+        a = reward_units(100, 300, 1000); // 333
+        b = reward_units(200, 300, 1000); // 666
+        assert(a == 333, "node a");
+        assert(b == 666, "node b");
+        assert(a + b <= (1000 as u64), "sum <= pool");
+    }
+
+    // Round accumulation grows monotonically and saturates.
+    test round_monotonic {
+        r0 = round_add(0, 19974);
+        r1 = round_add(r0, 40000);
+        assert(r1 > r0, "monotonic");
+        assert(r0 == 19974, "epoch1");
+        assert(r1 == 59974, "epoch1+2");
+    }
+
+    test round_saturates {
+        assert(round_add(0xFFFFFF00, 0x0000FFFF) == 0xFFFFFFFF, "saturates");
+    }
+
+    // ---- Link-quality-weighted reward (Helium-class Proof-of-Coverage, WAVE d) ----
+    // Flat proportional-to-bytes pays a node on a terrible link the same per byte as
+    // one on a great link -- so nobody is rewarded for extending good coverage. Weight
+    // each node's contribution by a link-quality score (derived from the measured SNR:
+    // e.g. quality = clamp(SNR_dB) so 47 dB -> high, 3 dB -> low). Effective
+    // contribution = bytes * quality; the pool is split by weighted contribution.
+
+    // One node's weighted contribution to the round (u64 to hold bytes*quality).
+    fn weighted_contrib(node_bytes: u32, quality: u32) -> u64 {
+        return (node_bytes as u64) * (quality as u64);
+    }
+
+    // Fold a node's weighted contribution into the round's weighted total.
+    fn round_add_weighted(wtotal: u64, node_bytes: u32, quality: u32) -> u64 {
+        return wtotal + weighted_contrib(node_bytes, quality);
+    }
+
+    // A node's token units = pool * (bytes*quality) / weighted_total. Two-stage
+    // scaling (ppm first) keeps every intermediate inside u64. Zero-guarded; floor
+    // division keeps the sum of all nodes' units within the pool.
+    fn reward_weighted(node_bytes: u32, quality: u32, weighted_total: u64, pool: u32) -> u64 {
+        // t27c codegen narrows a `u64 == <lit>` compare to u32, so a plain
+        // `weighted_total == 0` would read any 2^32 multiple as zero. Test both u32
+        // halves explicitly instead. (Compiler bug logged for the t27 repo.)
+        let hi: u32 = (weighted_total >> 32) as u32;
+        let lo: u32 = weighted_total as u32;
+        if ((hi == 0) && (lo == 0)) {
+            return 0;
+        } else {
+            let contrib: u64 = (node_bytes as u64) * (quality as u64);
+            let ppm: u64 = (contrib * 1000000) / weighted_total;
+            return ((pool as u64) * ppm) / 1000000;
+        }
+    }
+
+    // A better link earns more from the SAME bytes.
+    test weighted_quality_rewards_coverage {
+        // node A: 1000 bytes @ quality 47 (47 dB link, ours); node B: 1000 bytes @ 10
+        wt = round_add_weighted(round_add_weighted(0, 1000, 47), 1000, 10);
+        a = reward_weighted(1000, 47, wt, 1000);
+        b = reward_weighted(1000, 10, wt, 1000);
+        assert(a > b, "better link earns more per byte");
+        assert(wt == (57000 as u64), "weighted total = 47000 + 10000");
+    }
+
+    // Equal quality collapses to flat proportional-by-bytes.
+    test weighted_equal_quality_is_proportional {
+        wt = round_add_weighted(round_add_weighted(0, 100, 5), 200, 5);
+        a = reward_weighted(100, 5, wt, 1000); // 100/300 of pool
+        b = reward_weighted(200, 5, wt, 1000); // 200/300 of pool
+        assert(a == 333, "third");
+        assert(b == 666, "two thirds");
+    }
+
+    // Conservation: weighted units never exceed the pool.
+    test weighted_conservation {
+        wt = round_add_weighted(round_add_weighted(0, 1000, 47), 500, 30);
+        a = reward_weighted(1000, 47, wt, 10000);
+        b = reward_weighted(500, 30, wt, 10000);
+        assert(a + b <= (10000 as u64), "sum <= pool");
+    }
+
+    // No free mint: zero quality (dead link) earns nothing.
+    test weighted_zero_quality {
+        wt = round_add_weighted(0, 1000, 47);
+        assert(reward_weighted(1000, 0, wt, 1000) == 0, "dead link no reward");
+    }
+
+    // Large weighted total that is a 2^32 multiple must NOT be misread as zero
+    // (guards against a narrowing u64->u32 compare in the zero check): 2^32 as u32 = 0.
+    test weighted_large_total_not_zero {
+        big = (4294967296 as u64);                    // 2^32; as u32 this would be 0
+        r = reward_weighted(1000000, 1000, big, 1000); // contrib=1e9 -> ~232 units
+        assert(r > (0 as u64), "large total not read as zero");
+    }
+
+    // ---- SNR -> link-quality mapping (measured on hardware; WAVE f) ----
+    // Turn a node's measured link SNR (dB) into the quality weight reward_weighted
+    // uses. A link below the floor is too weak to be worth paying for (dead -> 0);
+    // above the ceiling it saturates. Piecewise-linear in dB, integer, monotone.
+    // Measured on .13->.12: strong link 34 dB -> 31, weak link 5 dB -> 2.
+
+    // snr_db is the measured SNR in dB, ALREADY CLAMPED to >= 0 by the caller (a
+    // negative-SNR link is below the floor and clamps to 0 -> quality 0). Kept
+    // unsigned on purpose: t27c narrows a signed `i32 <=` compare to u32, which would
+    // read a negative dB as a huge value and pay a dead link. (t27c bug, same family
+    // as the u64==0 narrowing; logged.)
+    fn snr_to_quality(snr_db: u32) -> u32 {
+        if (snr_db <= SNR_FLOOR) {
+            return 0;
+        } else if (snr_db >= SNR_CEIL) {
+            return SNR_CEIL - SNR_FLOOR;
+        } else {
+            return snr_db - SNR_FLOOR;
+        }
+    }
+
+    // A link at or below the floor earns nothing (matches "dead link no reward").
+    test snr_quality_floor {
+        assert(snr_to_quality(1) == 0, "1 dB unusable");
+        assert(snr_to_quality(3) == 0, "at floor unusable");
+    }
+
+    // The two real measured links: strong 34 dB and weak 5 dB.
+    test snr_quality_measured {
+        assert(snr_to_quality(34) == 31, "strong link (.13->.12 -10 dB)");
+        assert(snr_to_quality(5) == 2, "weak link (.13->.12 -50 dB)");
+        assert(snr_to_quality(34) > snr_to_quality(5), "stronger link -> higher quality");
+    }
+
+    // Saturates above the ceiling (no unbounded reward for an extreme SNR).
+    test snr_quality_ceiling {
+        assert(snr_to_quality(100) == 37, "saturates at CEIL-FLOOR");
+        assert(snr_to_quality(40) == 37, "at ceiling");
+    }
+
+    // End-to-end: the strong-coverage node out-earns the weak one for the SAME bytes.
+    test snr_drives_reward {
+        qa = snr_to_quality(34);
+        qb = snr_to_quality(5);
+        wt = round_add_weighted(round_add_weighted(0, 10000, qa), 10000, qb);
+        ra = reward_weighted(10000, qa, wt, 1000);
+        rb = reward_weighted(10000, qb, wt, 1000);
+        assert(ra > rb, "better coverage earns more $TRI");
+    }
+}

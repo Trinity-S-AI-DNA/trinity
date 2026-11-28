@@ -1,0 +1,608 @@
+// SPDX-License-Identifier: Apache-2.0
+// youtube_transcript.t27 — YouTube Transcript Extraction for NotebookLM Enrichment
+// Ring 090 — Fallback for blocked YouTube URL uploads
+// phi^2 + 1/phi^2 = 3 | TRINITY
+
+module enrichment::youtube_transcript;
+
+// ============================================================================
+// 1. Constants
+// ============================================================================
+
+const VERSION : u32 = 1;
+const MAX_TRANSCRIPT_SIZE : u32 = 10 * 1024 * 1024; // 10MB
+const YOUTUBE_TIMEOUT_SECONDS : u32 = 60;
+const YTDLP_CHECK_TIMEOUT_SECONDS : u32 = 10;
+
+// ============================================================================
+// 2. Error Codes
+// ============================================================================
+
+enum ErrorCode {
+    Success = 0,
+    YtDlpNotFound = 1,
+    VideoUnavailable = 2,
+    NoSubtitles = 3,
+    TranscriptTooLarge = 4,
+    InvalidYouTubeUrl = 5,
+    TranscriptTimeout = 6,
+    EncodingError = 7,
+    ApiAuthFailed = 8,
+    NetworkError = 9,
+    UnknownError = 99,
+}
+
+// ============================================================================
+// 3. Structs
+// ============================================================================
+
+pub struct YouTubeSource {
+    url : str,
+    video_id : ?str, // Rust Option<str> is the t27 optional ?str
+    title : str,
+}
+
+pub struct Transcript {
+    video_id : str,
+    title : str,
+    text : str,
+    lang : str,
+    size_bytes : u32,
+}
+
+pub struct EnrichmentReport {
+    sources_added : u32,
+    transcripts_added : u32,
+    transcripts_failed : u32,
+    errors : [0]str,
+}
+
+// ============================================================================
+// 4. Constants — YouTube Domains
+// ============================================================================
+
+const YOUTUBE_DOMAINS : [5]str = [
+    "youtube.com",
+    "www.youtube.com",
+    "m.youtube.com",
+    "music.youtube.com",
+    "youtu.be",
+];
+
+// ============================================================================
+// 5. URL Detection Functions
+// ============================================================================
+
+// is_youtube_url(url: str) -> bool
+// Check if URL is a YouTube URL
+pub fn is_youtube_url(url : str) -> bool {
+    let trimmed = @trim(url);
+    let lower = @toLower(trimmed);
+
+    for (domain in YOUTUBE_DOMAINS) {
+        if (@contains(lower, domain)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// extract_video_id(url: str) -> Option<str>
+// Extract YouTube video ID from URL
+// Handles: youtu.be/VIDEO_ID, youtube.com/watch?v=VIDEO_ID, shorts/, embed/, live/, v/
+pub fn extract_video_id(url : str) -> ?str {
+    let trimmed = @trim(url);
+
+    // youtu.be short URLs
+    if (@startsWith(trimmed, "youtu.be/")) {
+        let path = @substring(trimmed, 9, @len(trimmed));
+        let parts = @split(path, "/");
+        if (@len(parts) > 0) {
+            return @some(parts[0]);
+        }
+    }
+
+    // youtube.com path-based formats
+    if (@contains(trimmed, "youtube.com/")) {
+        let path_start = @indexOf(trimmed, "youtube.com/") + 11;
+        let path = @substring(trimmed, path_start, @len(trimmed));
+        // Typo fixed: was `@split(@trim(path, "/");` -- the `)` closing @split and
+        // its separator argument were missing. @trim(path, "/") strips the leading
+        // '/' (path_start = index + 11 points at it), then split on "/".
+        let segments = @split(@trim(path, "/"), "/");
+
+        // Handle shorts/, embed/, live/, v/ prefixes
+        if (@len(segments) >= 2) {
+            let first = segments[0];
+            if (first == "shorts" || first == "embed" || first == "live" || first == "v") {
+                if (@len(segments) >= 2) {
+                    return @some(segments[1]);
+                }
+            }
+        }
+    }
+
+    // Query param ?v=VIDEO_ID
+    let v_param = @indexOf(trimmed, "v=");
+    if (v_param != -1) {
+        let amp_idx = @indexOf(trimmed, "&", v_param);
+        if (amp_idx == -1) {
+            return @some(@substring(trimmed, v_param + 2, @len(trimmed)));
+        } else {
+            return @some(@substring(trimmed, v_param + 2, amp_idx));
+        }
+    }
+
+    return none;
+}
+
+// ============================================================================
+// 6. SRT Parsing Functions
+// ============================================================================
+
+// srt_to_text(srt_content: str) -> str
+// Convert SRT subtitle format to plain text
+// Filters out timestamps, line numbers, keeps only subtitle text
+pub fn srt_to_text(srt_content : str) -> str {
+    let lines = @split(srt_content, "\n");
+    var result_lines : [0]str = undefined;
+    var in_text_block : bool = false;
+    var was_empty_line : bool = true;
+
+    for (line in lines) {
+        let trimmed = @trim(line);
+
+        // Skip timestamps (contain -->)
+        if (@contains(trimmed, "-->")) {
+            in_text_block = false;
+            continue;
+        }
+
+        // Skip line numbers (standalone digits)
+        var is_line_number : bool = false;
+        var i : u32 = 0;
+        while (i < @len(trimmed)) {
+            let ch = @charAt(trimmed, i);
+            if (ch >= '0' && ch <= '9') {
+                i += 1;
+            } else {
+                is_line_number = true;
+                i = @len(trimmed);
+            }
+        }
+        if (!is_line_number && @len(trimmed) > 0) {
+            if (!in_text_block && was_empty_line) {
+                in_text_block = true;
+            }
+            if (in_text_block && @len(trimmed) > 0) {
+                result_lines = @push(result_lines, trimmed);
+            }
+        }
+
+        was_empty_line = @len(trimmed) == 0;
+    }
+
+    return @join(result_lines, "\n");
+}
+
+// ============================================================================
+// 7. Transcript Extraction Functions
+// ============================================================================
+
+// extract_transcript(video_url: str) -> (Transcript, ErrorCode)
+// Extract transcript using yt-dlp subprocess
+// Returns (transcript, error_code) tuple
+pub fn extract_transcript(video_url : str) -> (Transcript, ErrorCode) {
+    var error_result : Transcript = undefined;
+
+    // First extract video ID for identification
+    let video_id_opt = extract_video_id(video_url);
+    let video_id : str = if (video_id_opt != none) {
+        @unwrap(video_id_opt)
+    } else {
+        "unknown"
+    };
+
+    // Run yt-dlp --version to check availability (timeout 10s)
+    let ytdlp_check = @subprocessRun(["yt-dlp", "--version"], YTDLP_CHECK_TIMEOUT_SECONDS);
+    if (ytdlp_check.status != 0) {
+        error_result = Transcript{
+            .video_id = video_id,
+            .title = "",
+            .text = "",
+            .lang = "",
+            .size_bytes = 0,
+        };
+        return (error_result, ErrorCode::YtDlpNotFound);
+    }
+
+    // Create temp directory for SRT files
+    let temp_dir_result = @tempDirCreate();
+    if (temp_dir_result.error != "") {
+        error_result = Transcript{
+            .video_id = video_id,
+            .title = "",
+            .text = "",
+            .lang = "",
+            .size_bytes = 0,
+        };
+        return (error_result, ErrorCode::UnknownError);
+    }
+    let temp_dir = temp_dir_result.path;
+
+    // Build yt-dlp command
+    // Skip download, write subtitles, auto-subs, English only, SRT format
+    let output_template = @concat(temp_dir, "/%(title)s.%(ext)s");
+
+    let cmd_parts : [8]str = [
+        "yt-dlp",
+        "--no-update",
+        "--skip-download",
+        "--write-subs",
+        "--write-auto-subs",
+        "--sub-langs", "en",
+        "--sub-format", "srt",
+        "-o", output_template,
+        video_url,
+    ];
+
+    let result = @subprocessRun(cmd_parts, YOUTUBE_TIMEOUT_SECONDS);
+
+    // Check for errors in stderr
+    let stderr = result.stderr;
+    let stderr_lower = @toLower(stderr);
+
+    if (result.status != 0) {
+        if (@contains(stderr_lower, "unavailable") || @contains(stderr_lower, "video has been removed")) {
+            error_result = Transcript{
+                .video_id = video_id,
+                .title = "",
+                .text = "",
+                .lang = "",
+                .size_bytes = 0,
+            };
+            return (error_result, ErrorCode::VideoUnavailable);
+        }
+        if (@contains(stderr_lower, "subtitles") || @contains(stderr_lower, "no subtitles available")) {
+            error_result = Transcript{
+                .video_id = video_id,
+                .title = "",
+                .text = "",
+                .lang = "",
+                .size_bytes = 0,
+            };
+            return (error_result, ErrorCode::NoSubtitles);
+        }
+        // Other error
+        error_result = Transcript{
+            .video_id = video_id,
+            .title = "",
+            .text = "",
+            .lang = "",
+            .size_bytes = 0,
+        };
+        return (error_result, ErrorCode::UnknownError);
+    }
+
+    // Find SRT files in temp directory
+    let srt_files_result = @glob(temp_dir, "*.srt");
+    if (@len(srt_files_result.files) == 0) {
+        error_result = Transcript{
+            .video_id = video_id,
+            .title = "",
+            .text = "",
+            .lang = "",
+            .size_bytes = 0,
+        };
+        return (error_result, ErrorCode::NoSubtitles);
+    }
+
+    // Read the first SRT file
+    let srt_path = srt_files_result.files[0];
+    let srt_content_result = @readFile(srt_path);
+
+    if (srt_content_result.error != "") {
+        error_result = Transcript{
+            .video_id = video_id,
+            .title = "",
+            .text = "",
+            .lang = "",
+            .size_bytes = 0,
+        };
+        return (error_result, ErrorCode::EncodingError);
+    }
+
+    let srt_content = srt_content_result.content;
+
+    // Convert SRT to plain text
+    let transcript_text = srt_to_text(srt_content);
+
+    // Check if transcript is empty
+    if (@len(@trim(transcript_text)) == 0) {
+        error_result = Transcript{
+            .video_id = video_id,
+            .title = "",
+            .text = "",
+            .lang = "",
+            .size_bytes = 0,
+        };
+        return (error_result, ErrorCode::NoSubtitles);
+    }
+
+    // Check size limit
+    let size_bytes = @len(transcript_text);
+    if (size_bytes > MAX_TRANSCRIPT_SIZE) {
+        error_result = Transcript{
+            .video_id = video_id,
+            .title = "",
+            .text = "",
+            .lang = "",
+            .size_bytes = 0,
+        };
+        return (error_result, ErrorCode::TranscriptTooLarge);
+    }
+
+    // Extract title from filename (stem)
+    let title_parts = @split(srt_path, "/");
+    let filename = title_parts[@len(title_parts) - 1];
+    let title = @substring(filename, 0, @len(filename) - 4); // Remove .srt
+
+    let transcript = Transcript{
+        .video_id = video_id,
+        .title = title,
+        .text = transcript_text,
+        .lang = "en",
+        .size_bytes = size_bytes,
+    };
+
+    return (transcript, ErrorCode::Success);
+}
+
+// ============================================================================
+// 8. NotebookLM Upload Functions
+// ============================================================================
+
+// upload_transcript(notebook_id: str, transcript: Transcript, api_token: str) -> ErrorCode
+// Upload transcript to NotebookLM via Discovery Engine REST API
+pub fn upload_transcript(
+    notebook_id : str,
+    transcript : Transcript,
+    api_token : str
+) -> ErrorCode {
+    // Build REST API URL
+    let url = @concat("https://discoveryengine.googleapis.com/v1alpha/", notebook_id, ":addSource");
+
+    // Build request body with base64 encoded content
+    let encoded_content = @base64Encode(transcript.text);
+    let display_title = @concat("  ", transcript.title, " (transcript)"); // Note: emoji handling
+
+    let body_json = @concat(
+        "{\"rawContent\":\"",
+        encoded_content,
+        "\",\"mimeType\":\"text/plain\",\"title\":\"",
+        display_title,
+        "\"}"
+    );
+
+    // Send HTTP POST request
+    let http_result = @httpPost(
+        url,
+        body_json,
+        @concat("Bearer ", api_token)
+    );
+
+    // Check response
+    if (http_result.status_code == 401 || http_result.status_code == 403) {
+        return ErrorCode::ApiAuthFailed;
+    }
+    if (http_result.status_code < 200 || http_result.status_code >= 300) {
+        return ErrorCode::NetworkError;
+    }
+
+    return ErrorCode::Success;
+}
+
+// ============================================================================
+// 9. Enrichment Orchestration
+// ============================================================================
+
+// enrich_with_transcripts(notebook_id: str, sources: [0]str, api_token: str) -> EnrichmentReport
+// Enrich notebook with YouTube transcripts
+// Iterates through sources, extracts and uploads transcripts for YouTube URLs
+pub fn enrich_with_transcripts(
+    notebook_id : str,
+    sources : [0]str,
+    api_token : str
+) -> EnrichmentReport {
+    var report : EnrichmentReport = EnrichmentReport{
+        .sources_added = 0,
+        .transcripts_added = 0,
+        .transcripts_failed = 0,
+        .errors = undefined,
+    };
+
+    var error_list : [0]str = undefined;
+
+    for (url in sources) {
+        // Check if URL is YouTube
+        if (!is_youtube_url(url)) {
+            continue; // Skip non-YouTube URLs
+        }
+
+        // Extract transcript
+        let (transcript, error) = extract_transcript(url);
+
+        if (error != ErrorCode::Success) {
+            // Extract failed
+            report.transcripts_failed += 1;
+            let error_msg = if (error == ErrorCode::VideoUnavailable) {
+                @concat("Video unavailable: ", url)
+            } else if (error == ErrorCode::NoSubtitles) {
+                @concat("No subtitles: ", url)
+            } else if (error == ErrorCode::YtDlpNotFound) {
+                "yt-dlp not found"
+            } else if (error == ErrorCode::TranscriptTooLarge) {
+                @concat("Transcript too large: ", url)
+            } else if (error == ErrorCode::TranscriptTimeout) {
+                @concat("Timeout: ", url)
+            } else {
+                @concat("Unknown error: ", url)
+            };
+            error_list = @push(error_list, error_msg);
+            continue;
+        }
+
+        // Upload transcript
+        let upload_error = upload_transcript(notebook_id, transcript, api_token);
+
+        if (upload_error != ErrorCode::Success) {
+            report.transcripts_failed += 1;
+            let error_msg = if (upload_error == ErrorCode::ApiAuthFailed) {
+                @concat("API auth failed: ", transcript.title)
+            } else if (upload_error == ErrorCode::NetworkError) {
+                @concat("Network error: ", transcript.title)
+            } else {
+                @concat("Upload failed: ", transcript.title)
+            };
+            error_list = @push(error_list, error_msg);
+            continue;
+        }
+
+        // Success
+        report.transcripts_added += 1;
+    }
+
+    report.errors = error_list;
+    return report;
+}
+
+// ============================================================================
+// 10. TDD — Tests
+// ============================================================================
+
+test is_youtube_url_standard
+    assert is_youtube_url("https://youtube.com/watch?v=abc123") == true;
+    assert is_youtube_url("https://www.youtube.com/watch?v=abc123") == true;
+    assert is_youtube_url("https://m.youtube.com/watch?v=abc123") == true;
+    assert is_youtube_url("https://example.com") == false;
+    assert is_youtube_url("https://vimeo.com/watch?v=abc123") == false;
+
+test is_youtube_url_short
+    assert is_youtube_url("https://youtu.be/abc123") == true;
+    assert is_youtube_url("https://youtu.be/abc123") == true;
+    assert is_youtube_url("https://bit.ly/abc123") == false;
+
+test extract_video_id_standard
+    assert extract_video_id("https://youtube.com/watch?v=abc123") == @some("abc123");
+    assert extract_video_id("https://www.youtube.com/watch?v=abc123&feature=share") == @some("abc123");
+
+test extract_video_id_short
+    assert extract_video_id("https://youtu.be/abc123") == @some("abc123");
+    assert extract_video_id("https://youtu.be/abc123") == @some("abc123");
+
+test extract_video_id_shorts
+    assert extract_video_id("https://youtube.com/shorts/abc123") == @some("abc123");
+    assert extract_video_id("https://www.youtube.com/shorts/abc123") == @some("abc123");
+
+test extract_video_id_embed
+    assert extract_video_id("https://youtube.com/embed/abc123") == @some("abc123");
+
+test extract_video_id_live
+    assert extract_video_id("https://youtube.com/live/abc123") == @some("abc123");
+
+test extract_video_id_v_param
+    assert extract_video_id("https://youtube.com/watch?v=abc123") == @some("abc123");
+    assert extract_video_id("https://youtube.com/v/abc123") == @some("abc123");
+
+test extract_video_id_invalid
+    assert extract_video_id("https://example.com/watch?v=abc123") == none;
+    assert extract_video_id("https://youtube.com") == none;
+
+test srt_to_text_filters_timestamps
+    let srt = "1\n00:00:00 --> 00:00:05\nHello world\n\n2\n00:00:05 --> 00:00:10\nTest";
+    let result = srt_to_text(srt);
+    assert @contains(result, "Hello world");
+    assert @contains(result, "Test");
+    assert !@contains(result, "-->");
+    assert !@contains(result, "00:00:00");
+
+test srt_to_text_filters_line_numbers
+    let srt = "1\n00:00:00 --> 00:00:05\nHello\n2\n00:00:05 --> 00:00:10\nWorld";
+    let result = srt_to_text(srt);
+    assert @contains(result, "Hello");
+    assert @contains(result, "World");
+    assert !@contains(result, "\n1\n");
+    assert !@contains(result, "\n2\n");
+
+test srt_to_text_empty_lines
+    let srt = "\n1\n00:00:00 --> 00:00:05\n\n\nHello\n\n2\n00:00:05 --> 00:00:10\n\n\nWorld\n\n";
+    let result = srt_to_text(srt);
+    assert result == "Hello\nWorld";
+
+test srt_to_text_preserves_content
+    let srt = "1\n00:00:00 --> 00:00:10\nThis is a test subtitle\n2\n00:00:10 --> 00:00:15\nWith multiple lines";
+    let result = srt_to_text(srt);
+    assert @contains(result, "This is a test subtitle");
+    assert @contains(result, "With multiple lines");
+
+// ============================================================================
+// 11. TDD — Invariants
+// ============================================================================
+
+invariant transcript_size_limit
+    // All transcripts must respect MAX_TRANSCRIPT_SIZE
+    // Note: Cannot verify for all possible transcripts in pure spec
+    // Enforced in extract_transcript()
+    assert MAX_TRANSCRIPT_SIZE > 0;
+
+invariant youtube_domains_non_empty
+    // YOUTUBE_DOMAINS must contain valid domains
+    assert @len(YOUTUBE_DOMAINS) > 0;
+
+invariant error_codes_positive
+    // All error codes except Success must be positive
+    assert ErrorCode::Success == 0;
+    assert ErrorCode::YtDlpNotFound > 0;
+    assert ErrorCode::VideoUnavailable > 0;
+    assert ErrorCode::NoSubtitles > 0;
+    assert ErrorCode::TranscriptTooLarge > 0;
+    assert ErrorCode::InvalidYouTubeUrl > 0;
+    assert ErrorCode::TranscriptTimeout > 0;
+    assert ErrorCode::EncodingError > 0;
+    assert ErrorCode::ApiAuthFailed > 0;
+    assert ErrorCode::NetworkError > 0;
+    assert ErrorCode::UnknownError > 0;
+
+invariant enrichment_report_fields_initialized
+    // EnrichmentReport fields start at 0 for successful case
+    var report : EnrichmentReport = EnrichmentReport{
+        .sources_added = 0,
+        .transcripts_added = 0,
+        .transcripts_failed = 0,
+        .errors = undefined,
+    };
+    assert report.sources_added == 0;
+    assert report.transcripts_added == 0;
+    assert report.transcripts_failed == 0;
+
+// ============================================================================
+// 12. TDD — Benchmarks
+// ============================================================================
+
+bench is_youtube_url_latency
+    // Measure: nanoseconds to check URL
+    // Target: < 1000ns
+    measure: nanoseconds to compute is_youtube_url("https://youtube.com/watch?v=abc123")
+    target: < 1000ns
+
+bench extract_video_id_latency
+    // Measure: nanoseconds to extract video ID
+    // Target: < 500ns
+    measure: nanoseconds to compute extract_video_id("https://youtube.com/watch?v=abc123")
+    target: < 500ns
+
+bench srt_to_text_latency
+    // Measure: nanoseconds to convert SRT to text
+    // Target: < 2000ns for typical SRT
+    measure: nanoseconds to compute srt_to_text("1\n00:00:00 --> 00:00:05\nHello world\n2\n00:00:05 --> 00:00:10\nTest")
+    target: < 2000ns

@@ -1,0 +1,406 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/queen/review_valve.t27 -- what happens to work the review did not accept, with no person in the loop
+; The owner's rule of 2026-10-05: no person is needed; the loop fixes and closes itself. This file is the
+; one home of that rule. Runtimes read it, nobody restates it: the trios supervisor (gHashTag/BrowserOS,
+; trios/agent-server queen-tick.ts and queen-ci-verdict.ts) imports the constants from `t27c gen-js` of
+; this file and mirrors the functions line for line; `gen/c/queen/review_valve.c` is the executable copy.
+; What it replaces. The supervisor's stateOfDispatch maps `escalate` to awaitingReview with no clock
+; ("a timer is not a person"), and QueenReviewDecision escalates on: no criteria, every criterion met on
+; an empty diff, the send-back ceiling, a reviewer that gave up, a dead letter (three empty attempts),
+; criteria beyond what a patch shows, and an accept on criteria that were already true on master. An
+; escalated dispatch holds its file boundary, so every other bee touching those files is skipped.
+; Measured on the Queen's board, 2026-10-05 ~19:20Z:
+;   219 cards in review, 144 of them `escalate`; 193 stuck cards in all;
+;   of the 193 bee branches: 125 EMPTY (no commit), 30 foreign code, 38 t27 work;
+;   candidates skipped: fileConflict 108, blocked 99; 25 of 70 workers active;
+;   GitHub: the reviewer bee (t27-bees[bot]) judges most heads REQUEST_CHANGES and then skips the head
+;   for ever ("this head was already judged: changes"); nothing fixes them; 98 CI runs queued, 8 running.
+; The rule: every outcome that is not an accept has an automatic next step and a clock.
+;   empty diff, reviewer gave up, dead letter, unrecorded reason  -> RELEASE as failed after a short
+;       floor; the issue goes back to the swarm, at most MAX_RELEASES times; an effect that gave up
+;       after its run limit (control.t27 DO_GIVE_UP, recorded by the runtime) takes the same road;
+;   no criteria, criteria beyond a patch, accepted on base truth   -> BACKFILL: the criteria are rewritten
+;       (tools/queen/criteria_backfill.py) and the supervisor's releaseStaleContracts hands the issue to a
+;       fresh bee at once; if no new criteria arrive within the window -> CLOSE;
+;   send-back ceiling                                              -> RELEASE once after the ceiling floor,
+;       then CLOSE;
+;   releases spent                                                 -> CLOSE as obsolete: the dispatch is
+;       cancelled with its reason written down, its boundary is free at once, and the issue is not taken
+;       again while the dispatch stays in the supervisor's 7-day window;
+;   reviewer bee REQUEST_CHANGES on a Queen-published pull request -> the review goes back to the Queen
+;       as a send-back for the same branch, at most PR_FIX_ATTEMPTS times; then the pull request is
+;       closed with the reason.
+;   a Queen-published pull request that conflicts with master        -> GitHub's update-branch (master
+;       merged into the head, never a force-push) when the Actions queue has room; a branch that cannot
+;       be updated, or that conflicts again after CONFLICT_UPDATES updates, is closed and its issue goes
+;       back to the swarm from fresh master (one of MAX_RELEASES); see conflict_step.
+; HOLD is the only state that keeps files, and every HOLD ends before the policy's own 48-hour hold
+; (invariant below), so nothing here ever waits on a person.
+; Not here: the review policy's own verdicts (QueenReviewDecision), the send-back and wait floors that
+; already have clocks (queen-tick.ts SEND_BACK_IDLE_FLOOR_MS, WAIT_FROZEN_FLOOR_MS), merging.
+; ASCII only (L3).
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module QueenReviewValve;
+
+/// Why a dispatch escalated. The supervisor records the counters, not the reason, so escalation_kind
+/// below reads the kind back from the row's own columns; the last four kinds are named for a runtime
+/// that records its reason (recorded_escalation_kind), and a row that cannot tell them apart is
+/// UNRECORDED. The codes are mirrored by number: a new kind takes the next code, none moves.
+pub const KIND_UNRECORDED : u8 = 0;
+pub const KIND_NO_CRITERIA : u8 = 1;
+pub const KIND_SEND_BACK_CEILING : u8 = 2;
+pub const KIND_DEAD_LETTER : u8 = 3;
+pub const KIND_REVIEWER_GAVE_UP : u8 = 4;
+pub const KIND_EMPTY_ACCEPT : u8 = 5;
+pub const KIND_BEYOND_THE_PATCH : u8 = 6;
+pub const KIND_BASE_TRUTH_ALONE : u8 = 7;
+/// #7092: control.t27 ended an attempt with DO_GIVE_UP -- one effect key ran EFFECT_RUN_LIMIT times
+/// and each run crashed its holder before the result was written. The counters cannot show it (the
+/// criteria exist, nobody sent it back, the attempts were not empty), so without the record it reads
+/// UNRECORDED and the close note cannot say that the turn kept crashing its runtime.
+pub const KIND_EFFECT_GAVE_UP : u8 = 8;
+
+/// The next step. HOLD keeps the files and waits for its clock; the other three never wait.
+///   HOLD      -> the supervisor reports the row as it does today (awaitingReview / rejected)
+///   RELEASE   -> `failed`: free in claimOnIssue, the issue is dispatched again
+///   BACKFILL  -> held while the criteria are rewritten; the rewrite itself releases the row
+///   CLOSE     -> `cancelled`, review_state `obsolete`, reason in judged_note, issue skipped
+pub const STEP_HOLD : u8 = 0;
+pub const STEP_RELEASE : u8 = 1;
+pub const STEP_BACKFILL : u8 = 2;
+pub const STEP_CLOSE : u8 = 3;
+
+/// The review_state a closed dispatch is written with. Read by the supervisor's candidate filter.
+pub const OBSOLETE_STATE : str = "obsolete";
+
+/// Floor before an attempt with nothing to judge goes back to the swarm. 30 minutes, the supervisor's
+/// EMPTY_ATTEMPT_FLOOR_MS: long enough for a provider quota window (z.ai 1308/1316) to pass, short
+/// enough that the 125 empty branches of 193 stop holding boundaries within one half-hour.
+pub const RETRY_FLOOR_MINUTES : u32 = 30;
+
+/// Floor before a spent send-back ceiling goes back. 60 minutes, the supervisor's CEILING_RELEASE_MS:
+/// judged work keeps its files for the hour a single send-back waits out, and no longer.
+pub const CEILING_FLOOR_MINUTES : u32 = 60;
+
+/// How long a row waits for its criteria to be rewritten before it is closed. Two hours: two runs of an
+/// hourly criteria backfill. A rewrite inside the window releases the row at once (releaseStaleContracts);
+/// a backfill that cannot derive criteria from the issue's own words writes nothing, and then waiting
+/// longer would only keep the files held.
+pub const BACKFILL_WINDOW_MINUTES : u32 = 120;
+
+/// How many times one issue's escalation or spent ceiling is handed back before it is closed. One, and
+/// one counter for both (the row's ceiling_releases), so the two roads cannot each spend it: 125 of the
+/// 193 stuck branches are empty after FREE_ATTEMPT_CEILING silent attempts each, so a second identical
+/// set is evidence about the issue, not the attempt; one more set after the floor recovers what a deploy
+/// restart or a quota window took.
+pub const MAX_RELEASES : u32 = 1;
+
+/// The policy's own hold on an awaitingReview boundary (QueenDelegation.reviewBoundaryHoldHours = 48),
+/// in minutes. Every HOLD and BACKFILL here must end before it, or the valve would add a hold.
+pub const POLICY_HOLD_MINUTES : u32 = 2880;
+
+/// The reviewer bee whose verdict on a pull request counts.
+pub const REVIEWER_LOGIN : str = "t27-bees[bot]";
+
+/// Branches the Queen publishes. Only these are sent back and closed here: any other pull request has an
+/// author who answers its review.
+pub const QUEEN_BRANCH_PREFIX : str = "queen-";
+
+/// REQUEST_CHANGES rounds sent back to the Queen per pull request. Two, the review policy's
+/// maximumSendBacks and the CI take-back's CI_MAXIMUM_SEND_BACKS: one pass that can teach, one that proves
+/// it was taught; a bee that fails the same reviewer three times is telling you about the criteria.
+pub const PR_FIX_ATTEMPTS : u32 = 2;
+
+/// Hours a REQUEST_CHANGES head may stand with no new push before the pull request is closed. 48: the
+/// policy's own review hold; with 98 CI runs queued against 8 running a fix push can wait hours for its
+/// checks, and a branch nobody pushed to in two days is not being fixed.
+pub const PR_FIX_WINDOW_HOURS : u32 = 48;
+
+/// What the reviewer side does with one pull request.
+///   NONE       -> not this valve's (no REQUEST_CHANGES on the head, or not a Queen branch)
+///   JUDGE      -> a head the reviewer has not judged: judge it (never "already judged" for a new head)
+///   WAIT_FIX   -> the review is the Queen's send-back; the bee pushes to the same branch
+///   CLOSE      -> close the pull request, quoting the unmet criteria and the attempt count
+pub const PR_NONE : u8 = 0;
+pub const PR_JUDGE : u8 = 1;
+pub const PR_WAIT_FIX : u8 = 2;
+pub const PR_CLOSE : u8 = 3;
+
+/// What the publisher does with a Queen-published pull request that conflicts with master (#7571).
+/// Measured 2026-10-07 15:51Z: 94 of 213 open pull requests conflicted, 67 of them on `queen-` branches,
+/// the oldest opened 2026-09-21. GitHub runs no required check on a conflicting head, so the reviewer
+/// bee never sees one and the merger never merges one; and no bee updates its own branch, so every
+/// master merge that touches a bee's files leaves that pull request stranded for good.
+///   C_NONE    -> not this valve's (not a Queen branch, or it merges cleanly)
+///   C_WAIT    -> the Actions queue is over UPDATE_QUEUE_CEILING: an update now re-runs every workflow of
+///                the pull request behind a queue that is already the bottleneck; look again next tick
+///   C_UPDATE  -> PUT /pulls/N/update-branch: master is merged into the head by GitHub, no force-push
+///   C_REDO    -> close the pull request with the reason and release the dispatch: a fresh bee redoes
+///                the issue from current master on a new branch (counts against MAX_RELEASES)
+///   C_CLOSE   -> releases spent: close the pull request and the dispatch, as next_step's STEP_CLOSE
+pub const C_NONE : u8 = 0;
+pub const C_WAIT : u8 = 1;
+pub const C_UPDATE : u8 = 2;
+pub const C_REDO : u8 = 3;
+pub const C_CLOSE : u8 = 4;
+
+/// update-branch calls per pull request. Two: one for the master merge that broke it, one for a second
+/// merge landing while its checks ran; a head that conflicts a third time sits on files master keeps
+/// rewriting, and a redo from fresh master is cheaper than a third chase.
+pub const CONFLICT_UPDATES : u32 = 2;
+
+/// Queued Actions runs above which an update waits. 50, the loop rule that holds a second PR while the
+/// queue is over ~50 (queen-actors-loop T5): one update re-runs about 44 workflows.
+pub const UPDATE_QUEUE_CEILING : u32 = 50;
+
+/// Hours a conflicting pull request may wait on the queue before it is redone instead. 48, the review
+/// policy's hold: a conflict that waited two days for a queue slot is not waiting, it is stuck.
+pub const CONFLICT_WAIT_HOURS : u32 = 48;
+
+/// The publisher side, for one pull request. update_failed is GitHub's answer to the last update-branch
+/// call (422 merge conflict); updates counts the calls made on this pull request; hours counts from the
+/// first tick that saw it conflicting; releases is the dispatch's ceiling_releases.
+pub fn conflict_step(queen_branch: bool, conflicting: bool, update_failed: bool, updates: u32, hours: u32, releases: u32, queued_runs: u32) -> u8 {
+    if (queen_branch == false) { return C_NONE; }
+    if (conflicting == false) { return C_NONE; }
+    var redo : bool = update_failed;
+    if (updates >= CONFLICT_UPDATES) { redo = true; }
+    if (hours >= CONFLICT_WAIT_HOURS) { redo = true; }
+    if (redo) {
+        if (releases >= MAX_RELEASES) { return C_CLOSE; }
+        return C_REDO;
+    }
+    if (queued_runs > UPDATE_QUEUE_CEILING) { return C_WAIT; }
+    return C_UPDATE;
+}
+
+/// The kind of an escalated row, from what the row records. Order matters: a row with no criteria is
+/// that whatever else it carries, and a spent ceiling outranks the empty-attempt counters.
+pub fn escalation_kind(criteria: u32, send_back_ceiling: bool, dead_letter: bool, reviewer_gave_up: bool) -> u8 {
+    if (criteria == 0) { return KIND_NO_CRITERIA; }
+    if (send_back_ceiling) { return KIND_SEND_BACK_CEILING; }
+    if (dead_letter) { return KIND_DEAD_LETTER; }
+    if (reviewer_gave_up) { return KIND_REVIEWER_GAVE_UP; }
+    return KIND_UNRECORDED;
+}
+
+/// Whether a kind is one only a runtime's record can name: escalation_kind never returns it.
+pub fn is_recorded_kind(kind: u8) -> bool {
+    if (kind == KIND_EMPTY_ACCEPT) { return true; }
+    if (kind == KIND_BEYOND_THE_PATCH) { return true; }
+    if (kind == KIND_BASE_TRUTH_ALONE) { return true; }
+    if (kind == KIND_EFFECT_GAVE_UP) { return true; }
+    return false;
+}
+
+/// The kind of an escalated row whose runtime also wrote down why. The row's counters decide first, in
+/// escalation_kind's order, so the record cannot hide a missing criterion or a spent ceiling; the record
+/// names only a row the counters leave UNRECORDED, and only with a kind that is a record's to name. A
+/// runtime that records nothing passes KIND_UNRECORDED and gets escalation_kind's answer.
+pub fn recorded_escalation_kind(recorded: u8, criteria: u32, send_back_ceiling: bool, dead_letter: bool, reviewer_gave_up: bool) -> u8 {
+    var kind : u8 = escalation_kind(criteria, send_back_ceiling, dead_letter, reviewer_gave_up);
+    if (kind != KIND_UNRECORDED) { return kind; }
+    if (is_recorded_kind(recorded)) { return recorded; }
+    return KIND_UNRECORDED;
+}
+
+/// Whether a kind is fixed by rewriting the criteria rather than by another attempt.
+pub fn wants_backfill(kind: u8) -> bool {
+    if (kind == KIND_NO_CRITERIA) { return true; }
+    if (kind == KIND_BEYOND_THE_PATCH) { return true; }
+    if (kind == KIND_BASE_TRUTH_ALONE) { return true; }
+    return false;
+}
+
+/// The next step for a dispatch that was not accepted and has no clock of its own: an escalation of
+/// any kind, or a send-back at its ceiling. idle_minutes counts from finished_at, which nothing rewrites;
+/// releases is the row's ceiling_releases.
+pub fn next_step(kind: u8, idle_minutes: u32, releases: u32) -> u8 {
+    if (wants_backfill(kind)) {
+        if (idle_minutes >= BACKFILL_WINDOW_MINUTES) { return STEP_CLOSE; }
+        return STEP_BACKFILL;
+    }
+    if (releases >= MAX_RELEASES) { return STEP_CLOSE; }
+    var floor : u32 = RETRY_FLOOR_MINUTES;
+    if (kind == KIND_SEND_BACK_CEILING) { floor = CEILING_FLOOR_MINUTES; }
+    if (idle_minutes >= floor) { return STEP_RELEASE; }
+    return STEP_HOLD;
+}
+
+/// Whether a step keeps the dispatch's files.
+pub fn holds_files(step: u8) -> bool {
+    if (step == STEP_HOLD) { return true; }
+    if (step == STEP_BACKFILL) { return true; }
+    return false;
+}
+
+/// The reviewer side, for one pull request. changes_heads counts the distinct heads the reviewer judged
+/// REQUEST_CHANGES; hours counts from its newest judgement.
+pub fn pr_step(queen_branch: bool, changes_on_head: bool, head_judged: bool, changes_heads: u32, hours: u32) -> u8 {
+    if (queen_branch == false) { return PR_NONE; }
+    if (head_judged == false) { return PR_JUDGE; }
+    if (changes_on_head == false) { return PR_NONE; }
+    if (changes_heads > PR_FIX_ATTEMPTS) { return PR_CLOSE; }
+    if (hours >= PR_FIX_WINDOW_HOURS) { return PR_CLOSE; }
+    return PR_WAIT_FIX;
+}
+
+test the_kind_is_read_from_the_row {
+    assert escalation_kind(0, true, true, true) == KIND_NO_CRITERIA;
+    assert escalation_kind(3, true, true, false) == KIND_SEND_BACK_CEILING;
+    assert escalation_kind(3, false, true, true) == KIND_DEAD_LETTER;
+    assert escalation_kind(3, false, false, true) == KIND_REVIEWER_GAVE_UP;
+    assert escalation_kind(3, false, false, false) == KIND_UNRECORDED;
+}
+
+test an_effect_give_up_is_named_only_when_recorded {
+    assert recorded_escalation_kind(KIND_EFFECT_GAVE_UP, 3, false, false, false) == KIND_EFFECT_GAVE_UP;
+    assert escalation_kind(3, false, false, false) == KIND_UNRECORDED;
+    assert recorded_escalation_kind(KIND_UNRECORDED, 3, false, false, false) == KIND_UNRECORDED;
+    assert recorded_escalation_kind(KIND_EMPTY_ACCEPT, 3, false, false, false) == KIND_EMPTY_ACCEPT;
+    assert recorded_escalation_kind(KIND_BEYOND_THE_PATCH, 3, false, false, false) == KIND_BEYOND_THE_PATCH;
+    assert recorded_escalation_kind(KIND_BASE_TRUTH_ALONE, 3, false, false, false) == KIND_BASE_TRUTH_ALONE;
+}
+
+test the_counters_outrank_the_record {
+    assert recorded_escalation_kind(KIND_EFFECT_GAVE_UP, 0, false, false, false) == KIND_NO_CRITERIA;
+    assert recorded_escalation_kind(KIND_EFFECT_GAVE_UP, 3, true, false, false) == KIND_SEND_BACK_CEILING;
+    assert recorded_escalation_kind(KIND_EFFECT_GAVE_UP, 3, false, true, false) == KIND_DEAD_LETTER;
+    assert recorded_escalation_kind(KIND_EFFECT_GAVE_UP, 3, false, false, true) == KIND_REVIEWER_GAVE_UP;
+    // a record cannot claim a kind the counters own, nor a code nobody defined
+    assert recorded_escalation_kind(KIND_DEAD_LETTER, 3, false, false, false) == KIND_UNRECORDED;
+    assert recorded_escalation_kind(KIND_NO_CRITERIA, 3, false, false, false) == KIND_UNRECORDED;
+    assert recorded_escalation_kind(KIND_EFFECT_GAVE_UP + 1, 3, false, false, false) == KIND_UNRECORDED;
+    assert is_recorded_kind(KIND_SEND_BACK_CEILING) == false;
+    assert is_recorded_kind(KIND_REVIEWER_GAVE_UP) == false;
+}
+
+test a_give_up_waits_the_floor_then_goes_back_once {
+    // a crash loop that dispatch already moved between runtimes is not cured by an instant retry:
+    // it waits the empty-attempt floor (a deploy or a quota window), goes back once, then closes
+    assert next_step(KIND_EFFECT_GAVE_UP, 29, 0) == STEP_HOLD;
+    assert next_step(KIND_EFFECT_GAVE_UP, 30, 0) == STEP_RELEASE;
+    assert next_step(KIND_EFFECT_GAVE_UP, 30, 1) == STEP_CLOSE;
+    assert wants_backfill(KIND_EFFECT_GAVE_UP) == false;
+}
+
+test an_empty_attempt_is_released_after_the_floor {
+    assert next_step(KIND_DEAD_LETTER, 0, 0) == STEP_HOLD;
+    assert next_step(KIND_DEAD_LETTER, 29, 0) == STEP_HOLD;
+    assert next_step(KIND_DEAD_LETTER, 30, 0) == STEP_RELEASE;
+    assert next_step(KIND_REVIEWER_GAVE_UP, 30, 0) == STEP_RELEASE;
+    assert next_step(KIND_EMPTY_ACCEPT, 30, 0) == STEP_RELEASE;
+    assert next_step(KIND_UNRECORDED, 30, 0) == STEP_RELEASE;
+    // #7077: a hold keeps the dispatch's files until the floor
+    assert holds_files(next_step(KIND_DEAD_LETTER, 29, 0)) == true;
+}
+
+test a_spent_ceiling_waits_the_hour_then_goes_back_once {
+    assert next_step(KIND_SEND_BACK_CEILING, 59, 0) == STEP_HOLD;
+    assert next_step(KIND_SEND_BACK_CEILING, 60, 0) == STEP_RELEASE;
+    assert next_step(KIND_SEND_BACK_CEILING, 60, 1) == STEP_CLOSE;
+}
+
+test spent_releases_close_at_once_not_hold {
+    assert next_step(KIND_DEAD_LETTER, 0, 1) == STEP_CLOSE;
+    assert next_step(KIND_SEND_BACK_CEILING, 0, 1) == STEP_CLOSE;
+    assert next_step(KIND_UNRECORDED, 0, 5) == STEP_CLOSE;
+    assert holds_files(STEP_CLOSE) == false;
+    assert holds_files(STEP_RELEASE) == false;
+}
+
+test missing_criteria_are_backfilled_then_closed {
+    assert next_step(KIND_NO_CRITERIA, 0, 0) == STEP_BACKFILL;
+    assert next_step(KIND_BEYOND_THE_PATCH, 119, 0) == STEP_BACKFILL;
+    assert next_step(KIND_BASE_TRUTH_ALONE, 120, 0) == STEP_CLOSE;
+    assert next_step(KIND_NO_CRITERIA, 120, 0) == STEP_CLOSE;
+    assert wants_backfill(KIND_DEAD_LETTER) == false;
+    // #7077: a backfill keeps them too
+    assert holds_files(next_step(KIND_NO_CRITERIA, 0, 0)) == true;
+}
+
+test no_kind_waits_for_a_person {
+    assert holds_files(next_step(KIND_UNRECORDED, POLICY_HOLD_MINUTES, 0)) == false;
+    assert holds_files(next_step(KIND_NO_CRITERIA, POLICY_HOLD_MINUTES, 0)) == false;
+    assert holds_files(next_step(KIND_SEND_BACK_CEILING, POLICY_HOLD_MINUTES, 0)) == false;
+    assert holds_files(next_step(KIND_DEAD_LETTER, POLICY_HOLD_MINUTES, 0)) == false;
+    assert holds_files(next_step(KIND_REVIEWER_GAVE_UP, POLICY_HOLD_MINUTES, 0)) == false;
+    assert holds_files(next_step(KIND_EMPTY_ACCEPT, POLICY_HOLD_MINUTES, 0)) == false;
+    assert holds_files(next_step(KIND_BEYOND_THE_PATCH, POLICY_HOLD_MINUTES, 0)) == false;
+    assert holds_files(next_step(KIND_BASE_TRUTH_ALONE, POLICY_HOLD_MINUTES, 0)) == false;
+    assert holds_files(next_step(KIND_EFFECT_GAVE_UP, POLICY_HOLD_MINUTES, 0)) == false;
+}
+
+test request_changes_goes_back_to_the_queen_then_closes {
+    assert pr_step(true, true, true, 1, 0) == PR_WAIT_FIX;
+    assert pr_step(true, true, true, 2, 47) == PR_WAIT_FIX;
+    assert pr_step(true, true, true, 3, 0) == PR_CLOSE;
+    assert pr_step(true, true, true, 1, 48) == PR_CLOSE;
+}
+
+test a_new_head_is_judged_and_a_stranger_is_left_alone {
+    assert pr_step(true, true, false, 2, 100) == PR_JUDGE;
+    assert pr_step(false, true, true, 9, 900) == PR_NONE;
+    assert pr_step(true, false, true, 0, 900) == PR_NONE;
+}
+
+test a_conflicting_bee_branch_is_updated_not_left {
+    assert conflict_step(true, true, false, 0, 0, 0, 0) == C_UPDATE;
+    assert conflict_step(true, true, false, 1, 47, 0, 50) == C_UPDATE;
+    // the queue is the bottleneck: an update waits for room
+    assert conflict_step(true, true, false, 0, 0, 0, 51) == C_WAIT;
+    assert conflict_step(true, true, false, 1, 47, 1, 273) == C_WAIT;
+}
+
+test a_branch_that_cannot_be_updated_is_redone_from_master {
+    assert conflict_step(true, true, true, 1, 0, 0, 0) == C_REDO;
+    assert conflict_step(true, true, false, 2, 0, 0, 0) == C_REDO;
+    assert conflict_step(true, true, false, 1, 48, 0, 273) == C_REDO;
+    // a redo spends the one release; a second conflict closes
+    assert conflict_step(true, true, true, 1, 0, 1, 0) == C_CLOSE;
+    assert conflict_step(true, true, false, 2, 0, 1, 0) == C_CLOSE;
+    assert conflict_step(true, true, false, 0, 48, 1, 0) == C_CLOSE;
+}
+
+test a_clean_or_foreign_branch_is_left_alone {
+    assert conflict_step(true, false, true, 9, 900, 9, 999) == C_NONE;
+    assert conflict_step(false, true, true, 9, 900, 0, 0) == C_NONE;
+}
+
+// #7092: the runtime mirrors the kinds by number, so a code that moved would read a recorded reason
+// as another one; the values, not only their order, are the contract.
+invariant the_kind_codes_never_move {
+    assert KIND_UNRECORDED == 0;
+    assert KIND_NO_CRITERIA == 1;
+    assert KIND_SEND_BACK_CEILING == 2;
+    assert KIND_DEAD_LETTER == 3;
+    assert KIND_REVIEWER_GAVE_UP == 4;
+    assert KIND_EMPTY_ACCEPT == 5;
+    assert KIND_BEYOND_THE_PATCH == 6;
+    assert KIND_BASE_TRUTH_ALONE == 7;
+    assert KIND_EFFECT_GAVE_UP == 8;
+}
+
+// #7571: the publisher mirrors the conflict steps by number, as the runtime does the kinds.
+invariant the_conflict_codes_never_move {
+    assert C_NONE == 0;
+    assert C_WAIT == 1;
+    assert C_UPDATE == 2;
+    assert C_REDO == 3;
+    assert C_CLOSE == 4;
+}
+
+invariant every_clock_ends_before_the_policy_hold {
+    assert RETRY_FLOOR_MINUTES < CEILING_FLOOR_MINUTES;
+    assert CEILING_FLOOR_MINUTES < BACKFILL_WINDOW_MINUTES;
+    assert BACKFILL_WINDOW_MINUTES < POLICY_HOLD_MINUTES;
+    assert PR_FIX_WINDOW_HOURS * 60 <= POLICY_HOLD_MINUTES;
+    assert MAX_RELEASES > 0;
+    assert PR_FIX_ATTEMPTS > 0;
+    assert CONFLICT_WAIT_HOURS * 60 <= POLICY_HOLD_MINUTES;
+    assert CONFLICT_UPDATES > 0;
+    assert STEP_HOLD < STEP_RELEASE;
+    assert STEP_RELEASE < STEP_BACKFILL;
+    assert STEP_BACKFILL < STEP_CLOSE;
+}

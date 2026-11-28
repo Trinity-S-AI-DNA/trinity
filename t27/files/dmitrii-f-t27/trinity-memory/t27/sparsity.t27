@@ -1,0 +1,263 @@
+// Trinity Memory explicit lossy preparation and marginal entropy.
+// Status: 0 success, -1 invalid input, -2 short output.
+// Valid arrays and non-overlapping input/output buffers are a host ABI duty.
+// log2 is an external host libm primitive, not a second application algorithm.
+module TrinityMemorySparsity;
+
+fn tm_sparsity_finite(value: f64) -> bool {
+    return value == value && value <= 1.7976931348623157e308 && value >= -1.7976931348623157e308;
+}
+
+fn tm_sparsity_magnitude(value: f64) -> f64 {
+    if (value < 0.0) { return -value; }
+    return value;
+}
+
+// For each block, retain the k largest magnitudes, ties by lower index,
+// then emit only their signs. Magnitudes and other entries are discarded.
+// Rank counting requires no scratch allocation and preserves the exact tie
+// contract. Complexity is O(count * block_size), so it is a reference kernel.
+fn tm_project_topk(values: *f64, count: u64, block_size: u64,
+                   max_nonzero: u64, output: *i64, output_capacity: u64) -> i32 {
+    if (block_size == 0 || max_nonzero > block_size) { return -1; }
+    if (output_capacity < count) { return -2; }
+    if (count > 0 && (values == 0 || output == 0)) { return -1; }
+    var index: u64 = 0;
+    while (index < count) {
+        if (!tm_sparsity_finite(values[index])) { return -1; }
+        index = index + 1;
+    }
+    var start: u64 = 0;
+    while (start < count) {
+        var width: u64 = count - start;
+        if (width > block_size) { width = block_size; }
+        var end: u64 = start + width;
+        index = start;
+        while (index < end) {
+            var rank: u64 = 0;
+            var candidate: u64 = start;
+            var magnitude: f64 = tm_sparsity_magnitude(values[index]);
+            while (candidate < end) {
+                var other: f64 = tm_sparsity_magnitude(values[candidate]);
+                if (other > magnitude || (other == magnitude && candidate < index)) {
+                    rank = rank + 1;
+                }
+                candidate = candidate + 1;
+            }
+            var sign: i64 = 0;
+            if (rank < max_nonzero) {
+                if (values[index] > 0.0) { sign = 1; }
+                if (values[index] < 0.0) { sign = -1; }
+            }
+            output[index] = sign;
+            index = index + 1;
+        }
+        start = end;
+    }
+    return 0;
+}
+
+// Python integer weights retain exact canonical big-endian absolute bytes.
+// real is their finite binary64 representation, used only for sign/validation.
+// For a floating weight only real is used. All bytes must remain alive while
+// the call runs. Canonical integer zero has size 0; nonzero has no leading 0.
+struct TMExactWeight {
+    data: *u8,
+    size: usize,
+    real: f64,
+    is_integer: bool,
+}
+
+fn tm_exact_integer_high(weight: *TMExactWeight) -> i32 {
+    if (weight.size == 0) { return -1; }
+    var first: u8 = weight.data[0];
+    var bits: i32 = 0;
+    while (first > 0) { bits = bits + 1; first = first >> 1; }
+    return ((weight.size - 1) as i32) * 8 + bits - 1;
+}
+
+fn tm_exact_integer_bit(weight: *TMExactWeight, position: i32) -> u64 {
+    var byte_index: usize = weight.size - 1 - ((position as usize) / 8);
+    return ((weight.data[byte_index] as u64) >> ((position as u64) % 8)) & 1;
+}
+
+fn tm_exact_weight_valid(weight: *TMExactWeight) -> bool {
+    if (!tm_sparsity_finite(weight.real)) { return false; }
+    if (!weight.is_integer) { return true; }
+    if (weight.size > 128 || (weight.size > 0 && weight.data == 0)) { return false; }
+    if (weight.size == 0) { return weight.real == 0.0; }
+    if (weight.data[0] == 0 || weight.real == 0.0) { return false; }
+    // Python math.isfinite(int) first rounds to binary64. The overflow midpoint
+    // is 2^1024 - 2^970; reject it and larger magnitudes, without integer casts.
+    if (weight.size == 128 && weight.data[0] >= 128) {
+        var bit: i32 = 1023;
+        while (bit >= 970) {
+            if (tm_exact_integer_bit(weight, bit) == 0) { return true; }
+            bit = bit - 1;
+        }
+        return false;
+    }
+    return true;
+}
+
+// Compare an exact nonnegative integer magnitude with |real|. IEEE binary64
+// is expanded into its highest bit and at most 53 significant bits. There is
+// no rounded conversion of the integer magnitude in the comparison.
+fn tm_exact_integer_float(integer: *TMExactWeight, real: f64) -> i32 {
+    var bits: u64 = tm_float_bits(real) & 0x7fffffffffffffff;
+    if (integer.size == 0) { if (bits == 0) { return 0; } return -1; }
+    if (bits == 0) { return 1; }
+    var exponent: i32 = ((bits >> 52) & 2047) as i32;
+    var significand: u64 = bits & 0x000fffffffffffff;
+    var base: i32 = -1074;
+    var highest: i32 = -1074;
+    if (exponent > 0) {
+        significand = significand | 0x0010000000000000;
+        highest = exponent - 1023;
+        base = highest - 52;
+    } else {
+        var remaining: u64 = significand;
+        while (remaining > 1) { highest = highest + 1; remaining = remaining >> 1; }
+    }
+    var integer_high: i32 = tm_exact_integer_high(integer);
+    if (integer_high > highest) { return 1; }
+    if (integer_high < highest) { return -1; }
+    var position: i32 = integer_high;
+    while (position >= 0) {
+        var left: u64 = tm_exact_integer_bit(integer, position);
+        var right: u64 = 0;
+        if (position >= base && position - base <= 52) {
+            right = (significand >> ((position - base) as u64)) & 1;
+        }
+        if (left > right) { return 1; }
+        if (left < right) { return -1; }
+        position = position - 1;
+    }
+    // Equal integer parts: a remaining nonzero fractional part makes the
+    // floating magnitude larger. Here highest>=0, so -base is at most 52.
+    if (base < 0) {
+        var mask: u64 = (1 as u64) << ((-base) as u64);
+        mask = mask - 1;
+        if ((significand & mask) != 0) { return -1; }
+    }
+    return 0;
+}
+
+fn tm_exact_magnitude_compare(left: *TMExactWeight, right: *TMExactWeight) -> i32 {
+    if (left.is_integer && right.is_integer) {
+        if (left.size > right.size) { return 1; }
+        if (left.size < right.size) { return -1; }
+        var index: usize = 0;
+        while (index < left.size) {
+            if (left.data[index] > right.data[index]) { return 1; }
+            if (left.data[index] < right.data[index]) { return -1; }
+            index = index + 1;
+        }
+        return 0;
+    }
+    if (left.is_integer) { return tm_exact_integer_float(left, right.real); }
+    if (right.is_integer) { return -tm_exact_integer_float(right, left.real); }
+    var a: f64 = tm_sparsity_magnitude(left.real);
+    var b: f64 = tm_sparsity_magnitude(right.real);
+    if (a > b) { return 1; }
+    if (a < b) { return -1; }
+    return 0;
+}
+
+fn tm_project_topk_exact(values: *TMExactWeight, count: u64, block_size: u64,
+                         max_nonzero: u64, output: *i64, output_capacity: u64) -> i32 {
+    if (block_size == 0 || max_nonzero > block_size) { return -1; }
+    if (output_capacity < count) { return -2; }
+    if (count > 0 && (values == 0 || output == 0)) { return -1; }
+    var index: u64 = 0;
+    while (index < count) {
+        if (!tm_exact_weight_valid(&values[index])) { return -1; }
+        index = index + 1;
+    }
+    var start: u64 = 0;
+    while (start < count) {
+        var width: u64 = count - start;
+        if (width > block_size) { width = block_size; }
+        var end: u64 = start + width;
+        index = start;
+        while (index < end) {
+            var rank: u64 = 0;
+            var candidate: u64 = start;
+            while (candidate < end) {
+                var order: i32 = tm_exact_magnitude_compare(&values[candidate], &values[index]);
+                if (order > 0 || (order == 0 && candidate < index)) { rank = rank + 1; }
+                candidate = candidate + 1;
+            }
+            var sign: i64 = 0;
+            if (rank < max_nonzero) {
+                if (values[index].real > 0.0) { sign = 1; }
+                if (values[index].real < 0.0) { sign = -1; }
+            }
+            output[index] = sign;
+            index = index + 1;
+        }
+        start = end;
+    }
+    return 0;
+}
+
+fn tm_entropy_term(numerator: u64, denominator: u64) -> f64 {
+    if (numerator == 0 || denominator == 0) { return 0.0; }
+    var probability: f64 = (numerator as f64) / (denominator as f64);
+    return -probability * log2(probability);
+}
+
+// Counts are ordered [-1, 0, +1]. Output is marginal Shannon bits per trit.
+// Empty input has entropy zero. No lossy projection occurs in this function.
+fn tm_entropy_trits(values: *i64, count: u64, output: *f64) -> i32 {
+    if (output == 0 || (count > 0 && values == 0)) { return -1; }
+    var negative: u64 = 0;
+    var zero: u64 = 0;
+    var positive: u64 = 0;
+    var index: u64 = 0;
+    while (index < count) {
+        var value: i64 = values[index];
+        if (value == -1) { negative = negative + 1; }
+        else {
+            if (value == 0) { zero = zero + 1; }
+            else {
+                if (value == 1) { positive = positive + 1; }
+                else { return -1; }
+            }
+        }
+        index = index + 1;
+    }
+    output[0] = tm_entropy_term(negative, count) + tm_entropy_term(zero, count) + tm_entropy_term(positive, count);
+    return 0;
+}
+
+// Assumes equal probabilities for -1 and +1; validates a finite zero fraction.
+fn tm_symmetric_entropy(zero_fraction: f64, output: *f64) -> i32 {
+    if (output == 0 || !tm_sparsity_finite(zero_fraction)) { return -1; }
+    if (zero_fraction < 0.0 || zero_fraction > 1.0) { return -1; }
+    var other: f64 = (1.0 - zero_fraction) / 2.0;
+    var entropy: f64 = 0.0;
+    if (zero_fraction > 0.0) { entropy = entropy - zero_fraction * log2(zero_fraction); }
+    if (other > 0.0) { entropy = entropy - other * log2(other) - other * log2(other); }
+    output[0] = entropy;
+    return 0;
+}
+
+test tm_topk_lower_index_ties {
+    var values: [5]f64 = [0.2, -0.9, 0.9, 0.1, -0.3];
+    var output: [5]i64 = [0, 0, 0, 0, 0];
+    assert(tm_project_topk(values, 5, 4, 1, output, 5) == 0);
+    assert(output[0] == 0);
+    assert(output[1] == -1);
+    assert(output[2] == 0);
+    assert(output[3] == 0);
+    assert(output[4] == -1);
+}
+
+test tm_entropy_limits {
+    var output: [1]f64 = [7.0];
+    assert(tm_symmetric_entropy(1.0, output) == 0);
+    assert(output[0] == 0.0);
+    assert(tm_symmetric_entropy(0.0, output) == 0);
+    assert(output[0] == 1.0);
+}

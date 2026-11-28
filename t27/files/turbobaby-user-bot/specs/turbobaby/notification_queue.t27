@@ -1,0 +1,1394 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/turbobaby/notification_queue.t27 -- the outbound transport, and what it forgets
+; This contract owns the queue itself and nothing that travels through it: admission at the
+; insert, the derived states of a row and which of them are terminal, the drain interval and its
+; batch, the retry rule and the absence of a backoff, the ordering the scan does and does not
+; guarantee, the claim it does not take, and the rule that is supposed to stop one customer being
+; written to twice for one event. It owns no message, no recipient, no kind vocabulary that a
+; producer does not already own, and no schedule this repository does not implement.
+; --
+; WHY (measured 2026-09-21, the asymmetry -- and half of it CLOSED on the same date). This queue is
+; bounded where it ought to persist and WAS unbounded where it ought to stop. A send that FAILS
+; is retried on the very next tick: POLL_INTERVAL_SECS is 30 (src/notification_queue.rs:19),
+; MAX_ATTEMPTS is 3 (:21), and scheduled_at is written once at insert (src/db/notifications.rs:77)
+; and updated at 0 sites anywhere -- so the three sends fall at t, t+30 and t+60 and the retry
+; horizon of this queue is 60 seconds. A Telegram outage longer than that burns all three, and the
+; third failure does not record a loss in the ROW: the giveup branch at
+; src/notification_queue.rs:236-261 ends it by writing processed_at through the very same call a
+; delivery uses at :212. That half stands.
+; THE OTHER HALF IS HISTORY NOW, AND THE READING IS KEPT BECAUSE IT WAS TRUE. Until 2026-09-21 a
+; send that SUCCEEDED and whose mark then failed advanced nothing at all -- the Ok arm never
+; touched attempts -- so the row stayed pending with attempts unchanged and was sent again in 30
+; seconds, and again, without bound, while attempts stayed 0 and the giveup rule it would have had
+; to reach was never reached. The queue gave up on a message nobody received after 60 seconds and
+; re-sent a message that WAS received for ever. What closed it is one write moved and no new rule:
+; the attempt is counted at src/notification_queue.rs:120, BEFORE the send, rather than in the
+; failure arm after it, so every way out of the loop body leaves the counter one higher and the
+; bound is reachable from all of them -- including the path where the giveup's own write fails,
+; because the counter has by then reached the value the scan filters on. The superseded readings
+; are kept as constants rather than deleted: SUPERSEDED_RESENDS_WERE_UNBOUNDED,
+; SUPERSEDED_HIGHEST_ATTEMPTS_VALUE and SUPERSEDED_TERMINAL_WRITE_SITES.
+; --
+; WHY (measured 2026-09-21, LATER THE SAME DAY, and the reason every line number in this file
+; moved). The paragraph above says "one write moved and no new rule". That was true of the first
+; cut and the first cut was wrong in a second place: having moved the increment ahead of the send,
+; it REFUSED to send a row whose increment failed. An adversarial review put the test plainly --
+; revoke UPDATE on notification_queue and watch nothing go out -- and it was right. One UPDATE on
+; one column had become able to stop outbound delivery altogether, which the queue could not do
+; before the fix and must not do after it. There is now a new rule, and this is it: the counter is
+; still written first and its failure is CARRIED rather than obeyed. The attempt is held in this
+; process (UncountedAttempts, src/notification_queue.rs:291), attempts_spent (:321) adds the
+; column to what is held, and the one bound applies to the sum -- so the message still goes out
+; and it still goes out at most MAX_ATTEMPTS times. What the fix does NOT do is bound the SCAN on
+; that path, and it does not survive a restart: both are recorded, measured, in
+; UNCOUNTABLE_ROW_NOTE below rather than left for a reader to discover. Every citation into
+; src/notification_queue.rs in this file was re-measured against the rewritten drain on that date;
+; the file grew from 361 lines to 616 and no citation below is a remembered one.
+; --
+; WHY (measured 2026-09-21, the scope). The name says queue and the shape says transport, but a
+; grep for .send_message( over src/ on 2026-09-21 returns 53 occurrences across 12 files, and
+; exactly 1 of them is in src/notification_queue.rs. The other 52 -- order status
+; (src/bot/notify.rs), cart nudges (src/cart_abandonment.rs), event reminders (src/api/events.rs),
+; both broadcast paths (src/promo.rs, src/api/admin.rs) and every bot handler -- reach the customer
+; with no row, no attempt count and no record that they were sent. Retry, ordering and
+; at-least-once are properties of three referral kinds, not of this bot's outbound mail.
+; --
+; WHERE THE BRIEF IS REFUTED. The brief asks for "the queue row's states and which are terminal"
+; and for "the dedupe key". Neither exists as the question presumes.
+; migrations/067_notification_queue.sql:4-13 declares 8 columns and not one of them is a status or
+; a state: the state of a row is derived from processed_at being null or not, and the three
+; outcomes that end a row -- delivered (src/notification_queue.rs:212), abandoned after three
+; attempts (the SAME write at :212, chosen by the condition at :211) and skipped because the chat
+; id is 0 (:140-154) -- write
+; the same column, so the row afterwards cannot say which happened. And the word UNIQUE occurs 0 times in that migration; the only uniqueness on the
+; table is the PRIMARY KEY, whose declared default is gen_random_uuid (:5) and whose value in
+; practice is a client-side uuid v4 written at src/db/notifications.rs:73 -- the schema default is
+; never exercised, and neither number is one a producer can collide with. There is no dedupe key. What stops a second message is three separate guards in three
+; separate producers, and the transport contributes nothing to any of them. Two smaller
+; corrections, both inside the repository, and both closed on 2026-09-26 by the held-kinds decision
+; below rather than by a rewording: src/db/notifications.rs:30-31 told the reader that the
+; surviving friend_watered arm lived in a function called render_referral_text, which occurred 1
+; time in all of src/ -- that comment; the function is build_message at
+; src/notification_queue.rs:352, the arm is gone, and the comment now names build_message. And
+; src/trios/deeplink.rs:651-652 says the button is built for friend_joined, friend_ordered and
+; milestone; the markup at src/notification_queue.rs:177-180 is built outside the match and was
+; attached to all five rendering paths, the legacy arm and the unknown-kind fallback included.
+; Those two paths are gone, so the three that remain are exactly the three that comment names.
+; --
+; WHAT THIS FILE NEVER DOES. It quotes no message and no fragment of one, in any language; the
+; shipped copy is a set of fields at src/locales.rs:88-89 and :94-102 -- the four cart strings
+; between them at :90-93 belong to another path, and :96-99 has been a comment since 2026-09-26,
+; where the retired garden message's field stood -- and is cited by path. It names no
+; customer, no chat id and no telegram identifier. It declares no locale, no fallback locale and no
+; locale set -- turbobaby/locale-policy owns those, and the drain's own hard-coded fallback is
+; recorded here as a second copy rather than restated as a value. It declares no message subject:
+; turbobaby/promo-broadcast owns what may be said to a population and turbobaby/referral-program
+; owned the milestone that became a row until 2026-09-26 (R3 retired the ladder). It declares no metric name, no dashboard and no alert rule
+; -- turbobaby/observability owns the naming rule, and what is recorded here is which of this
+; path's events have a counter at all. It declares no delivery channel: turbobaby/bot-surface owns
+; that, and turbobaby/deeplink owns the payload the one button carries. Where the repository
+; publishes no bound -- a backoff, a per-recipient ceiling, a queue depth, a dead-letter store, a
+; receipt -- a named refusal and a note saying what is missing stand in place of a plausible
+; number.
+; RE-POINTED 2026-09-24: every src/db/mod.rs line this file cites past line 385 moved four lines
+; down when migrations/087_delivery_zones_phuket.sql joined MIGRATIONS, and four more with
+; migrations/088_unpublish_events.sql the same day; re-measured, and nothing they point at changed.
+; --
+; DECIDED 2026-09-26: A ROW OF A RETIRED OR UNKNOWN KIND IS HELD. Operator decision applying three
+; owner rulings: rental only, Phuket only, and nothing deleted (2026-09-24); nothing
+; cannabis-related may appear anywhere (2026-09-25, answer 12, verbatim in DECISIONS.md's D19
+; addendum of that day); and all of the cannabis-era content analysed (2026-09-25, the second
+; list's answer 3), read by the operator as: analyse all of it and take it out of customers' sight
+; without deleting stored data. Until this date the queue could still send such a row. Rows are
+; data and outlive the code that wrote them, and build_message kept a friend_watered arm on purpose
+; -- the retired garden's report that a friend watered a plant, whose writer left with D5 -- plus a
+; catch-all that sent any other kind with the raw kind column as its text, where this database
+; forked from another shop's bot (DECISIONS.md D19). Whether production holds such a row was NOT
+; read, and the rule does not depend on the answer. The section "Held kinds" below states the rule,
+; the reason the row is held rather than ended, and what that costs.
+; LINE CITATIONS RE-MEASURED 2026-09-26. The decision adds 2 lines at the scan call and 14 at the
+; head of the loop in src/notification_queue.rs, so the loop header moved by 2 and every line of
+; that file this corpus cites from the loop body down to build_message moved by 16; build_message
+; lost its two paths, and the scan's filters in src/db/notifications.rs moved into pending_scan.
+; Each citation was re-read against the file and rewritten in place, and five here and one in
+; turbobaby/deeplink were ALREADY off on the base commit and were corrected in the same pass:
+; MAX_ATTEMPTS was cited at :20 (it is :21), the delivery at :142 (it shares :212 with the
+; abandonment), the annotated empty tick at :36-39 (it is :41-43), the increment at :73 (the base
+; had it at :104, now :120) and the button's reasoning at :76-82 (the base had it at :154-160, now
+; :170-176). Lines above the scan call did not move. New text cites code by name.
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module turbobaby-notification-queue;
+
+pub const KIND : str = "transport-contract";
+pub const ID : str = "turbobaby/notification-queue";
+pub const NAME : str = "TurboBaby outbound notification queue";
+pub const WORLD : str = "gHashTag/turbobaby-user-bot";
+pub const DRAIN_IMPLEMENTATION : str = "src/notification_queue.rs";
+pub const STORE_IMPLEMENTATION : str = "src/db/notifications.rs";
+pub const ROW_IMPLEMENTATION : str = "src/db/entities/notification_queue.rs";
+pub const SCHEMA_MIGRATION : str = "migrations/067_notification_queue.sql";
+pub const WIRING_SITE : str = "src/main.rs:664-674";
+pub const TICK_WITNESS : str = "tests/timed_loops_announce_ticks.rs";
+pub const BUTTON_WITNESS : str = "src/trios/deeplink.rs:648-658";
+pub const MEASURED_AT : str = "2026-09-21";
+
+; --- Reuse edges ------------------------------------------------------------------------------
+; Each names an owner whose decision enters here as an abstract parameter. Not one of their
+; enumerations, thresholds or strings is restated below, with a single marked exception named at
+; its own edge: the poll interval, which this file and turbobaby/runtime-config read from one line.
+; --
+; What may be SENT to a population is turbobaby/promo-broadcast's subject; this file owns only the
+; carriage. The two do not overlap in code either: neither broadcast path writes a row on this
+; table and neither is drained by this worker.
+pub const REUSES_PROMO_BROADCAST_ID : str = "turbobaby/promo-broadcast";
+; A milestone mail was a row on this table (src/db/referrals.rs:874-885 at e39221e) until R3 of
+; 2026-09-26 deleted the award that queued it; which rung existed, when it was reached and whether
+; it was already awarded was turbobaby/referral-program's, and this file consumed only the boolean
+; that its producer guard fired. Since then that owner supplies the friend-joined row alone.
+pub const REUSES_REFERRAL_PROGRAM_ID : str = "turbobaby/referral-program";
+; The drain reads a per-recipient language (src/notification_queue.rs:162-166) before rendering. The
+; published set, the primary and the fallback are turbobaby/locale-policy's. What is recorded here
+; is that the drain resolves its own fallback from a literal instead of asking.
+pub const REUSES_LOCALE_POLICY_ID : str = "turbobaby/locale-policy";
+; The channel is the bot, and every row leaves through one send site. turbobaby/bot-surface owns
+; that surface, its escaping rule and its button vocabulary.
+pub const REUSES_BOT_SURFACE_ID : str = "turbobaby/bot-surface";
+; A drain failure should be a metric rather than a silence. Whether a metric name may exist at all,
+; and the rule binding a name to an emitting site, is turbobaby/observability's; this file records
+; only which events on this path have a counter and which have none.
+pub const REUSES_OBSERVABILITY_ID : str = "turbobaby/observability";
+; ADDED after reading the witness: the one button every message carries is a start payload, and
+; src/trios/deeplink.rs:648-658 is a live test that exists because of this queue. The payload
+; vocabulary is turbobaby/deeplink's; the fact that one target serves every path is this file's.
+pub const REUSES_DEEPLINK_ID : str = "turbobaby/deeplink";
+; The drain's interval is one of eight loop intervals turbobaby/runtime-config inventories, and
+; that contract owns whether any of them may be configured. POLL_INTERVAL_SECONDS below is
+; therefore a MARKED second copy and not an independent reading: both contracts take it from the
+; same source line, pinned here as INTERVAL_SOURCE_LINE, and that line is the arbiter if the two
+; copies ever disagree.
+pub const REUSES_RUNTIME_CONFIG_ID : str = "turbobaby/runtime-config";
+; Until 2026-09-26 a fourth rendering arm outlived its writer, because a mechanic was withdrawn and
+; its rows were not. What retirement means in this repository -- hidden data against a surface
+; still reachable -- is turbobaby/legacy-retirement's, and so was whether that arm should go: the
+; owner's ruling it records for 2026-09-25 (CANNABIS_RULING_AT) answered that, and the arm went.
+; This file takes only what it can measure: no kind with a reader and no writer, and one kind known
+; to be held (HELD_KINDS_KNOWN).
+pub const REUSES_LEGACY_RETIREMENT_ID : str = "turbobaby/legacy-retirement";
+pub const REUSE_EDGE_COUNT : u8 = 8;
+
+; --- The row: 8 columns and no state -----------------------------------------------------------
+; migrations/067_notification_queue.sql:4-13, mirrored at
+; src/db/entities/notification_queue.rs:20-31. The state of a row is not stored, it is computed
+; from one of the eight columns, and that column is doing three jobs at once.
+pub const ROW_COLUMN_COUNT : u8 = 8;
+pub const ROW_HAS_A_STATE_COLUMN : bool = false;
+pub const STATE_IS_DERIVED : bool = true;
+pub const STATE_PENDING : u8 = 1;
+pub const STATE_TERMINAL : u8 = 2;
+pub const STATE_COUNT : u8 = 2;
+
+pub fn row_state(processed: bool) u8 {
+  if (processed) {
+    return STATE_TERMINAL;
+  }
+  return STATE_PENDING;
+}
+
+pub fn state_is_terminal(state: u8) bool {
+  return state == STATE_TERMINAL;
+}
+
+pub fn row_may_be_drained_again(processed: bool) bool {
+  return !state_is_terminal(row_state(processed));
+}
+
+; Three outcomes end a row and all three write processed_at, now through TWO call sites rather
+; than three: delivery and abandonment share src/notification_queue.rs:212 (which of the two it
+; was is decided at :213 and :236), and the chat-id-zero skip has its own at :145. Only delivery
+; increments a counter (:233), so the three are separable in aggregate and not on the row -- which
+; is the only place an operator looks when the question is about one customer. What the row still
+; cannot say, the log now does for the giveup alone: :245-260 names the row, the kind, the
+; attempts spent and which of the two reasons ended it.
+pub const OUTCOME_DELIVERED : u8 = 1;
+pub const OUTCOME_ABANDONED : u8 = 2;
+pub const OUTCOME_SKIPPED_NO_CHAT : u8 = 3;
+pub const TERMINAL_OUTCOME_COUNT : u8 = 3;
+pub const TERMINAL_OUTCOMES_SHARE_ONE_COLUMN : bool = true;
+pub const THE_ROW_RECORDS_WHICH_OUTCOME : bool = false;
+pub const A_GIVEUP_IS_WRITTEN_AS_A_DELIVERY : bool = true;
+pub const TERMINAL_WRITE_SITES_IN_THE_DRAIN : u8 = 2;
+pub const SUPERSEDED_TERMINAL_WRITE_SITES : u8 = 3;
+pub const A_GIVEUP_IS_NAMED_IN_THE_LOG : bool = true;
+pub const A_GIVEUP_LOG_LINE_CARRIES_THE_REASON : bool = true;
+; One new state the table can hold, and it is the only one of these that survives a restart. When
+; the giveup's own write fails the row keeps processed_at NULL while attempts stands at the
+; ceiling, and no other outcome produces that pair: a delivery, an abandonment that wrote, and a
+; skip that wrote all set the column. It does NOT say which of the two reasons stopped the
+; retries -- only the log does that -- and it is reachable from the zero-chat path as well, so
+; what it means is exactly "the drain stopped handling this row and could not write it off". The
+; partial index at migrations/067_notification_queue.sql:15-17 already serves the query.
+pub const AN_UNWRITTEN_GIVEUP_IS_LEGIBLE_IN_THE_ROW : bool = true;
+
+pub fn row_was_given_up_without_its_terminal_write(processed: bool, attempts: u8) bool {
+  return !processed and attempts >= MAX_ATTEMPTS;
+}
+
+pub fn outcome_is_terminal(outcome: u8) bool {
+  return outcome >= OUTCOME_DELIVERED and outcome <= OUTCOME_SKIPPED_NO_CHAT;
+}
+
+pub fn outcome_increments_a_counter(outcome: u8) bool {
+  return outcome == OUTCOME_DELIVERED;
+}
+
+pub fn outcome_is_legible_afterwards(outcome: u8, reading_the_row: bool) bool {
+  if (reading_the_row) {
+    return THE_ROW_RECORDS_WHICH_OUTCOME;
+  }
+  return outcome_increments_a_counter(outcome);
+}
+
+; --- Admission ---------------------------------------------------------------------------------
+; The insert asks nothing about the kind: VARCHAR(50) at
+; migrations/067_notification_queue.sql:7 with 0 CHECK constraints, and
+; src/db/notifications.rs:65-88 validates neither the string nor the payload shape. Admission to
+; the QUEUE and admission to a RENDERING are different gates, and only the second has a vocabulary.
+pub const KIND_COLUMN_MAX_CHARS : u16 = 50;
+pub const KIND_CHECK_CONSTRAINT_COUNT : u8 = 0;
+pub const PAYLOAD_SCHEMA_IS_VALIDATED : bool = false;
+
+pub fn insert_is_admitted(kind_within_cap: bool, payload_is_json: bool) bool {
+  return kind_within_cap and payload_is_json;
+}
+
+; The rendering gate is DeliverableKind in src/notification_queue.rs: DeliverableKind::of turns a
+; kind column into its one variant or refuses it in a default arm, and build_message takes the
+; variant and matches it with no wildcard, so one kind renders and nothing else can. One writer,
+; the call at src/db/referrals.rs:289 in record_referral, writes it. RE-MEASURED 2026-09-26 (R3):
+; until then there were three variants and three writers -- the other two at src/db/orders.rs:463
+; and src/db/referrals.rs:877, at e39221e, writing friend_ordered and milestone -- and both were
+; deleted with the bonuses they announced; their rows are held (HELD_KINDS_SINCE_R3), and the
+; three-kind readings keep their *_BEFORE_2026_09_26_R3 names. RE-MEASURED 2026-09-26 earlier the
+; same day (the held-kinds decision): until then build_message took the raw column and
+; had four arms plus a catch-all -- the fourth kept deliberately for friend_watered rows written
+; before the garden was withdrawn (the writer is code, the rows are data), the catch-all sending any
+; other kind with that raw column as its text. Both paths left with the held-kinds decision below;
+; the superseded readings are kept as the *_BEFORE_2026_09_26 and SUPERSEDED_* constants.
+pub const RENDERABLE_KIND_COUNT : u8 = 1;
+pub const RENDERABLE_KINDS : [1]str = ["friend_joined"];
+pub const RENDERABLE_KIND_COUNT_BEFORE_2026_09_26_R3 : u8 = 3;
+pub const RENDERABLE_KINDS_BEFORE_2026_09_26_R3 : [3]str = ["friend_joined", "friend_ordered", "milestone"];
+pub const RENDERABLE_KIND_COUNT_BEFORE_2026_09_26 : u8 = 4;
+pub const RENDERABLE_KINDS_BEFORE_2026_09_26 : [4]str = ["friend_joined", "friend_watered", "friend_ordered", "milestone"];
+pub const WRITTEN_KIND_COUNT : u8 = 1;
+pub const WRITTEN_KINDS : [1]str = ["friend_joined"];
+pub const WRITTEN_KIND_COUNT_BEFORE_2026_09_26_R3 : u8 = 3;
+pub const WRITTEN_KINDS_BEFORE_2026_09_26_R3 : [3]str = ["friend_joined", "friend_ordered", "milestone"];
+pub const KINDS_WITH_A_READER_AND_NO_WRITER : u8 = 0;
+pub const SUPERSEDED_KINDS_WITH_A_READER_AND_NO_WRITER : u8 = 1;
+pub const RENDERING_PATH_COUNT : u8 = 1;
+pub const RENDERING_PATH_COUNT_BEFORE_2026_09_26_R3 : u8 = 3;
+pub const SUPERSEDED_RENDERING_PATH_COUNT : u8 = 5;
+pub const UNKNOWN_KIND_IS_REFUSED : bool = true;
+pub const UNKNOWN_KIND_STILL_SENDS : bool = false;
+pub const UNKNOWN_KIND_EMITS_THE_RAW_COLUMN : bool = false;
+pub const SUPERSEDED_UNKNOWN_KIND_STILL_SENDS : bool = true;
+pub const SUPERSEDED_UNKNOWN_KIND_EMITS_THE_RAW_COLUMN : bool = true;
+
+pub fn message_is_kind_specific(kind_has_an_arm: bool) bool {
+  return kind_has_an_arm;
+}
+
+pub fn row_reaches_a_customer(kind_has_an_arm: bool, chat_id_present: bool) bool {
+  return chat_id_present and (kind_has_an_arm or UNKNOWN_KIND_STILL_SENDS);
+}
+
+pub fn unwritten_readable_kinds(readable: u8, written: u8) u8 {
+  return readable - written;
+}
+
+pub fn row_reached_a_customer_before_2026_09_26(kind_has_an_arm: bool, chat_id_present: bool) bool {
+  return chat_id_present and (kind_has_an_arm or SUPERSEDED_UNKNOWN_KIND_STILL_SENDS);
+}
+
+; --- Held kinds (DECIDED 2026-09-26) --------------------------------------------------------------
+; THE RULE. A row is delivered only when its kind is one a producer writes today (WRITTEN_KINDS,
+; the same list as RENDERABLE_KINDS: one kind since R3). Every other row is HELD: not sent, not
+; counted, not marked, and not read again. Three sorts of row are held: friend_watered, the retired
+; garden's kind (HELD_KINDS_KNOWN); since R3 of 2026-09-26, friend_ordered and milestone, whose
+; producers were deleted with the referral and milestone bonuses they announced, so a row queued
+; before that is held rather than announcing money no longer paid (HELD_KINDS_SINCE_R3; the queue
+; drains within a tick, so few or none are expected); and any kind nothing here writes, refused by the
+; same default arm rather than by a list, because nobody here can enumerate what the other shop's
+; bot wrote. Two locks, both keyed on the drain's own list: the scan is handed
+; DeliverableKind::names() and filters on it (pending_notifications, the filter in pending_scan,
+; src/db/notifications.rs), and process_batch refuses any other kind in a let-else above every
+; write, so even a scan that stopped filtering would send nothing and write nothing for a held row.
+; WHY HELD AND NOT ENDED. The brief asked for the queue's own terminal state for a row that will
+; never be sent -- a skipped, failed or cancelled status with a reason naming the ruling -- if one
+; exists. None does: the row has no state column (ROW_HAS_A_STATE_COLUMN) and no column for a
+; reason (QUEUE_HAS_A_REASON_COLUMN), and its one terminal write is processed_at, made through the
+; same call a delivery makes (A_GIVEUP_IS_WRITTEN_AS_A_DELIVERY; mark_delivered). Writing it would
+; record a message nobody received as delivered, and it would rewrite a stored row; the rulings
+; allow neither, and a migration adding a status is outside this decision. So the row is left as
+; stored and kept out of the claim query. Filtering in the query and not only in the loop matters:
+; the scan is ORDER BY scheduled_at LIMIT BATCH_SIZE, so held rows refused only in the loop would
+; take head-of-queue slots on every tick, and fifty of them would starve every live message.
+; WHAT IT COSTS, SAID RATHER THAN HIDDEN. A held row stays pending for ever -- processed_at NULL,
+; attempts where they were -- and is legible as held only through its kind. A depth gauge over
+; processed_at IS NULL (QUEUE_DEPTH_NOTE) would count it as a backlog that never drains, so such a
+; gauge has to leave held kinds out. And a producer that starts writing a new kind without adding it
+; to DeliverableKind would be held in silence: tests/notification_drain_wiring.rs holds the
+; producers' kinds, the drain's and this file's RENDERABLE_KINDS and WRITTEN_KINDS to one list, and
+; scripts/verify_t27_against_source.py binds both lists to the code, so that becomes a red build.
+; ALSO REMOVED, on the same ruling: the locale field friend_watered was rendered with (src/locales.rs,
+; the struct and both constructors), each of its lines replaced by a comment line so that no
+; citation into that file moved; turbobaby/locale-policy re-counts the struct. The metric smoke test
+; in src/metrics.rs pushes a live kind instead of the retired one.
+; WHAT IT DOES NOT CHANGE. Admission: the insert still asks nothing about the kind, so a held kind
+; can still be WRITTEN, though nothing here writes one. The live kind (three until R3), its copy,
+; the one button, the retry budget and the ordering are as they were. No row is deleted or rewritten, no
+; table is touched and no migration is added. The other senders that read stored text are not
+; this file's subject (SEND_SITES_BEHIND_THIS_QUEUE is 1).
+pub const HELD_KINDS_DECIDED_AT : str = "2026-09-26";
+pub const HELD_KINDS_DECIDED_BY : str = "operator decision applying the owner's rulings";
+pub const HELD_KINDS_RULINGS : [3]str = ["2026-09-24 rental only, Phuket only, nothing deleted", "2026-09-25 answer 12, nothing cannabis-related anywhere", "2026-09-25 second list answer 3, all cannabis-era content analysed and out of customers' sight"];
+pub const HELD_KINDS_KNOWN : [1]str = ["friend_watered"];
+pub const HELD_KIND_COUNT_KNOWN : u8 = 1;
+; R3 (2026-09-26): the two kinds whose producers left with the referral and milestone bonuses.
+; Held, not deleted, exactly as friend_watered is; tests/notification_drain_wiring.rs reads this
+; list and refuses a drain that names either kind in shipped code.
+pub const HELD_KINDS_SINCE_R3 : [2]str = ["friend_ordered", "milestone"];
+pub const HELD_KIND_COUNT_SINCE_R3 : u8 = 2;
+pub const HELD_KINDS_SINCE_R3_DECIDED_AT : str = "2026-09-26";
+pub const AN_UNKNOWN_KIND_IS_HELD : bool = true;
+pub const HELD_KINDS_DECISION : str = "src/notification_queue.rs DeliverableKind";
+pub const HELD_KINDS_SCAN_FILTER : str = "src/db/notifications.rs pending_scan";
+pub const HELD_KINDS_LOOP_GUARD : str = "src/notification_queue.rs process_batch";
+pub const HELD_KINDS_WIRING_TEST : str = "tests/notification_drain_wiring.rs";
+pub const HELD_ROW_LOCKS : u8 = 2;
+pub const QUEUE_HAS_A_REASON_COLUMN : bool = false;
+pub const QUEUE_HAS_A_TERMINAL_STATE_OTHER_THAN_PROCESSED_AT : bool = false;
+pub const A_HELD_ROW_IS_SENT : bool = false;
+pub const A_HELD_ROW_IS_COUNTED : bool = false;
+pub const A_HELD_ROW_IS_MARKED : bool = false;
+pub const A_HELD_ROW_IS_DELETED : bool = false;
+pub const A_HELD_ROW_IS_HANDED_OUT_BY_THE_SCAN : bool = false;
+pub const A_HELD_ROW_IS_RETRIED : bool = false;
+pub const A_HELD_ROW_EVER_LEAVES_PENDING : bool = false;
+pub const THE_HELD_KINDS_ADD_A_MIGRATION : bool = false;
+pub const PRODUCTION_WAS_READ_FOR_HELD_ROWS : bool = false;
+
+pub fn kind_is_delivered(kind_is_written_today: bool) bool {
+  return kind_is_written_today;
+}
+
+pub fn row_is_held(processed: bool, kind_is_written_today: bool) bool {
+  return !processed and !kind_is_delivered(kind_is_written_today);
+}
+
+; Both locks on one row: the scan's filter and the loop's guard each refuse a held kind, and either
+; one alone keeps it from the customer.
+pub fn held_row_is_sent(scan_filters_the_kind: bool, loop_guards_the_kind: bool) bool {
+  return !scan_filters_the_kind and !loop_guards_the_kind;
+}
+
+; --- The drain ---------------------------------------------------------------------------------
+; src/notification_queue.rs:29-49. One interval, cold-start tick discarded at :33, then
+; process_batch run synchronously inside the tick. The empty tick is silent BY DECISION and the
+; decision is annotated in place at :41-43; tests/timed_loops_announce_ticks.rs:18-31 is the gate
+; that forces every timed loop either to log the empty case or to say in the file why not, and this
+; loop says why not -- 2880 lines a day, and Ok(0) here counts deliveries rather than work found.
+pub const INTERVAL_SOURCE_LINE : str = "src/notification_queue.rs:19";
+pub const POLL_INTERVAL_SECONDS : u16 = 30;
+pub const FIRST_TICK_IS_DISCARDED : bool = true;
+pub const BATCH_SIZE : u16 = 50;
+pub const EMPTY_TICK_IS_SILENT : bool = true;
+pub const EMPTY_TICK_SILENCE_IS_ANNOTATED : bool = true;
+pub const DRAINER_SPAWN_SITES : u8 = 1;
+pub const PACING_SLEEPS_IN_THE_DRAIN : u8 = 0;
+pub const SENDS_WITHIN_A_BATCH_ARE_SEQUENTIAL : bool = true;
+
+pub fn rows_this_tick(pending: u16) u16 {
+  if (pending > BATCH_SIZE) {
+    return BATCH_SIZE;
+  }
+  return pending;
+}
+
+pub fn tick_is_capped(pending: u16) bool {
+  return pending > BATCH_SIZE;
+}
+
+pub fn backlog_after_tick(pending: u16) u16 {
+  return pending - rows_this_tick(pending);
+}
+
+; The scan applies exactly three filters (src/db/notifications.rs:127-129, in pending_scan) and one
+; order (:130). The third, the kind filter, arrived on 2026-09-26 with the held kinds above; the two
+; before it are the ones this paragraph was written about, and the superseded count is kept.
+; scheduled_at is read as a sort key and never as a due time, so the column named like a schedule
+; does not schedule: a row dated into the future is admitted by the very next scan. The one thing
+; the date still does is sort it -- being the newest scheduled_at it goes to the BACK of the
+; result -- so it leaves as soon as it fits inside a batch, later than the rows queued before it
+; and not later than the time written on it. Nothing writes a future value today (:77 writes
+; now()), which is why the gap is invisible rather than harmless -- the first caller who wants a
+; delay will believe this column already gives one.
+pub const DRAIN_FILTER_COUNT : u8 = 3;
+pub const DRAIN_FILTER_COUNT_BEFORE_2026_09_26 : u8 = 2;
+pub const SCHEDULED_AT_COLUMN_EXISTS : bool = true;
+pub const SCHEDULED_AT_IS_A_DUE_TIME_FILTER : bool = false;
+pub const SCHEDULED_AT_UPDATE_SITES : u8 = 0;
+pub const FUTURE_SCHEDULED_AT_WRITE_SITES : u8 = 0;
+pub const A_FUTURE_ROW_IS_SENT_ON_THE_NEXT_TICK : bool = true;
+
+pub fn drain_waits_for_the_scheduled_time(due_filter_exists: bool, scheduled_in_the_future: bool) bool {
+  return due_filter_exists and scheduled_in_the_future;
+}
+
+pub fn drain_admits_row(processed: bool, attempts: u8, ceiling: u8, scheduled_in_the_future: bool) bool {
+  if (drain_waits_for_the_scheduled_time(SCHEDULED_AT_IS_A_DUE_TIME_FILTER, scheduled_in_the_future)) {
+    return false;
+  }
+  return !processed and attempts < ceiling;
+}
+
+; The whole scan since 2026-09-26: the two filters above and the kind. drain_admits_row is kept as
+; the two it always was, so every assertion written against it still reads what it read.
+pub fn scan_hands_out_row(processed: bool, attempts: u8, ceiling: u8, scheduled_in_the_future: bool, kind_is_written_today: bool) bool {
+  return drain_admits_row(processed, attempts, ceiling, scheduled_in_the_future) and kind_is_delivered(kind_is_written_today);
+}
+
+; --- Retry, and the backoff that does not exist -------------------------------------------------
+; src/notification_queue.rs:94-138 and :236-261, re-measured 2026-09-21 after the counter moved,
+; and again the same day after it stopped deciding the send (and re-pinned 2026-09-26).
+; One pass over a row runs the increment at :120 (SQL at src/db/notifications.rs:164) BEFORE it
+; sends, so the counter runs 0 -> 1 -> 2 -> 3 whatever each pass did, and the giveup at :236 fires
+; when the value it left is MAX_ATTEMPTS. The highest value the column can now hold is 3, which is
+; exactly the scan's ceiling (src/db/notifications.rs:128) -- and that ceiling is no longer a
+; second copy of this number: the drain passes MAX_ATTEMPTS into the query at :61-62, so the filter
+; and the giveup read one declaration (:21). The partial index carries attempts as a key column at
+; migrations/067_notification_queue.sql:16 to serve that same filter.
+; UNTIL 2026-09-21 this section read differently and the superseded figure is kept beside the new
+; one: the giveup fired at attempts + 1 >= MAX_ATTEMPTS from the FAILURE arm only, the increment
+; ran only from 0 and from 1, the highest value the column could hold was 2, and the scan's own
+; ceiling of 3 therefore excluded nothing the code could write. A reader who repeats that
+; measurement today gets 3, and the difference is the fix rather than either reading being sloppy.
+pub const MAX_ATTEMPTS : u8 = 3;
+pub const ATTEMPTS_AT_INSERT : u8 = 0;
+pub const HIGHEST_ATTEMPTS_VALUE_THE_CODE_CAN_WRITE : u8 = 3;
+pub const SUPERSEDED_HIGHEST_ATTEMPTS_VALUE : u8 = 2;
+pub const ATTEMPTS_FILTER_CEILING : u8 = 3;
+pub const SEND_ATTEMPTS_PER_ROW : u8 = 3;
+pub const THE_ATTEMPTS_FILTER_CAN_EXCLUDE_A_ROW : bool = true;
+pub const THE_FILTER_AND_THE_GIVEUP_READ_ONE_DECLARATION : bool = true;
+pub const BUDGET_DECLARATION_SITE : str = "src/notification_queue.rs:21";
+pub const RESEND_BOUND_LANDED_AT : str = "2026-09-21";
+pub const THE_ATTEMPT_IS_COUNTED_BEFORE_THE_SEND : bool = true;
+pub const COUNTER_WRITE_SITES_PER_PASS : u8 = 1;
+pub const BOUND_IS_REACHABLE_ON_EVERY_PATH : bool = true;
+
+; A row's attempts are read from TWO places and bounded as one number. The column is the durable
+; half and the only half the scan can see; the other is what this process is holding for a row
+; whose UPDATE would not land (src/notification_queue.rs:291-312, summed at :321). Both halves
+; existed as of 2026-09-21 and the second did not exist before that date, so the sum and the
+; column are the same number on every healthy row and differ only where the database refused a
+; write.
+pub const ATTEMPTS_ARE_READ_FROM_TWO_PLACES : u8 = 2;
+pub const ATTEMPTS_HELD_IN_MEMORY_DECLARATION_SITE : str = "src/notification_queue.rs:291";
+pub const ATTEMPTS_SUM_SITE : str = "src/notification_queue.rs:321";
+
+pub fn attempts_spent(column: u8, held_in_memory: u8) u8 {
+  return column + held_in_memory;
+}
+
+; Whether a pass sends the row it is holding. The counter's OUTCOME is not an argument, and that
+; absence is the statement: src/notification_queue.rs:160 decides the send from what the row has
+; already spent and from whether there is a chat to send to, and from nothing the database said
+; about the write at :120. A row with no chat reaches nobody whatever the column holds, which is
+; one of the two early exits the loop keeps (:153). The other, since 2026-09-26, is the held kind
+; (:78), and it is taken above every write, so it is not a write deciding a delivery either.
+; WHERE THIS IS TIED TO THE CODE. No test can execute the drain -- it needs a live Postgres and a
+; live Telegram -- so the two functions above are a model and a model can agree with a loop that
+; has stopped matching it. tests/notification_drain_wiring.rs reads the loop as text and holds the
+; wiring instead: that it decides through the same three rules, that it hands MAX_ATTEMPTS and its
+; deliverable kinds to the scan, that a refused counter is held rather than obeyed, and that the
+; two early exits left are the held kind, above every write, and the row with no chat. It also
+; reads INTERVAL_SOURCE_LINE, BUDGET_DECLARATION_SITE,
+; ATTEMPTS_HELD_IN_MEMORY_DECLARATION_SITE and ATTEMPTS_SUM_SITE back out of this file and
+; re-measures each against the declaration it names, so the four citations above cannot drift off
+; their lines in silence the way every citation in this file did on 2026-09-21.
+pub fn pass_sends(attempts_spent_before: u8, chat_id_is_zero: bool) bool {
+  if (chat_id_is_zero) {
+    return false;
+  }
+  return attempts_spent_before < MAX_ATTEMPTS;
+}
+
+; The shape of the defect, kept as a predicate so it cannot come back unnoticed: a send that
+; succeeded and a mark that did not is the one pair for which the counter used to stand still.
+pub fn counter_moves_when_the_mark_fails(send_ok: bool, mark_ok: bool) bool {
+  if (send_ok and !mark_ok) {
+    return A_FAILED_MARK_ADVANCES_ATTEMPTS;
+  }
+  return true;
+}
+; One drainer now reaches the ceiling by itself, which is what the change was for. The increment
+; is still a read-modify-write with no claim on the row (see the ordering section), so two drainers
+; that both read attempts = 2 would both run src/db/notifications.rs:164 and leave 4 in a column
+; whose filter stops at 3 -- an overshoot rather than an escape, since every value at or above the
+; ceiling is excluded. Exactly one drainer is spawned (src/main.rs:669). The superseded claim, that
+; the spawn count and not the branch was what kept 3 out of the column, is kept below.
+pub const ATTEMPTS_CEILING_IS_REACHED_BY_ONE_DRAINER : bool = true;
+pub const SUPERSEDED_CEILING_NEEDED_A_SECOND_DRAINER : bool = true;
+
+; The attempt is counted once per pass and before anything can consume it, which is the whole of
+; the fix. Everything below that says "after a failure" or "after a successful send" is this one
+; function seen from a different arm.
+pub fn attempts_after_pass(attempts: u8) u8 {
+  return attempts + 1;
+}
+
+pub fn attempts_after_failure(attempts: u8) u8 {
+  return attempts_after_pass(attempts);
+}
+
+pub fn failure_abandons_the_row(attempts: u8) bool {
+  return attempts + 1 >= MAX_ATTEMPTS;
+}
+
+pub fn failure_is_retried(attempts: u8) bool {
+  return !failure_abandons_the_row(attempts);
+}
+
+pub fn attempts_filter_excludes(attempts: u8) bool {
+  return attempts >= ATTEMPTS_FILTER_CEILING;
+}
+
+pub fn attempts_value_is_writable(attempts: u8) bool {
+  return attempts <= HIGHEST_ATTEMPTS_VALUE_THE_CODE_CAN_WRITE;
+}
+
+pub fn the_attempts_filter_is_reachable(attempts: u8) bool {
+  return attempts_filter_excludes(attempts) and attempts_value_is_writable(attempts);
+}
+
+pub fn attempts_ceiling_is_reached(single_drainer: bool) bool {
+  return single_drainer;
+}
+
+; The giveup is reached from BOTH ways a pass can end without a confirmed delivery, which is the
+; property the code did not have before 2026-09-21: src/notification_queue.rs:236 asks only
+; whether the delivery was confirmed and whether the budget is spent, and the send's outcome
+; chooses the WORDS of the log line at :255-259 and nothing else.
+pub fn pass_abandons_the_row(attempts: u8, delivery_confirmed: bool) bool {
+  if (delivery_confirmed) {
+    return false;
+  }
+  return attempts_after_pass(attempts) >= MAX_ATTEMPTS;
+}
+
+; No delay grows between attempts and no attempt is rescheduled, so the gap between two attempts on
+; one row is the poll interval itself and the whole budget is spent in (attempts - 1) intervals.
+; The boundary case -- an outage ending exactly as the last tick fires -- is counted as lost here,
+; because the first attempt is not aligned to the start of the outage and this contract will not
+; claim an alignment the code does not have.
+pub const BACKOFF_EXISTS : bool = false;
+pub const JITTER_EXISTS : bool = false;
+pub const RETRY_INTERVAL_SECONDS : u16 = 30;
+pub const RETRY_HORIZON_SECONDS : u16 = 60;
+
+pub fn retry_horizon_seconds(poll_seconds: u16, send_attempts: u16) u16 {
+  return poll_seconds * (send_attempts - 1);
+}
+
+pub fn message_survives_outage(outage_seconds: u16) bool {
+  return outage_seconds < RETRY_HORIZON_SECONDS;
+}
+
+; A refusal by Telegram and a broken socket are one event to this loop
+; (src/notification_queue.rs:160-261): one warn, one counter of attempts, one giveup. A customer
+; who has blocked the bot is retried twice like a timeout, and a timeout is discarded after 60
+; seconds like a block.
+pub const SEND_FAILURE_CLASS_COUNT : u8 = 1;
+pub const PERMANENT_AND_TRANSIENT_ARE_TOLD_APART : bool = false;
+
+pub fn failure_handling_depends_on_the_cause(cause_is_permanent: bool, classes: u8) bool {
+  return classes >= 2 and cause_is_permanent;
+}
+
+; --- Being messaged twice ------------------------------------------------------------------------
+; The transport has no dedupe key and cannot acquire one by reading the table: the only unique
+; constraint on it is the PRIMARY KEY, declared with a gen_random_uuid default at
+; migrations/067_notification_queue.sql:5 and filled in practice by a client-side uuid v4 at
+; src/db/notifications.rs:73, and UNIQUE occurs 0 times in that migration. The one producer left
+; carries its own guard instead -- a fresh-invite test at src/db/referrals.rs:284. Until R3 of
+; 2026-09-26 there were three, each with its own: that one, a first-order test at
+; src/db/orders.rs:423 and an ON CONFLICT (referrer_id, milestone) DO NOTHING whose rows_affected
+; decided the send at src/db/referrals.rs:805-817 (both at e39221e). Nothing was ever shared, and a
+; new producer inherits no guard.
+pub const QUEUE_UNIQUE_CONSTRAINT_COUNT : u8 = 1;
+pub const THE_UNIQUE_CONSTRAINT_IS_A_RANDOM_UUID : bool = true;
+pub const QUEUE_HAS_A_DEDUPE_KEY : bool = false;
+pub const TRANSPORT_GUARD_PRESENT : bool = false;
+pub const PRODUCER_COUNT : u8 = 1;
+pub const PRODUCERS_WITH_THEIR_OWN_GUARD : u8 = 1;
+pub const GUARD_SHAPE_COUNT : u8 = 1;
+pub const PRODUCER_COUNT_BEFORE_2026_09_26_R3 : u8 = 3;
+pub const GUARD_FRIEND_JOINED : str = "src/db/referrals.rs:284";
+pub const GUARD_FRIEND_ORDERED_BEFORE_2026_09_26_R3 : str = "src/db/orders.rs:423 at e39221e";
+pub const GUARD_MILESTONE_BEFORE_2026_09_26_R3 : str = "src/db/referrals.rs:805-817 at e39221e";
+
+pub fn duplicate_enqueue_is_stopped(producer_guard_present: bool) bool {
+  return producer_guard_present or TRANSPORT_GUARD_PRESENT;
+}
+
+pub fn a_new_producer_inherits_a_guard(producer_guard_present: bool) bool {
+  return duplicate_enqueue_is_stopped(producer_guard_present);
+}
+
+; The second way one customer is written to twice needs no duplicate row at all, and it is BOUNDED
+; rather than closed -- the distinction is the point of this section. On the success path
+; (src/notification_queue.rs:160-225) the mark is a second database write, and when it fails the
+; row is still pending, so the next tick re-reads it and re-sends it: the send is not idempotent
+; and nothing here makes it so. What changed on 2026-09-21 is that the row no longer comes back
+; unchanged. The attempt was counted at :120 before the send, so the repeat costs budget, and after
+; MAX_ATTEMPTS passes the scan stops handing the row out (src/db/notifications.rs:128) whether or
+; not any write ever succeeded. A customer can therefore receive the same referral message at most
+; SEND_ATTEMPTS_PER_ROW times instead of every POLL_INTERVAL_SECONDS seconds until someone
+; notices. The repeat is counted, in the column and nowhere else -- the delivery counter at :233
+; still fires only on a confirmed delivery, so a repeat is legible in `attempts` and not in any
+; metric. The warn at :217-223 names the failed MARK and the budget spent; the giveup at :245-260
+; names the row when the retries stop and says which of the two reasons stopped them.
+; SUPERSEDED, and kept because it was the measurement this section was written for: before that
+; date the Ok arm contained no call to the increment, the only barrier against a repeat send was
+; the write that had just failed, and the repeats were bounded by nothing in the code at all.
+pub const THE_SEND_IS_IDEMPOTENT : bool = false;
+pub const THE_ONLY_BARRIER_IS_THE_WRITE_THAT_FAILED : bool = false;
+pub const A_FAILED_MARK_ADVANCES_ATTEMPTS : bool = true;
+pub const A_RESEND_AFTER_A_FAILED_MARK_IS_LOGGED : bool = true;
+pub const A_RESEND_AFTER_A_FAILED_MARK_IS_COUNTED : bool = true;
+pub const A_RESEND_AFTER_A_FAILED_MARK_HAS_A_METRIC : bool = false;
+pub const RESENDS_AFTER_A_FAILED_MARK_ARE_BOUNDED : bool = true;
+pub const SUPERSEDED_RESENDS_WERE_UNBOUNDED : bool = true;
+pub const MAX_SENDS_TO_ONE_CUSTOMER_FOR_ONE_ROW : u8 = 3;
+
+pub fn attempts_after_successful_send(attempts: u8) u8 {
+  return attempts_after_pass(attempts);
+}
+
+pub fn row_stays_pending_after_send(send_ok: bool, mark_ok: bool) bool {
+  return send_ok and !mark_ok;
+}
+
+pub fn customer_is_messaged_twice(send_ok: bool, mark_ok: bool, another_tick_runs: bool) bool {
+  return row_stays_pending_after_send(send_ok, mark_ok) and another_tick_runs;
+}
+
+; The argument is kept so the superseded rule is still expressible: the bound used to depend on
+; the mark eventually succeeding, and now it does not depend on it at all.
+pub fn resend_count_is_bounded(mark_ever_succeeds: bool) bool {
+  return mark_ever_succeeds or RESENDS_AFTER_A_FAILED_MARK_ARE_BOUNDED;
+}
+
+pub fn sends_to_one_customer_for_one_row(mark_ever_succeeds: bool) u8 {
+  if (mark_ever_succeeds) {
+    return 1;
+  }
+  return MAX_SENDS_TO_ONE_CUSTOMER_FOR_ONE_ROW;
+}
+
+; --- Ordering -------------------------------------------------------------------------------------
+; One sort key, no tiebreaker (src/db/notifications.rs:130), and the loop at
+; src/notification_queue.rs:65 walks the result in order with nothing between sends. A failed row
+; keeps its scheduled_at, so it keeps the head of the queue for its remaining attempts rather than
+; falling behind. None of that is a global guarantee: there is no claim on a row -- 0 occurrences of
+; FOR UPDATE or SKIP LOCKED in src/db/notifications.rs -- so the ordering holds only while exactly
+; one drainer exists, and exactly one is spawned (src/main.rs:669). Per-recipient order is a
+; shadow of the global one rather than a rule of its own: two rows for one customer go out in
+; scheduled_at order only while no send fails -- a failed first row waits a tick while the second
+; is already gone -- and only while their two timestamps differ, since there is no tiebreaker.
+pub const ORDER_KEY : str = "scheduled_at";
+pub const ORDER_KEY_COUNT : u8 = 1;
+pub const TIEBREAKER_COUNT : u8 = 0;
+pub const ORDER_IS_OLDEST_FIRST : bool = true;
+pub const A_FAILED_ROW_KEEPS_ITS_PLACE : bool = true;
+pub const ROW_CLAIM_EXISTS : bool = false;
+pub const SKIP_LOCKED_SITES_IN_THE_STORE : u8 = 0;
+pub const PER_RECIPIENT_ORDERING_EXISTS : bool = false;
+
+pub fn order_is_total(tiebreakers: u8) bool {
+  return tiebreakers >= 1;
+}
+
+pub fn fifo_holds(single_drainer: bool, order_key_present: bool) bool {
+  return single_drainer and order_key_present;
+}
+
+pub fn two_drainers_see_the_same_rows(claim_exists: bool, drainer_count: u8) bool {
+  return !claim_exists and drainer_count >= 2;
+}
+
+pub fn ordering_survives_a_second_process(claim_exists: bool, drainer_count: u8) bool {
+  return !two_drainers_see_the_same_rows(claim_exists, drainer_count);
+}
+
+; --- The recipient the drain declines to send to ----------------------------------------------------
+; src/notification_queue.rs:140-154. A row whose chat id is 0 is marked processed and skipped, with
+; no log line and no counter, so it leaves the queue looking exactly like a delivery. Two things
+; changed on 2026-09-21 and neither is the skip itself: the pass that skips has already counted an
+; attempt at :120, so a row whose mark keeps failing is examined at most MAX_ATTEMPTS times instead
+; of every tick for ever; and the mark's failure is a warn at :147-151 where it used to be discarded
+; by an `.ok()`. The successful skip is still silent, which is what the constant below says.
+pub const ZERO_CHAT_ID_IS_SKIPPED : bool = true;
+pub const ZERO_CHAT_ID_SKIP_IS_LOGGED : bool = false;
+pub const ZERO_CHAT_ID_SKIP_INCREMENTS_A_COUNTER : bool = false;
+pub const ZERO_CHAT_ID_SKIP_COUNTS_AN_ATTEMPT : bool = true;
+pub const A_FAILED_SKIP_WRITE_IS_LOGGED : bool = true;
+
+pub fn send_is_attempted(chat_id_present: bool, admitted: bool) bool {
+  return chat_id_present and admitted;
+}
+
+; --- Localization boundary --------------------------------------------------------------------------
+; src/notification_queue.rs:162-166 reads the language per row and falls back to a literal written in
+; the drain. The read cannot distinguish a missing user from a failed query --
+; src/db/mod.rs:880-897 returns the same None for both and says so at :878-879 -- so a database
+; hiccup degrades to the fallback rather than deferring the row. The failure is not unobserved,
+; since the query error reaches a warn at src/db/mod.rs:889; it is unreadable HERE, because the
+; None handed to the drain carries no reason and no branch on this path can act on the difference. Whether that literal
+; agrees with the published fallback is turbobaby/locale-policy's to state; what is recorded here is
+; that the transport keeps its own copy instead of asking.
+pub const LOCALE_IS_READ_PER_ROW : bool = true;
+pub const LOCALE_SOURCE_COLUMN : str = "users.language";
+pub const LOCALE_READ_FAILURE_IS_DISTINGUISHABLE : bool = false;
+pub const DRAIN_HOLDS_ITS_OWN_FALLBACK_LITERAL : bool = true;
+pub const A_LOCALE_READ_FAILURE_DEFERS_THE_ROW : bool = false;
+
+pub fn locale_is_resolved(user_row_found: bool) bool {
+  return user_row_found;
+}
+
+pub fn drain_sends_in_the_fallback(user_row_found: bool, read_failed: bool) bool {
+  return !user_row_found or read_failed;
+}
+
+; --- The one button ----------------------------------------------------------------------------------
+; src/notification_queue.rs:177-180 builds the markup outside the match on kind, so every rendering
+; path carries the same single button at the same single target. That is not an accident and the
+; reasoning stands at :170-176; it is also why the live test at src/trios/deeplink.rs:648-658 exists.
+pub const BUTTON_COUNT_PER_MESSAGE : u8 = 1;
+pub const BUTTON_TARGET_COUNT : u8 = 1;
+pub const BUTTON_IS_BUILT_OUTSIDE_THE_KIND_MATCH : bool = true;
+pub const BUTTON_TARGET_HAS_A_LIVE_TEST : bool = true;
+
+pub fn button_can_differ_by_path(rendering_paths: u8, button_targets: u8) bool {
+  return button_targets >= rendering_paths;
+}
+
+; --- Observability ------------------------------------------------------------------------------------
+; Two counters exist on this path: one at the insert (src/db/notifications.rs:86, defined at
+; src/metrics.rs:149-155) and one after a confirmed delivery (src/notification_queue.rs:233, defined
+; at src/metrics.rs:158-164). A send failure, an abandonment, a zero-chat skip, a failed batch and
+; the depth of the queue have none. The batch failure is a warn at src/notification_queue.rs:46 and
+; nothing else. The abandonment gained a warn on 2026-09-21 (:245-260) and no counter: a metric
+; NAME is turbobaby/observability's to grant and none is coined here. Both counter names were searched for in all four monitoring artifacts this
+; repository ships -- docs/grafana-dashboard.json, docs/prometheus-alerts.yaml,
+; docs/prometheus-recording-rules.yaml and monitoring/grafana-dashboard.json -- and each returns 0.
+pub const COUNTERS_ON_THIS_PATH : u8 = 2;
+pub const COUNTER_ON_ENQUEUE : bool = true;
+pub const COUNTER_ON_DELIVERY : bool = true;
+pub const COUNTER_ON_SEND_FAILURE : bool = false;
+pub const COUNTER_ON_ABANDON : bool = false;
+pub const COUNTER_ON_BATCH_FAILURE : bool = false;
+pub const COUNTER_ON_QUEUE_DEPTH : bool = false;
+pub const MONITORING_ARTIFACTS_SEARCHED : u8 = 4;
+pub const MONITORING_ARTIFACTS_NAMING_EITHER_COUNTER : u8 = 0;
+pub const A_DRAIN_FAILURE_IS_A_LOG_LINE : bool = true;
+pub const A_DRAIN_FAILURE_IS_A_METRIC : bool = false;
+
+pub fn drain_failure_is_observable(counter_exists: bool, an_artifact_reads_it: bool) bool {
+  return counter_exists and an_artifact_reads_it;
+}
+
+pub fn outage_is_distinguishable_from_quiet(delivered_this_tick: u16, failure_counter_exists: bool) bool {
+  return failure_counter_exists or delivered_this_tick >= 1;
+}
+
+pub fn loss_is_measured(abandon_counter_exists: bool) bool {
+  return abandon_counter_exists;
+}
+
+pub fn queued_minus_delivered(queued: u16, delivered: u16) u16 {
+  return queued - delivered;
+}
+
+; That difference is an upper bound and not a loss: it also absorbs the zero-chat skip and every row
+; still in flight, and neither of those has a counter either.
+pub fn that_difference_is_a_loss(abandon_counted: bool, skip_counted: bool, inflight_is_known: bool) bool {
+  return abandon_counted and skip_counted and inflight_is_known;
+}
+
+; --- Scope: what this transport actually carries ---------------------------------------------------------
+pub const OUTBOUND_SEND_SITES_IN_SRC : u8 = 53;
+pub const FILES_WITH_AN_OUTBOUND_SEND : u8 = 12;
+pub const SEND_SITES_BEHIND_THIS_QUEUE : u8 = 1;
+pub const QUEUED_KINDS_ARE_ALL_REFERRAL_LIFECYCLE : bool = true;
+
+pub fn send_is_persisted(goes_through_the_queue: bool) bool {
+  return goes_through_the_queue;
+}
+
+pub fn unqueued_send_sites(total: u8, queued: u8) u8 {
+  return total - queued;
+}
+
+pub fn a_failed_send_can_be_retried(goes_through_the_queue: bool) bool {
+  return send_is_persisted(goes_through_the_queue);
+}
+
+; --- Refusals ----------------------------------------------------------------------------------------------
+pub const BACKOFF_IS_NOT_SHIPPED : bool = true;
+pub const BACKOFF_NOTE : str = "No delay grows between attempts and none is configurable. scheduled_at is written once (src/db/notifications.rs:77) and updated at 0 sites, the pass calls the counter increment and nothing resembling a delay (src/notification_queue.rs:120, SQL at src/db/notifications.rs:164), and the drain declares three constants and not one of them is a retry delay (:19-21). RE-READ 2026-09-21 after the counter moved ahead of the send: the increment changed PLACE and not nature, so this refusal is unaffected and the horizon it leaves is still the poll interval times two. Closing this needs a write of scheduled_at on failure and a due-time predicate in the scan, which the column already supports and the query does not use. No interval is invented here in its place, and the 30 seconds pinned above is the poll interval rather than a chosen retry delay -- the retry inherits it by having no opinion of its own.";
+
+pub const PER_RECIPIENT_RATE_LIMIT_IS_NOT_SHIPPED : bool = true;
+pub const PER_RECIPIENT_RATE_NOTE : str = "Nothing bounds how many rows for one person may be drained in one tick. The scan (src/db/notifications.rs:120-132, pending_scan) groups by nothing, the loop (src/notification_queue.rs:65-262) sends each row as it comes, and the file contains 0 sleeps. Fifty rows for one customer would be fifty messages as fast as the socket allows. Closing this needs a per-recipient bound at the scan or a pause in the loop; how often one customer may be written to is the owner's decision and not the transport's, and no figure is coined here to stand in for it.";
+
+pub const QUEUE_DEPTH_IS_NOT_PUBLISHED : bool = true;
+pub const QUEUE_DEPTH_NOTE : str = "The two counters on this path are events and not levels: one fires at the insert and one after a confirmed delivery, and neither reports how many rows are pending now. Their difference is not the backlog either, because an abandonment (src/notification_queue.rs:236-261) and a zero-chat skip (:140-154) both leave the queue without touching the delivery counter. A gauge over processed_at IS NULL is the missing input, and the partial index at migrations/067_notification_queue.sql:15-17 would already serve it; since 2026-09-26 it must also leave the held kinds out, because a held row is pending for ever by design (HELD_KINDS_DECIDED_AT). Metric naming is turbobaby/observability's rule and no name is coined here. The abandonment became a log line on 2026-09-21 and did not become a number: a depth still cannot be read from anything this path emits.";
+
+pub const DEAD_LETTER_STORE_IS_NOT_SHIPPED : bool = true;
+pub const DEAD_LETTER_NOTE : str = "An abandoned row is not moved, not flagged and not copied anywhere. src/notification_queue.rs:212 writes the same processed_at a delivery writes -- literally the same call, chosen by the condition at :211 -- and the error text reaches a warn (:189-201 for the send, :217-223 for the mark) and no column. RE-MEASURED 2026-09-21: the abandonment itself is now named in the log at :245-260, with the row id, the kind, the attempts spent and which of the two reasons ended the retries, so a message that stops being retried no longer stops silently. That is a line and not a record: after the third pass the repository still holds no PERSISTED trace that the message was never received, only a row that reads as delivered, and a log is not a store. Closing this needs either a column recording which outcome ended the row or a separate table for abandonment, plus the last error. Neither is invented here, and the abandonment is not renamed a delivery in this contract merely because the two share a column.";
+
+pub const AN_UNCOUNTABLE_ATTEMPT_IS_REFUSED_NOT_BOUNDED : bool = false;
+pub const SUPERSEDED_UNCOUNTABLE_ATTEMPT_WAS_REFUSED : bool = true;
+pub const AN_UNCOUNTABLE_ATTEMPT_IS_HELD_IN_MEMORY : bool = true;
+pub const UNCOUNTABLE_SEND_IS_BOUNDED : bool = true;
+pub const UNCOUNTABLE_SCAN_IS_BOUNDED : bool = false;
+pub const IN_MEMORY_BOUND_SURVIVES_A_RESTART : bool = false;
+pub const UNCOUNTABLE_BOUND_LANDED_AT : str = "2026-09-21";
+pub const UNCOUNTABLE_ROW_NOTE : str = "SUPERSEDED THE DAY IT WAS WRITTEN, and the superseded reading is kept because it was the measurement the fix was made against. It read: the bound lives in a column, so a row whose counter cannot be written has no bound; src/notification_queue.rs:73 ran the increment first and :83 skipped the row when it failed, which converted an unbounded SEND into an unbounded SCAN, and that was the honest half because an attempt nobody counted is the one that repeats for ever. It was half of an answer and the other half was a new single point of failure: one UPDATE on one column decided whether ANY message left this process, which is a power the queue did not hand it before the fix. Measured by revoking UPDATE on notification_queue -- the scan still returns rows, every increment fails, and nothing is sent. What ships now carries the failure instead of obeying it. The attempt is held in this process (UncountedAttempts, :291-312), attempts_spent (:321) adds it to the column, and the one bound applies to the sum, so the send is bounded at MAX_ATTEMPTS on that path as well and the customer still hears from us. TWO THINGS REMAIN OPEN AND ARE NOT DRESSED UP. The SCAN is bounded by nothing here: the column never reaches the ceiling it filters on, so the row is re-read every POLL_INTERVAL_SECONDS for ever, refused a send by what the process remembers and retried on its terminal write each tick in case the grant returns. And the memory is a process, not a store: a restart forgets what it held and spends the budget again, so the repeat is bounded by restarts rather than by anything persisted, which the warn at :125-130 says on every pass rather than leaving it to be discovered. Closing both needs the same persisted failure record DEAD_LETTER_NOTE names, and no number of restarts to tolerate is invented here in its place.";
+
+pub const DELIVERY_RECEIPT_IS_NOT_SHIPPED : bool = true;
+pub const DELIVERY_RECEIPT_NOTE : str = "processed_at records that a send returned Ok to this process, which is the transport's acknowledgement and not the customer's. Nothing reads a message id and nothing records one -- the send's result is bound at src/notification_queue.rs:160 and reduced to a bool at :203, which is the only thing four later lines ask (:211, :215, :236, :255) -- and no later pass reconciles anything against this table. This contract therefore never says a customer was reached; it says a send was acknowledged and a row was marked, and the gap between those two statements is exactly what a receipt would close.";
+
+; --- Tests ------------------------------------------------------------------------------------------------
+
+test a_row_has_two_derived_states_and_no_state_column {
+  assert ROW_HAS_A_STATE_COLUMN == false;
+  assert ROW_COLUMN_COUNT == 8;
+  assert STATE_COUNT == 2;
+  assert row_state(false) == STATE_PENDING;
+  assert row_state(true) == STATE_TERMINAL;
+  assert state_is_terminal(STATE_TERMINAL) == true;
+  assert state_is_terminal(STATE_PENDING) == false;
+  assert row_may_be_drained_again(false) == true;
+  assert row_may_be_drained_again(true) == false;
+}
+
+test three_outcomes_end_a_row_and_the_row_forgets_which {
+  assert TERMINAL_OUTCOME_COUNT == 3;
+  assert TERMINAL_WRITE_SITES_IN_THE_DRAIN == 2;
+  assert SUPERSEDED_TERMINAL_WRITE_SITES == 3;
+  assert A_GIVEUP_IS_NAMED_IN_THE_LOG == true;
+  assert A_GIVEUP_LOG_LINE_CARRIES_THE_REASON == true;
+  assert outcome_increments_a_counter(OUTCOME_ABANDONED) == false;
+  assert AN_UNWRITTEN_GIVEUP_IS_LEGIBLE_IN_THE_ROW == true;
+  assert row_was_given_up_without_its_terminal_write(false, 3) == true;
+  assert row_was_given_up_without_its_terminal_write(true, 3) == false;
+  assert row_was_given_up_without_its_terminal_write(false, 2) == false;
+  assert outcome_is_terminal(OUTCOME_DELIVERED) == true;
+  assert outcome_is_terminal(OUTCOME_ABANDONED) == true;
+  assert outcome_is_terminal(OUTCOME_SKIPPED_NO_CHAT) == true;
+  assert outcome_is_terminal(0) == false;
+  assert outcome_is_terminal(4) == false;
+  assert outcome_is_legible_afterwards(OUTCOME_DELIVERED, true) == false;
+  assert outcome_is_legible_afterwards(OUTCOME_ABANDONED, true) == false;
+  assert outcome_is_legible_afterwards(OUTCOME_DELIVERED, false) == true;
+  assert outcome_is_legible_afterwards(OUTCOME_ABANDONED, false) == false;
+}
+
+test the_insert_asks_nothing_about_the_kind {
+  assert KIND_CHECK_CONSTRAINT_COUNT == 0;
+  assert PAYLOAD_SCHEMA_IS_VALIDATED == false;
+  assert KIND_COLUMN_MAX_CHARS == 50;
+  assert insert_is_admitted(true, true) == true;
+  assert insert_is_admitted(false, true) == false;
+  assert insert_is_admitted(true, false) == false;
+}
+
+; Until 2026-09-26 one readable kind had no writer, and that was deliberate; the held-kinds
+; decision ended it, so every kind the drain can read is one a producer writes.
+test the_readable_kind_with_no_writer_left_with_the_held_kinds {
+  assert RENDERABLE_KIND_COUNT == 1;
+  assert WRITTEN_KIND_COUNT == 1;
+  assert RENDERABLE_KIND_COUNT_BEFORE_2026_09_26_R3 == 3;
+  assert WRITTEN_KIND_COUNT_BEFORE_2026_09_26_R3 == 3;
+  assert RENDERABLE_KIND_COUNT_BEFORE_2026_09_26_R3 - RENDERABLE_KIND_COUNT == HELD_KIND_COUNT_SINCE_R3;
+  assert HELD_KINDS_SINCE_R3[0] == "friend_ordered";
+  assert HELD_KINDS_SINCE_R3[1] == "milestone";
+  assert HELD_KINDS_SINCE_R3_DECIDED_AT == HELD_KINDS_DECIDED_AT;
+  assert unwritten_readable_kinds(RENDERABLE_KIND_COUNT, WRITTEN_KIND_COUNT) == KINDS_WITH_A_READER_AND_NO_WRITER;
+  assert unwritten_readable_kinds(RENDERABLE_KIND_COUNT_BEFORE_2026_09_26_R3, WRITTEN_KIND_COUNT_BEFORE_2026_09_26_R3) == 0;
+  assert KINDS_WITH_A_READER_AND_NO_WRITER == 0;
+  assert RENDERABLE_KIND_COUNT_BEFORE_2026_09_26 == 4;
+  assert unwritten_readable_kinds(RENDERABLE_KIND_COUNT_BEFORE_2026_09_26, WRITTEN_KIND_COUNT_BEFORE_2026_09_26_R3) == SUPERSEDED_KINDS_WITH_A_READER_AND_NO_WRITER;
+  assert SUPERSEDED_KINDS_WITH_A_READER_AND_NO_WRITER == 1;
+}
+
+; The superseded reading stays executable beside the new one: until 2026-09-26 an unknown kind was
+; sent, with the raw column as its text; now it is held.
+test an_unknown_kind_is_held_rather_than_sent {
+  assert UNKNOWN_KIND_IS_REFUSED == true;
+  assert UNKNOWN_KIND_STILL_SENDS == false;
+  assert UNKNOWN_KIND_EMITS_THE_RAW_COLUMN == false;
+  assert AN_UNKNOWN_KIND_IS_HELD == true;
+  assert message_is_kind_specific(false) == false;
+  assert message_is_kind_specific(true) == true;
+  assert row_reaches_a_customer(false, true) == false;
+  assert row_reaches_a_customer(true, true) == true;
+  assert row_reaches_a_customer(true, false) == false;
+  assert SUPERSEDED_UNKNOWN_KIND_STILL_SENDS == true;
+  assert SUPERSEDED_UNKNOWN_KIND_EMITS_THE_RAW_COLUMN == true;
+  assert row_reached_a_customer_before_2026_09_26(false, true) == true;
+  assert row_reached_a_customer_before_2026_09_26(true, false) == false;
+}
+
+; The decision of 2026-09-26, as the properties that have to hold together: a held row is never
+; sent, never counted, never marked and never deleted, it stays pending, and the scan never hands
+; it out -- while a row of a kind a producer writes is handed out exactly as before.
+test a_row_of_a_retired_or_unknown_kind_is_held_and_left_as_stored {
+  assert HELD_KINDS_DECIDED_AT == "2026-09-26";
+  assert HELD_KINDS_DECIDED_BY == "operator decision applying the owner's rulings";
+  assert HELD_KIND_COUNT_KNOWN == 1;
+  assert HELD_KINDS_DECISION == "src/notification_queue.rs DeliverableKind";
+  assert HELD_KINDS_SCAN_FILTER == "src/db/notifications.rs pending_scan";
+  assert HELD_KINDS_LOOP_GUARD == "src/notification_queue.rs process_batch";
+  assert HELD_KINDS_WIRING_TEST == "tests/notification_drain_wiring.rs";
+  assert HELD_ROW_LOCKS == 2;
+  assert QUEUE_HAS_A_REASON_COLUMN == false;
+  assert QUEUE_HAS_A_TERMINAL_STATE_OTHER_THAN_PROCESSED_AT == false;
+  assert ROW_HAS_A_STATE_COLUMN == false;
+  assert A_GIVEUP_IS_WRITTEN_AS_A_DELIVERY == true;
+  assert A_HELD_ROW_IS_SENT == false;
+  assert A_HELD_ROW_IS_COUNTED == false;
+  assert A_HELD_ROW_IS_MARKED == false;
+  assert A_HELD_ROW_IS_DELETED == false;
+  assert A_HELD_ROW_IS_HANDED_OUT_BY_THE_SCAN == false;
+  assert A_HELD_ROW_IS_RETRIED == false;
+  assert A_HELD_ROW_EVER_LEAVES_PENDING == false;
+  assert THE_HELD_KINDS_ADD_A_MIGRATION == false;
+  assert PRODUCTION_WAS_READ_FOR_HELD_ROWS == false;
+  assert kind_is_delivered(true) == true;
+  assert kind_is_delivered(false) == false;
+  assert row_is_held(false, false) == true;
+  assert row_is_held(false, true) == false;
+  assert row_is_held(true, false) == false;
+  assert row_state(false) == STATE_PENDING;
+  assert scan_hands_out_row(false, 0, ATTEMPTS_FILTER_CEILING, false, true) == true;
+  assert scan_hands_out_row(false, 0, ATTEMPTS_FILTER_CEILING, false, false) == false;
+  assert scan_hands_out_row(false, 3, ATTEMPTS_FILTER_CEILING, false, true) == false;
+  assert scan_hands_out_row(true, 0, ATTEMPTS_FILTER_CEILING, false, true) == false;
+  assert held_row_is_sent(true, true) == false;
+  assert held_row_is_sent(true, false) == false;
+  assert held_row_is_sent(false, true) == false;
+  assert held_row_is_sent(false, false) == true;
+}
+
+test the_batch_caps_the_tick_and_leaves_the_rest {
+  assert rows_this_tick(0) == 0;
+  assert rows_this_tick(50) == 50;
+  assert rows_this_tick(51) == 50;
+  assert tick_is_capped(50) == false;
+  assert tick_is_capped(51) == true;
+  assert backlog_after_tick(51) == 1;
+  assert backlog_after_tick(50) == 0;
+  assert FIRST_TICK_IS_DISCARDED == true;
+}
+
+test the_scheduled_at_column_does_not_schedule {
+  assert SCHEDULED_AT_COLUMN_EXISTS == true;
+  assert SCHEDULED_AT_IS_A_DUE_TIME_FILTER == false;
+  assert DRAIN_FILTER_COUNT == 3;
+  assert DRAIN_FILTER_COUNT_BEFORE_2026_09_26 == 2;
+  assert drain_waits_for_the_scheduled_time(false, true) == false;
+  assert drain_waits_for_the_scheduled_time(true, true) == true;
+  assert drain_waits_for_the_scheduled_time(true, false) == false;
+  assert drain_admits_row(false, 0, ATTEMPTS_FILTER_CEILING, true) == true;
+  assert drain_admits_row(false, 0, ATTEMPTS_FILTER_CEILING, false) == true;
+  assert drain_admits_row(true, 0, ATTEMPTS_FILTER_CEILING, false) == false;
+  assert drain_admits_row(false, 3, ATTEMPTS_FILTER_CEILING, false) == false;
+}
+
+test three_sends_are_allowed_and_the_third_failure_ends_the_row {
+  assert attempts_after_failure(0) == 1;
+  assert attempts_after_failure(1) == 2;
+  assert attempts_after_failure(2) == 3;
+  assert failure_abandons_the_row(0) == false;
+  assert failure_abandons_the_row(1) == false;
+  assert failure_abandons_the_row(2) == true;
+  assert failure_is_retried(0) == true;
+  assert failure_is_retried(2) == false;
+  assert SEND_ATTEMPTS_PER_ROW == MAX_ATTEMPTS;
+}
+
+; The half that did not exist before 2026-09-21: the giveup is reached from a pass that SENT, not
+; only from a pass that failed, and the counter gets there on every path.
+test the_giveup_is_reached_from_both_ways_a_pass_can_end {
+  assert THE_ATTEMPT_IS_COUNTED_BEFORE_THE_SEND == true;
+  assert COUNTER_WRITE_SITES_PER_PASS == 1;
+  assert attempts_after_pass(0) == 1;
+  assert attempts_after_pass(1) == 2;
+  assert attempts_after_pass(2) == 3;
+  assert pass_abandons_the_row(2, false) == true;
+  assert pass_abandons_the_row(2, true) == false;
+  assert pass_abandons_the_row(1, false) == false;
+  assert pass_abandons_the_row(0, false) == false;
+  assert counter_moves_when_the_mark_fails(true, false) == true;
+  assert counter_moves_when_the_mark_fails(true, true) == true;
+  assert counter_moves_when_the_mark_fails(false, false) == true;
+  assert BOUND_IS_REACHABLE_ON_EVERY_PATH == true;
+}
+
+test the_attempts_filter_now_guards_a_value_the_code_does_write {
+  assert ATTEMPTS_AT_INSERT == 0;
+  assert HIGHEST_ATTEMPTS_VALUE_THE_CODE_CAN_WRITE == 3;
+  assert SUPERSEDED_HIGHEST_ATTEMPTS_VALUE == 2;
+  assert ATTEMPTS_FILTER_CEILING == 3;
+  assert ATTEMPTS_FILTER_CEILING == MAX_ATTEMPTS;
+  assert attempts_filter_excludes(3) == true;
+  assert attempts_value_is_writable(3) == true;
+  assert the_attempts_filter_is_reachable(0) == false;
+  assert the_attempts_filter_is_reachable(1) == false;
+  assert the_attempts_filter_is_reachable(2) == false;
+  assert the_attempts_filter_is_reachable(3) == true;
+  assert THE_ATTEMPTS_FILTER_CAN_EXCLUDE_A_ROW == true;
+  assert attempts_ceiling_is_reached(true) == true;
+  assert ATTEMPTS_CEILING_IS_REACHED_BY_ONE_DRAINER == true;
+  assert SUPERSEDED_CEILING_NEEDED_A_SECOND_DRAINER == true;
+  assert THE_FILTER_AND_THE_GIVEUP_READ_ONE_DECLARATION == true;
+  assert BUDGET_DECLARATION_SITE == "src/notification_queue.rs:21";
+}
+
+test the_retry_horizon_is_sixty_seconds_because_nothing_backs_off {
+  assert BACKOFF_EXISTS == false;
+  assert JITTER_EXISTS == false;
+  assert SCHEDULED_AT_UPDATE_SITES == 0;
+  assert RETRY_INTERVAL_SECONDS == POLL_INTERVAL_SECONDS;
+  assert retry_horizon_seconds(POLL_INTERVAL_SECONDS, 3) == RETRY_HORIZON_SECONDS;
+  assert retry_horizon_seconds(30, 3) == 60;
+  assert message_survives_outage(59) == true;
+  assert message_survives_outage(60) == false;
+  assert message_survives_outage(600) == false;
+}
+
+test a_block_and_a_timeout_are_the_same_event_here {
+  assert SEND_FAILURE_CLASS_COUNT == 1;
+  assert PERMANENT_AND_TRANSIENT_ARE_TOLD_APART == false;
+  assert failure_handling_depends_on_the_cause(true, SEND_FAILURE_CLASS_COUNT) == false;
+  assert failure_handling_depends_on_the_cause(false, SEND_FAILURE_CLASS_COUNT) == false;
+  assert failure_handling_depends_on_the_cause(true, 2) == true;
+  assert failure_handling_depends_on_the_cause(false, 2) == false;
+}
+
+test the_transport_contributes_nothing_to_dedupe {
+  assert QUEUE_HAS_A_DEDUPE_KEY == false;
+  assert TRANSPORT_GUARD_PRESENT == false;
+  assert QUEUE_UNIQUE_CONSTRAINT_COUNT == 1;
+  assert THE_UNIQUE_CONSTRAINT_IS_A_RANDOM_UUID == true;
+  assert duplicate_enqueue_is_stopped(true) == true;
+  assert duplicate_enqueue_is_stopped(false) == false;
+  assert a_new_producer_inherits_a_guard(false) == false;
+  assert PRODUCERS_WITH_THEIR_OWN_GUARD == PRODUCER_COUNT;
+  assert GUARD_SHAPE_COUNT == PRODUCER_COUNT;
+  assert PRODUCER_COUNT == 1;
+  assert PRODUCER_COUNT_BEFORE_2026_09_26_R3 - PRODUCER_COUNT == HELD_KIND_COUNT_SINCE_R3;
+}
+
+test a_delivered_message_can_be_delivered_again_without_a_duplicate_row {
+  assert THE_SEND_IS_IDEMPOTENT == false;
+  assert A_FAILED_MARK_ADVANCES_ATTEMPTS == true;
+  assert attempts_after_successful_send(0) == 1;
+  assert attempts_after_successful_send(2) == 3;
+  assert attempts_after_successful_send(0) == attempts_after_pass(0);
+  assert row_stays_pending_after_send(true, false) == true;
+  assert row_stays_pending_after_send(true, true) == false;
+  assert row_stays_pending_after_send(false, false) == false;
+  assert customer_is_messaged_twice(true, false, true) == true;
+  assert customer_is_messaged_twice(true, true, true) == false;
+  assert customer_is_messaged_twice(true, false, false) == false;
+}
+
+test the_resend_loop_is_bounded_by_the_attempt_counter_and_not_by_the_write {
+  assert RESENDS_AFTER_A_FAILED_MARK_ARE_BOUNDED == true;
+  assert SUPERSEDED_RESENDS_WERE_UNBOUNDED == true;
+  assert THE_ONLY_BARRIER_IS_THE_WRITE_THAT_FAILED == false;
+  assert resend_count_is_bounded(true) == true;
+  assert resend_count_is_bounded(false) == true;
+  assert sends_to_one_customer_for_one_row(true) == 1;
+  assert sends_to_one_customer_for_one_row(false) == MAX_SENDS_TO_ONE_CUSTOMER_FOR_ONE_ROW;
+  assert MAX_SENDS_TO_ONE_CUSTOMER_FOR_ONE_ROW == SEND_ATTEMPTS_PER_ROW;
+  assert A_RESEND_AFTER_A_FAILED_MARK_IS_COUNTED == true;
+  assert A_RESEND_AFTER_A_FAILED_MARK_HAS_A_METRIC == false;
+  assert A_RESEND_AFTER_A_FAILED_MARK_IS_LOGGED == true;
+}
+
+test the_scan_orders_but_does_not_totally_order {
+  assert ORDER_KEY == "scheduled_at";
+  assert ORDER_KEY_COUNT == 1;
+  assert TIEBREAKER_COUNT == 0;
+  assert order_is_total(TIEBREAKER_COUNT) == false;
+  assert order_is_total(1) == true;
+  assert ORDER_IS_OLDEST_FIRST == true;
+  assert A_FAILED_ROW_KEEPS_ITS_PLACE == true;
+  assert PER_RECIPIENT_ORDERING_EXISTS == false;
+}
+
+test ordering_holds_only_while_one_drainer_exists {
+  assert ROW_CLAIM_EXISTS == false;
+  assert SKIP_LOCKED_SITES_IN_THE_STORE == 0;
+  assert DRAINER_SPAWN_SITES == 1;
+  assert SENDS_WITHIN_A_BATCH_ARE_SEQUENTIAL == true;
+  assert fifo_holds(true, true) == true;
+  assert fifo_holds(false, true) == false;
+  assert fifo_holds(true, false) == false;
+  assert two_drainers_see_the_same_rows(false, 2) == true;
+  assert two_drainers_see_the_same_rows(true, 2) == false;
+  assert two_drainers_see_the_same_rows(false, 1) == false;
+  assert ordering_survives_a_second_process(false, 2) == false;
+  assert ordering_survives_a_second_process(false, 1) == true;
+}
+
+test a_zero_chat_id_leaves_the_queue_looking_delivered {
+  assert ZERO_CHAT_ID_IS_SKIPPED == true;
+  assert ZERO_CHAT_ID_SKIP_IS_LOGGED == false;
+  assert ZERO_CHAT_ID_SKIP_INCREMENTS_A_COUNTER == false;
+  assert ZERO_CHAT_ID_SKIP_COUNTS_AN_ATTEMPT == true;
+  assert A_FAILED_SKIP_WRITE_IS_LOGGED == true;
+  assert send_is_attempted(false, true) == false;
+  assert send_is_attempted(true, true) == true;
+  assert send_is_attempted(true, false) == false;
+  assert outcome_increments_a_counter(OUTCOME_SKIPPED_NO_CHAT) == false;
+}
+
+test a_failed_language_read_degrades_instead_of_deferring {
+  assert LOCALE_IS_READ_PER_ROW == true;
+  assert LOCALE_READ_FAILURE_IS_DISTINGUISHABLE == false;
+  assert A_LOCALE_READ_FAILURE_DEFERS_THE_ROW == false;
+  assert DRAIN_HOLDS_ITS_OWN_FALLBACK_LITERAL == true;
+  assert locale_is_resolved(true) == true;
+  assert locale_is_resolved(false) == false;
+  assert drain_sends_in_the_fallback(false, false) == true;
+  assert drain_sends_in_the_fallback(true, true) == true;
+  assert drain_sends_in_the_fallback(true, false) == false;
+}
+
+test one_button_serves_every_rendering_path {
+  assert BUTTON_COUNT_PER_MESSAGE == 1;
+  assert BUTTON_TARGET_COUNT == 1;
+  assert BUTTON_IS_BUILT_OUTSIDE_THE_KIND_MATCH == true;
+  assert RENDERING_PATH_COUNT == 1;
+  assert RENDERING_PATH_COUNT_BEFORE_2026_09_26_R3 == 3;
+  assert SUPERSEDED_RENDERING_PATH_COUNT == 5;
+  assert button_can_differ_by_path(SUPERSEDED_RENDERING_PATH_COUNT, BUTTON_TARGET_COUNT) == false;
+  assert button_can_differ_by_path(RENDERING_PATH_COUNT_BEFORE_2026_09_26_R3, BUTTON_TARGET_COUNT) == false;
+  // since R3 one path renders, and one target serves it; nothing can differ across one path
+  assert button_can_differ_by_path(RENDERING_PATH_COUNT, BUTTON_TARGET_COUNT) == true;
+  assert button_can_differ_by_path(1, 1) == true;
+  assert BUTTON_TARGET_HAS_A_LIVE_TEST == true;
+}
+
+test a_drain_failure_is_a_log_line_and_nothing_reads_it {
+  assert COUNTERS_ON_THIS_PATH == 2;
+  assert COUNTER_ON_ENQUEUE == true;
+  assert COUNTER_ON_DELIVERY == true;
+  assert COUNTER_ON_SEND_FAILURE == false;
+  assert COUNTER_ON_ABANDON == false;
+  assert COUNTER_ON_BATCH_FAILURE == false;
+  assert COUNTER_ON_QUEUE_DEPTH == false;
+  assert MONITORING_ARTIFACTS_SEARCHED == 4;
+  assert MONITORING_ARTIFACTS_NAMING_EITHER_COUNTER == 0;
+  assert A_DRAIN_FAILURE_IS_A_LOG_LINE == true;
+  assert drain_failure_is_observable(COUNTER_ON_BATCH_FAILURE, false) == false;
+  assert drain_failure_is_observable(true, false) == false;
+  assert drain_failure_is_observable(true, true) == true;
+}
+
+test a_silent_tick_and_a_total_outage_look_alike {
+  assert EMPTY_TICK_IS_SILENT == true;
+  assert EMPTY_TICK_SILENCE_IS_ANNOTATED == true;
+  assert outage_is_distinguishable_from_quiet(0, false) == false;
+  assert outage_is_distinguishable_from_quiet(0, true) == true;
+  assert outage_is_distinguishable_from_quiet(1, false) == true;
+}
+
+test the_loss_figure_is_an_upper_bound_and_not_a_loss {
+  assert loss_is_measured(COUNTER_ON_ABANDON) == false;
+  assert loss_is_measured(true) == true;
+  assert queued_minus_delivered(10, 4) == 6;
+  assert queued_minus_delivered(4, 4) == 0;
+  assert that_difference_is_a_loss(false, false, false) == false;
+  assert that_difference_is_a_loss(true, false, true) == false;
+  assert that_difference_is_a_loss(true, true, true) == true;
+}
+
+test the_queue_carries_one_outbound_send_site_of_fifty_three {
+  assert OUTBOUND_SEND_SITES_IN_SRC == 53;
+  assert FILES_WITH_AN_OUTBOUND_SEND == 12;
+  assert SEND_SITES_BEHIND_THIS_QUEUE == 1;
+  assert unqueued_send_sites(OUTBOUND_SEND_SITES_IN_SRC, SEND_SITES_BEHIND_THIS_QUEUE) == 52;
+  assert send_is_persisted(true) == true;
+  assert send_is_persisted(false) == false;
+  assert a_failed_send_can_be_retried(false) == false;
+  assert a_failed_send_can_be_retried(true) == true;
+  assert QUEUED_KINDS_ARE_ALL_REFERRAL_LIFECYCLE == true;
+}
+
+test every_reuse_edge_names_an_owner_and_restates_nothing {
+  assert REUSES_PROMO_BROADCAST_ID == "turbobaby/promo-broadcast";
+  assert REUSES_REFERRAL_PROGRAM_ID == "turbobaby/referral-program";
+  assert REUSES_LOCALE_POLICY_ID == "turbobaby/locale-policy";
+  assert REUSES_BOT_SURFACE_ID == "turbobaby/bot-surface";
+  assert REUSES_OBSERVABILITY_ID == "turbobaby/observability";
+  assert REUSES_DEEPLINK_ID == "turbobaby/deeplink";
+  assert REUSES_RUNTIME_CONFIG_ID == "turbobaby/runtime-config";
+  assert REUSES_LEGACY_RETIREMENT_ID == "turbobaby/legacy-retirement";
+  assert REUSE_EDGE_COUNT == 8;
+  assert ID == "turbobaby/notification-queue";
+  assert KIND == "transport-contract";
+}
+
+test what_is_missing_is_named_rather_than_guessed {
+  assert BACKOFF_IS_NOT_SHIPPED == true;
+  ; Until 2026-09-21 the missing thing here was a bound on an uncountable row and the shipped
+  ; answer was a refusal to send it. The refusal is gone and the bound is real; what is still
+  ; missing is a PERSISTED one, so the two halves that survive the fix are what this asserts.
+  assert SUPERSEDED_UNCOUNTABLE_ATTEMPT_WAS_REFUSED == true;
+  assert UNCOUNTABLE_SCAN_IS_BOUNDED == false;
+  assert IN_MEMORY_BOUND_SURVIVES_A_RESTART == false;
+  assert PER_RECIPIENT_RATE_LIMIT_IS_NOT_SHIPPED == true;
+  assert QUEUE_DEPTH_IS_NOT_PUBLISHED == true;
+  assert DEAD_LETTER_STORE_IS_NOT_SHIPPED == true;
+  assert DELIVERY_RECEIPT_IS_NOT_SHIPPED == true;
+  assert PACING_SLEEPS_IN_THE_DRAIN == 0;
+  assert FUTURE_SCHEDULED_AT_WRITE_SITES == 0;
+  assert A_FUTURE_ROW_IS_SENT_ON_THE_NEXT_TICK == true;
+}
+
+; The finding of 2026-09-21, stated as the two properties that have to hold together. A send is
+; attempted at most a bounded number of times, AND a counter that cannot be written does not stop
+; delivery. The first cut of the resend fix had the first and broke the second.
+test a_counter_the_database_refuses_bounds_the_send_without_cancelling_it {
+  assert AN_UNCOUNTABLE_ATTEMPT_IS_REFUSED_NOT_BOUNDED == false;
+  assert SUPERSEDED_UNCOUNTABLE_ATTEMPT_WAS_REFUSED == true;
+  assert AN_UNCOUNTABLE_ATTEMPT_IS_HELD_IN_MEMORY == true;
+  assert ATTEMPTS_ARE_READ_FROM_TWO_PLACES == 2;
+  ; The first pass on a row nobody can count still goes out, and so do the second and the third.
+  assert pass_sends(0, false) == true;
+  assert pass_sends(1, false) == true;
+  assert pass_sends(2, false) == true;
+  ; The fourth does not: one bound over both halves of the count.
+  assert pass_sends(3, false) == false;
+  assert attempts_spent(0, 0) == 0;
+  assert attempts_spent(0, 3) == MAX_ATTEMPTS;
+  assert attempts_spent(1, 2) == MAX_ATTEMPTS;
+  assert attempts_spent(3, 0) == MAX_ATTEMPTS;
+  ; A row with no chat is not sent whatever the counter did, which is the one early exit left.
+  assert pass_sends(0, true) == false;
+  ; And what is still open, said here rather than implied.
+  assert UNCOUNTABLE_SEND_IS_BOUNDED == true;
+  assert UNCOUNTABLE_SCAN_IS_BOUNDED == false;
+  assert IN_MEMORY_BOUND_SURVIVES_A_RESTART == false;
+  assert UNCOUNTABLE_BOUND_LANDED_AT == RESEND_BOUND_LANDED_AT;
+}
+
+; --- Invariants ---------------------------------------------------------------------------------------------
+
+invariant the_row_never_says_which_of_the_three_outcomes_ended_it
+  assert THE_ROW_RECORDS_WHICH_OUTCOME == false and outcome_is_legible_afterwards(OUTCOME_ABANDONED, true) == false
+
+invariant an_abandonment_is_written_with_a_deliverys_column
+  assert A_GIVEUP_IS_WRITTEN_AS_A_DELIVERY == true and TERMINAL_OUTCOMES_SHARE_ONE_COLUMN == true and outcome_increments_a_counter(OUTCOME_ABANDONED) == false
+
+invariant the_third_failure_ends_the_row_and_the_second_does_not
+  assert failure_abandons_the_row(2) == true and failure_abandons_the_row(1) == false and attempts_after_failure(2) == 3
+
+; The property the loop did not have until 2026-09-21, stated where it cannot be edited away in
+; silence: no pair of write outcomes leaves the counter where it was, so the giveup is reachable
+; from all of them.
+invariant every_pass_spends_an_attempt_whatever_its_two_writes_did
+  assert counter_moves_when_the_mark_fails(true, false) == true and attempts_after_pass(2) == MAX_ATTEMPTS and pass_abandons_the_row(2, false) == true and BOUND_IS_REACHABLE_ON_EVERY_PATH == true
+
+; No single failed write decides whether a customer hears from us, in either direction: a refused
+; counter cannot cancel the delivery, and it cannot buy an extra one either.
+invariant no_single_failed_write_cancels_a_delivery_or_buys_an_extra_one
+  assert pass_sends(0, false) == true and pass_sends(3, false) == false and attempts_spent(1, 2) == MAX_ATTEMPTS and AN_UNCOUNTABLE_ATTEMPT_IS_REFUSED_NOT_BOUNDED == false
+
+invariant a_writable_value_now_reaches_the_attempts_filter
+  assert the_attempts_filter_is_reachable(2) == false and the_attempts_filter_is_reachable(3) == true and THE_ATTEMPTS_FILTER_CAN_EXCLUDE_A_ROW == true
+
+invariant the_attempts_ceiling_is_reached_by_the_one_drainer_that_exists
+  assert attempts_ceiling_is_reached(true) == true and DRAINER_SPAWN_SITES == 1 and ROW_CLAIM_EXISTS == false
+
+invariant the_poll_interval_is_a_marked_copy_with_one_arbiter
+  assert INTERVAL_SOURCE_LINE == "src/notification_queue.rs:19" and RETRY_INTERVAL_SECONDS == POLL_INTERVAL_SECONDS
+
+invariant the_retry_budget_is_spent_in_two_poll_intervals
+  assert retry_horizon_seconds(POLL_INTERVAL_SECONDS, 3) == 60 and BACKOFF_EXISTS == false and SCHEDULED_AT_UPDATE_SITES == 0
+
+invariant an_outage_of_one_minute_loses_the_message
+  assert message_survives_outage(60) == false and message_survives_outage(59) == true
+
+invariant the_queue_stops_no_duplicate_by_itself
+  assert duplicate_enqueue_is_stopped(false) == false and QUEUE_HAS_A_DEDUPE_KEY == false and TRANSPORT_GUARD_PRESENT == false
+
+invariant a_send_that_succeeds_and_a_mark_that_fails_sends_again
+  assert customer_is_messaged_twice(true, false, true) == true and attempts_after_successful_send(1) == 2
+
+invariant that_resend_is_bounded_by_the_counter_and_not_by_the_write
+  assert resend_count_is_bounded(false) == true and RESENDS_AFTER_A_FAILED_MARK_ARE_BOUNDED == true and sends_to_one_customer_for_one_row(false) == SEND_ATTEMPTS_PER_ROW
+
+invariant a_single_sort_key_is_not_a_total_order
+  assert order_is_total(TIEBREAKER_COUNT) == false and ORDER_KEY_COUNT == 1
+
+invariant fifo_is_a_property_of_having_one_drainer_not_of_the_table
+  assert fifo_holds(false, true) == false and two_drainers_see_the_same_rows(ROW_CLAIM_EXISTS, 2) == true
+
+invariant the_column_named_scheduled_at_never_delays_a_row
+  assert drain_waits_for_the_scheduled_time(SCHEDULED_AT_IS_A_DUE_TIME_FILTER, true) == false and drain_admits_row(false, 0, ATTEMPTS_FILTER_CEILING, true) == true
+
+invariant a_row_with_no_chat_leaves_without_a_trace
+  assert send_is_attempted(false, true) == false and ZERO_CHAT_ID_SKIP_INCREMENTS_A_COUNTER == false and ZERO_CHAT_ID_SKIP_IS_LOGGED == false
+
+invariant a_language_read_that_fails_still_sends
+  assert drain_sends_in_the_fallback(true, true) == true and A_LOCALE_READ_FAILURE_DEFERS_THE_ROW == false
+
+invariant one_target_cannot_differ_across_the_rendering_paths
+  assert button_can_differ_by_path(RENDERING_PATH_COUNT_BEFORE_2026_09_26_R3, BUTTON_TARGET_COUNT) == false and BUTTON_TARGET_COUNT == RENDERING_PATH_COUNT
+
+invariant a_batch_failure_reaches_no_counter_and_no_artifact
+  assert drain_failure_is_observable(COUNTER_ON_BATCH_FAILURE, false) == false and A_DRAIN_FAILURE_IS_A_METRIC == false and MONITORING_ARTIFACTS_NAMING_EITHER_COUNTER == 0
+
+invariant a_quiet_tick_is_indistinguishable_from_a_total_outage
+  assert outage_is_distinguishable_from_quiet(0, COUNTER_ON_SEND_FAILURE) == false
+
+invariant the_difference_of_two_counters_is_not_a_loss_figure
+  assert that_difference_is_a_loss(COUNTER_ON_ABANDON, false, false) == false and loss_is_measured(COUNTER_ON_ABANDON) == false
+
+invariant fifty_two_outbound_sends_are_not_persisted_at_all
+  assert unqueued_send_sites(OUTBOUND_SEND_SITES_IN_SRC, SEND_SITES_BEHIND_THIS_QUEUE) == 52 and a_failed_send_can_be_retried(false) == false
+
+invariant a_tick_never_exceeds_the_batch
+  assert rows_this_tick(51) == BATCH_SIZE and rows_this_tick(50) == BATCH_SIZE and tick_is_capped(50) == false
+
+invariant this_file_owns_no_kind_its_producers_do_not
+  assert unwritten_readable_kinds(RENDERABLE_KIND_COUNT, WRITTEN_KIND_COUNT) == 0 and UNKNOWN_KIND_IS_REFUSED == true
+
+; The decision of 2026-09-26, stated where it cannot be edited away in silence: a row of a kind no
+; producer writes is kept from the customer by either lock alone, and nothing is written to it.
+invariant a_held_row_is_never_sent_and_never_written
+  assert row_is_held(false, false) == true and scan_hands_out_row(false, 0, ATTEMPTS_FILTER_CEILING, false, false) == false and held_row_is_sent(true, false) == false and held_row_is_sent(false, true) == false and A_HELD_ROW_IS_MARKED == false and A_HELD_ROW_IS_COUNTED == false and A_HELD_ROW_IS_DELETED == false
+
+invariant the_stopped_bonus_announcements_are_held_and_not_deleted
+  assert HELD_KIND_COUNT_SINCE_R3 == 2 and A_HELD_ROW_IS_DELETED == false and A_HELD_ROW_IS_SENT == false and WRITTEN_KIND_COUNT == 1

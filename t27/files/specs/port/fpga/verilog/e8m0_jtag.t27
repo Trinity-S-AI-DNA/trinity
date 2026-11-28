@@ -1,0 +1,342 @@
+// SPDX-License-Identifier: Apache-2.0
+// t27/specs/port/fpga/verilog/e8m0_jtag.t27
+// E8M0 JTAG Test Module Specification
+// Ports the original Verilog module to T27 for generation via t27c gen-verilog
+// Tests E8M0 floating point implementation with known-answer sweep over JTAG
+// Based on gHashTag/t27 fpga/verilog/e8m0_jtag.v
+
+module e8m0_jtag {
+
+    // === Module parameter ===
+
+    pub const JTAG_CHAIN_N : u32 = 3;
+
+    // === Clock and reset configuration ===
+
+    pub struct StartupConfig {
+        prog_usr : &str,
+        sim_cclk_freq : f64,
+    }
+
+    pub struct ResetCounter {
+        count : u32,
+        max_count : u32,
+    }
+
+    fn startup_config() -> StartupConfig {
+        return StartupConfig{
+            .prog_usr = "FALSE",
+            .sim_cclk_freq = 10.0,
+        };
+    }
+
+    fn reset_counter() -> ResetCounter {
+        return ResetCounter{
+            .count = 0,
+            .max_count = 15,  // 4'hF in hex
+        };
+    }
+
+    fn reset_ready(counter: ResetCounter) -> bool {
+        return counter.count == counter.max_count;
+    }
+
+    fn increment_reset_counter(counter: ResetCounter) -> ResetCounter {
+        if (counter.count < counter.max_count) {
+            return ResetCounter{
+                .count = counter.count + 1,
+                .max_count = counter.max_count,
+            };
+        }
+        return counter;
+    }
+
+    // === Test probe configuration ===
+
+    pub struct ProbeInput {
+        index : u32,
+        input_code : u32,
+        expected_output : u32,
+    }
+
+    pub struct ProbeState {
+        current_index : u32,
+        input : u32,
+        expected : u32,
+        swept : bool,
+        all_correct : bool,
+        final_sig : bool,
+    }
+
+    fn probe_input_from_index(index: u32) -> ProbeInput {
+        if (index == 0) {
+            return ProbeInput{ .index = 0, .input_code = 0, .expected_output = 0 };
+        } else if (index == 1) {
+            return ProbeInput{ .index = 1, .input_code = 1, .expected_output = 1 };
+        } else if (index == 2) {
+            return ProbeInput{ .index = 2, .input_code = 126, .expected_output = 126 };
+        } else if (index == 3) {
+            return ProbeInput{ .index = 3, .input_code = 127, .expected_output = 127 };
+        } else if (index == 4) {
+            return ProbeInput{ .index = 4, .input_code = 128, .expected_output = 128 };
+        } else if (index == 5) {
+            return ProbeInput{ .index = 5, .input_code = 254, .expected_output = 254 };
+        } else if (index == 6) {
+            return ProbeInput{ .index = 6, .input_code = 255, .expected_output = 255 };
+        } else if (index == 7) {
+            return ProbeInput{ .index = 7, .input_code = 256, .expected_output = 255 };  // out of range -> NaN
+        } else {
+            return ProbeInput{ .index = 0, .input_code = 0, .expected_output = 0 };
+        }
+    }
+
+    fn initial_probe_state() -> ProbeState {
+        return ProbeState{
+            .current_index = 0,
+            .input = 0,
+            .expected = 0,
+            .swept = false,
+            .all_correct = true,
+            .final_sig = false,
+        };
+    }
+
+    fn update_probe_state(state: ProbeState, actual_output: u32, reset_ready: bool) -> ProbeState {
+        var new_state = state;
+        
+        if (!state.swept && reset_ready) {
+            var current_probe = probe_input_from_index(state.current_index);
+            new_state.input = current_probe.input_code;
+            new_state.expected = current_probe.expected_output;
+            
+            // Check if current probe result is correct
+            if (actual_output != current_probe.expected_output) {
+                new_state.all_correct = false;
+            }
+            
+            // Check if we've completed all probes
+            if (state.current_index == 7) {
+                new_state.swept = true;
+                new_state.final_sig = state.all_correct && (actual_output == current_probe.expected_output);
+            }
+            
+            // Move to next probe
+            if (state.current_index < 7) {
+                new_state.current_index = state.current_index + 1;
+            }
+        }
+        
+        return new_state;
+    }
+
+    // === Beat counter ===
+
+    pub struct BeatCounter {
+        count : u32,
+        max_count : u32,
+        beat_value : bool,
+    }
+
+    fn initial_beat_counter() -> BeatCounter {
+        return BeatCounter{
+            .count = 0,
+            .max_count = 16777216,  // 24'hFFFFFF in hex
+            .beat_value = false,
+        };
+    }
+
+    fn update_beat_counter(counter: BeatCounter) -> BeatCounter {
+        var new_count = counter.count + 1;
+        var new_beat = counter.beat_value;
+        
+        if (new_count == counter.max_count) {
+            new_count = 0;
+            new_beat = !counter.beat_value;
+        }
+        
+        return BeatCounter{
+            .count = new_count,
+            .max_count = counter.max_count,
+            .beat_value = new_beat,
+        };
+    }
+
+    fn get_beat_value(counter: BeatCounter) -> bool {
+        return counter.beat_value;
+    }
+
+    // === JTAG shift register ===
+
+    pub struct JtagShiftRegister {
+        data : u32,
+        mask : u32,
+    }
+
+    fn initial_shift_register() -> JtagShiftRegister {
+        return JtagShiftRegister{
+            .data = 0xA5A531BC,  // Initial value from original
+            .mask = 0xFFFFFFFF,
+        };
+    }
+
+    fn capture_to_shift_register(reg: JtagShiftRegister, acc: bool, swept: bool, beat: bool, ok: bool) -> JtagShiftRegister {
+        var data : u32 = 0;
+        // Each flag as a typed u32 bit first: an inline `if acc { 1 } else { 0 } << 5`
+        // lowers as `if (acc) 1 else (0 << 5)`, which puts the bit in the wrong place.
+        var acc_bit : u32 = 0;
+        var swept_bit : u32 = 0;
+        var beat_bit : u32 = 0;
+        var ok_bit : u32 = 0;
+        if (acc) { acc_bit = 1; }
+        if (swept) { swept_bit = 1; }
+        if (beat) { beat_bit = 1; }
+        if (ok) { ok_bit = 1; }
+        
+        // Construct the capture data according to original logic:
+        // {16'hA5A5, 4'd3, 6'd6, acc, swept, 1'b1, 1'b1, beat, ok}
+        data = (0xA5A5 << 16) |  // 16'hA5A5
+               (3 << 12) |       // 4'd3
+               (6 << 6) |        // 6'd6
+               (acc_bit << 5) |  // acc bit
+               (swept_bit << 4) |  // swept bit
+               (1 << 3) |        // padding bit 1
+               (1 << 2) |        // padding bit 2
+               (beat_bit << 1) |  // beat bit
+               ok_bit;           // ok bit
+        
+        return JtagShiftRegister{
+            .data = data,
+            .mask = reg.mask,
+        };
+    }
+
+    fn shift_shift_register(reg: JtagShiftRegister, tdi: bool) -> JtagShiftRegister {
+        var shifted_data : u32 = 0;
+        
+        // The original shifts right with TDI entering at bit 31:
+        // `sr <= {tdi, sr[31:1]}` (fpga/verilog/e8m0_jtag.v), so bit 0 leaves on TDO.
+        if (tdi) {
+            shifted_data = (1 << 31) | (reg.data >> 1);
+        } else {
+            shifted_data = reg.data >> 1;
+        }
+        
+        return JtagShiftRegister{
+            .data = shifted_data,
+            .mask = reg.mask,
+        };
+    }
+
+    fn get_tdo_value(reg: JtagShiftRegister) -> bool {
+        return (reg.data & 1) != 0;
+    }
+
+    // === Test functions ===
+
+    test reset_counter_logic
+        given counter = reset_counter()
+        then reset_ready(counter) == false
+
+    test reset_counter_increment
+        given counter = reset_counter()
+        then increment_reset_counter(counter).count == 1
+
+    test reset_counter_ready
+        given counter = ResetCounter { count: 15, max_count: 15 }
+        then reset_ready(counter) == true
+
+    test probe_generation
+        given probe = probe_input_from_index(0)
+        then probe.input_code == 0
+        and probe.expected_output == 0
+
+    test probe_generation_middle
+        given probe = probe_input_from_index(3)
+        then probe.input_code == 127
+        and probe.expected_output == 127
+
+    test probe_generation_out_of_range
+        given probe = probe_input_from_index(7)
+        then probe.input_code == 256
+        and probe.expected_output == 255  // NaN code
+
+    test probe_state_update_correct
+        given state = initial_probe_state()
+        then update_probe_state(state, 0, true).input == 0
+        and update_probe_state(state, 0, true).expected == 0
+
+    test probe_state_update_incorrect
+        given state = initial_probe_state()
+        then update_probe_state(state, 1, true).all_correct == false
+
+    test probe_state_update_sweep_complete
+        given state = ProbeState { current_index: 7, input: 256, expected: 255, swept: false, all_correct: true, final_sig: false }
+        then update_probe_state(state, 255, true).swept == true
+        and update_probe_state(state, 255, true).final_sig == true
+
+    test beat_counter_initial
+        given counter = initial_beat_counter()
+        then counter.count == 0
+        and counter.beat_value == false
+
+    test beat_counter_update
+        given counter = initial_beat_counter()
+        then update_beat_counter(counter).count == 1
+        and get_beat_value(update_beat_counter(counter)) == false
+
+    test beat_counter_toggle
+        given counter = BeatCounter { count: 16777215, max_count: 16777216, beat_value: false }
+        then get_beat_value(update_beat_counter(counter)) == true
+
+    test shift_register_initial
+        given reg = initial_shift_register()
+        then reg.data == 0xA5A531BC
+
+    test shift_register_capture
+        given reg = initial_shift_register()
+        then capture_to_shift_register(reg, true, true, false, true).data != 0
+
+    test shift_register_shift
+        given reg = initial_shift_register()
+        // Right shift, TDI = 1 enters at bit 31 (`sr <= {tdi, sr[31:1]}`).
+        then shift_shift_register(reg, true).data == (1 << 31) | (0xA5A531BC >> 1)
+
+    test shift_register_tdo
+        given reg = initial_shift_register()
+        // TDO is bit 0 (`assign tdo = sr[0]`). The low nibble 0xC is 0b1100,
+        // so bit 0 is 0 (the first draft said "LSB is 1 (0xC)").
+        then get_tdo_value(reg) == false
+
+    test jtag_chain_parameter
+        then JTAG_CHAIN_N == 3
+
+    test startup_config
+        given config = startup_config()
+        then config.prog_usr == "FALSE"
+        and config.sim_cclk_freq == 10.0
+
+    // === Invariants ===
+
+    invariant probe_index_valid
+        given p = probe_input_from_index(5)
+        assert p.index == 5
+
+    invariant probe_values_in_range
+        given p = probe_input_from_index(7)
+        assert p.input_code == 256
+        assert p.expected_output == 255
+
+    invariant beat_counter_bounds
+        given c = initial_beat_counter()
+        assert c.count <= c.max_count
+
+    invariant shift_register_32bit
+        given r = initial_shift_register()
+        assert r.data <= 0xFFFFFFFF
+
+    invariant reset_counter_bounds
+        given r = reset_counter()
+        assert r.count <= r.max_count
+}
+
+// phi^2 + 1/phi^2 = 3 | TRINITY

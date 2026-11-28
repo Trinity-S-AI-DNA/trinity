@@ -1,0 +1,177 @@
+// Link quality monitoring with EWMA-based prediction
+// Research: EWMA provides optimal balance between responsiveness and stability
+
+module LinkQualityMonitor {
+    // EWMA configuration constants
+    const ALPHA_Q8: u8 = 0x20;  // 0.125 in Q8 (1/8) - research-backed optimal
+    const ONE_MINUS_ALPHA_Q8: u8 = 0xE0;  // 0.875 in Q8
+    
+    // History configuration
+    const MAX_HISTORY: u8 = 8;
+    const MIN_HISTORY: u8 = 4;
+    
+    // Thresholds for quality assessment
+    const QUALITY_GOOD: u8 = 0x30;    // 3.0 in Q8
+    const QUALITY_POOR: u8 = 0x60;    // 6.0 in Q8
+    const TREND_THRESHOLD: u8 = 0x05;  // Small positive trend
+    
+    // Calculate EWMA (Exponentially Weighted Moving Average)
+    // Formula: est = α·sample + (1-α)·est
+    fn update_ewma(current: u8, sample: u8) -> u8 {
+        // Fixed-point Q8 calculation
+        // term1 = α * sample
+        let term1: u16 = ((ALPHA_Q8 as u16) * (sample as u16)) >> 8;
+        
+        // term2 = (1-α) * current  
+        let term2: u16 = ((ONE_MINUS_ALPHA_Q8 as u16) * (current as u16)) >> 8;
+        
+        let new_estimate: u16 = term1 + term2;
+        
+        // Cap at the u8 ceiling: the old body capped at 0x280, which cannot
+        // fit the u8 return (and the whole Rust-style body was silently
+        // DROPPED by the parser -- the fn was an unimplemented stub).
+        if (new_estimate > 0xFF) {
+            return 0xFF;
+        }
+        return new_estimate as u8;
+    }
+    
+    // Calculate trend based on historical data
+    fn calculate_trend(history: [u8; 8]) -> i8 {
+        // Compare recent average vs older average
+        let recent_avg: u8 = ((history[7] as u16 + history[6] as u16 + 
+                               history[5] as u16 + history[4] as u16) >> 2) as u8;
+        
+        let older_avg: u8 = ((history[3] as u16 + history[2] as u16 + 
+                              history[1] as u16 + history[0] as u16) >> 2) as u8;
+        
+        // Trend = recent - older (positive = worsening)
+        if (recent_avg > older_avg) {
+            return (recent_avg - older_avg) as i8;
+        }
+        return -((older_avg - recent_avg) as i8);
+    }
+    
+    // Predict next ETX value based on trend
+    fn predict_next_etx(current: u8, trend: i8) -> u8 {
+        let prediction: i16 = (current as i16) + (trend as i16);
+        
+        // Ensure reasonable bounds (1.0 to 10.0 in Q8 = 0x40 to 0x280)
+        // Caps must fit the u8 return: the old 0x280 ceiling did not.
+        if (prediction < 0x40) {
+            return 0x40; // Minimum ETX of 1.0
+        }
+        if (prediction > 0xFF) {
+            return 0xFF;
+        }
+        return prediction as u8;
+    }
+    
+    // Determine if link quality is degrading
+    fn is_degrading(current_etx: u8, trend: i8) -> bool {
+        // Degradation criteria: ETX is poor AND trend is positive (worsening)
+        return (current_etx > QUALITY_POOR) && (trend > TREND_THRESHOLD);
+    }
+    
+    // Calculate quality score (0-255, lower is better)
+    fn quality_score(etx: u8, latency_ms: u16) -> u8 {
+        // Combined metric: 70% ETX + 30% latency (normalized)
+        let etx_component: u16 = ((etx as u16) * 7) / 10;  // 70% weight
+        let latency_component: u16 = latency_ms / 100;     // 30% weight
+        
+        let combined: u16 = etx_component + latency_component;
+        
+        // Cap at 255
+        if (combined > 255) {
+            return 255;
+        }
+        return combined as u8;
+    }
+    
+    // Convert quality score to classification
+    fn classify_quality(score: u8) -> u8 {
+        if (score <= 50) {
+            return 0; // Excellent
+        }
+        if (score <= 100) {
+            return 1; // Good
+        }
+        if (score <= 150) {
+            return 2; // Fair
+        }
+        if (score <= 200) {
+            return 3; // Poor
+        }
+        return 4; // Very Poor
+    }
+
+    // ---- Tests (transcribed from the former testbench block: testbench
+    // blocks are not emitted into any executable backend, so these
+    // assertions had never actually run) ----
+
+    test ewma_calculation {
+        // Update from 2.0 to 3.0
+        let current: u8 = 0x40;  // 2.0 in Q8
+        let sample: u8 = 0x60;  // 3.0 in Q8
+        
+        let new_etx: u8 = update_ewma(current, sample);
+        
+        // Should be between current and sample (weighted average)
+        assert(new_etx > current, "new_etx > current");
+        assert(new_etx < sample, "new_etx < sample");
+    }
+    
+    test trend_detection {
+        // Improving quality (decreasing ETX)
+        let improving_history: [u8; 8] = [0x70, 0x68, 0x60, 0x58, 0x50, 0x48, 0x40, 0x38];
+        let trend: i8 = calculate_trend(improving_history);
+        assert(trend < 0, "trend < 0");  // Negative trend = improving
+        
+        // Worsening quality (increasing ETX)
+        let worsening_history: [u8; 8] = [0x40, 0x48, 0x50, 0x58, 0x60, 0x68, 0x70, 0x78];
+        let trend2: i8 = calculate_trend(worsening_history);
+        assert(trend2 > 0, "trend2 > 0");  // Positive trend = worsening
+    }
+    
+    test etx_prediction {
+        // Current ETX of 3.0, positive trend of 0.5
+        let current: u8 = 0x60;  // 3.0 in Q8
+        let trend: i8 = 0x08;   // +0.5 trend
+        
+        let predicted: u8 = predict_next_etx(current, trend);
+        
+        // Should predict slightly higher ETX
+        assert(predicted > current, "predicted > current");
+        assert(predicted < 0x70, "predicted < 0x70");  // Reasonable upper bound
+    }
+    
+    test degradation_detection {
+        // Poor ETX with worsening trend
+        assert(is_degrading(0x70, 0x10) == true, "is_degrading 0x70 0x10 == true");
+        
+        // Poor ETX with improving trend
+        assert(is_degrading(0x70, -0x10) == false, "is_degrading 0x70 -0x10 == false");
+        
+        // Good ETX regardless of trend
+        assert(is_degrading(0x30, 0x10) == false, "is_degrading 0x30 0x10 == false");
+    }
+    
+    test quality_score_calculation {
+        let etx: u8 = 0x50;    // 4.0 in Q8
+        let latency: u16 = 100; // 100ms
+        
+        let score: u8 = quality_score(etx, latency);
+        
+        // Score should be reasonable
+        assert(score > 50, "score > 50");
+        assert(score < 200, "score < 200");
+    }
+    
+    test quality_classification {
+        assert(classify_quality(30) == 0, "classify_quality 30 == 0");  // Excellent
+        assert(classify_quality(80) == 1, "classify_quality 80 == 1");  // Good
+        assert(classify_quality(125) == 2, "classify_quality 125 == 2"); // Fair
+        assert(classify_quality(175) == 3, "classify_quality 175 == 3"); // Poor
+        assert(classify_quality(225) == 4, "classify_quality 225 == 4"); // Very Poor
+    }
+}

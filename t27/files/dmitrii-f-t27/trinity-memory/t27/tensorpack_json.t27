@@ -1,0 +1,416 @@
+// Native TensorPack JSON binding and canonical serialization.
+// Workspace buffers are scratch and may change on errors. All other output
+// is committed only after complete validation. Caller ranges must be valid,
+// nonoverlapping and stable throughout a call; no routine allocates memory.
+module TrinityMemoryTensorPackJSON {
+    const TM_TPJ_ERR_SCHEMA: i32 = -26;
+    const TM_TPJ_ERR_JSON: i32 = -27;
+    struct TMTPJSONWorkspace {
+        tokens: []TMJsonToken, token_capacity: usize,
+        arena: []u8, arena_capacity: usize,
+        items: []TMTensorDescriptor, item_capacity: usize,
+        shapes: []u64, shape_capacity: usize,
+        scales: []f64, scale_capacity: usize,
+        axes: []TMTPText, axis_capacity: usize,
+    }
+    struct TMTPJSONWriter { data: []u8, capacity: usize, size: usize, status: i32, }
+
+    fn tm_tpj_text(data: []u8, size: usize, wanted: str, length: usize) -> bool {
+        if (size != length) { return false; }
+        var i: usize = 0;
+        while (i < size) { if (data[i] != (wanted[i] as u8)) { return false; } i = i + 1; }
+        return true;
+    }
+    fn tm_tpj_members(tokens: []TMJsonToken, index: i64) -> usize {
+        var child: i64 = tokens[index].first;
+        var count: usize = 0;
+        while (child >= 0) { count = count + 1; child = tokens[child].next; }
+        return count;
+    }
+    fn tm_tpj_field(tokens: []TMJsonToken, index: i64, key: str, size: usize) -> i64 {
+        var child: i64 = tokens[index].first;
+        while (child >= 0) {
+            if (tm_tpj_text(tokens[child].text, tokens[child].text_size, key, size)) { return tokens[child].first; }
+            child = tokens[child].next;
+        }
+        return -1;
+    }
+    fn tm_tpj_unsigned(token: *TMJsonToken) -> bool {
+        return token.kind == TM_JSON_INTEGER && (!token.negative || token.uinteger == 0);
+    }
+    fn tm_tpj_codec(token: *TMJsonToken) -> i32 {
+        if (token.kind != TM_JSON_STRING) { return -1; }
+        if (tm_tpj_text(token.text, token.text_size, "baseline2", 9)) { return 0; }
+        if (tm_tpj_text(token.text, token.text_size, "dense5", 6)) { return 1; }
+        if (tm_tpj_text(token.text, token.text_size, "dense17", 7)) { return 2; }
+        if (tm_tpj_text(token.text, token.text_size, "dense22", 7)) { return 3; }
+        if (tm_tpj_text(token.text, token.text_size, "sparse41", 8)) { return 4; }
+        if (tm_tpj_text(token.text, token.text_size, "sparse82", 8)) { return 5; }
+        return -1;
+    }
+
+    fn tm_tp_bind_json(data: []u8, size: usize, work: *TMTPJSONWorkspace,
+                       max_total_trits: u64, result: *TMTPValidation) -> i32 {
+        if (max_total_trits == 0) { return TM_ERR_LIMIT; }
+        var header: TMTPHeader = TMTPHeader{ .metadata_bytes = 0, .tensor_count = 0,
+            .payload_bytes = 0, .payload_offset = 0, .container_bytes = 0 };
+        var status: i32 = tm_tp_validate_header(data, size, &header);
+        if (status != 0) { return status; }
+        if (header.tensor_count > work.item_capacity) { return TM_ERR_CAPACITY; }
+        var parsed: TMJsonResult = TMJsonResult{ .root = -1, .token_count = 0, .arena_used = 0 };
+        status = tm_json_parse(&data[32], header.metadata_bytes, work.tokens, work.token_capacity,
+                              work.arena, work.arena_capacity, 8, &parsed);
+        if (status != 0) { return TM_TPJ_ERR_JSON; }
+        var tokens: *TMJsonToken = work.tokens;
+        var root: i64 = parsed.root;
+        if (root < 0 || tokens[root].kind != TM_JSON_OBJECT || tm_tpj_members(tokens, root) != 2) {
+            return TM_TPJ_ERR_SCHEMA;
+        }
+        var order: i64 = tm_tpj_field(tokens, root, "order", 5);
+        var tensors: i64 = tm_tpj_field(tokens, root, "tensors", 7);
+        if (order < 0 || tensors < 0 || tokens[order].kind != TM_JSON_STRING ||
+            !tm_tpj_text(tokens[order].text, tokens[order].text_size, "C", 1) ||
+            tokens[tensors].kind != TM_JSON_ARRAY || tm_tpj_members(tokens, tensors) != header.tensor_count) {
+            return TM_TPJ_ERR_SCHEMA;
+        }
+        var shape_used: usize = 0;
+        var scale_used: usize = 0;
+        var axis_used: usize = 0;
+        var entry: i64 = tokens[tensors].first;
+        var tensor: usize = 0;
+        while (entry >= 0) {
+            if (tokens[entry].kind != TM_JSON_OBJECT || tm_tpj_members(tokens, entry) != 8) { return TM_TPJ_ERR_SCHEMA; }
+            var name: i64 = tm_tpj_field(tokens, entry, "name", 4);
+            var shape: i64 = tm_tpj_field(tokens, entry, "shape", 5);
+            var scales: i64 = tm_tpj_field(tokens, entry, "scales", 6);
+            var axis: i64 = tm_tpj_field(tokens, entry, "scale_axis", 10);
+            var axes: i64 = tm_tpj_field(tokens, entry, "axes", 4);
+            var codec: i64 = tm_tpj_field(tokens, entry, "codec", 5);
+            var offset: i64 = tm_tpj_field(tokens, entry, "offset", 6);
+            var length: i64 = tm_tpj_field(tokens, entry, "length", 6);
+            if (name < 0 || shape < 0 || scales < 0 || axis < 0 || axes < 0 || codec < 0 || offset < 0 || length < 0) {
+                return TM_TPJ_ERR_SCHEMA;
+            }
+            if (tokens[name].kind != TM_JSON_STRING || tokens[shape].kind != TM_JSON_ARRAY ||
+                tokens[scales].kind != TM_JSON_ARRAY || tokens[axes].kind != TM_JSON_ARRAY ||
+                !tm_tpj_unsigned(&tokens[offset]) || !tm_tpj_unsigned(&tokens[length])) { return TM_TPJ_ERR_SCHEMA; }
+            var d: *TMTensorDescriptor = &work.items[tensor];
+            d[0].name = tokens[name].text; d[0].name_size = tokens[name].text_size;
+            d[0].codec = tm_tpj_codec(&tokens[codec]);
+            d[0].offset = tokens[offset].uinteger; d[0].length = tokens[length].uinteger;
+            d[0].rank = tm_tpj_members(tokens, shape);
+            d[0].scale_count = tm_tpj_members(tokens, scales);
+            d[0].axes_count = tm_tpj_members(tokens, axes);
+            if (d[0].rank > 16 || d[0].axes_count > 16) { return TM_TP_ERR_SHAPE; }
+            if (d[0].rank > work.shape_capacity - shape_used ||
+                d[0].scale_count > work.scale_capacity - scale_used ||
+                d[0].axes_count > work.axis_capacity - axis_used) { return TM_ERR_CAPACITY; }
+            d[0].shape = work.shapes; d[0].scales = work.scales; d[0].axes = work.axes;
+            if (shape_used > 0) { d[0].shape = &work.shapes[shape_used]; }
+            if (scale_used > 0) { d[0].scales = &work.scales[scale_used]; }
+            if (axis_used > 0) { d[0].axes = &work.axes[axis_used]; }
+            d[0].scale_axis = -1;
+            if (tokens[axis].kind != TM_JSON_NULL) {
+                if (!tm_tpj_unsigned(&tokens[axis]) || tokens[axis].uinteger > 15) { return TM_TP_ERR_SCALE; }
+                d[0].scale_axis = tokens[axis].uinteger as i32;
+            }
+            var child: i64 = tokens[shape].first;
+            while (child >= 0) {
+                if (!tm_tpj_unsigned(&tokens[child])) { return TM_TP_ERR_SHAPE; }
+                work.shapes[shape_used] = tokens[child].uinteger;
+                shape_used = shape_used + 1; child = tokens[child].next;
+            }
+            child = tokens[scales].first;
+            while (child >= 0) {
+                if (tokens[child].kind != TM_JSON_REAL) { return TM_TP_ERR_SCALE; }
+                work.scales[scale_used] = tokens[child].real;
+                scale_used = scale_used + 1; child = tokens[child].next;
+            }
+            child = tokens[axes].first;
+            while (child >= 0) {
+                if (tokens[child].kind != TM_JSON_STRING) { return TM_TP_ERR_AXES; }
+                work.axes[axis_used].data = tokens[child].text;
+                work.axes[axis_used].size = tokens[child].text_size;
+                axis_used = axis_used + 1; child = tokens[child].next;
+            }
+            tensor = tensor + 1; entry = tokens[entry].next;
+        }
+        var validation: TMTPValidation = TMTPValidation{ .tensor_count = 0, .total_trits = 0,
+            .payload_bytes = 0, .framing_valid = false, .descriptors_valid = false, .json_binding_valid = false };
+        status = tm_tp_validate_descriptors(data, size, work.items, tensor, max_total_trits, &validation);
+        if (status != 0) { return status; }
+        validation.json_binding_valid = true;
+        result[0] = validation;
+        return 0;
+    }
+
+    fn tm_tp_decode_json(data: []u8, size: usize, work: *TMTPJSONWorkspace,
+                         values: []i32, value_capacity: usize, max_total_trits: u64,
+                         result: *TMTPValidation) -> i32 {
+        var validation: TMTPValidation = TMTPValidation{ .tensor_count = 0, .total_trits = 0,
+            .payload_bytes = 0, .framing_valid = false, .descriptors_valid = false, .json_binding_valid = false };
+        var status: i32 = tm_tp_bind_json(data, size, work, max_total_trits, &validation);
+        if (status != 0) { return status; }
+        if (validation.total_trits > (value_capacity as u64)) { return TM_ERR_CAPACITY; }
+        var start: usize = 32 + (tm_read_u32(data, 8) as usize);
+        var position: usize = 0;
+        var i: usize = 0;
+        while (i < validation.tensor_count) {
+            var d: *TMTensorDescriptor = &work.items[i];
+            var count: i64 = tm_unpack(&data[start + (d[0].offset as usize)], d[0].length as usize,
+                                      &values[position], value_capacity - position);
+            // All nested files were validated before any decoded value write.
+            if (count < 0) { return count as i32; }
+            position = position + (count as usize); i = i + 1;
+        }
+        result[0] = validation;
+        return 0;
+    }
+
+    fn tm_tpj_put(writer: *TMTPJSONWriter, byte: u8) -> void {
+        if (writer.status != 0) { return; }
+        if (writer.size >= writer.capacity) { writer.status = TM_ERR_CAPACITY; return; }
+        writer.data[writer.size] = byte; writer.size = writer.size + 1;
+    }
+    fn tm_tpj_literal(writer: *TMTPJSONWriter, text: str, size: usize) -> void {
+        var i: usize = 0;
+        while (i < size) { tm_tpj_put(writer, text[i] as u8); i = i + 1; }
+    }
+    fn tm_tpj_string(writer: *TMTPJSONWriter, text: []u8, size: usize) -> void {
+        tm_tpj_put(writer, 34);
+        var i: usize = 0;
+        while (i < size) {
+            if (text[i] == 34 || text[i] == 92) { tm_tpj_put(writer, 92); }
+            tm_tpj_put(writer, text[i]); i = i + 1;
+        }
+        tm_tpj_put(writer, 34);
+    }
+    fn tm_tpj_u64(writer: *TMTPJSONWriter, value: u64) -> void {
+        var divisor: u64 = 1000000000000000000;
+        divisor = divisor * 10;
+        while (divisor > 1 && value < divisor) { divisor = divisor / 10; }
+        while (divisor > 0) { tm_tpj_put(writer, (48 + ((value / divisor) % 10)) as u8); divisor = divisor / 10; }
+    }
+    fn tm_tpj_z(writer: *TMTPJSONWriter, text: str) -> void {
+        var i: usize = 0;
+        while (text[i] != 0) { tm_tpj_put(writer, text[i] as u8); i = i + 1; }
+    }
+    // C++ to_chars supplies shortest round-tripping digits only. The exponent
+    // threshold, decimal point, exponent sign and padding are Python JSON rules.
+    fn tm_tpj_float(writer: *TMTPJSONWriter, value: f64) -> void {
+        if (!(value > 0.0 && value <= 1.7976931348623157e308)) { writer.status = TM_TP_ERR_SCALE; return; }
+        var shortest: [64]u8 = [0];
+        var digits: [32]u8 = [0];
+        var size: usize = tm_float_shortest(value, shortest, 64);
+        if (size == 0 || size > 64) { writer.status = TM_TP_ERR_SCALE; return; }
+        var used: usize = 0;
+        var before: i32 = 0;
+        var dot: bool = false;
+        var pos: usize = 0;
+        while (pos < size && shortest[pos] != 101 && shortest[pos] != 69) {
+            if (shortest[pos] == 46) {
+                if (dot) { writer.status = TM_TP_ERR_SCALE; return; }
+                dot = true;
+            } else {
+                if (shortest[pos] < 48 || shortest[pos] > 57 || used >= 32) { writer.status = TM_TP_ERR_SCALE; return; }
+                digits[used] = shortest[pos]; used = used + 1;
+                if (!dot) { before = before + 1; }
+            }
+            pos = pos + 1;
+        }
+        var power: i32 = 0;
+        if (pos < size) {
+            pos = pos + 1;
+            var sign: i32 = 1;
+            if (pos < size && shortest[pos] == 45) { sign = -1; pos = pos + 1; }
+            else { if (pos < size && shortest[pos] == 43) { pos = pos + 1; } }
+            if (pos == size) { writer.status = TM_TP_ERR_SCALE; return; }
+            while (pos < size) {
+                if (shortest[pos] < 48 || shortest[pos] > 57 || power > 400) { writer.status = TM_TP_ERR_SCALE; return; }
+                power = power * 10 + ((shortest[pos] - 48) as i32); pos = pos + 1;
+            }
+            power = power * sign;
+        }
+        var first: usize = 0;
+        while (first < used && digits[first] == 48) { first = first + 1; }
+        if (first == used) { writer.status = TM_TP_ERR_SCALE; return; }
+        var exponent: i32 = before - (first as i32) - 1 + power;
+        while (used > first + 1 && digits[used - 1] == 48) { used = used - 1; }
+        if (exponent >= -4 && exponent < 16) {
+            if (exponent < 0) {
+                tm_tpj_z(writer, "0.");
+                var zeros: i32 = -exponent - 1;
+                while (zeros > 0) { tm_tpj_put(writer, 48); zeros = zeros - 1; }
+                while (first < used) { tm_tpj_put(writer, digits[first]); first = first + 1; }
+            } else {
+                var integer_places: i32 = exponent + 1;
+                while (integer_places > 0) {
+                    if (first < used) { tm_tpj_put(writer, digits[first]); first = first + 1; }
+                    else { tm_tpj_put(writer, 48); }
+                    integer_places = integer_places - 1;
+                }
+                tm_tpj_put(writer, 46);
+                if (first == used) { tm_tpj_put(writer, 48); }
+                while (first < used) { tm_tpj_put(writer, digits[first]); first = first + 1; }
+            }
+        } else {
+            tm_tpj_put(writer, digits[first]); first = first + 1;
+            if (first < used) { tm_tpj_put(writer, 46); }
+            while (first < used) { tm_tpj_put(writer, digits[first]); first = first + 1; }
+            tm_tpj_put(writer, 101);
+            if (exponent < 0) { tm_tpj_put(writer, 45); exponent = -exponent; }
+            else { tm_tpj_put(writer, 43); }
+            if (exponent < 10) { tm_tpj_put(writer, 48); }
+            tm_tpj_u64(writer, exponent as u64);
+        }
+    }
+    fn tm_tpj_codec_json(writer: *TMTPJSONWriter, codec: i32) -> void {
+        if (codec == 0) { tm_tpj_z(writer, "\"baseline2\""); }
+        if (codec == 1) { tm_tpj_z(writer, "\"dense5\""); }
+        if (codec == 2) { tm_tpj_z(writer, "\"dense17\""); }
+        if (codec == 3) { tm_tpj_z(writer, "\"dense22\""); }
+        if (codec == 4) { tm_tpj_z(writer, "\"sparse41\""); }
+        if (codec == 5) { tm_tpj_z(writer, "\"sparse82\""); }
+    }
+    // Shared finite-number presentation for JSON clients. Output is scratch;
+    // callers publish it only on nonnegative return. Preserve signed zero.
+    fn tm_tpj_format_f64(value: f64, out: []u8, capacity: usize) -> i64 {
+        if (!(value == value && value <= 1.7976931348623157e308 && value >= -1.7976931348623157e308)) {
+            return TM_TP_ERR_SCALE as i64;
+        }
+        var writer: TMTPJSONWriter = TMTPJSONWriter{ .data = out, .capacity = capacity, .size = 0, .status = 0 };
+        if (value == 0.0) {
+            var zero: [8]u8 = [0];
+            var size: usize = tm_float_shortest(value, zero, 8);
+            if (size == 0) { return TM_TP_ERR_SCALE as i64; }
+            if (zero[0] == 45) { tm_tpj_put(&writer, 45); }
+            tm_tpj_z(&writer, "0.0");
+        } else {
+            var positive: f64 = value;
+            if (value < 0.0) { tm_tpj_put(&writer, 45); positive = -value; }
+            tm_tpj_float(&writer, positive);
+        }
+        if (writer.status != 0) { return writer.status as i64; }
+        return writer.size as i64;
+    }
+    fn tm_tpj_encode_metadata(items: []TMTensorDescriptor, count: usize, writer: *TMTPJSONWriter) -> void {
+        tm_tpj_z(writer, "{\"order\":\"C\",\"tensors\":[");
+        var offset: u64 = 0;
+        var i: usize = 0;
+        while (i < count) {
+            if (i > 0) { tm_tpj_put(writer, 44); }
+            var d: *TMTensorDescriptor = &items[i];
+            var trits: i64 = tm_tp_descriptor_count(d);
+            var length: u64 = 24 + (tm_payload_size(d[0].codec, trits as u64) as u64);
+            tm_tpj_z(writer, "{\"axes\":[");
+            var j: usize = 0;
+            while (j < d[0].axes_count) {
+                if (j > 0) { tm_tpj_put(writer, 44); }
+                tm_tpj_string(writer, d[0].axes[j].data, d[0].axes[j].size); j = j + 1;
+            }
+            tm_tpj_z(writer, "],\"codec\":"); tm_tpj_codec_json(writer, d[0].codec);
+            tm_tpj_z(writer, ",\"length\":"); tm_tpj_u64(writer, length);
+            tm_tpj_z(writer, ",\"name\":"); tm_tpj_string(writer, d[0].name, d[0].name_size);
+            tm_tpj_z(writer, ",\"offset\":"); tm_tpj_u64(writer, offset);
+            tm_tpj_z(writer, ",\"scale_axis\":");
+            if (d[0].scale_axis == -1) { tm_tpj_z(writer, "null"); }
+            else { tm_tpj_u64(writer, d[0].scale_axis as u64); }
+            tm_tpj_z(writer, ",\"scales\":["); j = 0;
+            while (j < d[0].scale_count) {
+                if (j > 0) { tm_tpj_put(writer, 44); }
+                tm_tpj_float(writer, d[0].scales[j]); j = j + 1;
+            }
+            tm_tpj_z(writer, "],\"shape\":["); j = 0;
+            while (j < d[0].rank) {
+                if (j > 0) { tm_tpj_put(writer, 44); }
+                tm_tpj_u64(writer, d[0].shape[j]); j = j + 1;
+            }
+            tm_tpj_z(writer, "]}"); offset = offset + length; i = i + 1;
+        }
+        tm_tpj_z(writer, "]}");
+    }
+    // Encoder inputs ignore descriptor offset/length: canonical positions are
+    // calculated from input order. Values are concatenated in the same order.
+    fn tm_tp_encode_json(items: []TMTensorDescriptor, item_count: usize,
+                         values: []i32, value_count: usize, metadata_scratch: []u8,
+                         metadata_capacity: usize, out: []u8, capacity: usize) -> i64 {
+        if (item_count > 1024 || value_count > 4194304) { return TM_ERR_LIMIT as i64; }
+        var total: usize = 0;
+        var payload: u64 = 0;
+        var i: usize = 0;
+        // Validate all metadata, aggregate counts and values before any output.
+        while (i < item_count) {
+            var d: *TMTensorDescriptor = &items[i];
+            var count: i64 = tm_tp_descriptor_count(d);
+            if (count < 0) { return count; }
+            if ((count as usize) > value_count - total) { return TM_TP_ERR_SHAPE as i64; }
+            var j: usize = 0;
+            while (j < i) {
+                if (tm_tp_text_equal(d[0].name, d[0].name_size, items[j].name, items[j].name_size)) {
+                    return TM_TP_ERR_DESCRIPTOR as i64;
+                }
+                j = j + 1;
+            }
+            var group: usize = tm_group_size(d[0].codec);
+            var nonzero: usize = 0;
+            j = 0;
+            while (j < (count as usize)) {
+                if (j % group == 0) { nonzero = 0; }
+                var value: i32 = values[total + j];
+                if (value < -1 || value > 1) { return TM_ERR_TRIT as i64; }
+                if (value != 0) { nonzero = nonzero + 1; }
+                if ((d[0].codec == 4 && nonzero > 1) || (d[0].codec == 5 && nonzero > 2)) { return TM_ERR_SPARSITY as i64; }
+                j = j + 1;
+            }
+            total = total + (count as usize);
+            payload = payload + 24 + (tm_payload_size(d[0].codec, count as u64) as u64);
+            if (payload > 67108864) { return TM_ERR_LIMIT as i64; }
+            i = i + 1;
+        }
+        if (total != value_count) { return TM_TP_ERR_SHAPE as i64; }
+        var scratch_capacity: usize = metadata_capacity;
+        if (scratch_capacity > 1048576) { scratch_capacity = 1048576; }
+        var writer: TMTPJSONWriter = TMTPJSONWriter{ .data = metadata_scratch,
+            .capacity = scratch_capacity, .size = 0, .status = 0 };
+        tm_tpj_encode_metadata(items, item_count, &writer);
+        if (writer.status != 0) { return writer.status as i64; }
+        var length: u64 = 32 + (writer.size as u64) + payload;
+        if (length > (capacity as u64)) { return TM_ERR_CAPACITY as i64; }
+        // The output commit begins only when every operation below is bounded
+        // and every tensor has passed the same checks as its TMEM encoder.
+        out[0] = 84; out[1] = 84; out[2] = 80; out[3] = 75;
+        out[4] = 1; out[5] = 0; out[6] = 0; out[7] = 0;
+        tm_write_u32(out, 8, writer.size as u32);
+        tm_write_u32(out, 12, item_count as u32);
+        tm_write_u64(out, 16, payload);
+        i = 0;
+        while (i < writer.size) { out[32 + i] = metadata_scratch[i]; i = i + 1; }
+        var offset: usize = 32 + writer.size;
+        total = 0; i = 0;
+        while (i < item_count) {
+            var count: i64 = tm_tp_descriptor_count(&items[i]);
+            var written: i64 = tm_pack(items[i].codec, &values[total], count as usize, &out[offset], capacity - offset);
+            if (written < 0) { return written; }
+            offset = offset + (written as usize); total = total + (count as usize); i = i + 1;
+        }
+        var crc: u32 = tm_crc32_update(out, 24, 0xffffffff);
+        crc = tm_crc32_update(&out[32], writer.size, crc) ^ 0xffffffff;
+        tm_write_u32(out, 24, crc);
+        tm_write_u32(out, 28, tm_crc32(&out[32 + writer.size], payload as usize));
+        return length as i64;
+    }
+    test tm_tpj_empty_pack_contract {
+        var metadata: [32]u8 = [0];
+        var output: [64]u8 = [0];
+        assert(tm_tp_encode_json(0, 0, 0, 0, metadata, 32, output, 64) == 58);
+        assert(output[0] == 84 && output[3] == 75 && output[4] == 1);
+        assert(tm_read_u32(output, 8) == 26);
+    }
+    test tm_tpj_float_threshold_contract {
+        var output: [32]u8 = [0];
+        assert(tm_tpj_format_f64(0.0001, output, 32) == 6);
+        assert(tm_tpj_text(output, 6, "0.0001", 6));
+        assert(tm_tpj_format_f64(0.00001, output, 32) == 5);
+        assert(tm_tpj_text(output, 5, "1e-05", 5));
+    }
+}

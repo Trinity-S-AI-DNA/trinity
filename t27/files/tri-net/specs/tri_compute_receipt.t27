@@ -1,0 +1,537 @@
+// TRI-NET compute-attesting receipt: bind an agent's COMPUTE result (not just
+// relayed bytes) into a verifiable, chained receipt. tri_depin seals forwarded
+// bytes (proof-of-relay); this seals WORK: a leaf commits {executor, task,
+// input-hash, output, epoch} so a peer can confirm which executor produced which
+// output for which input, and receipts chain prev->next like tri_ledger's state
+// root -- tampering with any past result or reordering the chain changes the head.
+//
+// This is the spec-first home for the "compute receipt" the trinet-a2a-poc
+// prototyped: the Ed25519 signature stays a Rust crate primitive (as in
+// tri_depin's epoch_seal), but the committed content and its verification logic
+// live here, in .t27, as the single source of truth.
+
+module TriComputeReceipt {
+    use base::types;
+
+    const RECEIPT_GENESIS: u32 = 0x54524352; // "TRCR" -- empty compute-ledger head
+    const R_C: u32 = 0x9E3779B9;             // golden-ratio mixing constant
+    const R_C2: u32 = 0x85EBCA77;            // second-lane seed (decorrelates the hi word)
+
+    // --- SHA-256 canonical preimage (opt 2, the STRONG binding). sign_digest is a
+    // fast 32-bit lo commitment; a value that GATES PAYMENT needs collision
+    // resistance a 32-bit mixer cannot give (~2^16 birthday -> a forger finds two
+    // (task,out) pairs with the same digest, and a signature over 32 bits validates
+    // for the forgery). digest_pre lays out the canonical single-block SHA-256
+    // preimage; the real 256-bit digest is tri_sha256.sha256_word over these 16
+    // words (composed in the binary wrapper -- t27 has no cross-module calls).
+    const TAG_RECEIPT: u32 = 0x54524350;     // "TRCP" -- receipt-preimage domain tag
+    const SHA_PAD: u32 = 0x80000000;         // SHA-256 padding: the 0x80 byte after the message
+    const DIGEST_MSG_BITS: u32 = 288;        // 9 message words * 32 bits = 36 bytes = 288 bits
+
+    // --- Settled-ledger head (opt 3). The head a peer audits should commit not just
+    // the receipt but the RESULTING BALANCE: then verifying the head verifies the
+    // whole settled state, not only that compute happened. ledger_entry_pre lays out
+    // the canonical TWO-message-block SHA-256 preimage of one ledger entry
+    //   prev_head(256) || receipt_digest(256) || balance_after || epoch || TAG_LEDGER
+    // (block 1 = the two 256-bit values; block 2 = balance/epoch/tag + padding). The
+    // head = SHA-256 over it (two-block, via tri_sha256.sha256_compress) in the
+    // binary wrapper. Replaces the 32-bit chain_step_full for the audited head.
+    const TAG_LEDGER: u32 = 0x54524C47;      // "TRLG" -- ledger-entry domain tag
+    const LEDGER_GENESIS: u32 = 0x54524C30;  // "TRL0" -- genesis head seed (word 0; rest 0)
+    const LEDGER_MSG_BITS: u32 = 608;        // 19 message words * 32 bits = 76 bytes = 608 bits
+    const MERKLE_MSG_BITS: u32 = 512;        // 16 message words * 32 bits = 64 bytes = 512 bits
+    const TAG_INPUT: u32 = 0x54524942;       // "TRIB" -- input-bound digest domain tag
+
+    // The GoldenFloat workload this receipt exists to attest. The actual GF
+    // arithmetic is the proven GF line (t27 specs/numeric/gf*.t27 -> gen-verilog
+    // -> gf16_mul_ax7203, GF16 @ ~322 MHz) -- NOT re-implemented here; the receipt
+    // binds which GF format+op was run and its operands+result.
+    const GF_ADD : u32 = 0x10;
+    const GF_MUL : u32 = 0x11;
+    const GF16   : u32 = 16;                  // GoldenFloat width (GF4..GF1024 family)
+
+    fn rotl(x: u32, k: u32) -> u32 {
+        return ((x << k) | (x >> (32 - k)));
+    }
+
+    fn mix32(x: u32) -> u32 {
+        let a: u32 = x ^ (x >> 16);
+        let b: u32 = a +% (a << 3);
+        let c: u32 = b ^ (b >> 11);
+        let d: u32 = c +% (c << 15);
+        return d ^ (d >> 16);
+    }
+
+    // Per-task receipt leaf: commits executor identity, task id, input hash,
+    // output value, and epoch. Changing ANY field changes the leaf, so the leaf
+    // attests "executor E produced output O for input H at epoch N".
+    fn receipt_leaf(executor: u32, task: u32, in_hash: u32, out: u32, epoch: u32) -> u32 {
+        let a: u32 = mix32(executor ^ rotl(task, 7));
+        let b: u32 = mix32(a ^ rotl(in_hash, 13));
+        let c: u32 = mix32(b ^ rotl(out, 19));
+        return mix32(c ^ rotl(epoch, 5));
+    }
+
+    // Fold one receipt into the evolving compute-ledger head: head_n =
+    // f(head_{n-1}, leaf). Order-sensitive and forward-dependent, so the chain is
+    // append-only and tamper-evident from one 32-bit value.
+    fn receipt_step(prev_head: u32, leaf: u32) -> u32 {
+        return mix32(prev_head ^ mix32(leaf ^ R_C));
+    }
+
+    // Recompute a single leaf and check it against a claimed leaf (verify one
+    // receipt without trusting the executor's self-report of the committed fields).
+    fn verify_leaf(executor: u32, task: u32, in_hash: u32, out: u32, epoch: u32, claimed: u32) -> bool {
+        return receipt_leaf(executor, task, in_hash, out, epoch) == claimed;
+    }
+
+    // Recompute a 3-receipt compute-ledger head from genesis and check the claim.
+    fn verify_chain3(l0: u32, l1: u32, l2: u32, claimed: u32) -> bool {
+        let h0: u32 = receipt_step(RECEIPT_GENESIS, l0);
+        let h1: u32 = receipt_step(h0, l1);
+        let h2: u32 = receipt_step(h1, l2);
+        return h2 == claimed;
+    }
+
+    // Second commitment lane: independent rotations + a distinct seed so the hi
+    // word is decorrelated from receipt_leaf. Together (lo, hi) form a 64-bit
+    // commitment, lifting birthday-collision resistance from ~2^16 to ~2^32.
+    fn receipt_leaf_hi(executor: u32, task: u32, in_hash: u32, out: u32, epoch: u32) -> u32 {
+        let a: u32 = mix32((executor ^ R_C2) + rotl(task, 11));
+        let b: u32 = mix32(a ^ rotl(in_hash, 17));
+        let c: u32 = mix32(b ^ rotl(out, 23));
+        return mix32(c ^ rotl(epoch, 29));
+    }
+
+    // Verify the full 64-bit commitment: BOTH lanes must match the claim.
+    fn verify_leaf64(executor: u32, task: u32, in_hash: u32, out: u32, epoch: u32, claimed_lo: u32, claimed_hi: u32) -> bool {
+        let lo: u32 = receipt_leaf(executor, task, in_hash, out, epoch);
+        let hi: u32 = receipt_leaf_hi(executor, task, in_hash, out, epoch);
+        if (lo == claimed_lo) { return hi == claimed_hi; } else { return lo != lo; }
+    }
+
+    // --- Device binding (opt 3): fold a per-chip secret into the receipt so a
+    // receipt provably from silicon differs from one a script could forge. The
+    // security depends on device_id being an UNSPOOFABLE per-chip value (PUF /
+    // FPGA DNA). NOTE: on the current openXC7 flow DNA_PORT reads zero, so
+    // device_id=0 is the "unbound / not-silicon-attested" sentinel until a real
+    // secret is available. The binding logic below is ready for that value.
+    fn receipt_leaf_bound(device_id: u32, executor: u32, task: u32, in_hash: u32, out: u32, epoch: u32) -> u32 {
+        let base: u32 = receipt_leaf(executor, task, in_hash, out, epoch);
+        return mix32(base ^ mix32(device_id ^ rotl(executor, 3)));
+    }
+
+    // --- Signable digest (opt 1): the single value an Ed25519 signature covers.
+    // Binds device + full 64-bit commitment + the prior chain head, so one
+    // signature attests {which chip, which executor, which input, which output,
+    // which epoch, which ledger position}. The signature itself is a Rust crate
+    // primitive (ed25519-dalek, as tri_depin's epoch_seal) -- this spec fixes only
+    // WHAT is signed, canonically.
+    fn sign_digest(device_id: u32, executor: u32, task: u32, in_hash: u32, out: u32, epoch: u32, prev_head: u32) -> u32 {
+        let bound: u32 = receipt_leaf_bound(device_id, executor, task, in_hash, out, epoch);
+        let hi: u32 = receipt_leaf_hi(executor, task, in_hash, out, epoch);
+        return mix32(mix32(bound ^ prev_head) ^ mix32(hi ^ R_C2));
+    }
+
+    // Bind the A2A request id (task nonce) into the signed digest, so a signed
+    // receipt is valid ONLY for the exact request it answers and cannot be
+    // reattached to a different taskAssign. Closes the gap where
+    // tri_a2a.result_matches_assign was enforced only on the UNSIGNED message
+    // envelope -- now the request binding is inside the signature.
+    fn sign_digest_req(request_id: u32, device_id: u32, executor: u32, task: u32, in_hash: u32, out: u32, epoch: u32, prev_head: u32) -> u32 {
+        let base: u32 = sign_digest(device_id, executor, task, in_hash, out, epoch, prev_head);
+        return mix32(base ^ mix32(request_id ^ rotl(executor, 11)));
+    }
+
+    // Canonical SHA-256 preimage of a receipt: word `idx` (0..15) of the single
+    // 512-bit block the 256-bit signable digest is computed over. Words 0..8 are the
+    // domain tag + the 8 request-bound fields (the exact set sign_digest_req binds);
+    // words 9..15 are the fixed SHA-256 padding for a 36-byte message. The 256-bit
+    // digest = tri_sha256.sha256_word(digest_pre(0..15), which) for which in 0..8;
+    // that composition lives in the binary wrapper (no cross-module calls in t27).
+    fn digest_pre(idx: u32, request_id: u32, device_id: u32, executor: u32, task: u32, in_hash: u32, out: u32, epoch: u32, prev_head: u32) -> u32 {
+        if (idx == 0) { return TAG_RECEIPT; }
+        if (idx == 1) { return request_id; }
+        if (idx == 2) { return device_id; }
+        if (idx == 3) { return executor; }
+        if (idx == 4) { return task; }
+        if (idx == 5) { return in_hash; }
+        if (idx == 6) { return out; }
+        if (idx == 7) { return epoch; }
+        if (idx == 8) { return prev_head; }
+        if (idx == 9) { return SHA_PAD; }
+        if (idx == 15) { return DIGEST_MSG_BITS; }
+        return 0;
+    }
+
+    // --- GoldenFloat attestation: bind a GF-line operation into the receipt.
+    // The agent's compute skill IS a GoldenFloat op (this is what GF was built
+    // for): gf_result = gf_op(a, b) over GFn, produced by the GF unit. The op
+    // selector goes in the task slot, the operands in the input hash, the GF
+    // result in the output -- so a GF16 MUL and a GF16 ADD of the same operands
+    // attest to different receipts, and the exact GF result is committed.
+    fn receipt_leaf_gf(gf_width: u32, gf_op: u32, a: u32, b: u32, gf_result: u32, device_id: u32, executor: u32, epoch: u32) -> u32 {
+        let opsel: u32 = mix32((gf_width << 8) ^ gf_op);
+        let ab: u32 = mix32(a ^ rotl(b, 7));
+        return receipt_leaf_bound(device_id, executor, opsel, ab, gf_result, epoch);
+    }
+
+    // Format families (must match tri_compute_gfvalid). GF16 and GF-T16 share the
+    // nominal width 16 but are different formats; without binding the family a
+    // GF16 result could be passed off as a GF-T16 one. Fold the family in.
+    const FMT_GF_BINARY: u32 = 0;   // GF4..GF1024, binary exponent
+    const FMT_GFT: u32 = 1;         // GF-T ladder, balanced-ternary exponent
+
+    // Ratified ladder Et per GF-T rung (from tri_gft_ladder width_to_et; Et = fib+1).
+    // The receipt-rung binder folds these so an attestation names the exact geometry.
+    const GFT16_RUNG_ET: u32 = 4;
+    const GFT32_RUNG_ET: u32 = 6;
+    const GFT64_RUNG_ET: u32 = 9;
+    const GFT128_RUNG_ET: u32 = 14;
+
+    fn receipt_leaf_gf_fmt(fmt_family: u32, gf_width: u32, gf_op: u32, a: u32, b: u32, gf_result: u32, device_id: u32, executor: u32, epoch: u32) -> u32 {
+        let base: u32 = receipt_leaf_gf(gf_width, gf_op, a, b, gf_result, device_id, executor, epoch);
+        return mix32(base ^ mix32(fmt_family ^ rotl(gf_width, 9)));
+    }
+
+    // Bind the exact ladder RUNG, not just the nominal width. The ratified golden rule
+    // (specs/tri_gft_ladder.t27) fixes each GF-T width's exponent-trit count Et = fib+1
+    // -- and bias / offset_max derive from Et, so Et IS the geometry key. Folding gf_et
+    // commits the attestation to the precise rung: a GF-T64 compute cannot be replayed
+    // as a cheaper GF-T16 one, and a recompute at the wrong geometry (right width, wrong
+    // Et) yields a different leaf. gf_et is the caller's width_to_et(width) from the
+    // ladder SSOT -- passed in, not duplicated here.
+    fn receipt_leaf_gf_rung(fmt_family: u32, gf_width: u32, gf_et: u32, gf_op: u32, a: u32, b: u32, gf_result: u32, device_id: u32, executor: u32, epoch: u32) -> u32 {
+        let base: u32 = receipt_leaf_gf_fmt(fmt_family, gf_width, gf_op, a, b, gf_result, device_id, executor, epoch);
+        return mix32(base ^ mix32(gf_et ^ rotl(fmt_family, 13)));
+    }
+
+    // --- Full-commitment ledger: fold the per-receipt SIGN DIGEST (which already
+    // binds device + 64-bit commitment + prior head) into the chain, so the
+    // ledger head a peer audits commits the FULL attestation -- not just the
+    // 32-bit lo leaf that receipt_step folds. Tampering device, GF result, or the
+    // hi lane now changes the head.
+    fn chain_step_full(prev_head: u32, digest: u32) -> u32 {
+        return mix32(prev_head ^ mix32(digest ^ R_C2));
+    }
+
+    // Canonical two-block SHA-256 preimage of a settled-ledger entry: word `idx`
+    // (0..31) over two 512-bit blocks. Block 1 (0..15) is prev_head(8) || digest(8);
+    // block 2 (16..31) is balance_after, epoch, TAG_LEDGER, then the SHA-256 padding
+    // for a 76-byte message. The 256-bit head = sha256_compress(IV, block1) then
+    // sha256_compress(that, block2), composed in the binary wrapper.
+    fn ledger_entry_pre(idx: u32, ph0: u32, ph1: u32, ph2: u32, ph3: u32, ph4: u32, ph5: u32, ph6: u32, ph7: u32, d0: u32, d1: u32, d2: u32, d3: u32, d4: u32, d5: u32, d6: u32, d7: u32, balance: u32, epoch: u32) -> u32 {
+        if (idx == 0) { return ph0; }
+        if (idx == 1) { return ph1; }
+        if (idx == 2) { return ph2; }
+        if (idx == 3) { return ph3; }
+        if (idx == 4) { return ph4; }
+        if (idx == 5) { return ph5; }
+        if (idx == 6) { return ph6; }
+        if (idx == 7) { return ph7; }
+        if (idx == 8) { return d0; }
+        if (idx == 9) { return d1; }
+        if (idx == 10) { return d2; }
+        if (idx == 11) { return d3; }
+        if (idx == 12) { return d4; }
+        if (idx == 13) { return d5; }
+        if (idx == 14) { return d6; }
+        if (idx == 15) { return d7; }
+        if (idx == 16) { return balance; }
+        if (idx == 17) { return epoch; }
+        if (idx == 18) { return TAG_LEDGER; }
+        if (idx == 19) { return SHA_PAD; }
+        if (idx == 31) { return LEDGER_MSG_BITS; }
+        return 0;
+    }
+
+    // Canonical two-block SHA-256 preimage of a Merkle inner node = H(left || right),
+    // where left and right are 256-bit child hashes (receipt digests at the leaves,
+    // node hashes above). Word `idx` (0..31): block 1 (0..15) = left(8) || right(8)
+    // (a full 512-bit block); block 2 (16..31) = the SHA-256 padding for a 64-byte
+    // message. Lets a node commit N receipts under ONE 256-bit root (batch settle
+    // with one signature + O(log N) inclusion proofs), composed via sha256_compress.
+    fn merkle_pair_pre(idx: u32, l0: u32, l1: u32, l2: u32, l3: u32, l4: u32, l5: u32, l6: u32, l7: u32, r0: u32, r1: u32, r2: u32, r3: u32, r4: u32, r5: u32, r6: u32, r7: u32) -> u32 {
+        if (idx == 0) { return l0; }
+        if (idx == 1) { return l1; }
+        if (idx == 2) { return l2; }
+        if (idx == 3) { return l3; }
+        if (idx == 4) { return l4; }
+        if (idx == 5) { return l5; }
+        if (idx == 6) { return l6; }
+        if (idx == 7) { return l7; }
+        if (idx == 8) { return r0; }
+        if (idx == 9) { return r1; }
+        if (idx == 10) { return r2; }
+        if (idx == 11) { return r3; }
+        if (idx == 12) { return r4; }
+        if (idx == 13) { return r5; }
+        if (idx == 14) { return r6; }
+        if (idx == 15) { return r7; }
+        if (idx == 16) { return SHA_PAD; }
+        if (idx == 31) { return MERKLE_MSG_BITS; }
+        return 0;
+    }
+
+    // Input-bound digest (opt 4): digest_pre commits a 32-bit `in_hash` of the
+    // operands (~2^16 collision resistance -- a forger could find two operand sets
+    // with the same 32-bit in_hash). This commits the FULL 256-bit operand hash
+    // (oh0..oh7) instead, so a receipt binds its inputs at ~2^128. Canonical
+    // two-message-block SHA-256 preimage, word `idx` (0..31): block 1 is
+    //   TAG_INPUT | request_id | device | executor | task | operand_hash(8) | out |
+    //   epoch | prev_head  (16 words); block 2 is the SHA padding for the 64-byte
+    // message. The digest = SHA-256 over it (two-block, tri_sha256.sha256_compress).
+    fn input_digest_pre(idx: u32, request_id: u32, device: u32, executor: u32, task: u32, oh0: u32, oh1: u32, oh2: u32, oh3: u32, oh4: u32, oh5: u32, oh6: u32, oh7: u32, out: u32, epoch: u32, prev_head: u32) -> u32 {
+        if (idx == 0) { return TAG_INPUT; }
+        if (idx == 1) { return request_id; }
+        if (idx == 2) { return device; }
+        if (idx == 3) { return executor; }
+        if (idx == 4) { return task; }
+        if (idx == 5) { return oh0; }
+        if (idx == 6) { return oh1; }
+        if (idx == 7) { return oh2; }
+        if (idx == 8) { return oh3; }
+        if (idx == 9) { return oh4; }
+        if (idx == 10) { return oh5; }
+        if (idx == 11) { return oh6; }
+        if (idx == 12) { return oh7; }
+        if (idx == 13) { return out; }
+        if (idx == 14) { return epoch; }
+        if (idx == 15) { return prev_head; }
+        if (idx == 16) { return SHA_PAD; }
+        if (idx == 31) { return MERKLE_MSG_BITS; }
+        return 0;
+    }
+
+    fn verify_chain3_full(d0: u32, d1: u32, d2: u32, claimed: u32) -> bool {
+        let h0: u32 = chain_step_full(RECEIPT_GENESIS, d0);
+        let h1: u32 = chain_step_full(h0, d1);
+        let h2: u32 = chain_step_full(h1, d2);
+        return h2 == claimed;
+    }
+
+    // ---- Tests / invariants ----
+
+    // An honest leaf verifies against its own recomputation.
+    test leaf_verifies {
+        leaf = receipt_leaf(0xE0E0, 0x11, 0xABCD, 2, 1);
+        assert(verify_leaf(0xE0E0, 0x11, 0xABCD, 2, 1, leaf) == true, "honest leaf verifies");
+    }
+
+    // Rewriting the OUTPUT changes the leaf: a forged result cannot reuse the receipt.
+    test output_tamper_evident {
+        honest = receipt_leaf(0xE0E0, 0x11, 0xABCD, 2, 1);
+        forged = receipt_leaf(0xE0E0, 0x11, 0xABCD, 999, 1);
+        assert(honest != forged, "rewriting the output changes the receipt leaf");
+    }
+
+    // A DIFFERENT executor produces a different leaf: the receipt binds identity.
+    test executor_bound {
+        a = receipt_leaf(0xE0E0, 0x11, 0xABCD, 2, 1);
+        b = receipt_leaf(0xBEEF, 0x11, 0xABCD, 2, 1);
+        assert(a != b, "different executor => different receipt");
+    }
+
+    // The compute-ledger head is deterministic and accepts the honest chain.
+    test chain_deterministic {
+        l0 = receipt_leaf(0xE0E0, 0x11, 0x1111, 5, 1);
+        l1 = receipt_leaf(0xE0E0, 0x12, 0x2222, 7, 2);
+        l2 = receipt_leaf(0xE0E0, 0x13, 0x3333, 9, 3);
+        h0 = receipt_step(RECEIPT_GENESIS, l0);
+        h1 = receipt_step(h0, l1);
+        h2 = receipt_step(h1, l2);
+        assert(verify_chain3(l0, l1, l2, h2) == true, "honest chain verifies");
+    }
+
+    // Reordering receipts changes the head (history is append-only).
+    test chain_order_sensitive {
+        la = receipt_leaf(0xE0E0, 0x11, 0x1111, 5, 1);
+        lb = receipt_leaf(0xE0E0, 0x12, 0x2222, 7, 2);
+        f0 = receipt_step(RECEIPT_GENESIS, la);
+        forward = receipt_step(f0, lb);
+        r0 = receipt_step(RECEIPT_GENESIS, lb);
+        swapped = receipt_step(r0, la);
+        assert(forward != swapped, "reordering receipts changes the head");
+    }
+
+    // verify_chain3 rejects a wrong claimed head (can't fake the compute ledger).
+    test chain_rejects_wrong_head {
+        l0 = receipt_leaf(0xE0E0, 0x11, 0x1111, 5, 1);
+        l1 = receipt_leaf(0xE0E0, 0x12, 0x2222, 7, 2);
+        l2 = receipt_leaf(0xE0E0, 0x13, 0x3333, 9, 3);
+        h0 = receipt_step(RECEIPT_GENESIS, l0);
+        h1 = receipt_step(h0, l1);
+        h2 = receipt_step(h1, l2);
+        assert(verify_chain3(l0, l1, l2, h2 ^ 1) == false, "wrong head rejected");
+    }
+
+    // The two commitment lanes are independent (must differ for the same input).
+    test leaf64_independent_lanes {
+        lo = receipt_leaf(0xE0E0, 0x11, 0xABCD, 2, 1);
+        hi = receipt_leaf_hi(0xE0E0, 0x11, 0xABCD, 2, 1);
+        assert(lo != hi, "hi lane must decorrelate from lo (real 64-bit commit)");
+    }
+
+    // The 64-bit commit verifies honestly and rejects a tampered output.
+    test leaf64_verifies_and_tamper {
+        lo = receipt_leaf(0xE0E0, 0x11, 0xABCD, 2, 1);
+        hi = receipt_leaf_hi(0xE0E0, 0x11, 0xABCD, 2, 1);
+        assert(verify_leaf64(0xE0E0, 0x11, 0xABCD, 2, 1, lo, hi) == true, "honest 64-bit commit verifies");
+        assert(verify_leaf64(0xE0E0, 0x11, 0xABCD, 999, 1, lo, hi) == false, "tampered output fails 64-bit verify");
+    }
+
+    // Device binding: a different chip secret yields a different receipt; the
+    // unbound (device=0, "script") receipt differs from any chip-bound one.
+    test device_binding {
+        unbound = receipt_leaf_bound(0, 0xE0E0, 0x11, 0xABCD, 2, 1);
+        chip_a  = receipt_leaf_bound(0xC0FFEE01, 0xE0E0, 0x11, 0xABCD, 2, 1);
+        chip_b  = receipt_leaf_bound(0xC0FFEE02, 0xE0E0, 0x11, 0xABCD, 2, 1);
+        assert(chip_a != chip_b, "different chip => different receipt");
+        assert(chip_a != unbound, "chip-bound differs from unbound (script) receipt");
+    }
+
+    // The signed digest binds device, output, and chain head: any change flips it.
+    test sign_digest_binds_all {
+        d = sign_digest(0xC0FFEE01, 0xE0E0, 0x11, 0xABCD, 2, 1, 0x1234);
+        assert(sign_digest(0xC0FFEE01, 0xE0E0, 0x11, 0xABCD, 999, 1, 0x1234) != d, "output change flips digest");
+        assert(sign_digest(0xC0FFEE02, 0xE0E0, 0x11, 0xABCD, 2, 1, 0x1234) != d, "device change flips digest");
+        assert(sign_digest(0xC0FFEE01, 0xE0E0, 0x11, 0xABCD, 2, 1, 0x9999) != d, "chain-head change flips digest");
+    }
+
+    // GoldenFloat: the GF format+op and the GF result are bound into the receipt.
+    test gf_op_bound {
+        r_mul  = receipt_leaf_gf(GF16, GF_MUL, 0x3C00, 0x4000, 0x4200, 0xC0FFEE01, 0xE0E0, 1);
+        r_add  = receipt_leaf_gf(GF16, GF_ADD, 0x3C00, 0x4000, 0x4200, 0xC0FFEE01, 0xE0E0, 1);
+        assert(r_mul != r_add, "GoldenFloat op is bound (GF16 MUL != GF16 ADD)");
+        r_mul2 = receipt_leaf_gf(GF16, GF_MUL, 0x3C00, 0x4000, 0x4300, 0xC0FFEE01, 0xE0E0, 1);
+        assert(r_mul != r_mul2, "the GF16 result is bound into the receipt");
+    }
+
+    // The full-commitment ledger head verifies honestly and breaks on any tamper
+    // to a receipt's bound fields (output/device/GF result), not just its lo leaf.
+    test full_chain_deterministic_and_tamper_evident {
+        d0 = sign_digest(0xC0FFEE01, 0xE0E0, 0x11, 0x1111, 0x4200, 1, RECEIPT_GENESIS);
+        h0 = chain_step_full(RECEIPT_GENESIS, d0);
+        d1 = sign_digest(0xC0FFEE01, 0xE0E0, 0x12, 0x2222, 0x4300, 2, h0);
+        h1 = chain_step_full(h0, d1);
+        d2 = sign_digest(0xC0FFEE01, 0xE0E0, 0x13, 0x3333, 0x4400, 3, h1);
+        h2 = chain_step_full(h1, d2);
+        assert(verify_chain3_full(d0, d1, d2, h2) == true, "honest full chain verifies");
+        t1 = sign_digest(0xC0FFEE01, 0xE0E0, 0x12, 0x2222, 0x9999, 2, h0);
+        assert(t1 != d1, "output tamper changes the signed digest");
+        assert(verify_chain3_full(d0, t1, d2, h2) == false, "tampered receipt breaks the ledger head");
+    }
+
+    // The ledger head distinguishes a silicon-bound receipt from a script's.
+    test full_chain_binds_device {
+        d_chip = sign_digest(0xC0FFEE01, 0xE0E0, 0x11, 0x1111, 0x4200, 1, RECEIPT_GENESIS);
+        d_script = sign_digest(0, 0xE0E0, 0x11, 0x1111, 0x4200, 1, RECEIPT_GENESIS);
+        assert(d_chip != d_script, "the ledger digest distinguishes silicon from a script");
+    }
+
+    // The signed digest is bound to its A2A request: a receipt for request A
+    // cannot be reattached to request B (its digest differs), and any change to
+    // the underlying result still flips it.
+    test request_bound_signature {
+        dA = sign_digest_req(0x1001, 0xC0FFEE01, 0xE0E0, 0x11, 0xABCD, 0x4100, 1, RECEIPT_GENESIS);
+        dB = sign_digest_req(0x1002, 0xC0FFEE01, 0xE0E0, 0x11, 0xABCD, 0x4100, 1, RECEIPT_GENESIS);
+        assert(dA != dB, "same result, different request => different signed digest");
+        dA2 = sign_digest_req(0x1001, 0xC0FFEE01, 0xE0E0, 0x11, 0xABCD, 0x9999, 1, RECEIPT_GENESIS);
+        assert(dA != dA2, "a tampered result still flips the request-bound digest");
+    }
+
+    // A GF16 result and a GF-T16 result with identical width/op/operands attest to
+    // DIFFERENT receipts: the format family is bound, so one cannot be passed off
+    // as the other.
+    test format_family_bound {
+        binary = receipt_leaf_gf_fmt(FMT_GF_BINARY, GF16, GF_MUL, 0x3C00, 0x4000, 0x4100, 0xC0FFEE01, 0xE0E0, 1);
+        ternary = receipt_leaf_gf_fmt(FMT_GFT, GF16, GF_MUL, 0x3C00, 0x4000, 0x4100, 0xC0FFEE01, 0xE0E0, 1);
+        assert(binary != ternary, "GF16 (binary) and GF-T16 (ternary) attest to different receipts");
+    }
+
+    // A receipt names the EXACT ladder rung: GF-T16/32/64/128 attestations of the same
+    // op/operands are pairwise distinct, so a GF-T64 compute cannot be replayed as a
+    // (cheaper) GF-T16 one.
+    test rung_attestations_are_distinct {
+        r16  = receipt_leaf_gf_rung(FMT_GFT, 16,  GFT16_RUNG_ET,  GF_MUL, 0x11, 0x22, 0x33, 0xC0FFEE01, 0xE0E0, 1);
+        r32  = receipt_leaf_gf_rung(FMT_GFT, 32,  GFT32_RUNG_ET,  GF_MUL, 0x11, 0x22, 0x33, 0xC0FFEE01, 0xE0E0, 1);
+        r64  = receipt_leaf_gf_rung(FMT_GFT, 64,  GFT64_RUNG_ET,  GF_MUL, 0x11, 0x22, 0x33, 0xC0FFEE01, 0xE0E0, 1);
+        r128 = receipt_leaf_gf_rung(FMT_GFT, 128, GFT128_RUNG_ET, GF_MUL, 0x11, 0x22, 0x33, 0xC0FFEE01, 0xE0E0, 1);
+        assert(r16 != r32,  "GF-T16 != GF-T32 attestation");
+        assert(r16 != r64,  "GF-T16 != GF-T64 attestation");
+        assert(r32 != r64,  "GF-T32 != GF-T64 attestation");
+        assert(r64 != r128, "GF-T64 != GF-T128 attestation");
+        assert(r16 != r128, "GF-T16 != GF-T128 attestation");
+    }
+
+    // Recomputing at the WRONG rung geometry (right width, wrong Et) yields a different
+    // leaf -- so a verifier using width_to_et(width) from the ladder detects a geometry
+    // mismatch; the rung is BOUND, not merely labelled. Same rung + inputs is deterministic.
+    test wrong_rung_geometry_is_caught {
+        good  = receipt_leaf_gf_rung(FMT_GFT, 64, GFT64_RUNG_ET, GF_MUL, 0x11, 0x22, 0x33, 0xC0FFEE01, 0xE0E0, 1);
+        bad   = receipt_leaf_gf_rung(FMT_GFT, 64, GFT16_RUNG_ET, GF_MUL, 0x11, 0x22, 0x33, 0xC0FFEE01, 0xE0E0, 1);
+        again = receipt_leaf_gf_rung(FMT_GFT, 64, GFT64_RUNG_ET, GF_MUL, 0x11, 0x22, 0x33, 0xC0FFEE01, 0xE0E0, 1);
+        assert(good != bad,   "width 64 with GF-T16's Et attests differently -- geometry bound");
+        assert(good == again, "same rung + inputs -> same attestation (deterministic)");
+    }
+
+    // The canonical SHA-256 preimage places each field in a fixed word and pins the
+    // SHA-256 padding, so the 256-bit digest computed over it is well-defined and
+    // reproducible. Bit-exactness vs an independent SHA-256 (Python hashlib KAT) is
+    // proven by the trinet_receipt_digest binary; here we pin the word layout.
+    test sha256_preimage_layout {
+        assert(digest_pre(0, 0x2001, 0xC0FFEE01, 0xE0E0, 0x11, 0xABCD, 0x4100, 1, RECEIPT_GENESIS) == TAG_RECEIPT, "word 0 is the domain tag");
+        assert(digest_pre(3, 0x2001, 0xC0FFEE01, 0xE0E0, 0x11, 0xABCD, 0x4100, 1, RECEIPT_GENESIS) == 0xE0E0, "executor lands in word 3");
+        assert(digest_pre(8, 0x2001, 0xC0FFEE01, 0xE0E0, 0x11, 0xABCD, 0x4100, 1, RECEIPT_GENESIS) == RECEIPT_GENESIS, "prev_head lands in word 8");
+        assert(digest_pre(9, 0, 0, 0, 0, 0, 0, 0, 0) == SHA_PAD, "word 9 starts the SHA-256 padding");
+        assert(digest_pre(15, 0, 0, 0, 0, 0, 0, 0, 0) == DIGEST_MSG_BITS, "word 15 is the 288-bit message length");
+        assert(digest_pre(12, 0x2001, 0xC0FFEE01, 0xE0E0, 0x11, 0xABCD, 0x4100, 1, RECEIPT_GENESIS) == 0, "words 10..14 are zero pad");
+    }
+
+    // Domain separation: word 0 is a fixed non-zero tag no attacker controls, so a
+    // receipt preimage can never collide with a differently-tagged structure fed to
+    // the same SHA-256 primitive.
+    test sha256_preimage_domain_sep {
+        assert(digest_pre(0, 0, 0, 0, 0, 0, 0, 0, 0) == TAG_RECEIPT, "tag fixed even for all-zero fields");
+        assert(TAG_RECEIPT != 0, "domain tag is non-zero");
+    }
+
+    // The settled-ledger entry preimage places prev_head in block 1 words 0..7, the
+    // receipt digest in words 8..15, then balance/epoch/tag and the SHA padding in
+    // block 2 -- so the two-block head commits the balance, not just the receipt.
+    // (Full two-block bit-exactness vs hashlib is proven by trinet_ledger_chain.)
+    test ledger_entry_layout {
+        assert(ledger_entry_pre(0, 0xAA, 1, 2, 3, 4, 5, 6, 7, 0xD0, 0xD1, 0xD2, 0xD3, 0xD4, 0xD5, 0xD6, 0xD7, 1000, 9) == 0xAA, "prev_head word 0 at idx 0");
+        assert(ledger_entry_pre(8, 0xAA, 1, 2, 3, 4, 5, 6, 7, 0xD0, 0xD1, 0xD2, 0xD3, 0xD4, 0xD5, 0xD6, 0xD7, 1000, 9) == 0xD0, "digest word 0 at idx 8");
+        assert(ledger_entry_pre(16, 0xAA, 1, 2, 3, 4, 5, 6, 7, 0xD0, 0xD1, 0xD2, 0xD3, 0xD4, 0xD5, 0xD6, 0xD7, 1000, 9) == 1000, "balance_after at idx 16");
+        assert(ledger_entry_pre(17, 0xAA, 1, 2, 3, 4, 5, 6, 7, 0xD0, 0xD1, 0xD2, 0xD3, 0xD4, 0xD5, 0xD6, 0xD7, 1000, 9) == 9, "epoch at idx 17");
+        assert(ledger_entry_pre(18, 0xAA, 1, 2, 3, 4, 5, 6, 7, 0xD0, 0xD1, 0xD2, 0xD3, 0xD4, 0xD5, 0xD6, 0xD7, 1000, 9) == TAG_LEDGER, "ledger tag at idx 18");
+        assert(ledger_entry_pre(19, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0) == SHA_PAD, "SHA pad marker at idx 19");
+        assert(ledger_entry_pre(31, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0) == LEDGER_MSG_BITS, "608-bit length at idx 31");
+        assert(ledger_entry_pre(24, 0xAA, 1, 2, 3, 4, 5, 6, 7, 0xD0, 0xD1, 0xD2, 0xD3, 0xD4, 0xD5, 0xD6, 0xD7, 1000, 9) == 0, "interior padding word is zero");
+    }
+
+    // A Merkle inner node hashes left(256) || right(256): block 1 is the two child
+    // hashes, block 2 the SHA padding for the 64-byte message. (Full two-block
+    // bit-exactness vs hashlib is proven by trinet_merkle_batch.)
+    test merkle_pair_layout {
+        assert(merkle_pair_pre(0, 0xA0, 1, 2, 3, 4, 5, 6, 7, 0xB0, 1, 2, 3, 4, 5, 6, 7) == 0xA0, "left child word 0 at idx 0");
+        assert(merkle_pair_pre(8, 0xA0, 1, 2, 3, 4, 5, 6, 7, 0xB0, 1, 2, 3, 4, 5, 6, 7) == 0xB0, "right child word 0 at idx 8");
+        assert(merkle_pair_pre(15, 0xA0, 1, 2, 3, 4, 5, 6, 7, 0xB0, 1, 2, 3, 4, 5, 6, 7) == 7, "right child word 7 at idx 15");
+        assert(merkle_pair_pre(16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0) == SHA_PAD, "SHA pad marker at idx 16");
+        assert(merkle_pair_pre(31, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0) == MERKLE_MSG_BITS, "512-bit length at idx 31");
+        assert(merkle_pair_pre(20, 0xA0, 1, 2, 3, 4, 5, 6, 7, 0xB0, 1, 2, 3, 4, 5, 6, 7) == 0, "interior padding word is zero");
+    }
+
+    // The input-bound preimage places the FULL 8-word operand hash in block 1 words
+    // 5..12 (vs digest_pre's single 32-bit in_hash), so the digest binds the inputs
+    // at ~2^128. (Two-block bit-exactness vs hashlib is proven by trinet_input_digest.)
+    test input_digest_layout {
+        assert(input_digest_pre(0, 9, 9, 9, 9, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 9, 9, 9) == TAG_INPUT, "tag at word 0");
+        assert(input_digest_pre(5, 9, 9, 9, 9, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 9, 9, 9) == 0xA0, "operand hash word 0 at idx 5");
+        assert(input_digest_pre(12, 9, 9, 9, 9, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 9, 9, 9) == 0xA7, "operand hash word 7 at idx 12");
+        assert(input_digest_pre(13, 9, 9, 9, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0x4100, 1, 0x54524352) == 0x4100, "out at idx 13");
+        assert(input_digest_pre(16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0) == SHA_PAD, "pad at idx 16");
+        assert(input_digest_pre(31, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0) == MERKLE_MSG_BITS, "512-bit length at idx 31");
+    }
+}

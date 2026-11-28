@@ -1,0 +1,178 @@
+module TrinityBramTritCodecT27;
+
+// Packing of trit lanes into one 36-bit block-RAM word, three formats:
+//   FMT_B2  (0): 18 trits, two bits per trit (the lane code itself);
+//   FMT_D5  (1): 20 trits, four dense5 bytes (5 trits in 8 bits) in bits 31:0;
+//                bits 35:32 unused, as in any byte-oriented layout;
+//   FMT_D5D2 (2): 22 trits, the four dense5 bytes plus a dense2 nibble
+//                (2 trits in 4 bits, 3^2 = 9 <= 16) in the parity bits 35:32.
+// A lane is two bits, lane j at bits 2j+1:2j: 00 = 0, 01 = +1, 10 = -1 (11 is
+// invalid), the lane code of the RTL decoders. A dense digit is trit + 1, and
+// code = d0 + 3 d1 + 9 d2 + 27 d3 + 81 d4 (codes 243..255 are invalid); the
+// logical zero group is code 121, the zero nibble is code 4.
+// on_comb is the encoder (op 0: lanes -> word) and the decoder (op 1: word ->
+// lanes in bits 43:0 with the number of invalid groups in bits 55:48); the
+// adapter instantiates it twice with op tied, so each copy keeps one half.
+const FMT_B2: u32 = 0;
+const FMT_D5: u32 = 1;
+const FMT_D5D2: u32 = 2;
+const OP_ENCODE: u32 = 0;
+const OP_DECODE: u32 = 1;
+const WORD_BITS: u32 = 36;
+const WORD_MASK: u64 = 68719476735;
+const INVALID_SHIFT: u64 = 48;
+
+fn lanes_of(format: u32) -> u32 {
+    if (format == FMT_B2) { return 18; }
+    if (format == FMT_D5) { return 20; }
+    return 22;
+}
+
+// A local u64: gen-c emits constants as untyped macros, so a shifted
+// constant would be a 32-bit int in C.
+fn lane_mask(lanes: u32) -> u64 {
+    var one: u64 = 1;
+    return (one << (lanes << 1)) - 1;
+}
+
+// Dense digit of a lane code: 0 -> 1, +1 -> 2, -1 -> 0 (an invalid lane, 11,
+// never reaches the encoder: the trit source maps it to zero).
+fn digit_of_lane(code: u64) -> u64 {
+    if (code == 1) { return 2; }
+    if (code == 2) { return 0; }
+    return 1;
+}
+
+fn lane_of_digit(digit: u16) -> u64 {
+    if (digit == 0) { return 2; }
+    if (digit == 1) { return 0; }
+    return 1;
+}
+
+// Weights 3, 9, 27, 81 as shifts and adds: the pinned gen-verilog lowers `*`
+// to a 64-step shift-add function, which yosys elaborates for every call.
+fn encode_group5(lanes: u64, first: u64) -> u64 {
+    var d0: u64 = digit_of_lane((lanes >> (first << 1)) & 3);
+    var d1: u64 = digit_of_lane((lanes >> ((first << 1) + 2)) & 3);
+    var d2: u64 = digit_of_lane((lanes >> ((first << 1) + 4)) & 3);
+    var d3: u64 = digit_of_lane((lanes >> ((first << 1) + 6)) & 3);
+    var d4: u64 = digit_of_lane((lanes >> ((first << 1) + 8)) & 3);
+    return d0 + ((d1 << 1) + d1) + ((d2 << 3) + d2) + ((d3 << 4) + (d3 << 3) + (d3 << 1) + d3)
+        + ((d4 << 6) + (d4 << 4) + d4);
+}
+
+fn encode_group2(lanes: u64, first: u64) -> u64 {
+    var d0: u64 = digit_of_lane((lanes >> (first << 1)) & 3);
+    var d1: u64 = digit_of_lane((lanes >> ((first << 1) + 2)) & 3);
+    return d0 + ((d1 << 1) + d1);
+}
+
+// Ten lane bits of a dense5 byte; 0 for an invalid code (243..255). The digit
+// arithmetic is 16 bits wide, as in dense5_decoder.t27: a u64 division by a
+// constant makes yosys build a 64-bit divider for every digit.
+fn decode_group5(code: u16) -> u64 {
+    if (code < 243) {
+        return lane_of_digit(code % 3) | (lane_of_digit((code / 3) % 3) << 2)
+            | (lane_of_digit((code / 9) % 3) << 4) | (lane_of_digit((code / 27) % 3) << 6)
+            | (lane_of_digit((code / 81) % 3) << 8);
+    }
+    return 0;
+}
+
+// Four lane bits of a dense2 nibble; 0 for an invalid code (9..15).
+fn decode_group2(code: u16) -> u64 {
+    if (code < 9) {
+        return lane_of_digit(code % 3) | (lane_of_digit((code / 3) % 3) << 2);
+    }
+    return 0;
+}
+
+fn group5_invalid(code: u16) -> u64 {
+    if (code < 243) { return 0; }
+    return 1;
+}
+
+fn encode(format: u32, lanes: u64) -> u64 {
+    if (format == FMT_B2) { return lanes & lane_mask(18); }
+    var bytes: u64 = encode_group5(lanes, 0) | (encode_group5(lanes, 5) << 8)
+        | (encode_group5(lanes, 10) << 16) | (encode_group5(lanes, 15) << 24);
+    if (format == FMT_D5) { return bytes; }
+    return bytes | (encode_group2(lanes, 20) << 32);
+}
+
+// Lanes of a two-bit word with every 11 lane cleared, and the count of such lanes.
+fn decode_b2(word: u64) -> u64 {
+    var lanes: u64 = 0;
+    var bad: u64 = 0;
+    var j: u64 = 0;
+    while (j < 18) {
+        var code: u64 = (word >> (j << 1)) & 3;
+        if (code == 3) { bad = bad + 1; } else { lanes = lanes | (code << (j << 1)); }
+        j = j + 1;
+    }
+    return lanes | (bad << INVALID_SHIFT);
+}
+
+fn group2_invalid(code: u16) -> u64 {
+    if (code < 9) { return 0; }
+    return 1;
+}
+
+// Lanes and invalid count of the dense layouts. Every local is assigned on every
+// path and the nibble is selected at the end: yosys (proc_dlatch) takes minutes
+// on a function whose locals are assigned only on some paths.
+fn decode_dense(word: u64, with_nibble: bool) -> u64 {
+    var b0: u16 = (word & 255) as u16;
+    var b1: u16 = ((word >> 8) & 255) as u16;
+    var b2: u16 = ((word >> 16) & 255) as u16;
+    var b3: u16 = ((word >> 24) & 255) as u16;
+    var nibble: u16 = ((word >> 32) & 15) as u16;
+    var lanes: u64 = decode_group5(b0) | (decode_group5(b1) << 10)
+        | (decode_group5(b2) << 20) | (decode_group5(b3) << 30);
+    var bad: u64 = group5_invalid(b0) + group5_invalid(b1) + group5_invalid(b2) + group5_invalid(b3);
+    var nib_lanes: u64 = decode_group2(nibble) << 40;
+    var nib_bad: u64 = group2_invalid(nibble);
+    if (with_nibble) { return lanes | nib_lanes | ((bad + nib_bad) << INVALID_SHIFT); }
+    return lanes | (bad << INVALID_SHIFT);
+}
+
+// Both layouts are decoded and the result selected afterwards: with a function
+// call inside a branch on a port, yosys spends minutes in proc.
+fn decode(format: u32, word: u64) -> u64 {
+    var two: u64 = decode_b2(word & WORD_MASK);
+    var dense: u64 = decode_dense(word, format == FMT_D5D2);
+    if (format == FMT_B2) { return two; }
+    return dense;
+}
+
+// Both halves are computed and the result selected afterwards: yosys spends
+// minutes in proc when a heavy function is called inside a branch of another.
+fn on_comb(format: u32, op: u32, x: u64) -> u64 {
+    var encoded: u64 = encode(format, x);
+    var decoded: u64 = decode(format, x);
+    if (op == OP_ENCODE) { return encoded; }
+    return decoded;
+}
+
+test lanes_per_format { assert_eq(lanes_of(0), 18); assert_eq(lanes_of(1), 20); assert_eq(lanes_of(2), 22); }
+test zero_group_is_121 { assert_eq(encode_group5(0, 0), 121); }
+test zero_nibble_is_4 { assert_eq(encode_group2(0, 0), 4); }
+test all_zero_words {
+    assert_eq(encode(0, 0), 0);
+    assert_eq(encode(1, 0), 2038004089);
+    assert_eq(encode(2, 0), 19217873273);
+}
+test all_positive_group_is_242 { assert_eq(encode_group5(341, 0), 242); }
+test all_negative_group_is_0 { assert_eq(encode_group5(682, 0), 0); }
+test dense_round_trip {
+    assert_eq(encode(1, 11562141679974), 832652254);
+    assert_eq(decode(1, encode(1, 11562141679974)), 567025402214);
+    assert_eq(encode(2, 11173450058082), 1469766619);
+    assert_eq(decode(2, encode(2, 11173450058082)), 11173450058082);
+}
+test b2_round_trip { assert_eq(decode(0, encode(0, 34973196880)), 34973196880); }
+test invalid_byte_is_counted { assert_eq(decode(1, 255) >> 48, 1); assert_eq(decode(1, 255) & 1023, 0); }
+test invalid_nibble_is_counted { assert_eq(decode(2, 38654705664) >> 48, 1); }
+test invalid_b2_lane_is_counted { assert_eq(decode(0, 15) >> 48, 2); assert_eq(decode(0, 15) & 15, 0); }
+test on_comb_selects { assert_eq(on_comb(2, 0, 0), 19217873273); assert_eq(on_comb(2, 1, 19217873273), 0); }
+endmodule

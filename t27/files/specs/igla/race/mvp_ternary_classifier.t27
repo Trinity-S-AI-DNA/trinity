@@ -1,0 +1,324 @@
+// SPDX-License-Identifier: Apache-2.0
+// t27/specs/igla/race/mvp_ternary_classifier.t27
+// The MVP: a complete ternary neural network, small enough that every number in
+// it can be checked by hand, built to be placed on an XC7A200T with ZERO DSPs.
+//
+// WHY THIS SHAPE.  The claim worth proving first is not "a big model runs" but
+// "a model runs AT ALL, with no multiplier anywhere". A network small enough to
+// verify by hand is the only one where a wrong answer is unmistakably wrong --
+// and this session has three times mistaken a truncated output for a result, so
+// the first hardware model must be one whose every expected value is written
+// down before the silicon is asked.
+//
+// ARCHITECTURE.  One layer, 8 binary inputs -> 3 class scores -> argmax.
+// Twenty-four ternary weights, fifteen of them non-zero. Each class is a
+// template over the input; the score is the correlation; the class is the
+// largest score. This IS a ternary neural network layer -- the same operation a
+// BitNet layer performs, at a size where the arithmetic fits on one line.
+//
+//   class A  + + + - - 0 0 0     "left"
+//   class B  0 - + + + - 0 0     "middle"
+//   class C  0 0 0 - - + + +     "right"
+//
+// WEIGHTS ARE GFTernary.  Codes are GAT_ZERO=0, GAT_POS=1, GAT_NEG=2, identical
+// to specs/numeric/gfternary.t27 and to the codes RACE already stores (T89), and
+// identical to the wire encoding of specs/fpga/ternary_link.t27 (T87). The
+// alphabet is {-phi, 0, +phi}; because every input is 0 or 1 and enters as the
+// pair (x, 0), applying a weight gives (0, +/-x), so the whole layer accumulates
+// in the b component alone and the score is an exact integer. No rounding, no
+// normalisation, no multiplier -- the closure argument, at MVP scale.
+//
+// TIE-BREAKING IS PART OF THE SPEC.  argmax returns the FIRST maximal class.
+// A tie rule left implicit is a place where a reference and an implementation
+// can disagree while both look right; it is written here and tested at x=0 and
+// x=255, where all three scores are equal.
+//
+// REFERENCE, computed independently before this file was written:
+//
+//     x     bits      A   B   C   class
+//     0   00000000    0   0   0     0
+//     7   00000111    3   0   0     0
+//    60   00111100   -1   2  -1     1
+//   224   11100000    0  -1   3     2
+//   255   11111111    1   1   1     0
+//     3   00000011    2  -1   0     0
+//    24   00011000   -2   2  -2     1
+//   192   11000000    0   0   2     2
+//    15   00001111    2   1  -1     0
+//   240   11110000   -1   0   2     2
+//
+// SIZE.  24 weights, 15 non-zero. At the measured 33 LUT per composed MAC node
+// that is 495 LUT fully parallel -- 0.23% of an XC7A200T. The point is not that
+// it is small; the point is that it is small enough to be certain about.
+//
+// W806 CORRECTION.  This line said 66 LUT and 990 LUT for several waves, and
+// T161 built an argument on the 66. It was never a measurement: `cell_census` in
+// `bootstrap/src/service.rs` summed BOTH tables of yosys's final statistics block
+// -- the module's own and the `=== design hierarchy ===` repeat -- and so
+// doubled every cell count `t27c path --synth` ever printed (T500). The single
+// runtime-weight ternary MAC is **33 LUT, 10 CARRY4, 0 DSP48E1**, verified by
+// `t27c yostat` and again by `path --synth` after the fix.
+//
+// The 83 LUT figure below is from a different route and is NOT corrected here;
+// it is a whole-classifier number whose 24 weights are compile-time constants
+// that Yosys folds, so it is not a MAC density at all and must never be quoted
+// against the field's LUT-per-multiply figures (T498).
+//
+// phi^2 + 1/phi^2 = 3 | TRINITY
+
+module IglaMvpTernaryClassifier {
+    use base::types;
+
+    // ---- The GFTernary alphabet, pinned to specs/numeric/gfternary.t27 ----
+    const GAT_ZERO : u8 = 0;
+    const GAT_POS  : u8 = 1;
+    const GAT_NEG  : u8 = 2;
+
+    const N_INPUTS  : u8 = 8;
+    const N_CLASSES : u8 = 3;
+    const N_WEIGHTS : u8 = 24;
+
+    // ---- The model, as ternary weight codes ----
+    // Packed one class per constant, two bits per weight, input i in bits 2i+1:2i.
+    // A: + + + - - 0 0 0  ->  01 01 01 10 10 00 00 00  (i=0 in the low pair)
+    const W_A : u16 = 0b0000001010010101;
+    const W_B : u16 = 0b0000100101011000;
+    const W_C : u16 = 0b0101011010000000;
+
+    // ---- Weight extraction ----
+    // W657: the parameter was named `packed` in the first draft. `packed` is a
+    // ZIG KEYWORD (`packed struct`), and the Zig backend does not escape target
+    // keywords used as parameter names -- `fn weight_at(packed: u16, ...)` is a
+    // syntax error there while the Verilog backend accepted it and passed all 31
+    // tests. The same class as the Verilog keyword escaping of T53/T64, on the
+    // other side, and found the same way: by a backend that could disagree.
+    fn weight_at(tmpl: u16, i: u8) -> u8 {
+        return (((tmpl >> (i * 2)) & 3) as u8);
+    }
+
+    // ---- One weighted contribution ----
+    // The activation is a single bit. It enters Z[phi] as the pair (x, 0);
+    // applying +phi gives (0, x) and -phi gives (0, -x), so only the b component
+    // ever moves and the score is an exact integer. A zero weight is a SKIP.
+    fn contrib(code: u8, x: u8) -> i32 {
+        if (code == GAT_POS) { return (x as i32); } else {
+        if (code == GAT_NEG) { return (0 - (x as i32)); } else {
+                               return 0;
+        } }
+    }
+
+    fn bit_at(x: u8, i: u8) -> u8 {
+        return ((x >> i) & 1);
+    }
+
+    // ---- Class score: the correlation of the input with a template ----
+    // Unrolled over eight inputs. Unrolled rather than looped because the
+    // Verilog backend lowers a fixed unroll to a pure adder tree, which is what
+    // the zero-DSP claim rests on.
+    fn score(tmpl: u16, x: u8) -> i32 {
+        return (contrib(weight_at(tmpl, 0), bit_at(x, 0))
+              + contrib(weight_at(tmpl, 1), bit_at(x, 1))
+              + contrib(weight_at(tmpl, 2), bit_at(x, 2))
+              + contrib(weight_at(tmpl, 3), bit_at(x, 3))
+              + contrib(weight_at(tmpl, 4), bit_at(x, 4))
+              + contrib(weight_at(tmpl, 5), bit_at(x, 5))
+              + contrib(weight_at(tmpl, 6), bit_at(x, 6))
+              + contrib(weight_at(tmpl, 7), bit_at(x, 7)));
+    }
+
+    fn score_a(x: u8) -> i32 { return score(W_A, x); }
+    fn score_b(x: u8) -> i32 { return score(W_B, x); }
+    fn score_c(x: u8) -> i32 { return score(W_C, x); }
+
+    // ---- argmax, first-maximal wins ----
+    fn classify(x: u8) -> u8 {
+        if (score_a(x) >= score_b(x) && score_a(x) >= score_c(x)) { return 0; } else {
+        if (score_b(x) >= score_c(x)) { return 1; } else {
+                                        return 2;
+        } }
+    }
+
+    // ---- Combinational port surface (T81): 8 bits in, class out ----
+    fn on_comb(x: u8) -> u8 {
+        return classify(x);
+    }
+
+    // ========================================================================
+    // Tests -- every expected value written before the implementation ran
+    // ========================================================================
+
+    // ---- Weight extraction ----
+
+    test weight_a0_is_pos
+        given w = weight_at(W_A, 0)
+        then w == 1
+
+    test weight_a3_is_neg
+        given w = weight_at(W_A, 3)
+        then w == 2
+
+    test weight_a5_is_zero
+        given w = weight_at(W_A, 5)
+        then w == 0
+
+    test weight_b1_is_neg
+        given w = weight_at(W_B, 1)
+        then w == 2
+
+    test weight_c7_is_pos
+        given w = weight_at(W_C, 7)
+        then w == 1
+
+    // ---- One contribution ----
+
+    test pos_weight_passes_a_set_bit
+        given r = contrib(1, 1)
+        then r == 1
+
+    test neg_weight_negates_a_set_bit
+        given r = contrib(2, 1)
+        then r == -1
+
+    test zero_weight_is_a_skip
+        given r = contrib(0, 1)
+        then r == 0
+
+    test any_weight_on_a_clear_bit_is_zero
+        given r = contrib(1, 0)
+        then r == 0
+
+    // ---- Scores, against the independently computed reference ----
+
+    test score_a_of_7
+        given s = score_a(7)
+        then s == 3
+
+    test score_b_of_7
+        given s = score_b(7)
+        then s == 0
+
+    test score_c_of_7
+        given s = score_c(7)
+        then s == 0
+
+    test score_a_of_60
+        given s = score_a(60)
+        then s == -1
+
+    test score_b_of_60
+        given s = score_b(60)
+        then s == 2
+
+    test score_c_of_224
+        given s = score_c(224)
+        then s == 3
+
+    test score_a_of_255
+        given s = score_a(255)
+        then s == 1
+
+    test score_b_of_24
+        given s = score_b(24)
+        then s == 2
+
+    test score_c_of_240
+        given s = score_c(240)
+        then s == 2
+
+    // ---- Classification, the whole reference table ----
+
+    test classify_0_is_class_0
+        given c = classify(0)
+        then c == 0
+
+    test classify_7_is_class_0
+        given c = classify(7)
+        then c == 0
+
+    test classify_60_is_class_1
+        given c = classify(60)
+        then c == 1
+
+    test classify_224_is_class_2
+        given c = classify(224)
+        then c == 2
+
+    // Ties: all three scores equal. The rule is FIRST wins, and it is tested
+    // rather than assumed, because an implicit tie rule is where a reference and
+    // an implementation disagree while both look correct.
+    test classify_255_ties_to_class_0
+        given c = classify(255)
+        then c == 0
+
+    test classify_3_is_class_0
+        given c = classify(3)
+        then c == 0
+
+    test classify_24_is_class_1
+        given c = classify(24)
+        then c == 1
+
+    test classify_192_is_class_2
+        given c = classify(192)
+        then c == 2
+
+    test classify_15_is_class_0
+        given c = classify(15)
+        then c == 0
+
+    test classify_240_is_class_2
+        given c = classify(240)
+        then c == 2
+
+    // ---- Port surface ----
+
+    test comb_surface_classifies_left
+        given c = on_comb(7)
+        then c == 0
+
+    test comb_surface_classifies_middle
+        given c = on_comb(60)
+        then c == 1
+
+    test comb_surface_classifies_right
+        given c = on_comb(224)
+        then c == 2
+
+    // ========================================================================
+    // Invariants
+    // ========================================================================
+
+    // ---- The alphabet, pinned to gfternary.t27 (no cross-import, #1773) ----
+    invariant gat_zero_matches_canonical
+        assert GAT_ZERO == 0
+
+    invariant gat_pos_matches_canonical
+        assert GAT_POS == 1
+
+    invariant gat_neg_matches_canonical
+        assert GAT_NEG == 2
+
+    // ---- Model geometry ----
+    invariant weight_count_is_inputs_times_classes
+        assert N_WEIGHTS == N_INPUTS * N_CLASSES
+
+    invariant eight_inputs
+        assert N_INPUTS == 8
+
+    invariant three_classes
+        assert N_CLASSES == 3
+
+    // Two bits per weight, eight weights, so a class template is exactly 16 bits.
+    invariant a_template_fits_sixteen_bits
+        assert N_INPUTS * 2 == 16
+
+    // The three templates must be distinct, or two classes are the same class.
+    invariant templates_a_and_b_differ
+        assert W_A != W_B
+
+    invariant templates_b_and_c_differ
+        assert W_B != W_C
+
+    invariant templates_a_and_c_differ
+        assert W_A != W_C
+}

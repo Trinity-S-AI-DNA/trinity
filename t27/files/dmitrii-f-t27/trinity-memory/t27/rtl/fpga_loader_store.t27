@@ -1,0 +1,126 @@
+module TrinityFpgaLoaderStoreT27;
+
+// Block-RAM store behind the UART loader's write and read ports (issue #63,
+// t27/rtl/fpga_uart_loader.t27): STORE_BYTES bytes, one byte per write transfer
+// and per read request.
+//
+// The bytes live in 32-bit words, four banks of BANK_WORDS words (bank = address
+// bits 17:16, word = bits 15:2, byte lane = bits 1:0), so that yosys maps every bank
+// to RAMB36 blocks in the 1K x 36 configuration, the one the block-RAM benches have
+// verified on the board (fpga/ax7203/brams_x36.txt; 16 blocks per bank). The first
+// board run of this loader had the store in the 32K x 1 configuration and read
+// back every even byte as its odd neighbour (docs/uart-loader.md).
+//
+// A byte write is a read-modify-write of its word: the clock that sees wr_valid
+// while the store is idle (wr_ready) reads the word, the next one writes it back
+// with the byte merged in. wr_idle is low while a write is in flight. A read
+// request taken while idle (rd_ready) returns the byte (rdata) with rd_valid one
+// clock later. A DDR3 Wishbone master can take this module's place behind the same
+// ports (docs/uart-loader.md, "DDR3"). Addresses wrap at the store size; the loader
+// never issues one outside it. The banks infer block RAM with yosys
+// `read_verilog -nomem2reg`; each read register takes its bank's word directly and
+// has no reset value; reset does not clear the memory.
+// Every statement reads a variable before the same tick writes it.
+const STORE_BYTES: u32 = 262144;
+const STORE_LOG2: u32 = 18;
+const BANK_WORDS: u32 = 16384;
+const WORD_MASK: u32 = 16383;
+const S_IDLE: u32 = 0;
+const S_MERGE: u32 = 1;
+
+var mem_b0: [16384]u32;
+var mem_b1: [16384]u32;
+var mem_b2: [16384]u32;
+var mem_b3: [16384]u32;
+var rd_b0: u32;
+var rd_b1: u32;
+var rd_b2: u32;
+var rd_b3: u32;
+var sstate: u32 = 0;
+var bank: u32 = 0;
+var lane: u32 = 0;
+var w_word: u32 = 0;
+var w_byte: u32 = 0;
+var rd_valid: bool = false;
+var writes: u32 = 0;
+var size_log2: u32 = STORE_LOG2;
+
+fn select_bank(b: u32, w0: u32, w1: u32, w2: u32, w3: u32) -> u32 {
+    if (b == 0) { return w0; }
+    if (b == 1) { return w1; }
+    if (b == 2) { return w2; }
+    return w3;
+}
+
+fn pick(sel: bool, x: u32, y: u32) -> u32 {
+    if (sel) { return x; }
+    return y;
+}
+
+// The word with byte `ln` replaced by `v`.
+fn merge(word: u32, v: u32, ln: u32) -> u32 {
+    var sh: u32 = ln << 3;
+    var mask: u32 = 255;
+    return (word & ~(mask << sh)) | ((v & 255) << sh);
+}
+
+var word_now: u32;
+var rdata: u32;
+var merged: u32;
+var wr_ready: bool;
+var wr_idle: bool;
+var rd_ready: bool;
+var a_byte: u32;
+var a_word: u32;
+word_now = select_bank(bank, rd_b0, rd_b1, rd_b2, rd_b3);
+rdata = (word_now >> (lane << 3)) & 255;
+merged = merge(word_now, w_byte, lane);
+wr_ready = sstate == S_IDLE;
+wr_idle = sstate == S_IDLE;
+rd_ready = sstate == S_IDLE;
+a_byte = pick(wr_valid, wr_addr, rd_addr);
+a_word = (a_byte >> 2) & WORD_MASK;
+
+fn on_clock(wr_valid: bool, wr_addr: u32, wr_data: u32, rd_req: bool, rd_addr: u32) {
+    rd_valid = false;
+    if (sstate == S_IDLE) {
+        // One read address for both requests: two addresses would ask yosys for a
+        // third memory port, and it then builds the banks from LUT RAM.
+        if (wr_valid || rd_req) {
+            rd_b0 = mem_b0[a_word];
+            rd_b1 = mem_b1[a_word];
+            rd_b2 = mem_b2[a_word];
+            rd_b3 = mem_b3[a_word];
+            bank = (a_byte >> 16) & 3;
+            lane = a_byte & 3;
+        }
+        if (wr_valid) {
+            w_word = a_word;
+            w_byte = wr_data & 255;
+            sstate = S_MERGE;
+        } else if (rd_req) {
+            rd_valid = true;
+        }
+    } else {
+        if (bank == 0) {
+            mem_b0[w_word] = merged;
+        } else if (bank == 1) {
+            mem_b1[w_word] = merged;
+        } else if (bank == 2) {
+            mem_b2[w_word] = merged;
+        } else {
+            mem_b3[w_word] = merged;
+        }
+        writes = writes + 1;
+        sstate = S_IDLE;
+    }
+}
+
+test store_geometry { assert_eq(4 * BANK_WORDS * 4, STORE_BYTES); assert_eq(STORE_BYTES >> STORE_LOG2, 1); }
+test merge_replaces_one_byte {
+    assert_eq(merge(305419896, 171, 0), 305419947);
+    assert_eq(merge(305419896, 171, 3), 2872333944);
+    assert_eq(merge(0, 511, 1), 65280);
+}
+test bank_select { assert_eq(select_bank(2, 5, 6, 7, 8), 7); }
+endmodule

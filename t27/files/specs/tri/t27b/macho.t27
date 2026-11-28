@@ -1,0 +1,476 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/tri/t27b/macho.t27 -- the layout and the bytes of t27b's Mach-O object file (port epic #6198)
+; `t27b build` writes a 64-bit relocatable object (MH_OBJECT) for arm64. Until this file, all of it was
+; hand-written Rust in cli/t27b/src/macho.rs. Now the layout (where every part of the file starts) and
+; the serialization of the header, the load commands, the relocations and the symbols are written here
+; and reach cli/t27b through `t27c gen-rust` (gen/rust/tri/t27b/macho.rs). The Rust left in macho.rs is
+; glue: it turns the linked code words into bytes, sorts the exported names, builds the string table
+; and copies text, data and strings into the buffer at the offsets this file computes.
+; --
+; The file, in order:
+;   mach_header_64                      32 bytes
+;   LC_SEGMENT_64 + 1 or 2 section_64   72 + 80 per section (__TEXT,__text and, with data, __TEXT,__const)
+;   LC_BUILD_VERSION                    24 bytes (macOS 11.0)
+;   LC_SYMTAB                           24 bytes
+;   LC_DYSYMTAB                         80 bytes
+;   padding to 16
+;   __text                              the linked functions
+;   __const                             read-only data blobs, 8-byte aligned, at the next 16 bytes
+;   relocations, at the next 8 bytes    two per data reference (ARM64_RELOC_PAGE21, ARM64_RELOC_PAGEOFF12)
+;   nlist_64 symbols                    one local symbol per referenced blob, then one external per fn
+;   string table                        padded to 8 bytes by the glue
+; --
+; Intra-module `bl` offsets are resolved at emit time, so calls need no relocations. A data reference
+; is an `adrp` + `add` pair; its target is named by the blob's local symbol (`l_t27b_data.N`) so the
+; linker computes the page and the page offset itself, as for clang's own `adrp`/`add` to a `l_.str`
+; literal. The header does not set MH_SUBSECTIONS_VIA_SYMBOLS: the linker must keep __text as one block.
+; --
+; The oracle. Every byte string in the tests below was printed by the hand-written Rust this file
+; replaces (cli/t27b/src/macho.rs `object` on master bd3bdcda1, run on the t27c Railway lab) for three
+; images: S1 one function and no data; S2 three functions, three blobs, two data references; S3 four
+; functions (one without an offset), twelve blobs and four references to two-digit blob numbers.
+; ASCII only (L3)
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module T27bMachO;
+
+// mach_header_64 and load command constants (<mach-o/loader.h>).
+pub const MH_MAGIC_64 : u32 = 0xfeedfacf;
+pub const CPU_TYPE_ARM64 : u32 = 0x0100000c;
+pub const CPU_SUBTYPE_ARM64_ALL : u32 = 0;
+pub const MH_OBJECT : u32 = 1;
+pub const LC_SEGMENT_64 : u32 = 0x19;
+pub const LC_SYMTAB : u32 = 2;
+pub const LC_DYSYMTAB : u32 = 0xb;
+pub const LC_BUILD_VERSION : u32 = 0x32;
+pub const PLATFORM_MACOS : u32 = 1;
+pub const MINOS_11_0 : u32 = 0x000b0000;
+pub const VM_PROT_RWX : u32 = 7;
+pub const S_ATTR_PURE_INSTRUCTIONS : u32 = 0x80000000;
+pub const S_ATTR_SOME_INSTRUCTIONS : u32 = 0x00000400;
+pub const S_REGULAR : u32 = 0;
+// nlist_64 n_type bits and section numbers (1-based).
+pub const N_SECT : u8 = 0xe;
+pub const N_EXT : u8 = 1;
+pub const SECT_TEXT : u8 = 1;
+pub const SECT_CONST : u8 = 2;
+// relocation_info r_type values (<mach-o/arm64/reloc.h>).
+pub const ARM64_RELOC_PAGE21 : u32 = 3;
+pub const ARM64_RELOC_PAGEOFF12 : u32 = 4;
+// log2 alignments of the two sections: functions start on 16 bytes, blobs on 8.
+pub const TEXT_ALIGN_LOG2 : u32 = 4;
+pub const CONST_ALIGN_LOG2 : u32 = 3;
+
+// Sizes in bytes of the fixed records.
+pub const HEADER_SIZE : usize = 32;
+pub const SEGMENT_SIZE : usize = 72;
+pub const SECTION_SIZE : usize = 80;
+pub const BUILD_VERSION_SIZE : usize = 24;
+pub const SYMTAB_SIZE : usize = 24;
+pub const DYSYMTAB_SIZE : usize = 80;
+pub const RELOC_SIZE : usize = 8;
+pub const NLIST_SIZE : usize = 16;
+pub const NCMDS : u32 = 4;
+
+/// x rounded up to a multiple of a (a > 0).
+pub fn align_up(x: usize, a: usize) -> usize {
+    return (x + a - 1) / a * a;
+}
+
+/// __TEXT,__const exists only when the data blobs take room.
+pub fn nsects(const_size: usize) -> u32 {
+    if (const_size > 0) { return 2; }
+    return 1;
+}
+
+/// LC_SEGMENT_64 with its section_64 records.
+pub fn segment_cmdsize(const_size: usize) -> usize {
+    return SEGMENT_SIZE + SECTION_SIZE * (nsects(const_size) as usize);
+}
+
+/// mach_header_64.sizeofcmds: the four load commands.
+pub fn sizeofcmds(const_size: usize) -> usize {
+    return segment_cmdsize(const_size) + BUILD_VERSION_SIZE + SYMTAB_SIZE + DYSYMTAB_SIZE;
+}
+
+/// File offset of __text: the header and the commands, padded to 16.
+pub fn text_off(const_size: usize) -> usize {
+    return align_up(HEADER_SIZE + sizeofcmds(const_size), 16);
+}
+
+/// Address (and offset from __text) of __const: it follows __text at the next 16 bytes.
+pub fn const_addr(text_size: usize) -> usize {
+    return align_up(text_size, 16);
+}
+
+/// vmsize and filesize of the segment.
+pub fn vm_size(text_size: usize, const_size: usize) -> usize {
+    if (const_size > 0) { return const_addr(text_size) + const_size; }
+    return text_size;
+}
+
+/// File offset of the relocations: after the segment, at the next 8 bytes.
+pub fn reloff(text_size: usize, const_size: usize) -> usize {
+    return align_up(text_off(const_size) + vm_size(text_size, const_size), 8);
+}
+
+/// File offset of the symbols: two relocations per data reference.
+pub fn symoff(text_size: usize, const_size: usize, nrefs: usize) -> usize {
+    return reloff(text_size, const_size) + RELOC_SIZE * 2 * nrefs;
+}
+
+/// File offset of the string table.
+pub fn stroff(text_size: usize, const_size: usize, nrefs: usize, nsyms: usize) -> usize {
+    return symoff(text_size, const_size, nrefs) + NLIST_SIZE * nsyms;
+}
+
+/// Length of the whole object; strsize is the padded string table.
+pub fn object_size(text_size: usize, const_size: usize, nrefs: usize, nsyms: usize, strsize: usize) -> usize {
+    return stroff(text_size, const_size, nrefs, nsyms) + strsize;
+}
+
+/// relocation_info word two: r_symbolnum:24 r_pcrel:1 r_length:2 (2 = 4 bytes) r_extern:1 r_type:4,
+/// low bits first.
+pub fn reloc_info(sym: u32, pcrel: u32, ty: u32) -> u32 {
+    return sym | (pcrel << 24) | (2 << 25) | (1 << 27) | (ty << 28);
+}
+
+/// Little-endian writers. Each writes at `at` and returns the position after what it wrote.
+pub fn put_u8(out: []u8, at: usize, v: u8) -> usize {
+    out[at] = v;
+    return at + 1;
+}
+
+pub fn put_u16(out: []u8, at: usize, v: u16) -> usize {
+    out[at] = (v & 255) as u8;
+    out[at + 1] = (v >> 8) as u8;
+    return at + 2;
+}
+
+pub fn put_u32(out: []u8, at: usize, v: u32) -> usize {
+    var x : u32 = v;
+    var i : usize = 0;
+    while (i < 4) {
+        out[at + i] = (x & 255) as u8;
+        x = x >> 8;
+        i = i + 1;
+    }
+    return at + 4;
+}
+
+pub fn put_u64(out: []u8, at: usize, v: u64) -> usize {
+    var x : u64 = v;
+    var i : usize = 0;
+    while (i < 8) {
+        out[at + i] = (x & 255) as u8;
+        x = x >> 8;
+        i = i + 1;
+    }
+    return at + 8;
+}
+
+/// A 16-byte name field: the name, then zeros.
+pub fn put_name16(out: []u8, at: usize, name: string) -> usize {
+    var i : usize = 0;
+    while (i < 16) {
+        if (i < name.len) { out[at + i] = name[i]; } else { out[at + i] = 0; }
+        i = i + 1;
+    }
+    return at + 16;
+}
+
+/// One section_64 of segment __TEXT.
+pub fn put_section(out: []u8, at: usize, sect: string, addr: usize, size: usize, off: usize, align: u32, rel: usize, nreloc: usize, flags: u32) -> usize {
+    var p : usize = put_name16(out, at, sect);
+    p = put_name16(out, p, "__TEXT");
+    p = put_u64(out, p, addr as u64);
+    p = put_u64(out, p, size as u64);
+    p = put_u32(out, p, off as u32);
+    p = put_u32(out, p, align);
+    p = put_u32(out, p, rel as u32);
+    p = put_u32(out, p, nreloc as u32);
+    p = put_u32(out, p, flags);
+    p = put_u32(out, p, 0);
+    p = put_u32(out, p, 0);
+    return put_u32(out, p, 0);
+}
+
+/// mach_header_64 and the four load commands, from offset 0. Returns the end of the commands,
+/// HEADER_SIZE + sizeofcmds; the bytes up to text_off are padding the caller leaves zero.
+/// nrefs data references, nlocal blob symbols, nextdef function symbols, strsize padded string bytes.
+pub fn put_commands(out: []u8, text_size: usize, const_size: usize, nrefs: usize, nlocal: usize, nextdef: usize, strsize: usize) -> usize {
+    const ns : u32 = nsects(const_size);
+    const toff : usize = text_off(const_size);
+    const vm : usize = vm_size(text_size, const_size);
+    const nsyms : usize = nlocal + nextdef;
+    // mach_header_64
+    var p : usize = put_u32(out, 0, MH_MAGIC_64);
+    p = put_u32(out, p, CPU_TYPE_ARM64);
+    p = put_u32(out, p, CPU_SUBTYPE_ARM64_ALL);
+    p = put_u32(out, p, MH_OBJECT);
+    p = put_u32(out, p, NCMDS);
+    p = put_u32(out, p, sizeofcmds(const_size) as u32);
+    p = put_u32(out, p, 0);
+    p = put_u32(out, p, 0);
+    // LC_SEGMENT_64, unnamed as in every MH_OBJECT
+    p = put_u32(out, p, LC_SEGMENT_64);
+    p = put_u32(out, p, segment_cmdsize(const_size) as u32);
+    p = put_name16(out, p, "");
+    p = put_u64(out, p, 0);
+    p = put_u64(out, p, vm as u64);
+    p = put_u64(out, p, toff as u64);
+    p = put_u64(out, p, vm as u64);
+    p = put_u32(out, p, VM_PROT_RWX);
+    p = put_u32(out, p, VM_PROT_RWX);
+    p = put_u32(out, p, ns);
+    p = put_u32(out, p, 0);
+    // __text carries the relocations; with none, reloff and nreloc are both 0.
+    var rel : usize = 0;
+    if (nrefs > 0) { rel = reloff(text_size, const_size); }
+    p = put_section(out, p, "__text", 0, text_size, toff, TEXT_ALIGN_LOG2, rel, 2 * nrefs, S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS);
+    if (const_size > 0) {
+        const ca : usize = const_addr(text_size);
+        p = put_section(out, p, "__const", ca, const_size, toff + ca, CONST_ALIGN_LOG2, 0, 0, S_REGULAR);
+    }
+    // LC_BUILD_VERSION: no sdk, no tools
+    p = put_u32(out, p, LC_BUILD_VERSION);
+    p = put_u32(out, p, BUILD_VERSION_SIZE as u32);
+    p = put_u32(out, p, PLATFORM_MACOS);
+    p = put_u32(out, p, MINOS_11_0);
+    p = put_u32(out, p, 0);
+    p = put_u32(out, p, 0);
+    // LC_SYMTAB
+    p = put_u32(out, p, LC_SYMTAB);
+    p = put_u32(out, p, SYMTAB_SIZE as u32);
+    p = put_u32(out, p, symoff(text_size, const_size, nrefs) as u32);
+    p = put_u32(out, p, nsyms as u32);
+    p = put_u32(out, p, stroff(text_size, const_size, nrefs, nsyms) as u32);
+    p = put_u32(out, p, strsize as u32);
+    // LC_DYSYMTAB: the blob symbols are local, the functions external, nothing undefined.
+    p = put_u32(out, p, LC_DYSYMTAB);
+    p = put_u32(out, p, DYSYMTAB_SIZE as u32);
+    p = put_u32(out, p, 0);
+    p = put_u32(out, p, nlocal as u32);
+    p = put_u32(out, p, nlocal as u32);
+    p = put_u32(out, p, nextdef as u32);
+    p = put_u32(out, p, nsyms as u32);
+    p = put_u32(out, p, 0);
+    var k : usize = 0;
+    while (k < 12) {
+        p = put_u32(out, p, 0);
+        k = k + 1;
+    }
+    return p;
+}
+
+/// The two relocations of the `adrp` + `add` pair at code word w, naming local symbol sym.
+pub fn put_reloc_pair(out: []u8, at: usize, w: usize, sym: u32) -> usize {
+    var p : usize = put_u32(out, at, (w * 4) as u32);
+    p = put_u32(out, p, reloc_info(sym, 1, ARM64_RELOC_PAGE21));
+    p = put_u32(out, p, ((w + 1) * 4) as u32);
+    return put_u32(out, p, reloc_info(sym, 0, ARM64_RELOC_PAGEOFF12));
+}
+
+/// One nlist_64: string index, type, section, n_desc 0, value.
+pub fn put_nlist(out: []u8, at: usize, strx: u32, ntype: u8, sect: u8, value: u64) -> usize {
+    var p : usize = put_u32(out, at, strx);
+    p = put_u8(out, p, ntype);
+    p = put_u8(out, p, sect);
+    p = put_u16(out, p, 0);
+    return put_u64(out, p, value);
+}
+
+/// Test helper: the value of one hex digit.
+pub fn hex_digit(c: u8) -> u8 {
+    if (c >= 97) { return c - 87; }
+    return c - 48;
+}
+
+/// Test helper: do the bytes at `at` equal the lowercase hex string?
+pub fn bytes_are(out: []u8, at: usize, hex: string) -> bool {
+    var i : usize = 0;
+    while (2 * i < hex.len) {
+        const b : u8 = hex_digit(hex[2 * i]) * 16 + hex_digit(hex[2 * i + 1]);
+        if (out[at + i] != b) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+test layout_without_data_matches_the_rust_oracle_s1 {
+    // S1: 3 code words, no data, no references, 1 symbol, string table 16 bytes; object 368 bytes.
+    assert nsects(0) == 1;
+    assert sizeofcmds(0) == 280;
+    assert text_off(0) == 320;
+    assert vm_size(12, 0) == 12;
+    assert reloff(12, 0) == 336;
+    assert symoff(12, 0, 0) == 336;
+    assert stroff(12, 0, 0, 1) == 352;
+    assert object_size(12, 0, 0, 1, 16) == 368;
+}
+
+test layout_with_data_matches_the_rust_oracle_s2 {
+    // S2: 10 code words, blobs 5 + 16 + 3 bytes at 0, 8, 24, two references, 2 + 2 symbols.
+    assert nsects(27) == 2;
+    assert sizeofcmds(27) == 360;
+    assert text_off(27) == 400;
+    assert const_addr(40) == 48;
+    assert vm_size(40, 27) == 75;
+    assert reloff(40, 27) == 480;
+    assert symoff(40, 27, 2) == 512;
+    assert stroff(40, 27, 2, 4) == 576;
+    assert object_size(40, 27, 2, 4, 40) == 616;
+}
+
+test layout_matches_the_rust_oracle_s3 {
+    // S3: 13 code words (52 bytes, so __const starts at 64), const_size 65, four references, 3 + 3 symbols.
+    assert const_addr(52) == 64;
+    assert vm_size(52, 65) == 129;
+    assert reloff(52, 65) == 536;
+    assert symoff(52, 65, 4) == 600;
+    assert stroff(52, 65, 4, 6) == 696;
+    assert object_size(52, 65, 4, 6, 72) == 768;
+}
+
+test alignment_rounds_up_only_when_needed {
+    assert align_up(0, 16) == 0;
+    assert align_up(1, 16) == 16;
+    assert align_up(16, 16) == 16;
+    assert align_up(17, 16) == 32;
+    assert align_up(483, 8) == 488;
+    assert const_addr(16) == 16;
+    assert const_addr(17) == 32;
+}
+
+test commands_without_data_are_the_rust_bytes_s1 {
+    // Bytes 0 .. 312 of S1: the header and the four commands, one section.
+    var out : [320]u8 = undefined;
+    assert put_commands(&out, 12, 0, 0, 0, 1, 16) == 312;
+    assert bytes_are(&out, 0, "cffaedfe0c0000010000000001000000040000001801000000000000000000001900000098000000000000000000000000000000000000000000000000000000");
+    assert bytes_are(&out, 64, "0c0000000000000040010000000000000c00000000000000070000000700000001000000000000005f5f74657874000000000000000000005f5f544558540000");
+    assert bytes_are(&out, 128, "000000000000000000000000000000000c0000000000000040010000040000000000000000000000000400800000000000000000000000003200000018000000");
+    assert bytes_are(&out, 192, "0100000000000b0000000000000000000200000018000000500100000100000060010000100000000b0000005000000000000000000000000000000001000000");
+    assert bytes_are(&out, 256, "0100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000");
+}
+
+test commands_with_data_are_the_rust_bytes_s2 {
+    // Bytes 0 .. 392 of S2: two sections, __text carries 4 relocations.
+    var out : [400]u8 = undefined;
+    assert put_commands(&out, 40, 27, 2, 2, 2, 40) == 392;
+    assert bytes_are(&out, 0, "cffaedfe0c00000100000000010000000400000068010000000000000000000019000000e8000000000000000000000000000000000000000000000000000000");
+    assert bytes_are(&out, 64, "4b0000000000000090010000000000004b00000000000000070000000700000002000000000000005f5f74657874000000000000000000005f5f544558540000");
+    assert bytes_are(&out, 128, "0000000000000000000000000000000028000000000000009001000004000000e001000004000000000400800000000000000000000000005f5f636f6e737400");
+    assert bytes_are(&out, 192, "00000000000000005f5f544558540000000000000000000030000000000000001b00000000000000c00100000300000000000000000000000000000000000000");
+    assert bytes_are(&out, 256, "000000000000000032000000180000000100000000000b0000000000000000000200000018000000000200000400000040020000280000000b00000050000000");
+    assert bytes_are(&out, 320, "00000000020000000200000002000000040000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000");
+    assert bytes_are(&out, 384, "0000000000000000");
+}
+
+test commands_are_the_rust_bytes_s3 {
+    // Bytes 0 .. 392 of S3.
+    var out : [400]u8 = undefined;
+    assert put_commands(&out, 52, 65, 4, 3, 3, 72) == 392;
+    assert bytes_are(&out, 0, "cffaedfe0c00000100000000010000000400000068010000000000000000000019000000e8000000000000000000000000000000000000000000000000000000");
+    assert bytes_are(&out, 64, "810000000000000090010000000000008100000000000000070000000700000002000000000000005f5f74657874000000000000000000005f5f544558540000");
+    assert bytes_are(&out, 128, "00000000000000000000000000000000340000000000000090010000040000001802000008000000000400800000000000000000000000005f5f636f6e737400");
+    assert bytes_are(&out, 192, "00000000000000005f5f544558540000000000000000000040000000000000004100000000000000d00100000300000000000000000000000000000000000000");
+    assert bytes_are(&out, 256, "000000000000000032000000180000000100000000000b00000000000000000002000000180000005802000006000000b8020000480000000b00000050000000");
+    assert bytes_are(&out, 320, "00000000030000000300000003000000060000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000");
+    assert bytes_are(&out, 384, "0000000000000000");
+}
+
+test relocations_are_the_rust_bytes_s2 {
+    // S2 references blob 0 at word 2 and blob 2 at word 5: local symbols 0 and 1.
+    var out : [32]u8 = undefined;
+    var p : usize = put_reloc_pair(&out, 0, 2, 0);
+    p = put_reloc_pair(&out, p, 5, 1);
+    assert p == 32;
+    assert bytes_are(&out, 0, "080000000000003d0c0000000000004c140000000100003d180000000100004c");
+}
+
+test relocations_are_the_rust_bytes_s3 {
+    // S3 references blobs 11, 10, 11, 1 at words 1, 3, 6, 9; the used blobs 1, 10, 11 are symbols 0, 1, 2.
+    var out : [64]u8 = undefined;
+    var p : usize = put_reloc_pair(&out, 0, 1, 2);
+    p = put_reloc_pair(&out, p, 3, 1);
+    p = put_reloc_pair(&out, p, 6, 2);
+    p = put_reloc_pair(&out, p, 9, 0);
+    assert p == 64;
+    assert bytes_are(&out, 0, "040000000200003d080000000200004c0c0000000100003d100000000100004c180000000200003d1c0000000200004c240000000000003d280000000000004c");
+    assert reloc_info(2, 1, ARM64_RELOC_PAGE21) == 0x3d000002;
+    assert reloc_info(2, 0, ARM64_RELOC_PAGEOFF12) == 0x4c000002;
+}
+
+test symbols_are_the_rust_bytes_s1 {
+    // S1: _answer at __text + 0, string index 1.
+    var out : [16]u8 = undefined;
+    assert put_nlist(&out, 0, 1, N_SECT | N_EXT, SECT_TEXT, 0) == 16;
+    assert bytes_are(&out, 0, "010000000f0100000000000000000000");
+}
+
+test symbols_are_the_rust_bytes_s2 {
+    // S2: l_t27b_data.0 and .2 at __const 48 + 0 and 48 + 24, then _g at 16 and _main at 0.
+    var out : [64]u8 = undefined;
+    var p : usize = put_nlist(&out, 0, 1, N_SECT, SECT_CONST, 48);
+    p = put_nlist(&out, p, 15, N_SECT, SECT_CONST, 72);
+    p = put_nlist(&out, p, 29, N_SECT | N_EXT, SECT_TEXT, 16);
+    p = put_nlist(&out, p, 32, N_SECT | N_EXT, SECT_TEXT, 0);
+    assert p == 64;
+    assert bytes_are(&out, 0, "010000000e02000030000000000000000f0000000e02000048000000000000001d0000000f0100001000000000000000200000000f0100000000000000000000");
+}
+
+test symbols_are_the_rust_bytes_s3 {
+    // S3: blobs 1, 10, 11 at __const 64 + 0, 64, 64; then _alpha_beta 32, _k 48, _zeta 0.
+    var out : [96]u8 = undefined;
+    var p : usize = put_nlist(&out, 0, 1, N_SECT, SECT_CONST, 64);
+    p = put_nlist(&out, p, 15, N_SECT, SECT_CONST, 128);
+    p = put_nlist(&out, p, 30, N_SECT, SECT_CONST, 128);
+    p = put_nlist(&out, p, 45, N_SECT | N_EXT, SECT_TEXT, 32);
+    p = put_nlist(&out, p, 57, N_SECT | N_EXT, SECT_TEXT, 48);
+    p = put_nlist(&out, p, 60, N_SECT | N_EXT, SECT_TEXT, 0);
+    assert p == 96;
+    assert bytes_are(&out, 0, "010000000e02000040000000000000000f0000000e02000080000000000000001e0000000e02000080000000000000002d0000000f0100002000000000000000");
+    assert bytes_are(&out, 64, "390000000f01000030000000000000003c0000000f0100000000000000000000");
+}
+
+test name_fields_are_zero_padded {
+    var out : [16]u8 = undefined;
+    out[7] = 99;
+    out[15] = 99;
+    assert put_name16(&out, 0, "__const") == 16;
+    assert bytes_are(&out, 0, "5f5f636f6e7374000000000000000000");
+}
+
+test writers_are_little_endian {
+    var out : [16]u8 = undefined;
+    assert put_u64(&out, 0, 0x0102030405060708) == 8;
+    assert put_u32(&out, 8, 0xa1b2c3d4) == 12;
+    assert put_u16(&out, 12, 0xbeef) == 14;
+    assert put_u8(&out, 14, 0x7f) == 15;
+    assert bytes_are(&out, 0, "0807060504030201d4c3b2a1efbe7f");
+}
+
+test the_hex_helper_can_fail {
+    // bytes_are is the judge of every test above; it must say no when one byte differs.
+    var out : [4]u8 = undefined;
+    assert put_u32(&out, 0, 0x04030201) == 4;
+    assert bytes_are(&out, 0, "01020304");
+    assert bytes_are(&out, 0, "01020305") == false;
+    assert bytes_are(&out, 1, "03") == false;
+    assert bytes_are(&out, 3, "04");
+    assert hex_digit(48) == 0;
+    assert hex_digit(57) == 9;
+    assert hex_digit(97) == 10;
+    assert hex_digit(102) == 15;
+}
+
+invariant one_section_without_data_two_with {
+    assert segment_cmdsize(0) == SEGMENT_SIZE + SECTION_SIZE;
+    assert segment_cmdsize(1) == SEGMENT_SIZE + 2 * SECTION_SIZE;
+    assert text_off(0) % 16 == 0;
+    assert text_off(1) % 16 == 0;
+    assert reloff(13, 0) % 8 == 0;
+    assert reloff(52, 65) % 8 == 0;
+}
+
+endmodule
