@@ -74,6 +74,12 @@ const urlOf = (C, lang, id) => `${ORIGIN}/${pathOf(C, lang, id)}`
 const CARRY_UTM = `<script>(function(){var q=location.search;if(!/[?&]utm_source=/.test(q))return;document.querySelectorAll('a[href^="/#/"]').forEach(function(a){a.setAttribute('href','/'+q+a.getAttribute('href').slice(1))})})()</script>`
 
 export const appOf = (C, id) => `/#/${C.route}${id ? `/${id}` : ''}`
+/** The course's view in the HUD homepage (/ru/, emitted from specs/site/landing_ru.t27, Russian
+ *  only so far); a lesson opens its course's view. null for a course the HUD has no view for. */
+const HUD = join(PUBLIC, 'ru', 'index.html')
+const hudPage = existsSync(HUD) ? readFileSync(HUD, 'utf8') : ''
+export const hudOf = (C) => (hudPage.includes(`id="v-${C.id}"`) ? `/ru/#v-${C.id}` : null)
+export const ctaOf = (C, id) => hudOf(C) ?? appOf(C, id)
 /** A neighbouring course's lesson page: lesson pages live under learn/ whatever the course. */
 const lessonPath = (lang, id) => `${lang === 'ru' ? 'ru/' : ''}${BASE}/${id}/`
 
@@ -177,10 +183,11 @@ function pageHtml(C, lang, lesson, cardUrl, all = []) {
   const body = lesson
     ? `<div class="hd"><h1>${esc(t.title)}</h1><p class="lab">${esc(say.GOAL)}</p><p class="goal">${esc(t.goal)}</p></div>
 <div class="txt"><p>${esc(t.text)}</p></div>
-<div class="ft"><aside class="try"><h2>${esc(say.TRY)}</h2><p>${esc(t.task)}</p></aside><a class="cta" href="${appOf(C, id)}">${esc(say.OPEN_LESSON)} →</a></div>`
+<div class="ft"><aside class="try"><h2>${esc(say.TRY)}</h2><p>${esc(t.task)}</p></aside><a class="cta" href="${ctaOf(C, id)}">${esc(say.OPEN_LESSON)} →</a></div>
+<nav class="pager">${back}${fwd}</nav>`
     : `<div class="hd"><p class="lab">${esc(say.KICKER)}</p><h1>${esc(say.TITLE)}</h1><p class="goal">${esc(say.LEAD)}</p></div>
 <div class="txt"><p>${esc(say.DESCRIPTION)}</p>${catalog}${courses}</div>
-<div class="ft"><a class="cta" href="${appOf(C)}">${esc(say.OPEN_COURSE)} →</a></div>`
+<div class="ft"><a class="cta" href="${ctaOf(C)}">${esc(say.OPEN_COURSE)} →</a></div>`
   return `<!doctype html>
 <html lang="${lang}">
 <head>

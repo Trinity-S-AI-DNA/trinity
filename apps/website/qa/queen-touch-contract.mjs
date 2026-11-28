@@ -44,6 +44,22 @@ const wait = ms => new Promise(r => setTimeout(r, ms));
 const cleanup = () => { try { ws.close(); } catch {} chrome.kill(); server.close(); };
 
 await call('Page.enable');
+// The sector rows draw GET /queen/public-board, whose default host is gone: answer it with a
+// fixed six-column board (one card each), as qa/queen-viewport-contract.mjs does.
+const BOARD = (() => {
+  const keys = ['backlog', 'blocked', 'running', 'review', 'done', 'dropped'];
+  const cards = keys.map((column, i) => ({ number: 990001 + i, title: `fixture ${column}`, column, criteria: 0, needs: [] }));
+  const pulse = { rounds: 0, bees: 0, verdicts: 0, lastRoundAt: null, roundSeconds: null };
+  return { repo: 'gHashTag/t27', columns: keys.map(key => ({ key, title: key, blurb: '' })), cards, pulse };
+})();
+await call('Fetch.enable', { patterns: [{ urlPattern: '*/queen/public-board*', requestStage: 'Request' }] });
+ws.addEventListener('message', ev => {
+  const msg = JSON.parse(ev.data);
+  if (msg.sessionId !== sessionId || msg.method !== 'Fetch.requestPaused') return;
+  const responseHeaders = [{ name: 'Content-Type', value: 'application/json' }, { name: 'Access-Control-Allow-Origin', value: '*' }];
+  const body = Buffer.from(JSON.stringify(BOARD)).toString('base64');
+  call('Fetch.fulfillRequest', { requestId: msg.params.requestId, responseCode: 200, responseHeaders, body }).catch(() => {});
+});
 await call('Emulation.setDeviceMetricsOverride', { width: 1272, height: 806, deviceScaleFactor: 1, mobile: true });
 await call('Emulation.setTouchEmulationEnabled', { enabled: true, maxTouchPoints: 1 });
 await call('Page.navigate', { url: `${ORIGIN}/?touch=1${process.env.QUEEN_ENGINE ? '&engine=' + process.env.QUEEN_ENGINE : ''}#/queen` });

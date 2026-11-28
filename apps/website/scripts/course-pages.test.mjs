@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { appOf, buildPages, loadCourses, sitemapOf } from './course-pages.mjs'
+import { appOf, ctaOf, buildPages, loadCourses, sitemapOf } from './course-pages.mjs'
 
 const COURSES = loadCourses()
 const pages = buildPages(COURSES)
@@ -52,7 +52,7 @@ test('every page carries a large card of its own and the lesson words', () => {
     if (p.lesson) {
       const t = p.lesson[p.lang]
       for (const w of [t.title, t.goal, t.task]) assert.ok(p.html.includes(w.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')), `${p.dir} lacks: ${w}`)
-      assert.ok(p.html.includes(`href="${appOf(p.course, p.lesson.id)}"`), `${p.dir} does not open the lesson`)
+      assert.ok(p.html.includes(`href="${ctaOf(p.course, p.lesson.id)}"`), `${p.dir} does not open the lesson`)
       assert.ok(appOf(p.course, p.lesson.id).startsWith(`/#/${p.course.route}/`))
     }
   }
