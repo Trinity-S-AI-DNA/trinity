@@ -112,7 +112,7 @@ export interface AgentSpecFields {
   KEY_FILES: string[]
   ENTRY_INVARIANT: string
   EXIT_INVARIANT: string
-  CLARA_ROLE: string
+  AR_ROLE: string
   SKILLS: string[]
   SKILLS_NOTE: string
   TOOLS?: string[]
@@ -243,7 +243,7 @@ export interface CronSpecCatalog extends SpecCatalogBase {
 
 export interface AgentSpecCatalog extends Omit<SpecCatalogBase, 'codeOnly'> {
   counts: {
-    specs: number; enabled: number; typecheckOk: number; withSkills: number; withCrons: number; withTools: number; withExperience: number; withClaraRole: number
+    specs: number; enabled: number; typecheckOk: number; withSkills: number; withCrons: number; withTools: number; withExperience: number; withArRole: number
     specPlusExperience: number; specOnly: number; byLayer: Record<AgentLayer, number>
     episodesAttributed: number; episodesUnattributed: number | null; episodesTotal: number | null
   }
