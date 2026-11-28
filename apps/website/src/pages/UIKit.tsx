@@ -340,6 +340,17 @@ export default function UIKit() {
 
   useEffect(() => { setStepResults([]) }, [activeId])
 
+  // At <=640px the sidebar becomes an off-canvas drawer toggled from the
+  // toolbar (issue #1867); above 640px it stays inline and the drawer is closed.
+  const [narrow, setNarrow] = useState(() => window.matchMedia('(max-width: 640px)').matches)
+  const [drawerOpen, setDrawerOpen] = useState(false)
+  useEffect(() => {
+    const mq = window.matchMedia('(max-width: 640px)')
+    const onChange = () => { setNarrow(mq.matches); if (!mq.matches) setDrawerOpen(false) }
+    mq.addEventListener('change', onChange)
+    return () => mq.removeEventListener('change', onChange)
+  }, [])
+
   // The story id lives in the hash query; read it on mount and again on every
   // hashchange so Back/Forward restore the matching story (issue #1866).
   // history.replaceState above does not fire hashchange, so this cannot loop.
@@ -371,10 +382,15 @@ export default function UIKit() {
     })
   }
 
+  // Off-canvas when narrow (issue #1867): fixed overlay off-screen until opened.
+  const asideStyle: CSSProperties = narrow
+    ? { position: 'fixed', top: 0, bottom: 0, left: drawerOpen ? '0' : '-240px', width: '230px', zIndex: 40, transition: 'left 0.2s ease', boxShadow: drawerOpen ? '0 0 24px rgba(0,0,0,0.5)' : 'none', borderRight: `1px solid ${t.cardBorder}`, overflow: 'auto', background: theme === 't27' ? '#080808' : '#FFFFFF' }
+    : { width: '230px', borderRight: `1px solid ${t.cardBorder}`, overflow: 'auto', flexShrink: 0, background: theme === 't27' ? '#080808' : '#FFFFFF' }
+
   return (
     <div style={{ display: 'flex', height: '100vh', fontFamily: 'Outfit, system-ui, sans-serif', background: t.bg, color: t.text, overflow: 'hidden' }}>
       {/* Sidebar */}
-      <aside style={{ width: '230px', borderRight: `1px solid ${t.cardBorder}`, overflow: 'auto', flexShrink: 0, background: theme === 't27' ? '#080808' : '#FFFFFF' }}>
+      <aside style={asideStyle}>
         <div style={{ padding: '14px 12px 10px', borderBottom: `1px solid ${t.cardBorder}` }}>
           <div style={{ color: t.accent, fontWeight: 800, fontSize: '15px', letterSpacing: '0.04em' }}>t27 UI Kit</div>
           <div style={{ color: t.muted, fontSize: '11px', marginTop: '2px' }}>M0 · 35 stories</div>
@@ -385,7 +401,7 @@ export default function UIKit() {
               {comp}
             </button>
             {openGroups.has(comp) && STORIES.filter(s => s.component === comp).map(s => (
-              <button key={s.id} onClick={() => { setActiveId(s.id); setTab('stories') }} style={{ display: 'block', width: '100%', textAlign: 'left', padding: '5px 20px', background: activeId === s.id ? (theme === 't27' ? '#111' : '#EEE') : 'none', border: 'none', borderLeft: activeId === s.id ? `2px solid ${t.accent}` : '2px solid transparent', color: activeId === s.id ? t.accent : t.text, fontSize: '12px', cursor: 'pointer', fontFamily: 'inherit' }}>
+              <button key={s.id} onClick={() => { setActiveId(s.id); setTab('stories'); setDrawerOpen(false) }} style={{ display: 'block', width: '100%', textAlign: 'left', padding: '5px 20px', background: activeId === s.id ? (theme === 't27' ? '#111' : '#EEE') : 'none', border: 'none', borderLeft: activeId === s.id ? `2px solid ${t.accent}` : '2px solid transparent', color: activeId === s.id ? t.accent : t.text, fontSize: '12px', cursor: 'pointer', fontFamily: 'inherit' }}>
                 {s.title.split(' / ').slice(-2).join(' / ')}
               </button>
             ))}
@@ -394,7 +410,7 @@ export default function UIKit() {
         <div style={{ borderTop: `1px solid ${t.cardBorder}`, marginTop: '8px' }}>
           <div style={{ color: t.muted, fontSize: '11px', letterSpacing: '0.1em', textTransform: 'uppercase', padding: '6px 12px' }}>Tools</div>
           {(['netlist', 'badge-vr'] as Tab[]).map(id => (
-            <button key={id} onClick={() => setTab(id)} style={{ display: 'block', width: '100%', textAlign: 'left', padding: '5px 20px', background: tab === id ? (theme === 't27' ? '#111' : '#EEE') : 'none', border: 'none', borderLeft: tab === id ? `2px solid ${t.accent}` : '2px solid transparent', color: tab === id ? t.accent : t.text, fontSize: '12px', cursor: 'pointer', fontFamily: 'inherit' }}>
+            <button key={id} onClick={() => { setTab(id); setDrawerOpen(false) }} style={{ display: 'block', width: '100%', textAlign: 'left', padding: '5px 20px', background: tab === id ? (theme === 't27' ? '#111' : '#EEE') : 'none', border: 'none', borderLeft: tab === id ? `2px solid ${t.accent}` : '2px solid transparent', color: tab === id ? t.accent : t.text, fontSize: '12px', cursor: 'pointer', fontFamily: 'inherit' }}>
               {id === 'badge-vr' ? 'Badge VR' : 'Netlist'}
             </button>
           ))}
@@ -406,6 +422,7 @@ export default function UIKit() {
         {/* Toolbar */}
         <div style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '10px 16px', borderBottom: `1px solid ${t.cardBorder}`, background: theme === 't27' ? '#080808' : '#FFFFFF', flexShrink: 0 }}>
           <span style={{ color: t.muted, fontSize: '12px', flex: 1, fontFamily: 'monospace' }}>{tab === 'netlist' ? 'Tools / Netlist' : tab === 'badge-vr' ? 'Tools / Badge VR' : story.title}</span>
+          {narrow && <button aria-label={drawerOpen ? 'Close story tree' : 'Open story tree'} onClick={() => setDrawerOpen(v => !v)} style={{ padding: '5px 10px', fontSize: '14px', border: `1px solid ${t.cardBorder}`, background: 'none', color: t.text, cursor: 'pointer', borderRadius: '4px', fontFamily: 'inherit', lineHeight: 1 }}>☰</button>}
           {(['stories', 'gallery'] as Tab[]).map(tabId => (
             <button key={tabId} onClick={() => setTab(tabId)} style={{ padding: '5px 12px', fontSize: '12px', border: `1px solid ${tab === tabId ? t.accent : t.cardBorder}`, background: tab === tabId ? (theme === 't27' ? '#111' : '#EEE') : 'none', color: tab === tabId ? t.accent : t.muted, cursor: 'pointer', borderRadius: '4px', fontFamily: 'inherit' }}>
               {tabId === 'stories' ? 'Preview' : 'Gallery'}
