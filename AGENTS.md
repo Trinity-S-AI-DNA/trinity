@@ -418,3 +418,25 @@ The Queen and the swarm move to the actor model.
 The Queen server lives in gHashTag/trios, on branches `queen` and `queen-runners`. The gHashTag/BrowserOS fork holds the browser extension and nothing else.
 
 The full rule is in [gHashTag/t27 `AGENTS.md`, "Actors, not threads"](https://github.com/gHashTag/t27/blob/master/AGENTS.md#actors-not-threads-owner-rule-2026-10-08). This section points to it; it is not a copy.
+
+## New functionality is written in .t27 only
+
+**Owner, 2026-10-11:** new functionality is added on `t27c` / `t27b`, and the
+outdated logic that lives outside `.t27` is abandoned, not extended.
+
+1. **Spec first, `.t27` only.** A new rule, number, threshold, limit, price,
+   access decision or order of steps is written as a `.t27` spec and executed
+   by `t27c` / `t27b`. It is not written in TypeScript, Rust, Python or
+   hand-written Zig.
+2. **Existing logic outside `.t27` is legacy.** It is not extended. When it is
+   touched for a fix, the rule moves into a spec first and the host keeps only
+   plumbing.
+3. **Plumbing may stay in the host language**: transport, HTTP, database
+   drivers, rendering, wiring. Plumbing never decides a rule. A host function
+   that only looks like a rule is a defect, not plumbing.
+4. **Concurrency uses the actor model of `specs/queen/actors.t27`** (pids,
+   mailboxes, links, monitors, supervisors), not hand-written threads or
+   queues.
+5. **A claim that `t27b` can host a runtime is verified by running it.** Where
+   it cannot yet, the existing host stays as a thin transitional host and the
+   gap is recorded as an issue, not hidden.
