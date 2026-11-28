@@ -2,13 +2,14 @@
 //
 // Owner's word, 2026-10-02: a tab with the token and its leaderboard, ranked by
 // GitHub account. Owner's word, 2026-10-03: the tokens are counted by the
-// leaderboard. So every number here is read, nothing typed in by hand:
+// leaderboard. Owner's word, 2026-10-10: lanes never count -- only .t27 spec
+// creators and their bees earn, under the creator's login. So every number
+// here is read, nothing typed in by hand:
 //
 // - the minter's `get_tri_state` on TON testnet: minted, cap, epoch, quorum;
-// - the leaderboard's two counts, the same files the LEADERBOARD tab reads:
-//   spec commits per author (`roadmap/spec-authors.json`) and accepted .t27
-//   specs per lane (`/queen/public-leaderboard`), summed per GitHub account in
-//   lib/triBoard.ts;
+// - the leaderboard's count, the same file the LEADERBOARD tab reads:
+//   spec commits per author (`roadmap/spec-authors.json`), summed per GitHub
+//   account in lib/triBoard.ts;
 // - the rate per spec, as the Queen's ledger states it (`triPerSpec`).
 //
 // The status line is not decoration. This is a testnet token under a signer
@@ -127,7 +128,7 @@ function TokenBoard({
       </p>
     )
 
-  const { authors, lanes, triPerSpec } = board.value
+  const { authors, triPerSpec } = board.value
   const { rows, nobody, total } = boardOf(board.value)
   const tri = (n: number | null) => (n === null ? '—' : fmt(n))
 
@@ -155,14 +156,7 @@ function TokenBoard({
                 <a href={`https://github.com/${row.login}`} target="_blank" rel="noreferrer noopener">
                   {row.login}
                 </a>
-                <b className="qp-repos">
-                  {[
-                    row.specCommits > 0 && c.specCommits(fmt(row.specCommits)),
-                    row.laneSpecs > 0 && c.laneSpecs(fmt(row.laneSpecs)),
-                  ]
-                    .filter(Boolean)
-                    .join(' · ')}
-                </b>
+                <b className="qp-repos">{c.specCommits(fmt(row.specCommits))}</b>
               </span>
               <span className="qp-commits">
                 <b>{tri(row.tri)}</b> TRI
@@ -171,10 +165,8 @@ function TokenBoard({
           ))}
         </ol>
       )}
-      {nobody.specCommits + nobody.laneSpecs > 0 && (
-        <p className="qp-counted">
-          {c.nobody(fmt(nobody.specCommits), fmt(nobody.laneSpecs), tri(nobody.tri))}
-        </p>
+      {nobody.specCommits > 0 && (
+        <p className="qp-counted">{c.nobody(fmt(nobody.specCommits), tri(nobody.tri))}</p>
       )}
       {total !== null && (
         <p className="qp-counted">
@@ -184,7 +176,7 @@ function TokenBoard({
         </p>
       )}
       <p className="qp-counted">
-        {c.measured}: {authors.measuredAt.slice(0, 10)} · {lanes.measuredAt.slice(0, 16).replace('T', ' ')} UTC ·{' '}
+        {c.measured}: {authors.measuredAt.slice(0, 10)} ·{' '}
         <a href="#/queen?tab=leaderboard">{c.leaderboardLink} →</a>
       </p>
     </>

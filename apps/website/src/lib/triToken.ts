@@ -6,8 +6,10 @@
 // - the cap, what has been minted, the epoch and the signer quorum come from
 //   the minter's own `get_tri_state` get-method, so the page cannot disagree
 //   with the contract that enforces them;
-// - who has earned what is counted by the leaderboard (owner, 2026-10-03):
-//   its two reads, summed in lib/triBoard.ts, at the rate the Queen's
+// - who has earned what is counted by the leaderboard (owner, 2026-10-03;
+//   lanes struck from the count by the owner, 2026-10-10: only .t27 spec
+//   creators and their bees earn, and the board credits the login, not the
+//   agent): its one read, summed in lib/triBoard.ts, at the rate the Queen's
 //   `/queen/public-earnings` ledger states. `readTriCounts` is that one read,
 //   for the TOKEN tab and the landing alike.
 //
@@ -16,7 +18,6 @@
 // /tri/jetton.json, the minter's `content`). It is written once, below.
 
 import { QUEEN_API } from './queenApi'
-import { readLeaderboard, type Leaderboard } from './leaderboard'
 import { readSpecAuthors, type SpecAuthors } from './queenPeople'
 import { triBoard, validRate, type TriBoard } from './triBoard'
 
@@ -112,24 +113,21 @@ export async function readEarnings(signal?: AbortSignal): Promise<TriEarnings | 
   return (await res.json()) as TriEarnings
 }
 
-/** What the TRI board is counted from: the leaderboard's two reads and the rate. */
+/** What the TRI board is counted from: the leaderboard's read and the rate. */
 export interface TriCounts {
   authors: SpecAuthors
-  lanes: Leaderboard
   /** The ledger's rate; null when the ledger could not say, or said something
    *  validRate refuses. Gated here, at the one read, so no caller can show it. */
   triPerSpec: number | null
 }
 
 /**
- * Both counts are required: a board built from half of them would rank the
- * other road's people at zero. The rate is not: without it the units still
- * stand, and the TRI is shown as unknown.
+ * The count is required. The rate is not: without it the units still stand,
+ * and the TRI is shown as unknown.
  */
 export async function readTriCounts(signal?: AbortSignal): Promise<TriCounts> {
-  const [authors, lanes, triPerSpec] = await Promise.all([
+  const [authors, triPerSpec] = await Promise.all([
     readSpecAuthors(signal),
-    readLeaderboard(QUEEN_API, signal),
     readEarnings(signal).then(
       (e) => {
         const rate: unknown = e?.triPerSpec
@@ -138,9 +136,9 @@ export async function readTriCounts(signal?: AbortSignal): Promise<TriCounts> {
       () => null,
     ),
   ])
-  return { authors, lanes, triPerSpec }
+  return { authors, triPerSpec }
 }
 
 /** The board those counts make: the one call both the tab and the landing use. */
-export const boardOf = ({ authors, lanes, triPerSpec }: TriCounts): TriBoard =>
-  triBoard(authors.people, lanes.contributors, triPerSpec, authors.unattributed?.commits ?? 0)
+export const boardOf = ({ authors, triPerSpec }: TriCounts): TriBoard =>
+  triBoard(authors.people, triPerSpec, authors.unattributed?.commits ?? 0)

@@ -3,8 +3,9 @@
 // Owner's word, 2026-10-03: the landing says what the token is right now, and
 // a "Copy to agent" button gives a person's agent everything it needs to mine
 // TRI on that person's behalf. Mining here is not hashing: a TRI is minted for
-// a .t27 spec the Queen accepted and whose pull request merged, or earned by a
-// lane that ran on the person's own machine. So the prompt is the work order
+// a .t27 spec the Queen accepted and whose pull request merged. Lanes never
+// earn (owner, 2026-10-10): only .t27 spec creators and their bees count, and
+// the bees work under the creator's login. So the prompt is the work order
 // for exactly that, and nothing a chain does not back.
 //
 // Every number the prompt carries is read live by the block that renders it
@@ -30,7 +31,6 @@ export const MINE_LINKS = {
   explorer: 'https://t27.ai/#/specs',
   token: 'https://t27.ai/#/queen?tab=token',
   runners: 'https://t27.ai/#/queen?tab=leaderboard',
-  howToJoin: 'https://t27.ai/blog/how-to-join-the-swarm/',
   minedNotSold: 'https://t27.ai/blog/tri-mined-not-sold/',
   issues: 'https://github.com/gHashTag/t27/issues',
 } as const
@@ -96,8 +96,7 @@ export function minePrompt(lang: Lang, roads: MineRoads, facts: MineFacts = {}):
       '3. Скомпилируй её настоящим компилятором (обозреватель или t27c). Не компилируется — значит, это ещё не спека.',
       '4. Покажи мне дифф. Только после моего «да» открой pull request из моего аккаунта GitHub со ссылкой на задачу; он должен менять объявленный файл .t27.',
       `5. Когда Королева примет работу и PR смержат, заработок появится на вкладке ${MINE_LINKS.token} под моим логином GitHub.`,
-      `6. Второй путь — моё железо: раннер на моей машине под моим аккаунтом провайдера (${MINE_LINKS.runners}, «Мои раннеры»; руководство: ${MINE_LINKS.howToJoin}). Расскажи, что именно запустится, и запускай только после моего «да». Ключ провайдера остаётся на моей машине.`,
-      `7. Вывод делаю я сам, не ты; как — написано на вкладке токена: ${MINE_LINKS.token}`,
+      `6. Вывод делаю я сам, не ты; как — написано на вкладке токена: ${MINE_LINKS.token}`,
       '',
       'Правила:',
       '- Никогда не вставляй ключ провайдера, токен или пароль в PR, задачу, коммит или чат.',
@@ -122,8 +121,7 @@ export function minePrompt(lang: Lang, roads: MineRoads, facts: MineFacts = {}):
     '3. Compile it with the real compiler (the Explorer or t27c). If it does not compile, it is not a spec yet.',
     '4. Show me the diff. Only after my "yes", open a pull request from my GitHub account that references the issue and changes the declared .t27 file.',
     `5. Once the Queen accepts the work and the PR merges, the earning appears on ${MINE_LINKS.token} under my GitHub login.`,
-    `6. The second road is my own hardware: a runner on my machine under my own provider account (${MINE_LINKS.runners}, "My runners"; guide: ${MINE_LINKS.howToJoin}). Tell me what it will start, and start it only after my "yes". The provider key stays on my machine.`,
-    `7. Withdrawing is mine to do, not yours; the token tab says how: ${MINE_LINKS.token}`,
+    `6. Withdrawing is mine to do, not yours; the token tab says how: ${MINE_LINKS.token}`,
     '',
     'Rules:',
     '- Never put a provider key, token or password in a PR, issue, commit or chat.',
