@@ -340,10 +340,18 @@ export default function UIKit() {
 
   useEffect(() => { setStepResults([]) }, [activeId])
 
-  useEffect(() => {
+  // The story id lives in the hash query; read it on mount and again on every
+  // hashchange so Back/Forward restore the matching story (issue #1866).
+  // history.replaceState above does not fire hashchange, so this cannot loop.
+  const storyFromHash = () => {
     const p = new URLSearchParams(window.location.hash.split('?')[1] ?? '')
-    const s = STORIES.find(x => x.id === p.get('story'))
-    if (s) setActiveId(s.id)
+    return STORIES.find(x => x.id === p.get('story'))
+  }
+  useEffect(() => {
+    const apply = () => { const s = storyFromHash(); if (s) setActiveId(s.id) }
+    apply()
+    window.addEventListener('hashchange', apply)
+    return () => window.removeEventListener('hashchange', apply)
   }, [])
   useEffect(() => {
     history.replaceState(null, '', window.location.hash.split('?')[0] + '?story=' + activeId)
