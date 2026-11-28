@@ -40,7 +40,8 @@ pub fn main() !void {
     const wallet_path = try config_mod.Config.getWalletPath(allocator);
     defer allocator.free(wallet_path);
 
-    const password = "trinity123"; // DEFERRED (v12): prompt for password
+    // Wallet password comes from the environment, never from source.
+    const password = std.posix.getenv("TRINITY_WALLET_PASSWORD") orelse return error.MissingWalletPassword;
 
     var wallet = wallet_mod.Wallet.loadOrCreate(wallet_path, password) catch |err| {
         std.debug.print("Failed to load wallet: {}\n", .{err});

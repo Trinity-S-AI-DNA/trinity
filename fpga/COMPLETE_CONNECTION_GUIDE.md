@@ -282,8 +282,8 @@ OK: LED blinking enabled
 #include <WebSocketsServer.h>
 
 // WiFi credentials
-const char* ssid = "Trinity-FPGA";
-const char* password = "trinity2026";
+const char* ssid = "your-ssid";          // keep real values in a gitignored secrets.h
+const char* password = "your-wifi-password";
 
 WebServer server(80);
 WebSocketsServer webSocket = WebSocketsServer(81);
